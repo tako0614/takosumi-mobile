@@ -1,0 +1,220 @@
+@import "@takosjp/mobile-kit/mobile-shell.css";
+
+/*
+ * Takosumi design language. Values mirror `--tg-*` in
+ * `takosumi/dashboard/src/styles/tokens.css`: the dashboard is a dark-first
+ * product ("absent an explicit choice, default to dark rather than following
+ * the OS"), so the mobile shell opens on the same deep-neutral ground with the
+ * single Takosumi-red accent instead of a light blue-grey theme.
+ */
+:root {
+  color-scheme: dark;
+
+  --shell-text: #f5f5f6; /* --tg-fg */
+  --shell-bg: #0a0a0b; /* --tg-bg */
+  --shell-card: #151517; /* --tg-bg-elev */
+  --shell-muted: #a1a1a8; /* --tg-fg-muted */
+  --shell-subtle: #8a8a93; /* --tg-fg-subtle */
+  --shell-strong: #ffffff;
+  --shell-label: #ededf0;
+  --shell-border: #262629; /* --tg-line */
+  --shell-input-border: #37373d; /* --tg-line-strong */
+  --shell-control-border: #37373d;
+  --shell-metric-border: #262629;
+  --shell-soft: #1c1c1f; /* --tg-bg-subtle */
+}
+
+.takosumi-control-home {
+  display: grid;
+  gap: 18px;
+}
+
+.workspace-picker {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid var(--shell-border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, var(--shell-soft), var(--shell-card));
+}
+
+.workspace-picker div,
+.workspace-picker span {
+  display: grid;
+  min-width: 0;
+}
+
+.workspace-picker span {
+  color: var(--shell-subtle);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workspace-picker strong {
+  overflow: hidden;
+  color: var(--shell-text);
+  font-size: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-picker select {
+  max-width: 46%;
+  border: 1px solid var(--shell-control-border);
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: var(--shell-card);
+  color: var(--shell-text);
+}
+
+.mobile-status {
+  margin: -6px 0 0;
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+  color: var(--shell-muted);
+  font-size: 0.78rem;
+}
+
+.run-heading,
+.run-card footer {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.run-heading > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.run-heading strong {
+  overflow: hidden;
+  color: var(--shell-text);
+  font-size: 0.88rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-heading small,
+.capsule-row small,
+.run-card time {
+  color: var(--shell-subtle);
+  font-size: 0.72rem;
+}
+
+.run-heading em,
+.capsule-row em {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: var(--shell-soft);
+  color: var(--shell-muted);
+  font-size: 0.66rem;
+  font-style: normal;
+  font-weight: 800;
+}
+
+[data-status="waiting_approval"],
+[data-status="stale"] {
+  background: #2a1f08 !important;
+  color: #e0a53a !important; /* --tg-warn */
+}
+
+[data-status="failed"],
+[data-status="error"] {
+  background: #2a1210 !important;
+  color: #f85149 !important; /* --tg-danger */
+}
+
+[data-status="running"],
+[data-status="queued"],
+[data-status="pending"] {
+  background: #101a2a !important;
+  color: #6ea8ff !important; /* --tg-info */
+}
+
+[data-status="succeeded"],
+[data-status="active"] {
+  background: #0e2213 !important;
+  color: #54d16a !important; /* --tg-success-text */
+}
+
+.run-summary {
+  margin: 10px 0 0;
+  color: var(--shell-muted);
+  font-size: 0.76rem;
+}
+
+.run-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.attention-card .run-actions {
+  margin-top: 12px;
+}
+
+.run-actions .primary,
+.run-actions .text-button {
+  min-width: 64px;
+  justify-content: center;
+}
+
+.text-button.danger {
+  color: #b42318;
+}
+
+.capsule-row {
+  display: grid;
+  width: 100%;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: center;
+  border: 1px solid var(--shell-metric-border);
+  border-radius: 12px;
+  padding: 11px 12px;
+  background: var(--shell-card);
+  color: inherit;
+  text-align: left;
+}
+
+.capsule-row > span:not(.capsule-mark) {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.capsule-row strong {
+  overflow: hidden;
+  color: var(--shell-text);
+  font-size: 0.84rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.capsule-mark {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f5483d, #d63a2f);
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.empty {
+  margin: 0;
+  color: var(--shell-subtle);
+  font-size: 0.78rem;
+}

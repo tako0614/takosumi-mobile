@@ -1,0 +1,16 @@
+# Android 16 runs the 64-bit ABIs on 16 KB memory pages. The NDK only injects
+# `-Wl,-z,max-page-size=16384` through its CMake / ndk-build front ends, which
+# the Rust JNI library never goes through, so it would ship 4 KB-aligned next to
+# the 16 KB-aligned Google / AndroidX `.so` files in the same APK — a device
+# compatibility warning today and a Play Console upload rejection.
+#
+# These merge with the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` the Tauri CLI exports
+# for the NDK; cargo appends env and file rustflags rather than replacing them.
+# 32-bit ABIs are left alone: 16 KB pages only exist on 64-bit devices, and the
+# NDK skips them for the same reason.
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

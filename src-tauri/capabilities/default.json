@@ -1,0 +1,36 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Takosumi desktop capability set",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:path:default",
+    "clipboard-manager:allow-write-text",
+    "deep-link:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        {
+          "url": "https://*:*"
+        },
+        {
+          "url": "http://localhost:*"
+        },
+        {
+          "url": "http://127.0.0.1:*"
+        }
+      ]
+    },
+    "notification:default",
+    "opener:allow-default-urls",
+    "opener:allow-open-url",
+    "os:default",
+    "store:default",
+    "stronghold:default",
+    "stronghold:allow-remove-store-record"
+  ]
+}
