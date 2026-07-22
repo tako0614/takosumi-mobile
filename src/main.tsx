@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 import {
   confirmMobileAction,
   formatMobilePreviewDate,
+  mobileErrorMessage,
 } from "@takosjp/mobile-kit";
 import {
   defineMobileHostActions,
@@ -126,9 +127,7 @@ function TakosumiControlHome(props: {
         ),
       );
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "更新できませんでした。",
-      );
+      setStatus(mobileErrorMessage(error, "更新できませんでした。"));
     } finally {
       setLoading(false);
     }
@@ -147,9 +146,7 @@ function TakosumiControlHome(props: {
       setStatus("変更を承認しました。");
       await reload();
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "承認できませんでした。",
-      );
+      setStatus(mobileErrorMessage(error, "承認できませんでした。"));
       setLoading(false);
     }
   }
@@ -163,9 +160,7 @@ function TakosumiControlHome(props: {
       setStatus("キャンセルを受け付けました。");
       await reload();
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "キャンセルできませんでした。",
-      );
+      setStatus(mobileErrorMessage(error, "キャンセルできませんでした。"));
       setLoading(false);
     }
   }
