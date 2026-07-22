@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: takosumi-mobile
+Upstream-Contact: Takos Project
+Source: https://github.com/tako0614/takosumi-mobile
+
+Files: *
+Copyright: 2026 Takos Project
+License: AGPL-3.0-only
