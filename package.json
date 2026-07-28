@@ -9,9 +9,11 @@
     "dev:web": "bun run dev",
     "build": "bunx vite build --config vite.config.ts",
     "build:web": "bun run build",
-    "check": "tsc --noEmit -p tsconfig.json",
+    "check": "bun run fmt:check && bun run lint && bun run test && bun run build",
+    "fmt:check": "bun ../mobile-kit/scripts/check-source-format.mjs",
+    "lint": "bun run typecheck",
     "test": "bun test tests",
-    "mobile:check": "bun run doctor && bun run test && bun run check && bun run build",
+    "mobile:check": "bun run doctor && bun run check",
     "mobile:doctor": "bun run doctor",
     "mobile:native-release-check": "bun run release:native-check",
     "mobile:release-evidence-check": "bun run release:evidence-check",
@@ -31,7 +33,8 @@
     "tauri:android:build": "bunx tauri android build",
     "tauri:ios:init": "bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform ios --apple-environment development",
     "tauri:ios:dev": "bunx tauri ios dev",
-    "tauri:ios:build": "bunx tauri ios build"
+    "tauri:ios:build": "bunx tauri ios build",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@takosjp/mobile-kit": "file:../mobile-kit",

@@ -1,8 +1,9 @@
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 import {
-  confirmMobileAction,
   formatMobilePreviewDate,
   mobileErrorMessage,
+  type MobileSession,
+  type NativeBridge,
 } from "@takosjp/mobile-kit";
 import {
   defineMobileHostActions,
@@ -14,6 +15,9 @@ import {
 } from "@takosjp/mobile-kit/solid";
 import {
   approveRun,
+  approveRestoreRun,
+  canApproveRun,
+  canCancelRun,
   cancelRun,
   loadHome,
   loadWorkspaceHome,
@@ -23,8 +27,16 @@ import {
   type MobileRunType,
   type TakosumiMobileHome,
 } from "./api.ts";
-import { createProductNativeBridge } from "./native.ts";
+import {
+  createProductNativeBridge,
+  isUnsupportedTauriDesktop,
+} from "./native.ts";
 import { productAdapter } from "./product.ts";
+import { authorizeRunMutation } from "./security.ts";
+import {
+  createWorkspacePreference,
+  type WorkspacePreference,
+} from "./workspace-preference.ts";
 import "./styles.css";
 
 const metrics = [
@@ -49,61 +61,93 @@ const actions = defineMobileHostActions<TakosumiMobileHome>([
   { label: "設定", description: "Workspaceとアカウント", path: "/settings" },
 ]);
 
-renderMobileClientApp<TakosumiMobileHome>({
-  adapter: productAdapter,
-  createNativeBridge: createProductNativeBridge,
-  loadHome,
-  sessionUnlock: {
-    restoreMode: "if-available",
-    prompt: {
-      title: "Takosumi",
-      message: "管理セッションを開きます",
-      allowDeviceCredential: true,
+if (isUnsupportedTauriDesktop()) {
+  renderUnsupportedDesktop();
+} else {
+  startTakosumiMobile();
+}
+
+function startTakosumiMobile() {
+  const nativeBridge = createProductNativeBridge();
+  const workspacePreference = createWorkspacePreference(nativeBridge.storage);
+  renderMobileClientApp<TakosumiMobileHome>({
+    adapter: productAdapter,
+    createNativeBridge: () => nativeBridge,
+    loadHome: async (session) =>
+      await loadHome(session, {
+        preferredWorkspaceId: await workspacePreference.load(session),
+      }),
+    sessionUnlock: {
+      restoreMode: "required",
+      prompt: {
+        title: "Takosumi",
+        message: "管理セッションを開きます",
+        allowDeviceCredential: true,
+        confirmationRequired: true,
+      },
     },
-  },
-  homeLabel: "ホーム",
-  copy: {
-    eyebrow: "YOUR SERVICES, IN YOUR POCKET",
-    // Mirror of takosumi/dashboard/public/tako.png, the canonical Takosumi
-    // mark named by docs/reference/design-language.md; `brandMark` stays as
-    // the fallback glyph.
-    brandLogoUrl: "/brand/takosumi.png",
-    brandMark: "T",
-    onboardingTitle: "Takosumiを持ち歩こう",
-    summary:
-      "サービスの確認、通知、承認をスマホから。Cloudにもself-hostにも接続できます。",
-    manualActionLabel: "Takosumiに接続",
-    manualActionDescription: "app.takosumi.com または自分のTakosumi URLを入力",
-    connectLabel: "Takosumi URL",
-    qrActionLabel: "接続QRを読み取る",
-    discoveredHeading: "Takosumiが見つかりました",
-    homeFallbackTitle: "Takosumi",
-    refreshLabel: "更新",
-    homeTitle: (home) => home?.workspace?.displayName,
-    metricsLabel: "現在の状態",
-    shortcutsLabel: "メニュー",
-  },
-  metrics,
-  hostActions: actions,
-  renderHomeExtra: ({ home, session, openHostRoute }) => (
-    <TakosumiControlHome
-      home={home}
-      session={session}
-      openHostRoute={openHostRoute}
-    />
-  ),
-});
+    homeLabel: "ホーム",
+    copy: {
+      eyebrow: "YOUR SERVICES, IN YOUR POCKET",
+      // Mirror of takosumi/dashboard/public/tako.png, the canonical Takosumi
+      // mark named by docs/reference/design-language.md; `brandMark` stays as
+      // the fallback glyph.
+      brandLogoUrl: "/brand/takosumi.png",
+      brandMark: "T",
+      onboardingTitle: "Takosumiを持ち歩こう",
+      summary:
+        "サービスの確認、通知、承認をスマホから。Cloudにもself-hostにも接続できます。",
+      manualActionLabel: "Takosumiに接続",
+      manualActionDescription:
+        "app.takosumi.com または自分のTakosumi URLを入力",
+      connectLabel: "Takosumi URL",
+      qrActionLabel: "接続QRを読み取る",
+      discoveredHeading: "Takosumiが見つかりました",
+      homeFallbackTitle: "Takosumi",
+      refreshLabel: "更新",
+      homeTitle: (home) => home?.workspace?.displayName,
+      metricsLabel: "現在の状態",
+      shortcutsLabel: "メニュー",
+    },
+    metrics,
+    hostActions: actions,
+    renderHomeExtra: ({ home, session, openHostRoute }) => (
+      <TakosumiControlHome
+        home={home}
+        session={session}
+        nativeBridge={nativeBridge}
+        workspacePreference={workspacePreference}
+        openHostRoute={openHostRoute}
+      />
+    ),
+  });
+}
+
+function renderUnsupportedDesktop() {
+  const root = document.getElementById("root");
+  if (!root) throw new Error("Mobile app root not found: root");
+  const message = document.createElement("main");
+  message.className = "unsupported-platform";
+  message.setAttribute("role", "alert");
+  message.textContent =
+    "Takosumi Mobile は iOS / Android 専用です。このデスクトップ版では認証情報を読み込みません。";
+  root.replaceChildren(message);
+}
 
 function TakosumiControlHome(props: {
   home?: TakosumiMobileHome;
-  session: Parameters<typeof loadHome>[0];
+  session: MobileSession;
+  nativeBridge: NativeBridge;
+  workspacePreference: WorkspacePreference;
   openHostRoute: (path: string) => Promise<void>;
 }) {
   const [current, setCurrent] = createSignal(props.home);
+  const [activeSession, setActiveSession] = createSignal(props.session);
   const [loading, setLoading] = createSignal(false);
   const [status, setStatus] = createSignal<string>();
 
   createEffect(() => setCurrent(props.home));
+  createEffect(() => setActiveSession(props.session));
 
   const attentionRuns = createMemo(() =>
     (current()?.runs ?? []).filter(isAttentionRun),
@@ -119,13 +163,13 @@ function TakosumiControlHome(props: {
     setLoading(true);
     setStatus(undefined);
     try {
-      setCurrent(
-        await loadWorkspaceHome(
-          props.session,
-          activeId,
-          current()?.workspaces ?? props.home?.workspaces,
-        ),
+      const home = await loadWorkspaceHome(
+        activeSession(),
+        activeId,
+        current()?.workspaces ?? props.home?.workspaces,
       );
+      setCurrent(home);
+      await props.workspacePreference.save(activeSession(), activeId);
     } catch (error) {
       setStatus(mobileErrorMessage(error, "更新できませんでした。"));
     } finally {
@@ -134,16 +178,32 @@ function TakosumiControlHome(props: {
   }
 
   async function approve(run: MobileRun) {
-    if (
-      !confirmMobileAction({
-        message: `${capsuleName(run)} の変更を承認しますか？`,
-      })
-    )
-      return;
     setLoading(true);
     try {
-      await approveRun(props.session, run.id);
-      setStatus("変更を承認しました。");
+      const input = {
+        session: activeSession(),
+        nativeBridge: props.nativeBridge,
+        run,
+        authorize: async () =>
+          await authorizeRunMutation({
+            bridge: props.nativeBridge,
+            intent: {
+              kind: "approve",
+              run,
+              capsuleName: capsuleName(run),
+            },
+          }),
+      };
+      const result =
+        run.type === "restore"
+          ? await approveRestoreRun(input)
+          : await approveRun(input);
+      setActiveSession(result.session);
+      setStatus(
+        run.type === "restore"
+          ? "復元を承認しました。"
+          : "変更を承認しました。",
+      );
       await reload();
     } catch (error) {
       setStatus(mobileErrorMessage(error, "承認できませんでした。"));
@@ -152,11 +212,23 @@ function TakosumiControlHome(props: {
   }
 
   async function cancel(run: MobileRun) {
-    if (!confirmMobileAction({ message: "この実行をキャンセルしますか？" }))
-      return;
     setLoading(true);
     try {
-      await cancelRun(props.session, run.id);
+      const result = await cancelRun({
+        session: activeSession(),
+        nativeBridge: props.nativeBridge,
+        run,
+        authorize: async () =>
+          await authorizeRunMutation({
+            bridge: props.nativeBridge,
+            intent: {
+              kind: "cancel",
+              run,
+              capsuleName: capsuleName(run),
+            },
+          }),
+      });
+      setActiveSession(result.session);
       setStatus("キャンセルを受け付けました。");
       await reload();
     } catch (error) {
@@ -218,14 +290,16 @@ function TakosumiControlHome(props: {
                       >
                         詳細
                       </button>
-                      <Show when={run.status === "waiting_approval"}>
+                      <Show when={canApproveRun(run)}>
                         <button
                           type="button"
                           class="primary"
                           disabled={loading()}
                           onClick={() => void approve(run)}
                         >
-                          承認する
+                          {run.type === "restore"
+                            ? "復元を承認"
+                            : "承認する"}
                         </button>
                       </Show>
                     </div>
@@ -291,11 +365,7 @@ function TakosumiControlHome(props: {
                       {formatMobilePreviewDate(run.createdAt, "ja-JP")}
                     </time>
                     <div class="run-actions">
-                      <Show
-                        when={
-                          run.status === "queued" || run.status === "running"
-                        }
-                      >
+                      <Show when={canCancelRun(run)}>
                         <button
                           type="button"
                           class="text-button danger"

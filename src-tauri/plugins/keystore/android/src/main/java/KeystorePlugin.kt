@@ -155,6 +155,7 @@ class KeystorePlugin(private val activity: Activity) : Plugin(activity) {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setRandomizedEncryptionRequired(true)
+                .setUnlockedDeviceRequired(true)
                 .build(),
         )
         return generator.generateKey()

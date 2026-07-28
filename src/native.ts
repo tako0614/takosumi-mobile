@@ -22,11 +22,19 @@ import { Stronghold } from "@tauri-apps/plugin-stronghold";
 import {
   createTauriMobileDefaultProductBridge,
   detectTauriRuntime,
+  isTauriMobilePlatform,
   type NativeBridge,
 } from "@takosjp/mobile-kit";
 import { productAdapter } from "./product.ts";
 
+export function isUnsupportedTauriDesktop(): boolean {
+  return detectTauriRuntime() && !isTauriMobilePlatform(platform());
+}
+
 export function createProductNativeBridge(): NativeBridge {
+  if (isUnsupportedTauriDesktop()) {
+    throw new Error("Takosumi Mobile supports only iOS and Android.");
+  }
   if (detectTauriRuntime()) globalThis.fetch = tauriFetch as typeof fetch;
   const opener = { openUrl };
   return createTauriMobileDefaultProductBridge({

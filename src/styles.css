@@ -24,6 +24,17 @@
   --shell-soft: #1c1c1f; /* --tg-bg-subtle */
 }
 
+.unsupported-platform {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background: #0f172a;
+  color: #f8fafc;
+  font: 600 1rem/1.7 system-ui, sans-serif;
+  text-align: center;
+}
+
 .takosumi-control-home {
   display: grid;
   gap: 18px;

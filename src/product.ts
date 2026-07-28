@@ -2,6 +2,8 @@ import type { MobileProductAdapter } from "@takosjp/mobile-kit";
 
 export const productAdapter: MobileProductAdapter = {
   product: "takosumi",
+  discoveryProduct: "takosumi",
+  strictDiscoveryProduct: true,
   appName: "Takosumi",
   // Reads inside Japanese status sentences, so the noun is Japanese too.
   hostNoun: "Takosumi ホスト",
@@ -13,9 +15,11 @@ export const productAdapter: MobileProductAdapter = {
   mobileScheme: "takosumi",
   oidcScopes: [
     "openid",
-    "profile",
     "offline_access",
+    "workspaces:read",
     "capsules:read",
-    "capsules:write",
+    "runs:read",
+    "runs:approve",
+    "runs:cancel",
   ],
 };
