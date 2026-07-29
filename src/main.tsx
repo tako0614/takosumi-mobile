@@ -468,5 +468,6 @@ function runTypeLabel(type: MobileRunType): string {
     drift_check: "差分確認",
     backup: "バックアップ",
     restore: "復元",
+    artifact: "実行準備",
   }[type];
 }
