@@ -13,7 +13,7 @@
 ## Ownership
 
 - Owns: Takosumi daily mobile Workspace, Capsule, and Run UX / Product-native storage, biometrics, deep links, and plugins / Least-privilege Run approval and cancellation flows
-- Does not own: Control-plane state or runner execution / Takosumi Cloud-only services / Product-neutral mobile primitives
+- Does not own: Control-plane state or runner execution / Takoserver- or Takosumi Hosted-only services / Product-neutral mobile primitives
 - Hazards: Use only the host-advertised public OIDC client and scope set. / Session restore and Run mutation require native user presence. / Backup restore is a distinct destructive action, not generic approval.
 
 ## Required workflow
