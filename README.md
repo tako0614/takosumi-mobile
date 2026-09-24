@@ -4,6 +4,8 @@ The mobile-first Takosumi client for iOS and Android. It connects to Takosumi
 Cloud or an operator/self-hosted Takosumi deployment through host discovery and
 public-client OIDC PKCE.
 
+## What you can do
+
 The first slice keeps the daily control loop inside the app:
 
 - switch Workspaces;
@@ -11,6 +13,8 @@ The first slice keeps the daily control loop inside the app:
 - review approval/failed/running attention items;
 - approve or cancel eligible Runs;
 - hand off only advanced detail/store/settings routes to the full dashboard.
+
+## How it behaves
 
 The shell follows the control API's opaque pagination cursors, remembers the
 selected Workspace per operator host, and uses the canonical
@@ -24,7 +28,7 @@ destructive confirmation and cannot pass through the ordinary approval helper.
 Desktop Tauri builds fail closed and never load stored credentials; the product
 is distributed for iOS and Android.
 
-## Development
+## Getting started
 
 ```bash
 bun install
