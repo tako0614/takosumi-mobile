@@ -30,6 +30,9 @@ is distributed for iOS and Android.
 
 ## Getting started
 
+A Takosumi source checkout is also required at `../takosumi`; `src/api.ts`
+imports the public session contract directly from that checkout.
+
 ```bash
 bun install
 bun run mobile:check
