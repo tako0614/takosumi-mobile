@@ -1,7 +1,7 @@
 # Takosumi Mobile
 
 The mobile-first Takosumi client for iOS and Android. It connects to Takosumi
-Cloud or an operator/self-hosted Takosumi deployment through host discovery and
+Hosted or an operator/self-hosted Takosumi deployment through host discovery and
 public-client OIDC PKCE.
 
 ## What you can do
