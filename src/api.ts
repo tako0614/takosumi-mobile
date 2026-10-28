@@ -227,7 +227,11 @@ async function listLegacyRunsForApps(
           basePath: `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/runs?limit=${RUN_PAGE_SIZE}`,
           decoder: PUBLIC_SESSION_RUNS_RESPONSE_DECODER,
           pageItems: (page) =>
-            page.runs.filter((run) => workspaceCapsuleIds.has(run.capsuleId)),
+            page.runs.filter(
+              (run) =>
+                run.capsuleId !== undefined &&
+                workspaceCapsuleIds.has(run.capsuleId),
+            ),
           maximumItems: remaining,
           label: "runs",
         })),
