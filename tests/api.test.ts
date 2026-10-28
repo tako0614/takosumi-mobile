@@ -30,7 +30,7 @@ const session: MobileSession = {
   createdAt: "2026-07-20T00:00:00.000Z",
 };
 
-test("apps are the home list and omit aggregate Runs without a detail Workspace", async () => {
+test("app-scoped Runs paginate without Capsule detail or Workspace lookups", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
@@ -41,7 +41,7 @@ test("apps are the home list and omit aggregate Runs without a detail Workspace"
           {
             capsuleId: "cap_mobile",
             name: "Takos Office",
-            displayName: "Office",
+            displayName: { ja: "Office", en: "Office" },
             role: "member",
             ownerDisplayName: "Owner",
             state: "active",
@@ -50,19 +50,41 @@ test("apps are the home list and omit aggregate Runs without a detail Workspace"
         ],
       });
     }
-    if (url.pathname === "/api/v1/capsules/cap_mobile") {
-      return Response.json({ capsule: { id: "cap_mobile" } });
+    if (url.pathname === "/api/v1/capsules/cap_mobile/runs") {
+      if (url.searchParams.get("cursor") === "runs-next") {
+        return Response.json({
+          runs: [
+            run({
+              id: "run_older",
+              capsuleId: "cap_mobile",
+              createdAt: "2026-07-19T00:00:00.000Z",
+            }),
+          ],
+        });
+      }
+      return Response.json({
+        runs: [
+          run({
+            id: "run_newer",
+            capsuleId: "cap_mobile",
+            createdAt: "2026-07-20T00:00:00.000Z",
+          }),
+        ],
+        nextCursor: "runs-next",
+      });
     }
     throw new Error(`Unexpected request: ${url.pathname}`);
   }) as typeof fetch;
 
   const home = await loadHome(session);
   expect(home.apps.map((app) => app.capsuleId)).toEqual(["cap_mobile"]);
+  expect(home.apps[0]?.displayName).toBe("Office");
   expect(home.capsules).toEqual([]);
-  expect(home.runs).toEqual([]);
+  expect(home.runs.map((item) => item.id)).toEqual(["run_newer", "run_older"]);
   expect(paths).toEqual([
     "/api/v1/apps?limit=100",
-    "/api/v1/capsules/cap_mobile",
+    "/api/v1/capsules/cap_mobile/runs?limit=50",
+    "/api/v1/capsules/cap_mobile/runs?limit=50&cursor=runs-next",
   ]);
 });
 
@@ -96,6 +118,124 @@ test("only a missing apps route falls back to the legacy Workspace API", async (
   expect(paths.at(-1)).toBe("/api/v1/apps");
 });
 
+test("per-app Run 404 falls back to Workspace Runs filtered to listed apps", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname + url.search);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        apps: [
+          {
+            capsuleId: "cap_fallback",
+            name: "Legacy app",
+            role: "owner",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+          {
+            capsuleId: "cap_current",
+            name: "Current app",
+            displayName: "Current app label",
+            role: "owner",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_fallback/runs") {
+      return new Response(null, { status: 404 });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_current/runs") {
+      return Response.json({ runs: [] });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_fallback") {
+      return Response.json({
+        capsule: { id: "cap_fallback", workspaceId: "ws_legacy" },
+      });
+    }
+    if (url.pathname === "/api/v1/workspaces/ws_legacy/runs") {
+      return Response.json({
+        runs: [
+          run({ id: "run_visible", capsuleId: "cap_fallback" }),
+          run({ id: "run_unrelated", capsuleId: "cap_hidden" }),
+        ],
+      });
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  }) as typeof fetch;
+
+  const home = await loadHome(session);
+  expect(home.runs.map((item) => item.id)).toEqual(["run_visible"]);
+  expect(
+    home.apps.find((app) => app.capsuleId === "cap_current")?.displayName,
+  ).toBe("Current app label");
+  expect(paths).toContain("/api/v1/capsules/cap_fallback");
+  expect(paths).toContain("/api/v1/workspaces/ws_legacy/runs?limit=50");
+  expect(paths).toContain("/api/v1/capsules/cap_current/runs?limit=50");
+  expect(paths).not.toContain("/api/v1/capsules/cap_current");
+});
+
+test("a per-app Run 404 without detail Workspace skips optional history", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        apps: [
+          {
+            capsuleId: "cap_no_workspace",
+            name: "No Workspace app",
+            role: "member",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_no_workspace/runs") {
+      return new Response(null, { status: 404 });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_no_workspace") {
+      return Response.json({ capsule: { id: "cap_no_workspace" } });
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  }) as typeof fetch;
+
+  const home = await loadHome(session);
+  expect(home.runs).toEqual([]);
+  expect(paths).toContain("/api/v1/capsules/cap_no_workspace");
+  expect(paths.some((path) => path.startsWith("/api/v1/workspaces/"))).toBe(false);
+});
+
+test("authorization failures from per-app Run listing are not masked", async () => {
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        apps: [
+          {
+            capsuleId: "cap_forbidden",
+            name: "Forbidden app",
+            role: "member",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+        ],
+      });
+    }
+    return Response.json({ message: "forbidden" }, { status: 403 });
+  }) as typeof fetch;
+
+  await expect(loadHome(session)).rejects.toThrow("403 /api/v1/capsules/cap_forbidden/runs");
+});
+
 test("legacy Run listing uses only a Workspace id from Capsule detail", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
@@ -115,6 +255,9 @@ test("legacy Run listing uses only a Workspace id from Capsule detail", async ()
         ],
       });
     }
+    if (url.pathname === "/api/v1/capsules/cap_legacy/runs") {
+      return new Response(null, { status: 404 });
+    }
     if (url.pathname === "/api/v1/capsules/cap_legacy") {
       return Response.json({
         capsule: { id: "cap_legacy", workspaceId: "ws_from_detail" },
@@ -130,6 +273,7 @@ test("legacy Run listing uses only a Workspace id from Capsule detail", async ()
   expect(home.runs).toEqual([]);
   expect(paths).toEqual([
     "/api/v1/apps?limit=100",
+    "/api/v1/capsules/cap_legacy/runs?limit=50",
     "/api/v1/capsules/cap_legacy",
     "/api/v1/workspaces/ws_from_detail/runs?limit=50",
   ]);

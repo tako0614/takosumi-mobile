@@ -70,51 +70,173 @@ export async function loadHome(
     }
     throw error;
   }
+  const runs = await listAppRuns(session, apps);
+  return { apps, workspaces: [], capsules: [], runs };
+}
+
+async function listAppRuns(
+  session: MobileSession,
+  apps: readonly MobileApp[],
+): Promise<readonly MobileRun[]> {
   const api = createMobileApiClient({ session });
-  const capsuleDetails: MobileCapsuleDetail[] = [];
-  for (let offset = 0; offset < apps.length; offset += 20) {
-    const details = await Promise.all(
-      apps.slice(offset, offset + 20).map(async (app) => {
-        const detail = await api.wire(
-          `/api/v1/capsules/${encodeURIComponent(app.capsuleId)}`,
-          APP_CAPSULE_DETAIL_DECODER,
-        );
-        if (detail.id !== app.capsuleId) {
-          throw new Error("Capsule detail id does not match the listed app.");
+  const perAppPageSize = Math.max(
+    1,
+    Math.min(RUN_PAGE_SIZE, Math.floor(MAX_RUNS / Math.max(1, apps.length))),
+  );
+  const states = apps.map((app) => ({
+    capsuleId: app.capsuleId,
+    cursor: undefined as string | undefined,
+    pageCount: 0,
+    done: false,
+  }));
+  const runs: MobileRun[] = [];
+  const legacyCapsuleIds = new Set<string>();
+
+  for (let offset = 0; offset < states.length; offset += 20) {
+    await Promise.all(
+      states.slice(offset, offset + 20).map(async (state) => {
+        const page = await readAppRunPage(api, state, perAppPageSize);
+        state.pageCount += 1;
+        if (!page) {
+          legacyCapsuleIds.add(state.capsuleId);
+          state.done = true;
+          return;
         }
-        return detail;
+        runs.push(
+          ...page.runs
+            .filter((run) => run.capsuleId === state.capsuleId)
+            .slice(0, Math.max(0, MAX_RUNS - runs.length)),
+        );
+        state.cursor = page.nextCursor;
+        state.done = !page.nextCursor;
       }),
     );
-    capsuleDetails.push(...details);
   }
-  const workspaceIds = [...new Set(
-    capsuleDetails.flatMap((capsule) =>
-      capsule.workspaceId ? [capsule.workspaceId] : [],
-    ),
-  )];
-  const runs: MobileRun[] = [];
-  for (const [index, workspaceId] of workspaceIds.entries()) {
-    const remaining = MAX_RUNS - runs.length;
-    if (remaining <= 0) {
-      throw new Error("runs listing exceeds its safety limit.");
+
+  while (runs.length < MAX_RUNS) {
+    const pending = states.filter((state) => !state.done);
+    if (pending.length === 0) break;
+    if (pending.some((state) => state.pageCount >= MAX_LIST_PAGES)) {
+      throw new Error("runs pagination exceeded its safety limit.");
     }
+    for (let offset = 0; offset < pending.length && runs.length < MAX_RUNS; offset += 20) {
+      const batch = pending.slice(offset, offset + 20);
+      await Promise.all(
+        batch.map(async (state) => {
+          const page = await readAppRunPage(
+            api,
+            state,
+            Math.min(perAppPageSize, Math.max(1, MAX_RUNS - runs.length)),
+          );
+          state.pageCount += 1;
+          if (!page) {
+            legacyCapsuleIds.add(state.capsuleId);
+            state.done = true;
+            runs.splice(
+              0,
+              runs.length,
+              ...runs.filter((run) => run.capsuleId !== state.capsuleId),
+            );
+            return;
+          }
+          runs.push(
+            ...page.runs
+              .filter((run) => run.capsuleId === state.capsuleId)
+              .slice(0, Math.max(0, MAX_RUNS - runs.length)),
+          );
+          state.cursor = page.nextCursor;
+          state.done = !page.nextCursor;
+        }),
+      );
+    }
+  }
+
+  if (runs.length < MAX_RUNS && legacyCapsuleIds.size > 0) {
+    const legacyRuns = await listLegacyRunsForApps(
+      api,
+      legacyCapsuleIds,
+      MAX_RUNS - runs.length,
+    );
+    runs.push(...legacyRuns);
+  }
+  return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+async function readAppRunPage(
+  api: ReturnType<typeof createMobileApiClient>,
+  state: {
+    readonly capsuleId: string;
+    readonly cursor: string | undefined;
+  },
+  limit: number,
+): Promise<{ readonly runs: readonly MobileRun[]; readonly nextCursor?: string } | undefined> {
+  const path = `/api/v1/capsules/${encodeURIComponent(state.capsuleId)}/runs?limit=${limit}${state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : ""}`;
+  try {
+    return await api.wire(path, PUBLIC_SESSION_RUNS_RESPONSE_DECODER);
+  } catch (error) {
+    if (error instanceof MobileApiError && error.status === 404) return undefined;
+    throw error;
+  }
+}
+
+async function listLegacyRunsForApps(
+  api: ReturnType<typeof createMobileApiClient>,
+  capsuleIds: ReadonlySet<string>,
+  maximumItems: number,
+): Promise<readonly MobileRun[]> {
+  const capsuleIdList = [...capsuleIds];
+  const details: Array<{ capsuleId: string; workspaceId: string } | undefined> = [];
+  for (let offset = 0; offset < capsuleIdList.length; offset += 20) {
+    details.push(
+      ...(await Promise.all(
+        capsuleIdList.slice(offset, offset + 20).map(async (capsuleId) => {
+          try {
+            const detail = await api.wire(
+              `/api/v1/capsules/${encodeURIComponent(capsuleId)}`,
+              APP_CAPSULE_DETAIL_DECODER,
+            );
+            if (detail.id !== capsuleId) {
+              throw new Error("Capsule detail id does not match the listed app.");
+            }
+            return detail.workspaceId
+              ? { capsuleId, workspaceId: detail.workspaceId }
+              : undefined;
+          } catch (error) {
+            if (error instanceof MobileApiError && error.status === 404) return undefined;
+            throw error;
+          }
+        }),
+      )),
+    );
+  }
+  const workspaceApps = new Map<string, Set<string>>();
+  for (const detail of details) {
+    if (!detail) continue;
+    const capsuleIdsForWorkspace = workspaceApps.get(detail.workspaceId) ?? new Set();
+    capsuleIdsForWorkspace.add(detail.capsuleId);
+    workspaceApps.set(detail.workspaceId, capsuleIdsForWorkspace);
+  }
+  const runs: MobileRun[] = [];
+  for (const [workspaceId, workspaceCapsuleIds] of workspaceApps) {
+    const remaining = maximumItems - runs.length;
+    if (remaining <= 0) break;
     try {
       runs.push(
         ...(await collectPages({
           api,
           basePath: `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/runs?limit=${RUN_PAGE_SIZE}`,
           decoder: PUBLIC_SESSION_RUNS_RESPONSE_DECODER,
-          pageItems: (page) => page.runs,
+          pageItems: (page) =>
+            page.runs.filter((run) => workspaceCapsuleIds.has(run.capsuleId)),
           maximumItems: remaining,
           label: "runs",
         })),
       );
     } catch (error) {
       if (!(error instanceof MobileApiError) || error.status !== 404) throw error;
-      if (index === workspaceIds.length - 1) continue;
     }
   }
-  return { apps, workspaces: [], capsules: [], runs };
+  return runs;
 }
 
 async function loadLegacyHome(
@@ -288,15 +410,14 @@ const MOBILE_APPS_RESPONSE_DECODER: WireDecoder<MobileAppsPage> = {
       apps: requireArray(body.apps, "apps").map((item) => {
         const app = requireRecord(item, "app");
         const role = app.role;
+        const displayName = decodeAppDisplayName(app.displayName);
         if (role !== "owner" && role !== "member") {
           throw new Error("app.role must be owner or member");
         }
         return {
           capsuleId: requireString(app.capsuleId, "app.capsuleId"),
           name: requireString(app.name, "app.name"),
-          ...(optionalString(app.displayName, "app.displayName") === undefined
-            ? {}
-            : { displayName: app.displayName as string }),
+          ...(displayName === undefined ? {} : { displayName }),
           ...(optionalString(app.iconUrl, "app.iconUrl") === undefined
             ? {}
             : { iconUrl: app.iconUrl as string }),
@@ -354,6 +475,14 @@ function requireString(value: unknown, label: string): string {
 function optionalString(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   return requireString(value, label);
+}
+
+function decodeAppDisplayName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return requireString(value, "app.displayName");
+  const localized = requireRecord(value, "app.displayName");
+  requireString(localized.en, "app.displayName.en");
+  return requireString(localized.ja, "app.displayName.ja");
 }
 
 async function mutateRun(
