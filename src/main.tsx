@@ -436,18 +436,20 @@ function isAttentionRun(run: MobileRun): boolean {
 }
 
 function capsuleStatusLabel(capsule: MobileCapsule): string {
-  return {
+  const labels: Record<MobileCapsule["status"], string> = {
     pending: "準備中",
     active: "稼働中",
     stale: "更新あり",
     error: "エラー",
     disabled: "停止中",
+    uninstalled: "未インストール",
     destroyed: "削除済み",
-  }[capsule.status];
+  };
+  return labels[capsule.status];
 }
 
 function runStatusLabel(status: MobileRunStatus): string {
-  return {
+  const labels: Record<MobileRunStatus, string> = {
     queued: "待機中",
     running: "実行中",
     waiting_approval: "承認待ち",
@@ -455,11 +457,12 @@ function runStatusLabel(status: MobileRunStatus): string {
     failed: "失敗",
     cancelled: "中止",
     expired: "期限切れ",
-  }[status];
+  };
+  return labels[status];
 }
 
 function runTypeLabel(type: MobileRunType): string {
-  return {
+  const labels: Record<MobileRunType, string> = {
     source_sync: "ソース同期",
     compatibility_check: "互換性確認",
     plan: "変更確認",
@@ -470,5 +473,7 @@ function runTypeLabel(type: MobileRunType): string {
     backup: "バックアップ",
     restore: "復元",
     artifact: "実行準備",
-  }[type];
+    state_recovery: "状態復旧",
+  };
+  return labels[type];
 }
