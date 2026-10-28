@@ -30,6 +30,111 @@ const session: MobileSession = {
   createdAt: "2026-07-20T00:00:00.000Z",
 };
 
+test("apps are the home list and omit aggregate Runs without a detail Workspace", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname + url.search);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        apps: [
+          {
+            capsuleId: "cap_mobile",
+            name: "Takos Office",
+            displayName: "Office",
+            role: "member",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_mobile") {
+      return Response.json({ capsule: { id: "cap_mobile" } });
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  }) as typeof fetch;
+
+  const home = await loadHome(session);
+  expect(home.apps.map((app) => app.capsuleId)).toEqual(["cap_mobile"]);
+  expect(home.capsules).toEqual([]);
+  expect(home.runs).toEqual([]);
+  expect(paths).toEqual([
+    "/api/v1/apps?limit=100",
+    "/api/v1/capsules/cap_mobile",
+  ]);
+});
+
+test("only a missing apps route falls back to the legacy Workspace API", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/api/v1/apps") {
+      return new Response(null, { status: 404 });
+    }
+    if (url.pathname === "/api/v1/workspaces") {
+      return Response.json({ workspaces: [] });
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  }) as typeof fetch;
+  const legacyHome = await loadHome(session);
+  expect(legacyHome.apps).toEqual([]);
+  expect(legacyHome.workspaces).toEqual([]);
+  expect(paths).toEqual(["/api/v1/apps", "/api/v1/workspaces"]);
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({ message: "unavailable" }, { status: 503 });
+    }
+    throw new Error(`Unexpected fallback request: ${url.pathname}`);
+  }) as typeof fetch;
+  await expect(loadHome(session)).rejects.toThrow("503 /api/v1/apps");
+  expect(paths.at(-1)).toBe("/api/v1/apps");
+});
+
+test("legacy Run listing uses only a Workspace id from Capsule detail", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    paths.push(url.pathname + url.search);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        apps: [
+          {
+            capsuleId: "cap_legacy",
+            name: "Legacy app",
+            role: "owner",
+            ownerDisplayName: "Owner",
+            state: "active",
+            primaryAction: "open",
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/capsules/cap_legacy") {
+      return Response.json({
+        capsule: { id: "cap_legacy", workspaceId: "ws_from_detail" },
+      });
+    }
+    if (url.pathname === "/api/v1/workspaces/ws_from_detail/runs") {
+      return Response.json({ runs: [] });
+    }
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  }) as typeof fetch;
+
+  const home = await loadHome(session);
+  expect(home.runs).toEqual([]);
+  expect(paths).toEqual([
+    "/api/v1/apps?limit=100",
+    "/api/v1/capsules/cap_legacy",
+    "/api/v1/workspaces/ws_from_detail/runs?limit=50",
+  ]);
+});
+
 test("home follows opaque pages and restores the preferred Workspace", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -38,6 +143,9 @@ test("home follows opaque pages and restores the preferred Workspace", async () 
     expect(new Headers(init?.headers).get("authorization")).toBe(
       "Bearer mobile-access",
     );
+    if (url.pathname === "/api/v1/apps") {
+      return new Response(null, { status: 404 });
+    }
     if (url.pathname === "/api/v1/workspaces") {
       if (url.searchParams.get("cursor") === "workspace-next") {
         return Response.json({
@@ -92,6 +200,7 @@ test("home follows opaque pages and restores the preferred Workspace", async () 
   expect(home.capsules).toHaveLength(2);
   expect(home.runs).toHaveLength(2);
   expect(paths.sort()).toEqual([
+    "/api/v1/apps?limit=100",
     "/api/v1/workspaces/ws_b/capsules?includeDestroyed=false&limit=100",
     "/api/v1/workspaces/ws_b/capsules?includeDestroyed=false&limit=100&cursor=capsule-next",
     "/api/v1/workspaces/ws_b/runs?limit=50",
@@ -125,8 +234,12 @@ test("Workspace switching reuses the known Workspace list", async () => {
 });
 
 test("legacy team owner kind is rejected instead of being persisted", async () => {
-  globalThis.fetch = (async (_input: RequestInfo | URL) =>
-    Response.json({
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v1/apps") {
+      return new Response(null, { status: 404 });
+    }
+    return Response.json({
       workspaces: [
         {
           id: "ws_legacy",
@@ -138,7 +251,8 @@ test("legacy team owner kind is rejected instead of being persisted", async () =
           updatedAt: "2026-07-20T00:00:00.000Z",
         },
       ],
-    })) as typeof fetch;
+    });
+  }) as typeof fetch;
 
   await expect(loadHome(session)).rejects.toThrow(
     "workspace.type must be personal or organization",
