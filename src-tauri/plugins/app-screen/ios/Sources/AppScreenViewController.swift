@@ -11,6 +11,7 @@ final class AppScreenSession {
     let key: String
     let webView: WKWebView
     let popup: Bool
+    let navigator: AppScreenNavigator
     /// URL the screen was opened with; reopening with it keeps the page state.
     var launchURL: URL?
     var title: String = ""
@@ -19,7 +20,241 @@ final class AppScreenSession {
         self.key = key
         self.webView = webView
         self.popup = popup
+        navigator = AppScreenNavigator(webView: webView)
     }
+}
+
+/// Calls WebKit's completion handler exactly once, also when the dialog is
+/// dismissed from code (WebKit raises if a handler is dropped uncalled).
+final class DialogCompletion {
+    private var finished = false
+    private let onCancel: () -> Void
+
+    init(onCancel: @escaping () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    func finish(_ action: () -> Void) {
+        guard !finished else { return }
+        finished = true
+        action()
+    }
+
+    func cancel() {
+        finish(onCancel)
+    }
+}
+
+/// Navigation and UI delegate for one session, attached for its whole life,
+/// so the policy holds while the screen is not shown. UI (prompts, popups,
+/// bar updates) goes to the controller currently showing the session.
+final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    weak var screen: AppScreenViewController?
+    /// Last committed URL. The host label shows only this, never the URL of
+    /// a navigation that has not committed yet (no spoofing by slow loads).
+    private(set) var committedURL: URL?
+    private(set) var needsReload = false
+    private var observations: [NSKeyValueObservation] = []
+
+    init(webView: WKWebView) {
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        observations = [
+            webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+                self?.refreshCommitted(webView)
+            },
+            webView.observe(\.isLoading, options: [.new]) { [weak self] webView, _ in
+                self?.refreshCommitted(webView)
+                self?.screen?.updateProgress()
+            },
+            webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in
+                self?.screen?.updateBar()
+            },
+            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in
+                self?.screen?.updateProgress()
+            },
+        ]
+    }
+
+    func invalidate(_ webView: WKWebView) {
+        observations.removeAll()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        screen = nil
+    }
+
+    func reloadIfNeeded(_ webView: WKWebView) {
+        guard needsReload else { return }
+        needsReload = false
+        webView.reload()
+    }
+
+    /// While a load is in flight, `url` may already be the next page's.
+    private func refreshCommitted(_ webView: WKWebView) {
+        if !webView.isLoading {
+            committedURL = webView.url
+        }
+        screen?.updateBar()
+    }
+
+    // MARK: WKNavigationDelegate
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        let url = navigationAction.request.url
+        // A nil target frame is a new window; it is judged as a main frame.
+        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        switch AppScreenPolicy.decide(url?.absoluteString ?? "", mainFrame: mainFrame) {
+        case .inApp:
+            decisionHandler(.allow)
+        case .block:
+            decisionHandler(.cancel)
+        case .externalConfirm(let insecureHttp):
+            decisionHandler(.cancel)
+            if mainFrame, let url = url {
+                screen?.confirmExternal(
+                    url,
+                    insecureHttp: insecureHttp,
+                    userGesture: navigationAction.navigationType == .linkActivated)
+            }
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        if !navigationResponse.canShowMIMEType,
+           navigationResponse.isForMainFrame,
+           let url = navigationResponse.response.url,
+           AppScreenPolicy.isLaunchable(url.absoluteString) {
+            decisionHandler(.cancel)
+            screen?.confirmExternal(url, insecureHttp: false, download: true, userGesture: true)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        committedURL = webView.url
+        screen?.updateBar()
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        committedURL = webView.url
+        screen?.updateBar()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        if screen != nil {
+            webView.reload()
+        } else {
+            needsReload = true
+        }
+    }
+
+    // MARK: WKUIDelegate
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        screen?.presentPopup(configuration: configuration)
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        screen?.pageClosed(webView)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        let completion = DialogCompletion { completionHandler() }
+        guard let screen = screen else {
+            completion.cancel()
+            return
+        }
+        screen.presentDialog(
+            title: frame.securityOrigin.host, message: message, completion: completion,
+            actions: [("OK", .default, { completionHandler() })], textField: nil)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let completion = DialogCompletion { completionHandler(false) }
+        guard let screen = screen else {
+            completion.cancel()
+            return
+        }
+        screen.presentDialog(
+            title: frame.securityOrigin.host, message: message, completion: completion,
+            actions: [
+                ("キャンセル", .cancel, { completionHandler(false) }),
+                ("OK", .default, { completionHandler(true) }),
+            ],
+            textField: nil)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (String?) -> Void
+    ) {
+        let completion = DialogCompletion { completionHandler(nil) }
+        guard let screen = screen else {
+            completion.cancel()
+            return
+        }
+        let field = DialogTextField(defaultText: defaultText)
+        screen.presentDialog(
+            title: frame.securityOrigin.host, message: prompt, completion: completion,
+            actions: [
+                ("キャンセル", .cancel, { completionHandler(nil) }),
+                ("OK", .default, { completionHandler(field.text) }),
+            ],
+            textField: field)
+    }
+
+    /// Camera and microphone for app screens come later with an origin-named
+    /// prompt; until then they are refused (as on Android).
+    @available(iOS 15.0, *)
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        decisionHandler(.deny)
+    }
+}
+
+/// Text of a prompt dialog's field, read when the person taps OK.
+final class DialogTextField {
+    let defaultText: String?
+    weak var field: UITextField?
+
+    init(defaultText: String?) {
+        self.defaultText = defaultText
+    }
+
+    var text: String? { field?.text }
 }
 
 /// Keeps app screen webviews alive across switches (at most `maxAlive`, least
@@ -47,12 +282,13 @@ final class AppScreenCoordinator {
         let keep = existing != nil && existing?.webView.url != nil && existing?.launchURL == request.url
         if !keep { session.webView.load(URLRequest(url: request.url)) }
 
-        if let screen = screen, screen.presentingViewController != nil {
+        if let screen = screen, screen.presentingViewController != nil, !screen.isBeingDismissed {
             screen.dismissPopups()
             screen.show(session)
         } else {
             let controller = AppScreenViewController(coordinator: self, session: session)
             controller.modalPresentationStyle = .fullScreen
+            controller.loadViewIfNeeded()
             screen = controller
             topmost(from: presenter).present(controller, animated: true)
         }
@@ -70,8 +306,7 @@ final class AppScreenCoordinator {
         order.removeAll { $0 == key }
         visibleKeys.remove(key)
         session.webView.stopLoading()
-        session.webView.navigationDelegate = nil
-        session.webView.uiDelegate = nil
+        session.navigator.invalidate(session.webView)
         session.webView.removeFromSuperview()
     }
 
@@ -137,14 +372,15 @@ final class AppScreenCoordinator {
 /// One installed app in a WKWebView under a thin bar: the current host (always
 /// visible; there is no address field), back, reload, close and a menu with
 /// share, open in Safari and switch apps.
-final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+final class AppScreenViewController: UIViewController {
     private static let barColor = UIColor(red: 0x15 / 255, green: 0x15 / 255, blue: 0x17 / 255, alpha: 1)
+    private static let promptCooldown: TimeInterval = 5
 
     private let coordinator: AppScreenCoordinator
     private(set) var session: AppScreenSession
     private var attachedSession: AppScreenSession?
-    private var observations: [NSKeyValueObservation] = []
-    private var externalAlertShown = false
+    private var pendingDialog: DialogCompletion?
+    private var lastExternalDeclinedAt: Date?
 
     private let bar = UIStackView()
     private let hostLabel = UILabel()
@@ -182,7 +418,11 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        coordinator.setVisible(session.key, false)
+        // Covered by its own popup it stays on the stack and stays alive.
+        if isBeingDismissed || presentingViewController == nil {
+            pendingDialog?.cancel()
+            coordinator.setVisible(session.key, false)
+        }
     }
 
     func show(_ next: AppScreenSession) {
@@ -192,24 +432,22 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
         if isViewLoaded { attach(next) }
     }
 
+    /// Close popups opened from this screen (they are transient).
     func dismissPopups() {
-        if presentedViewController != nil {
-            dismiss(animated: false)
-        }
+        guard presentedViewController != nil else { return }
+        removePopupChain()
+        dismiss(animated: false)
     }
 
     private func attach(_ next: AppScreenSession) {
         if attachedSession === next { return }
-        observations.removeAll()
         if let previous = attachedSession {
-            previous.webView.navigationDelegate = nil
-            previous.webView.uiDelegate = nil
+            if previous.navigator.screen === self { previous.navigator.screen = nil }
             previous.webView.removeFromSuperview()
         }
         attachedSession = next
+        next.navigator.screen = self
         let webView = next.webView
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(webView)
         NSLayoutConstraint.activate([
@@ -218,12 +456,8 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
             webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
-        observations = [
-            webView.observe(\.url, options: [.new]) { [weak self] _, _ in self?.updateBar() },
-            webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in self?.updateBar() },
-            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in self?.updateProgress() },
-            webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in self?.updateProgress() },
-        ]
+        menuButton.menu = makeMenu()
+        next.navigator.reloadIfNeeded(webView)
         updateBar()
         updateProgress()
     }
@@ -236,17 +470,19 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
         bar.spacing = 2
         bar.translatesAutoresizingMaskIntoConstraints = false
 
-        configure(closeButton, symbol: "xmark", label: "閉じる", action: #selector(closeTapped))
+        configure(closeButton, symbol: "xmark", label: "閉じる")
+        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         hostLabel.textColor = .white
         hostLabel.font = .boldSystemFont(ofSize: 15)
         // Long hosts keep their registrable end visible.
         hostLabel.lineBreakMode = .byTruncatingHead
         hostLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         hostLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        configure(backButton, symbol: "chevron.left", label: "戻る", action: #selector(backTapped))
-        configure(reloadButton, symbol: "arrow.clockwise", label: "再読み込み", action: #selector(reloadTapped))
-        configure(menuButton, symbol: "ellipsis.circle", label: "メニュー", action: #selector(menuTapped))
-        menuButton.menu = makeMenu()
+        configure(backButton, symbol: "chevron.left", label: "戻る")
+        backButton.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
+        configure(reloadButton, symbol: "arrow.clockwise", label: "再読み込み")
+        reloadButton.addTarget(self, action: #selector(reloadTapped), for: .touchUpInside)
+        configure(menuButton, symbol: "ellipsis.circle", label: "メニュー")
         menuButton.showsMenuAsPrimaryAction = true
 
         for item in [closeButton, hostLabel, backButton, reloadButton, menuButton] as [UIView] {
@@ -280,11 +516,10 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
         ])
     }
 
-    private func configure(_ button: UIButton, symbol: String, label: String, action: Selector) {
+    private func configure(_ button: UIButton, symbol: String, label: String) {
         button.setImage(UIImage(systemName: symbol), for: .normal)
         button.tintColor = .white
         button.accessibilityLabel = label
-        button.addTarget(self, action: action, for: .touchUpInside)
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             button.widthAnchor.constraint(equalToConstant: 44),
@@ -315,17 +550,20 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
         return UIMenu(title: "", children: actions)
     }
 
-    private func updateBar() {
+    func updateBar() {
+        guard isViewLoaded else { return }
         let webView = session.webView
-        let host = AppScreenPolicy.displayHost(webView.url)
-        let secure = webView.url?.scheme?.lowercased() == "https"
+        let shown = session.navigator.committedURL ?? session.launchURL
+        let host = AppScreenPolicy.displayHost(shown)
+        let secure = shown?.scheme?.lowercased() == "https"
         hostLabel.text = secure ? "🔒 \(host)" : host
         hostLabel.accessibilityLabel = "表示中のサイト \(host)"
         backButton.isEnabled = webView.canGoBack
         backButton.alpha = webView.canGoBack ? 1 : 0.35
     }
 
-    private func updateProgress() {
+    func updateProgress() {
+        guard isViewLoaded else { return }
         let webView = session.webView
         progressView.isHidden = !webView.isLoading
         progressView.setProgress(Float(webView.estimatedProgress), animated: webView.isLoading)
@@ -339,47 +577,112 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
 
     @objc private func reloadTapped() { session.webView.reload() }
 
-    @objc private func menuTapped() {}
-
     private func currentLaunchableURL() -> URL? {
-        guard let url = session.webView.url, AppScreenPolicy.isLaunchable(url.absoluteString) else {
+        guard let url = session.navigator.committedURL,
+              AppScreenPolicy.isLaunchable(url.absoluteString) else {
             return nil
         }
         return url
     }
 
     private func share() {
-        guard let url = currentLaunchableURL() else { return }
+        guard let url = currentLaunchableURL(), presentedViewController == nil else { return }
         let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         activity.popoverPresentationController?.sourceView = menuButton
         activity.popoverPresentationController?.sourceRect = menuButton.bounds
         present(activity, animated: true)
     }
 
+    // MARK: Closing and switching
+
+    /// The popup screens presented above this one, nearest first.
+    private func popupChain() -> [AppScreenViewController] {
+        var chain: [AppScreenViewController] = []
+        var next = presentedViewController
+        while let current = next {
+            if let screen = current as? AppScreenViewController { chain.append(screen) }
+            next = current.presentedViewController
+        }
+        return chain
+    }
+
+    private func removePopupChain() {
+        for popupScreen in popupChain() {
+            popupScreen.pendingDialog?.cancel()
+            coordinator.remove(popupScreen.session.key)
+        }
+        pendingDialog?.cancel()
+    }
+
     /// Back to the Takosumi home; the page stays alive for the next switch.
     private func switchApps() {
+        removePopupChain()
         presentingViewController?.dismiss(animated: true)
     }
 
     private func closeScreen() {
         let key = session.key
-        let popup = session.popup
+        removePopupChain()
         presentingViewController?.dismiss(animated: true) { [coordinator] in
             coordinator.remove(key)
         }
-        if !popup {
-            // Popups opened from this screen go with it.
-            var child = presentedViewController as? AppScreenViewController
-            while let popupScreen = child {
-                coordinator.remove(popupScreen.session.key)
-                child = popupScreen.presentedViewController as? AppScreenViewController
-            }
-        }
     }
 
-    private func confirmExternal(_ url: URL, insecureHttp: Bool, download: Bool = false) {
-        guard !externalAlertShown, viewIfLoaded?.window != nil else { return }
-        let host = AppScreenPolicy.displayHost(session.webView.url)
+    func pageClosed(_ webView: WKWebView) {
+        if webView === session.webView { closeScreen() }
+    }
+
+    // MARK: Prompts and popups
+
+    private func canPresent() -> Bool {
+        viewIfLoaded?.window != nil && presentedViewController == nil && !isBeingDismissed
+    }
+
+    func presentPopup(configuration: WKWebViewConfiguration) -> WKWebView? {
+        guard canPresent() else { return nil }
+        let popup = coordinator.makePopupSession(configuration: configuration)
+        popup.title = session.title
+        let controller = AppScreenViewController(coordinator: coordinator, session: popup)
+        controller.modalPresentationStyle = .fullScreen
+        controller.loadViewIfNeeded()
+        present(controller, animated: true)
+        return popup.webView
+    }
+
+    func presentDialog(
+        title: String,
+        message: String,
+        completion: DialogCompletion,
+        actions: [(String, UIAlertAction.Style, () -> Void)],
+        textField: DialogTextField?
+    ) {
+        guard canPresent() else {
+            completion.cancel()
+            return
+        }
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        if let textField = textField {
+            alert.addTextField { field in
+                field.text = textField.defaultText
+                textField.field = field
+            }
+        }
+        for (label, style, handler) in actions {
+            alert.addAction(UIAlertAction(title: label, style: style) { _ in completion.finish(handler) })
+        }
+        pendingDialog = completion
+        present(alert, animated: true)
+    }
+
+    /// Ask before leaving the app. Without a user gesture, a page that was just
+    /// declined cannot ask again for a few seconds (no prompt loops).
+    func confirmExternal(_ url: URL, insecureHttp: Bool, download: Bool = false, userGesture: Bool) {
+        guard canPresent() else { return }
+        if !userGesture, let declined = lastExternalDeclinedAt,
+           Date().timeIntervalSince(declined) < Self.promptCooldown {
+            return
+        }
+        let host = AppScreenPolicy.displayHost(session.navigator.committedURL)
         let origin = host.isEmpty ? "このページ" : host
         let message: String
         if download {
@@ -391,150 +694,20 @@ final class AppScreenViewController: UIViewController, WKNavigationDelegate, WKU
         }
         let alert = UIAlertController(title: "外部で開く", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel) { [weak self] _ in
-            self?.externalAlertShown = false
+            self?.lastExternalDeclinedAt = Date()
         })
         alert.addAction(UIAlertAction(title: "開く", style: .default) { [weak self] _ in
-            self?.externalAlertShown = false
             self?.openExternally(url)
         })
-        externalAlertShown = true
         present(alert, animated: true)
     }
 
     private func openExternally(_ url: URL) {
         UIApplication.shared.open(url, options: [:]) { [weak self] opened in
-            guard !opened, let self = self, self.viewIfLoaded?.window != nil else { return }
+            guard !opened, let self = self, self.canPresent() else { return }
             let alert = UIAlertController(title: nil, message: "開けるアプリがありません", preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             self.present(alert, animated: true)
         }
-    }
-
-    // MARK: WKNavigationDelegate
-
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
-    ) {
-        let url = navigationAction.request.url
-        // A nil target frame is a new window; it is judged as a main frame.
-        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
-        switch AppScreenPolicy.decide(url?.absoluteString ?? "", mainFrame: mainFrame) {
-        case .inApp:
-            decisionHandler(.allow)
-        case .block:
-            decisionHandler(.cancel)
-        case .externalConfirm(let insecureHttp):
-            decisionHandler(.cancel)
-            if mainFrame, webView === session.webView, let url = url {
-                confirmExternal(url, insecureHttp: insecureHttp)
-            }
-        }
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationResponse: WKNavigationResponse,
-        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
-    ) {
-        if !navigationResponse.canShowMIMEType,
-           navigationResponse.isForMainFrame,
-           let url = navigationResponse.response.url,
-           AppScreenPolicy.isLaunchable(url.absoluteString) {
-            decisionHandler(.cancel)
-            confirmExternal(url, insecureHttp: false, download: true)
-            return
-        }
-        decisionHandler(.allow)
-    }
-
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        webView.reload()
-    }
-
-    // MARK: WKUIDelegate
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        guard viewIfLoaded?.window != nil else { return nil }
-        let popup = coordinator.makePopupSession(configuration: configuration)
-        popup.title = session.title
-        let controller = AppScreenViewController(coordinator: coordinator, session: popup)
-        controller.modalPresentationStyle = .fullScreen
-        present(controller, animated: true)
-        return popup.webView
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        if webView === session.webView { closeScreen() }
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        runJavaScriptAlertPanelWithMessage message: String,
-        initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping () -> Void
-    ) {
-        guard viewIfLoaded?.window != nil, presentedViewController == nil else {
-            completionHandler()
-            return
-        }
-        let alert = UIAlertController(title: frame.securityOrigin.host, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
-        present(alert, animated: true)
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        runJavaScriptConfirmPanelWithMessage message: String,
-        initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping (Bool) -> Void
-    ) {
-        guard viewIfLoaded?.window != nil, presentedViewController == nil else {
-            completionHandler(false)
-            return
-        }
-        let alert = UIAlertController(title: frame.securityOrigin.host, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel) { _ in completionHandler(false) })
-        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
-        present(alert, animated: true)
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        runJavaScriptTextInputPanelWithPrompt prompt: String,
-        defaultText: String?,
-        initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping (String?) -> Void
-    ) {
-        guard viewIfLoaded?.window != nil, presentedViewController == nil else {
-            completionHandler(nil)
-            return
-        }
-        let alert = UIAlertController(title: frame.securityOrigin.host, message: prompt, preferredStyle: .alert)
-        alert.addTextField { field in field.text = defaultText }
-        alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel) { _ in completionHandler(nil) })
-        alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak alert] _ in
-            completionHandler(alert?.textFields?.first?.text)
-        })
-        present(alert, animated: true)
-    }
-
-    /// Camera and microphone for app screens come later with an origin-named
-    /// prompt; until then they are refused (as on Android).
-    @available(iOS 15.0, *)
-    func webView(
-        _ webView: WKWebView,
-        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
-        initiatedByFrame frame: WKFrameInfo,
-        type: WKMediaCaptureType,
-        decisionHandler: @escaping (WKPermissionDecision) -> Void
-    ) {
-        decisionHandler(.deny)
     }
 }

@@ -42,11 +42,30 @@ internal object AppScreenPolicy {
         }
         if (scheme == "about" && trimmed.lowercase() in inScreenAbout) return inApp(scheme)
         if (scheme == SHELL_SCHEME || scheme in localContentSchemes) return block(scheme)
+        if (scheme == "intent") {
+            // An intent: URI opens the scheme named in its fragment; judge that.
+            val target = intentTargetScheme(trimmed)
+            if (target == SHELL_SCHEME || (target != null && target in localContentSchemes)) {
+                return block(scheme)
+            }
+        }
         if (scheme == "http") {
             if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
             return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme, insecureHttp = true)
         }
         return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme)
+    }
+
+    /** The `scheme=` of `intent://...#Intent;scheme=x;end`, lowercased. */
+    fun intentTargetScheme(rawUrl: String): String? {
+        val marker = rawUrl.indexOf("#Intent;")
+        if (marker < 0) return null
+        return rawUrl.substring(marker + "#Intent;".length)
+            .split(';')
+            .firstOrNull { it.startsWith("scheme=", ignoreCase = true) }
+            ?.substring("scheme=".length)
+            ?.trim()
+            ?.lowercase()
     }
 
     /** https with a host and no user info: the only URLs a screen opens with. */

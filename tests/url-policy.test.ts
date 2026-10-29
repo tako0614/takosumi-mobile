@@ -3,6 +3,7 @@ import policyCases from "../src-tauri/plugins/app-screen/navigation-policy-cases
 import {
   decideAppScreenNavigation,
   displayHost,
+  intentTargetScheme,
   isLaunchableAppScreenUrl,
   normalizeUserAppUrl,
   sameOrigin,
@@ -60,6 +61,18 @@ test("pages cannot drive the shell or open local content", () => {
   expect(
     decideAppScreenNavigation("https://bank.example@evil.example/", { mainFrame: true }),
   ).toEqual({ kind: "block", reason: "user-info" });
+  // An Android intent: URI is judged by the scheme it would really open.
+  expect(
+    decideAppScreenNavigation(
+      "intent://oauth/callback?code=x#Intent;scheme=takosumi;end",
+      { mainFrame: true },
+    ),
+  ).toEqual({ kind: "block", reason: "shell-scheme" });
+  expect(
+    decideAppScreenNavigation("intent://x#Intent;scheme=file;end", { mainFrame: true }),
+  ).toEqual({ kind: "block", reason: "local-content" });
+  expect(intentTargetScheme("intent://scan/#Intent;package=a;scheme=ZXing;end")).toBe("zxing");
+  expect(intentTargetScheme("intent://scan/")).toBeUndefined();
 });
 
 test("subframes never reach the OS", () => {

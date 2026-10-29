@@ -37,6 +37,7 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
     fun open(invoke: Invoke) {
         val request = screenRequestOrReject(invoke) ?: return
         try {
+            AppScreenLaunch.remember(activity, request)
             activity.startActivity(AppScreenLaunch.documentIntent(activity, request))
             invoke.resolve()
         } catch (_: Exception) {

@@ -100,6 +100,14 @@ export function decideAppScreenNavigation(
   if (LOCAL_CONTENT_SCHEMES.has(scheme)) {
     return { kind: "block", reason: "local-content" };
   }
+  if (scheme === "intent") {
+    // Android `intent:` URIs name their real scheme in the fragment; judge that.
+    const target = intentTargetScheme(rawUrl);
+    if (target === SHELL_SCHEME) return { kind: "block", reason: "shell-scheme" };
+    if (target !== undefined && LOCAL_CONTENT_SCHEMES.has(target)) {
+      return { kind: "block", reason: "local-content" };
+    }
+  }
   if (scheme === "http") {
     if (url.username || url.password) {
       return { kind: "block", reason: "user-info" };
@@ -107,6 +115,21 @@ export function decideAppScreenNavigation(
     return { kind: "external-confirm", reason: "insecure-http", scheme };
   }
   return { kind: "external-confirm", reason: "other-scheme", scheme };
+}
+
+/**
+ * The `scheme=` of an `intent://...#Intent;scheme=x;end` URI, lowercased.
+ * Android turns the URI into a VIEW intent for `x://...`.
+ */
+export function intentTargetScheme(rawUrl: string): string | undefined {
+  const marker = rawUrl.indexOf("#Intent;");
+  if (marker < 0) return undefined;
+  for (const part of rawUrl.slice(marker + "#Intent;".length).split(";")) {
+    if (part.toLowerCase().startsWith("scheme=")) {
+      return part.slice("scheme=".length).trim().toLowerCase();
+    }
+  }
+  return undefined;
 }
 
 /** True when the URL may be opened as the first page of an app screen. */

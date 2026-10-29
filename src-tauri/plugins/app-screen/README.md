@@ -41,7 +41,11 @@ the same rules:
 - `http:` and other schemes (`tel:`, `mailto:`, `intent:` ...) go to the OS only
   after a confirmation that names the page's host, and only from the main frame;
 - `javascript:`, `data:`, `file:`, `content:` and Takosumi Mobile's own
-  `takosumi:` scheme are refused, as are URLs with user info;
+  `takosumi:` scheme are refused, as are URLs with user info. An Android
+  `intent:` URI is judged by the scheme it would open (`#Intent;scheme=...`),
+  and on Android it is also refused when Takosumi Mobile itself would handle it;
+- without a user gesture, a page whose prompt was just declined cannot prompt
+  again for five seconds;
 - `target=_blank` and `window.open` (with a user gesture) open a new in-app
   screen stacked on the opener; `window.close()` closes it.
 
@@ -54,7 +58,14 @@ Takosumi OIDC. Do not give screens their own data directory, profile or
 non-persistent store.
 
 Up to four screens stay alive when the person switches between apps; the least
-recently used one is closed first and reloads its last URL when it returns.
+recently used one is closed first. On Android it reloads its last URL when its
+task returns; on iOS it reopens at the app's launch URL. A screen covered by its
+own popup is never closed for this.
+
+The host label shows the committed page only: on iOS it does not change while a
+navigation is still loading, so a slow load of another site cannot borrow its
+name. On Android, main-frame requests that are not https (POSTs and redirects,
+which skip `shouldOverrideUrlLoading`) are refused before they load.
 
 ## Android specifics
 
@@ -68,4 +79,7 @@ recently used one is closed first and reloads its last URL when it returns.
   an app opens without the Tauri shell starting.
 - `AppScreenActivity` is not exported. External `takosumi://app?url=...` links
   reach the shell's deep-link handler, which resolves the URL to a known app.
-- Camera, microphone and location requests from pages are refused for now.
+- Files picked for `<input type=file>` are passed on only as content URIs from
+  other apps' providers, never this app's own files.
+- Camera, microphone and location requests from pages are refused for now
+  (on iOS too).

@@ -35,6 +35,8 @@ internal object AppScreenRegistry {
         var lastUrl: String = ""
         var title: String = ""
         var host: AppScreenActivity? = null
+        /** For a popup: the screen whose page opened it. */
+        var openerKey: String? = null
         var destroyed = false
     }
 
@@ -54,7 +56,32 @@ internal object AppScreenRegistry {
 
     fun remove(key: String) {
         val entry = entries.remove(key) ?: return
-        destroy(entry)
+        destroy(entry, crashed = false)
+    }
+
+    /** A webview whose renderer died may only be destroyed, never used. */
+    fun removeCrashed(key: String) {
+        val entry = entries.remove(key) ?: return
+        destroy(entry, crashed = true)
+    }
+
+    fun findByWebView(webView: WebView): Entry? =
+        entries.values.firstOrNull { it.webView === webView && !it.destroyed }
+
+    /** The activity showing the screen that opened popup [popupKey], if any. */
+    fun openerHost(popupKey: String): AppScreenActivity? =
+        get(popupKey)?.openerKey?.let { get(it)?.host }
+
+    /** Renderer gone for a webview no activity is handling: drop it safely. */
+    fun handleCrashedWebView(webView: WebView) {
+        val entry = findByWebView(webView)
+        if (entry == null) {
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+            return
+        }
+        entry.host?.releaseEvictedWebView(entry)
+        removeCrashed(entry.key)
     }
 
     /** Close the oldest screens beyond the limit, never [keepKey] or a visible one. */
@@ -67,19 +94,21 @@ internal object AppScreenRegistry {
             if (entries.size <= MAX_ALIVE) break
             entries.remove(entry.key)
             entry.host?.releaseEvictedWebView(entry)
-            destroy(entry)
+            destroy(entry, crashed = false)
         }
     }
 
-    private fun destroy(entry: Entry) {
+    private fun destroy(entry: Entry, crashed: Boolean) {
         if (entry.destroyed) return
         entry.destroyed = true
         val webView = entry.webView
         (webView.parent as? ViewGroup)?.removeView(webView)
         entry.host = null
         entry.context.baseContext = entry.context.applicationContext
-        webView.stopLoading()
-        webView.loadUrl("about:blank")
+        if (!crashed) {
+            webView.stopLoading()
+            webView.loadUrl("about:blank")
+        }
         webView.destroy()
     }
 

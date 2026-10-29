@@ -30,7 +30,7 @@ enum AppScreenPolicy {
             return subframeWebSchemes.contains(scheme) ? .inApp : .block
         }
         if scheme == "https" {
-            if url.user != nil || url.password != nil { return .block }
+            if hasUserInfo(url) { return .block }
             guard let host = url.host, !host.isEmpty else { return .block }
             return .inApp
         }
@@ -40,11 +40,33 @@ enum AppScreenPolicy {
         if scheme == shellScheme || localContentSchemes.contains(scheme) {
             return .block
         }
+        if scheme == "intent", let target = intentTargetScheme(trimmed),
+           target == shellScheme || localContentSchemes.contains(target) {
+            // An Android intent: URI opens the scheme named in its fragment.
+            return .block
+        }
         if scheme == "http" {
-            if url.user != nil || url.password != nil { return .block }
+            if hasUserInfo(url) { return .block }
             return .externalConfirm(insecureHttp: true)
         }
         return .externalConfirm(insecureHttp: false)
+    }
+
+    /// The `scheme=` of `intent://...#Intent;scheme=x;end`, lowercased.
+    static func intentTargetScheme(_ rawUrl: String) -> String? {
+        guard let marker = rawUrl.range(of: "#Intent;") else { return nil }
+        for part in rawUrl[marker.upperBound...].split(separator: ";") {
+            if part.lowercased().hasPrefix("scheme=") {
+                return part.dropFirst("scheme=".count)
+                    .trimmingCharacters(in: .whitespaces)
+                    .lowercased()
+            }
+        }
+        return nil
+    }
+
+    private static func hasUserInfo(_ url: URL) -> Bool {
+        !(url.user ?? "").isEmpty || !(url.password ?? "").isEmpty
     }
 
     /// https with a host and no user info: the only URLs a screen opens with.

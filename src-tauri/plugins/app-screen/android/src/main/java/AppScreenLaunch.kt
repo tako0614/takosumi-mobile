@@ -35,6 +35,8 @@ internal object AppScreenLaunch {
     private const val SCHEME = "takosumi"
     private const val HOST = "app"
     private const val KEY_MAX_LENGTH = 512
+    private const val LAUNCH_PREFERENCES = "com.takosumi.appscreen.launch.v1"
+    private const val MAX_REMEMBERED = 64
     private const val TITLE_MAX_LENGTH = 128
 
     /**
@@ -66,24 +68,72 @@ internal object AppScreenLaunch {
         Uri.Builder().scheme(SCHEME).authority(HOST).appendQueryParameter("key", key).build()
 
     /**
-     * Reads a screen intent. Accepts the extras written above and, for a
-     * `takosumi://app?url=` deep link, the URL alone (keyed by its origin).
+     * Reads a screen intent. Accepts the extras written above; a document
+     * restored without extras (Recents after a reboot) uses the launch stored
+     * for its key; a `takosumi://app?url=` link may carry the URL alone
+     * (keyed by its origin).
      */
-    fun parse(intent: Intent?): ScreenRequest? {
+    fun parse(context: Context, intent: Intent?): ScreenRequest? {
         if (intent == null) return null
         val popup = intent.getBooleanExtra(EXTRA_POPUP, false)
-        val data = intent.data
+        val data = intent.data?.takeIf { it.scheme == SCHEME && it.host == HOST }
+        val dataKey = data?.getQueryParameter("key")
+        val stored = if (!popup && intent.getStringExtra(EXTRA_URL) == null && dataKey != null) {
+            recall(context, dataKey)
+        } else {
+            null
+        }
         val url = intent.getStringExtra(EXTRA_URL)
-            ?: data?.takeIf { it.scheme == SCHEME && it.host == HOST }?.getQueryParameter("url")
+            ?: stored?.url
+            ?: data?.getQueryParameter("url")
             ?: return null
         if (!popup && !AppScreenPolicy.isLaunchable(url)) return null
         val key = intent.getStringExtra(EXTRA_KEY)
+            ?: dataKey
             ?: AppScreenPolicy.origin(url)?.let { "origin:$it" }
             ?: return null
         if (key.isBlank() || key.length > KEY_MAX_LENGTH) return null
-        val title = (intent.getStringExtra(EXTRA_TITLE) ?: AppScreenPolicy.displayHost(url))
+        val title = (intent.getStringExtra(EXTRA_TITLE) ?: stored?.title ?: AppScreenPolicy.displayHost(url))
             .take(TITLE_MAX_LENGTH)
         return ScreenRequest(key, url, title, popup)
+    }
+
+    /** Keep the screen's launch so its task can be restored without extras. */
+    fun remember(context: Context, request: ScreenRequest) {
+        if (request.popup || !AppScreenPolicy.isLaunchable(request.url)) return
+        try {
+            val preferences = context.getSharedPreferences(LAUNCH_PREFERENCES, Context.MODE_PRIVATE)
+            val editor = preferences.edit().putString(
+                digest(request.key),
+                JSONObject()
+                    .put("url", request.url)
+                    .put("title", request.title)
+                    .put("t", System.currentTimeMillis())
+                    .toString(),
+            )
+            val all = preferences.all
+            if (all.size > MAX_REMEMBERED) {
+                all.mapNotNull { (id, value) ->
+                    (value as? String)?.let { runCatching { id to JSONObject(it).optLong("t") }.getOrNull() }
+                }
+                    .sortedBy { it.second }
+                    .take(all.size - MAX_REMEMBERED)
+                    .forEach { editor.remove(it.first) }
+            }
+            editor.apply()
+        } catch (_: Exception) {
+            // Restoring after a reboot is a convenience.
+        }
+    }
+
+    private fun recall(context: Context, key: String): ScreenRequest? = try {
+        context.getSharedPreferences(LAUNCH_PREFERENCES, Context.MODE_PRIVATE)
+            .getString(digest(key), null)
+            ?.let { JSONObject(it) }
+            ?.let { ScreenRequest(key, it.optString("url"), it.optString("title")) }
+            ?.takeIf { AppScreenPolicy.isLaunchable(it.url) }
+    } catch (_: Exception) {
+        null
     }
 
     fun digest(key: String): String =
