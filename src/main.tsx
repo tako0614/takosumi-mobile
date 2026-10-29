@@ -21,6 +21,7 @@ import {
   cancelRun,
   loadHome,
   loadWorkspaceHome,
+  type MobileApp,
   type MobileCapsule,
   type MobileRun,
   type MobileRunStatus,
@@ -31,16 +32,22 @@ import {
   createProductNativeBridge,
   isUnsupportedTauriDesktop,
 } from "./native.ts";
+import {
+  appDisplayName,
+  appRoleLabel,
+  appStateLabel,
+  legacyWorkspaceOptions,
+  mobileHomeTitle,
+} from "./home-presentation.ts";
 import { productAdapter } from "./product.ts";
 import { authorizeRunMutation } from "./security.ts";
-import {
-  createWorkspacePreference,
-  type WorkspacePreference,
-} from "./workspace-preference.ts";
 import "./styles.css";
 
 const metrics = [
-  { label: "サービス", value: (home) => home?.capsules.length },
+  {
+    label: "サービス",
+    value: (home) => home?.apps.length || home?.capsules.length,
+  },
   {
     label: "実行中",
     value: (home) =>
@@ -58,7 +65,7 @@ const actions = defineMobileHostActions<TakosumiMobileHome>([
   { label: "ストア", description: "サービスを追加", path: "/new" },
   { label: "通知", description: "要対応と更新を確認", path: "/notifications" },
   { label: "サービス", description: "すべてのサービス", path: "/services" },
-  { label: "設定", description: "Workspaceとアカウント", path: "/settings" },
+  { label: "設定", description: "アカウント", path: "/settings" },
 ]);
 
 if (isUnsupportedTauriDesktop()) {
@@ -69,14 +76,10 @@ if (isUnsupportedTauriDesktop()) {
 
 function startTakosumiMobile() {
   const nativeBridge = createProductNativeBridge();
-  const workspacePreference = createWorkspacePreference(nativeBridge.storage);
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
     createNativeBridge: () => nativeBridge,
-    loadHome: async (session) =>
-      await loadHome(session, {
-        preferredWorkspaceId: await workspacePreference.load(session),
-      }),
+    loadHome,
     sessionUnlock: {
       restoreMode: "required",
       prompt: {
@@ -105,7 +108,7 @@ function startTakosumiMobile() {
       discoveredHeading: "Takosumiが見つかりました",
       homeFallbackTitle: "Takosumi",
       refreshLabel: "更新",
-      homeTitle: (home) => home?.workspace?.displayName,
+      homeTitle: mobileHomeTitle,
       metricsLabel: "現在の状態",
       shortcutsLabel: "メニュー",
     },
@@ -116,7 +119,6 @@ function startTakosumiMobile() {
         home={home}
         session={session}
         nativeBridge={nativeBridge}
-        workspacePreference={workspacePreference}
         openHostRoute={openHostRoute}
       />
     ),
@@ -138,7 +140,6 @@ function TakosumiControlHome(props: {
   home?: TakosumiMobileHome;
   session: MobileSession;
   nativeBridge: NativeBridge;
-  workspacePreference: WorkspacePreference;
   openHostRoute: (path: string) => Promise<void>;
 }) {
   const [current, setCurrent] = createSignal(props.home);
@@ -153,23 +154,28 @@ function TakosumiControlHome(props: {
     (current()?.runs ?? []).filter(isAttentionRun),
   );
   const recentRuns = createMemo(() => (current()?.runs ?? []).slice(0, 8));
-  const capsuleName = (run: MobileRun) =>
-    current()?.capsules.find((capsule) => capsule.id === run.capsuleId)?.name ??
-    "Workspace operation";
+  const capsuleName = (run: MobileRun) => {
+    const app = current()?.apps.find((app) => app.capsuleId === run.capsuleId);
+    return app
+      ? appDisplayName(app)
+      : current()?.capsules.find((capsule) => capsule.id === run.capsuleId)?.name ??
+          "Takosumi operation";
+  };
 
   async function reload(workspaceId?: string) {
-    const activeId = workspaceId ?? current()?.workspace?.id;
-    if (!activeId) return;
     setLoading(true);
     setStatus(undefined);
     try {
-      const home = await loadWorkspaceHome(
-        activeSession(),
-        activeId,
-        current()?.workspaces ?? props.home?.workspaces,
+      const home = current();
+      setCurrent(
+        home?.workspace
+          ? await loadWorkspaceHome(
+              activeSession(),
+              workspaceId ?? home.workspace.id,
+              home.workspaces,
+            )
+          : await loadHome(activeSession()),
       );
-      setCurrent(home);
-      await props.workspacePreference.save(activeSession(), activeId);
     } catch (error) {
       setStatus(mobileErrorMessage(error, "更新できませんでした。"));
     } finally {
@@ -239,27 +245,22 @@ function TakosumiControlHome(props: {
 
   return (
     <div class="takosumi-control-home">
-      <section class="workspace-picker" aria-label="Workspace">
-        <div>
-          <span>Workspace</span>
-          <strong>
-            {current()?.workspace?.displayName ?? "Workspaceなし"}
-          </strong>
-        </div>
-        <Show when={(current()?.workspaces.length ?? 0) > 1}>
+      <Show when={legacyWorkspaceOptions(current()).length > 1}>
+        <label class="workspace-picker">
+          <span>スペース</span>
           <select
             value={current()?.workspace?.id}
             disabled={loading()}
             onChange={(event) => void reload(event.currentTarget.value)}
           >
-            <For each={current()?.workspaces}>
+            <For each={legacyWorkspaceOptions(current())}>
               {(workspace) => (
                 <option value={workspace.id}>{workspace.displayName}</option>
               )}
             </For>
           </select>
-        </Show>
-      </section>
+        </label>
+      </Show>
 
       <Show when={status()}>
         {(message) => <p class="mobile-status">{message()}</p>}
@@ -313,35 +314,65 @@ function TakosumiControlHome(props: {
 
       <MobilePreviewSection
         title="サービス"
-        detail={`${current()?.capsules.length ?? 0}件`}
+        detail={`${current()?.apps.length || current()?.capsules.length || 0}件`}
       >
         <Show
-          when={current()?.capsules.length}
+          when={current()?.apps.length}
           fallback={
-            <p class="empty">
-              サービスはまだありません。ストアから追加できます。
-            </p>
+            <Show
+              when={current()?.capsules.length}
+              fallback={
+                <p class="empty">
+                  サービスはまだありません。ストアから追加できます。
+                </p>
+              }
+            >
+              <MobilePreviewList>
+                <For each={current()?.capsules.slice(0, 6)}>
+                  {(capsule) => (
+                    <li>
+                      <button
+                        type="button"
+                        class="capsule-row"
+                        onClick={() =>
+                          void props.openHostRoute(`/services/${capsule.id}`)
+                        }
+                      >
+                        <CapsuleMark capsule={capsule} />
+                        <span>
+                          <strong>{capsule.name}</strong>
+                          <small>{capsule.environment}</small>
+                        </span>
+                        <em data-status={capsule.status}>
+                          {capsuleStatusLabel(capsule)}
+                        </em>
+                      </button>
+                    </li>
+                  )}
+                </For>
+              </MobilePreviewList>
+            </Show>
           }
         >
           <MobilePreviewList>
-            <For each={current()?.capsules.slice(0, 6)}>
-              {(capsule) => (
+            <For each={current()?.apps.slice(0, 6)}>
+              {(app) => (
                 <li>
                   <button
                     type="button"
                     class="capsule-row"
                     onClick={() =>
-                      void props.openHostRoute(`/services/${capsule.id}`)
+                      void props.openHostRoute(`/services/${app.capsuleId}`)
                     }
                   >
-                    <CapsuleMark capsule={capsule} />
+                    <AppMark app={app} />
                     <span>
-                      <strong>{capsule.name}</strong>
-                      <small>{capsule.environment}</small>
+                      <strong>{appDisplayName(app)}</strong>
+                      <small>
+                        {appRoleLabel(app.role)} · {app.ownerDisplayName}
+                      </small>
                     </span>
-                    <em data-status={capsule.status}>
-                      {capsuleStatusLabel(capsule)}
-                    </em>
+                    <em data-status={app.state}>{appStateLabel(app.state)}</em>
                   </button>
                 </li>
               )}
@@ -396,6 +427,14 @@ function TakosumiControlHome(props: {
   );
 }
 
+function AppMark(props: { app: MobileApp }) {
+  return (
+    <span class="capsule-mark" aria-hidden="true">
+      {appDisplayName(props.app).slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
+
 function RunHeading(props: { run: MobileRun; capsuleName: string }) {
   return (
     <header class="run-heading">
@@ -435,18 +474,20 @@ function isAttentionRun(run: MobileRun): boolean {
 }
 
 function capsuleStatusLabel(capsule: MobileCapsule): string {
-  return {
+  const labels: Record<MobileCapsule["status"], string> = {
     pending: "準備中",
     active: "稼働中",
     stale: "更新あり",
     error: "エラー",
     disabled: "停止中",
+    uninstalled: "未インストール",
     destroyed: "削除済み",
-  }[capsule.status];
+  };
+  return labels[capsule.status];
 }
 
 function runStatusLabel(status: MobileRunStatus): string {
-  return {
+  const labels: Record<MobileRunStatus, string> = {
     queued: "待機中",
     running: "実行中",
     waiting_approval: "承認待ち",
@@ -454,11 +495,12 @@ function runStatusLabel(status: MobileRunStatus): string {
     failed: "失敗",
     cancelled: "中止",
     expired: "期限切れ",
-  }[status];
+  };
+  return labels[status];
 }
 
 function runTypeLabel(type: MobileRunType): string {
-  return {
+  const labels: Record<MobileRunType, string> = {
     source_sync: "ソース同期",
     compatibility_check: "互換性確認",
     plan: "変更確認",
@@ -469,5 +511,7 @@ function runTypeLabel(type: MobileRunType): string {
     backup: "バックアップ",
     restore: "復元",
     artifact: "実行準備",
-  }[type];
+    state_recovery: "状態復旧",
+  };
+  return labels[type];
 }

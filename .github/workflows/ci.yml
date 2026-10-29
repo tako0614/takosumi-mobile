@@ -14,7 +14,8 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  MOBILE_KIT_SOURCE_REF: 24036b32892d659f846e00a29849f0884ed4691a
+  MOBILE_KIT_SOURCE_REF: 5c1bd1cea2cf54f811f21ad3dac64cac347794e1
+  TAKOSUMI_SOURCE_REF: fd2fe1acf84eede8027221ccb295af1c87b72eae
 
 jobs:
   quality:
@@ -30,6 +31,13 @@ jobs:
           repository: tako0614/mobile-kit
           ref: ${{ env.MOBILE_KIT_SOURCE_REF }}
           path: mobile-kit
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tako0614/takosumi
+          ref: ${{ env.TAKOSUMI_SOURCE_REF }}
+          path: takosumi
+          sparse-checkout: contract
           persist-credentials: false
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
         with:

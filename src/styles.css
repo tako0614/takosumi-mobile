@@ -40,48 +40,6 @@
   gap: 18px;
 }
 
-.workspace-picker {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  justify-content: space-between;
-  border: 1px solid var(--shell-border);
-  border-radius: 14px;
-  padding: 14px 16px;
-  background: linear-gradient(135deg, var(--shell-soft), var(--shell-card));
-}
-
-.workspace-picker div,
-.workspace-picker span {
-  display: grid;
-  min-width: 0;
-}
-
-.workspace-picker span {
-  color: var(--shell-subtle);
-  font-size: 0.68rem;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.workspace-picker strong {
-  overflow: hidden;
-  color: var(--shell-text);
-  font-size: 1rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-picker select {
-  max-width: 46%;
-  border: 1px solid var(--shell-control-border);
-  border-radius: 10px;
-  padding: 9px 10px;
-  background: var(--shell-card);
-  color: var(--shell-text);
-}
-
 .mobile-status {
   margin: -6px 0 0;
   border-left: 3px solid var(--accent);
@@ -133,7 +91,9 @@
 }
 
 [data-status="waiting_approval"],
-[data-status="stale"] {
+[data-status="stale"],
+[data-status="needs_attention"],
+[data-status="uninstall_scheduled"] {
   background: #2a1f08 !important;
   color: #e0a53a !important; /* --tg-warn */
 }
@@ -146,13 +106,17 @@
 
 [data-status="running"],
 [data-status="queued"],
-[data-status="pending"] {
+[data-status="pending"],
+[data-status="installing"],
+[data-status="updating"],
+[data-status="uninstalling"] {
   background: #101a2a !important;
   color: #6ea8ff !important; /* --tg-info */
 }
 
 [data-status="succeeded"],
-[data-status="active"] {
+[data-status="active"],
+[data-status="installed"] {
   background: #0e2213 !important;
   color: #54d16a !important; /* --tg-success-text */
 }
@@ -228,4 +192,22 @@
   margin: 0;
   color: var(--shell-subtle);
   font-size: 0.78rem;
+}
+
+.workspace-picker {
+  display: grid;
+  gap: 8px;
+  color: var(--shell-muted);
+  font-size: 0.78rem;
+}
+
+.workspace-picker select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--shell-control-border);
+  border-radius: 12px;
+  padding: 8px 12px;
+  background: var(--shell-card);
+  color: var(--shell-text);
+  font: inherit;
 }
