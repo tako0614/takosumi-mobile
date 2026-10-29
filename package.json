@@ -10,9 +10,10 @@
     "build": "bunx vite build --config vite.config.ts",
     "build:web": "bun run build",
     "check": "bun run fmt:check && bun run lint && bun run test && bun run build",
+    "deploy": "bun scripts/deploy.mjs",
     "fmt:check": "bun ../mobile-kit/scripts/check-source-format.mjs",
     "lint": "bun run typecheck",
-    "test": "bun test tests",
+    "test": "bun test tests relay/tests",
     "mobile:check": "bun run doctor && bun run check",
     "mobile:doctor": "bun run doctor",
     "mobile:native-release-check": "bun run release:native-check",
@@ -24,6 +25,8 @@
     "release:check": "bun ../mobile-kit/scripts/check-mobile-full-release.mjs",
     "release:status": "bun ../mobile-kit/scripts/report-mobile-release-status.mjs --product takosumi --product-name Takosumi --bundle-id com.takosumi --require-secure-keystore",
     "release:repo-check": "bun ../mobile-kit/scripts/report-mobile-release-status.mjs --product takosumi --product-name Takosumi --bundle-id com.takosumi --require-secure-keystore --skip-toolchain-probe --fail-on-repo-blockers",
+    "relay:check": "tsc --noEmit -p relay/tsconfig.json && bun test relay/tests",
+    "relay:smoke": "bun relay/scripts/smoke.ts",
     "tauri:dev": "bunx tauri dev",
     "tauri:build": "bunx tauri build",
     "tauri:android:init": "bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform android --apple-environment development",
@@ -34,7 +37,7 @@
     "tauri:ios:init": "bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform ios --apple-environment development",
     "tauri:ios:dev": "bunx tauri ios dev",
     "tauri:ios:build": "bunx tauri ios build",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p relay/tsconfig.json"
   },
   "dependencies": {
     "@takosjp/mobile-kit": "file:../mobile-kit",

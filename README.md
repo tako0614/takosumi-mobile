@@ -61,3 +61,10 @@ openid offline_access workspaces:read capsules:read runs:read runs:approve runs:
 The host derives the published client id from the one registered public client
 whose redirect URI is exactly `takosumi://oauth/callback`; the app has no
 fallback client id. See the Takosumi platform deployment runbook.
+
+## Push relay
+
+`relay/` holds the Web Push relay that lets apps opened inside Takosumi Mobile
+receive standard Web Push through APNs and FCM (a Cloudflare Worker with D1).
+See [relay/README.md](relay/README.md); `bun run deploy -- --contract` lists its
+deploy surfaces.
