@@ -122,14 +122,18 @@ export function decideAppScreenNavigation(
  * Android turns the URI into a VIEW intent for `x://...`.
  */
 export function intentTargetScheme(rawUrl: string): string | undefined {
-  const marker = rawUrl.indexOf("#Intent;");
-  if (marker < 0) return undefined;
-  for (const part of rawUrl.slice(marker + "#Intent;".length).split(";")) {
+  // Like Intent.parseUri: the parameters follow the last '#'.
+  const hash = rawUrl.lastIndexOf("#");
+  if (hash < 0 || !rawUrl.startsWith("Intent;", hash + 1)) return undefined;
+  for (const part of rawUrl.slice(hash + "#Intent;".length).split(";")) {
     if (part.toLowerCase().startsWith("scheme=")) {
       return part.slice("scheme=".length).trim().toLowerCase();
     }
   }
-  return undefined;
+  // Without scheme=, `intent:x://...` opens the data part's own scheme.
+  const data = rawUrl.slice(rawUrl.indexOf(":") + 1, hash);
+  const scheme = /^([a-z][a-z0-9+.-]*):/iu.exec(data)?.[1];
+  return scheme?.toLowerCase();
 }
 
 /** True when the URL may be opened as the first page of an app screen. */

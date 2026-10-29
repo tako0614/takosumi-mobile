@@ -179,13 +179,20 @@ class AppScreenActivity : AppCompatActivity() {
             }
         bind(current)
         current.title = request.title
+        val keptUrl = existing?.webView?.url
         val keep = existing != null &&
-            existing.webView.url != null &&
+            keptUrl != null &&
             keepIfLaunchedWith != null &&
             keepIfLaunchedWith == existing.launchUrl
         if (!request.popup && !keep) {
             if (AppScreenPolicy.isLaunchable(target)) current.webView.loadUrl(target)
             else current.webView.loadUrl(request.url)
+        } else if (keptUrl != null && !isAllowedCommittedUrl(keptUrl)) {
+            // A detached page ended up outside the policy (a blocked POST).
+            current.webView.loadUrl(
+                current.lastUrl.takeIf { AppScreenPolicy.isLaunchable(it) }
+                    ?: if (request.popup) "about:blank" else request.url,
+            )
         }
         updateBar(current.webView.url ?: target)
     }
@@ -434,16 +441,26 @@ class AppScreenActivity : AppCompatActivity() {
         return if (accepted.isEmpty()) null else accepted.toTypedArray()
     }
 
-    private fun isBlankPopup(view: WebView): Boolean =
-        request.popup && (view.url == null || view.url == "about:blank") && !view.canGoBack()
+    /** A popup's first main-frame navigation: where window.open sent it. */
+    private fun isPopupTarget(): Boolean {
+        val current = entry ?: return false
+        if (!current.popup || current.popupTargetDecided) return false
+        current.popupTargetDecided = true
+        // window.open(url) navigates at once; a document-written popup's first
+        // navigation is a later tap on its content and must not close it.
+        return SystemClock.elapsedRealtime() - current.createdAt < POPUP_TARGET_WINDOW_MS &&
+            current.webView.url.let { it == null || it == "about:blank" } &&
+            !current.webView.canGoBack()
+    }
 
     private inner class ScreenClient : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val url = request.url.toString()
             val decision = AppScreenPolicy.decide(url, request.isForMainFrame)
+            val popupTarget = request.isForMainFrame && view === entry?.webView && isPopupTarget()
             if (decision.kind == NavigationKind.IN_APP) return false
             if (request.isForMainFrame && view === entry?.webView) {
-                if (isBlankPopup(view)) {
+                if (popupTarget) {
                     // A target=_blank / window.open to tel:, http: and the like:
                     // ask on the opener and drop the empty popup.
                     AppScreenRegistry.openerHost(this@AppScreenActivity.request.key)
@@ -657,6 +674,7 @@ class AppScreenActivity : AppCompatActivity() {
         const val STATE_URL = "com.takosumi.appscreen.state.URL"
         const val SHELL_SCHEME = "takosumi"
         const val PROMPT_COOLDOWN_MS = 5_000L
+        const val POPUP_TARGET_WINDOW_MS = 3_000L
         const val MENU_SHARE = 1
         const val MENU_BROWSER = 2
         const val MENU_PIN = 3
@@ -711,6 +729,7 @@ internal class PopupPrebindClient(private val key: String) : WebViewClient() {
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url.toString()
         val decision = AppScreenPolicy.decide(url, request.isForMainFrame)
+        if (request.isForMainFrame) AppScreenRegistry.get(key)?.popupTargetDecided = true
         if (decision.kind == NavigationKind.IN_APP) return false
         if (request.isForMainFrame) {
             if (decision.kind == NavigationKind.EXTERNAL_CONFIRM) {
@@ -721,7 +740,12 @@ internal class PopupPrebindClient(private val key: String) : WebViewClient() {
                 )
             }
             val target = WeakReference(view)
-            view.post { target.get()?.let { AppScreenRegistry.findByWebView(it) }?.let { AppScreenRegistry.remove(it.key) } }
+            view.post {
+                val popup = target.get()?.let { AppScreenRegistry.findByWebView(it) } ?: return@post
+                // The popup's activity may have bound it meanwhile; let it finish.
+                popup.host?.releaseEvictedWebView(popup)
+                AppScreenRegistry.remove(popup.key)
+            }
         }
         return true
     }

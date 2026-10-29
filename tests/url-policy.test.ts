@@ -73,6 +73,10 @@ test("pages cannot drive the shell or open local content", () => {
   ).toEqual({ kind: "block", reason: "local-content" });
   expect(intentTargetScheme("intent://scan/#Intent;package=a;scheme=ZXing;end")).toBe("zxing");
   expect(intentTargetScheme("intent://scan/")).toBeUndefined();
+  // As Intent.parseUri: parameters after the last '#', else the data's scheme.
+  expect(intentTargetScheme("intent://x/#frag#Intent;scheme=takosumi;end")).toBe("takosumi");
+  expect(intentTargetScheme("intent:takosumi://oauth/callback#Intent;end")).toBe("takosumi");
+  expect(intentTargetScheme("intent://scan/#Intent;end")).toBeUndefined();
 });
 
 test("subframes never reach the OS", () => {

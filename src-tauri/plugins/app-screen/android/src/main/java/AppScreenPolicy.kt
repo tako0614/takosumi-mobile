@@ -58,14 +58,19 @@ internal object AppScreenPolicy {
 
     /** The `scheme=` of `intent://...#Intent;scheme=x;end`, lowercased. */
     fun intentTargetScheme(rawUrl: String): String? {
-        val marker = rawUrl.indexOf("#Intent;")
-        if (marker < 0) return null
-        return rawUrl.substring(marker + "#Intent;".length)
+        // Like Intent.parseUri: the parameters follow the last '#'.
+        val hash = rawUrl.lastIndexOf('#')
+        if (hash < 0 || !rawUrl.startsWith("Intent;", hash + 1)) return null
+        val named = rawUrl.substring(hash + "#Intent;".length)
             .split(';')
             .firstOrNull { it.startsWith("scheme=", ignoreCase = true) }
             ?.substring("scheme=".length)
             ?.trim()
             ?.lowercase()
+        if (named != null) return named
+        // Without scheme=, `intent:x://...` opens the data part's own scheme.
+        val data = rawUrl.substring(rawUrl.indexOf(':') + 1, hash)
+        return Regex("^([a-zA-Z][a-zA-Z0-9+.-]*):").find(data)?.groupValues?.get(1)?.lowercase()
     }
 
     /** https with a host and no user info: the only URLs a screen opens with. */

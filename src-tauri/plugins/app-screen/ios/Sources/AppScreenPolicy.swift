@@ -54,15 +54,27 @@ enum AppScreenPolicy {
 
     /// The `scheme=` of `intent://...#Intent;scheme=x;end`, lowercased.
     static func intentTargetScheme(_ rawUrl: String) -> String? {
-        guard let marker = rawUrl.range(of: "#Intent;") else { return nil }
-        for part in rawUrl[marker.upperBound...].split(separator: ";") {
+        // Like Android's Intent.parseUri: the parameters follow the last '#'.
+        guard let hash = rawUrl.lastIndex(of: "#") else { return nil }
+        let parameters = rawUrl[rawUrl.index(after: hash)...]
+        guard parameters.hasPrefix("Intent;") else { return nil }
+        for part in parameters.dropFirst("Intent;".count).split(separator: ";") {
             if part.lowercased().hasPrefix("scheme=") {
                 return part.dropFirst("scheme=".count)
                     .trimmingCharacters(in: .whitespaces)
                     .lowercased()
             }
         }
-        return nil
+        // Without scheme=, `intent:x://...` opens the data part's own scheme.
+        guard let colon = rawUrl.firstIndex(of: ":"), colon < hash else { return nil }
+        let data = rawUrl[rawUrl.index(after: colon)..<hash]
+        guard let end = data.firstIndex(of: ":") else { return nil }
+        let scheme = data[data.startIndex..<end]
+        guard let first = scheme.first, first.isLetter,
+              scheme.allSatisfy({ $0.isLetter || $0.isNumber || "+.-".contains($0) }) else {
+            return nil
+        }
+        return scheme.lowercased()
     }
 
     private static func hasUserInfo(_ url: URL) -> Bool {

@@ -87,6 +87,8 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     func reloadIfNeeded(_ webView: WKWebView) {
         guard needsReload else { return }
         needsReload = false
+        // A load just started (a deep link) replaces the crashed page anyway.
+        guard !webView.isLoading else { return }
         webView.reload()
     }
 
@@ -146,7 +148,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        committedURL = webView.url
+        if !webView.isLoading { committedURL = webView.url }
         screen?.updateBar()
     }
 
@@ -421,7 +423,8 @@ final class AppScreenViewController: UIViewController {
         // Covered by its own popup it stays on the stack and stays alive.
         if isBeingDismissed || presentingViewController == nil {
             pendingDialog?.cancel()
-            coordinator.setVisible(session.key, false)
+            // The app may already be reopened in a new controller.
+            if ownsSession() { coordinator.setVisible(session.key, false) }
         }
     }
 
@@ -621,11 +624,18 @@ final class AppScreenViewController: UIViewController {
     }
 
     private func closeScreen() {
-        let key = session.key
+        let closing = session
         removePopupChain()
-        presentingViewController?.dismiss(animated: true) { [coordinator] in
-            coordinator.remove(key)
+        presentingViewController?.dismiss(animated: true) { [weak self, coordinator] in
+            // Reopened meanwhile in a new controller: keep it.
+            let owner = closing.navigator.screen
+            if owner == nil || owner === self { coordinator.remove(closing.key) }
         }
+    }
+
+    private func ownsSession() -> Bool {
+        let owner = session.navigator.screen
+        return owner == nil || owner === self
     }
 
     func pageClosed(_ webView: WKWebView) {
@@ -635,7 +645,8 @@ final class AppScreenViewController: UIViewController {
     // MARK: Prompts and popups
 
     private func canPresent() -> Bool {
-        viewIfLoaded?.window != nil && presentedViewController == nil && !isBeingDismissed
+        viewIfLoaded?.window != nil && presentedViewController == nil &&
+            !isBeingDismissed && !isBeingPresented && transitionCoordinator == nil
     }
 
     func presentPopup(configuration: WKWebViewConfiguration) -> WKWebView? {
@@ -646,6 +657,10 @@ final class AppScreenViewController: UIViewController {
         controller.modalPresentationStyle = .fullScreen
         controller.loadViewIfNeeded()
         present(controller, animated: true)
+        guard presentedViewController === controller else {
+            coordinator.remove(popup.key)
+            return nil
+        }
         return popup.webView
     }
 
@@ -672,6 +687,7 @@ final class AppScreenViewController: UIViewController {
         }
         pendingDialog = completion
         present(alert, animated: true)
+        if presentedViewController !== alert { completion.cancel() }
     }
 
     /// Ask before leaving the app. Without a user gesture, a page that was just

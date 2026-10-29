@@ -37,6 +37,9 @@ internal object AppScreenRegistry {
         var host: AppScreenActivity? = null
         /** For a popup: the screen whose page opened it. */
         var openerKey: String? = null
+        /** For a popup: its first main-frame navigation has been judged. */
+        var popupTargetDecided = false
+        val createdAt: Long = android.os.SystemClock.elapsedRealtime()
         var destroyed = false
     }
 
