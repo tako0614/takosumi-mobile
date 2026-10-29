@@ -89,10 +89,16 @@ const breakerCounters = (context: RelayContext, platform: Platform) => {
 
 /**
  * The invalidation breaker. An unrecognized configuration mistake could make
- * APNs/FCM call every token invalid; marking them all would make every app
- * delete its subscriptions for good. So when a platform's invalidations in the
- * window exceed an absolute count, or a share of its deliveries, the relay stops
- * invalidating, answers 502 (apps retry later), and logs an alert.
+ * APNs/FCM reject every token; marking them all would make every app delete its
+ * subscriptions for good. So when a platform's rejections in the window exceed
+ * an absolute count, or a share of its deliveries, the relay stops invalidating
+ * on rejections, answers 502 (apps retry later), and logs an alert.
+ *
+ * It sees only `rejected` answers for devices that were delivered to before.
+ * `expired` answers (Unregistered, ExpiredToken, UNREGISTERED) come only for
+ * tokens the platform once issued, so they always invalidate; and tokens that
+ * never worked are invalidated directly. That way registering junk tokens
+ * cannot hold the breaker open and turn real uninstalls into 502s.
  */
 async function breakerOpen(
   context: RelayContext,
@@ -113,6 +119,8 @@ async function breakerOpen(
     deliveries >= limits.breakerMinDeliveries && invalidations > limits.breakerMaxRatio * deliveries;
   return { open: tooMany || tooLarge, invalidations, deliveries };
 }
+
+const DAY = 24 * 60 * 60;
 
 const gone = () =>
   problem(410, "subscription_gone", "the device behind this subscription is no longer reachable");
@@ -216,6 +224,10 @@ export async function handlePush(
   const fields = { platform, outcome: outcome.kind };
   switch (outcome.kind) {
     case "delivered":
+      // At most one write a day: the device is in use, and has been delivered to.
+      if (target.device.deliveredAt === null || now - target.device.deliveredAt >= DAY) {
+        await context.store.recordDelivery(target.device.deviceId, now);
+      }
       context.log.info("push_delivered", { ...fields, bytes: body.length, urgency, ttl });
       return new Response(null, {
         status: 201,
@@ -226,8 +238,9 @@ export async function handlePush(
         },
       });
     case "device-invalid": {
-      const breaker = await breakerOpen(context, platform, now);
-      if (breaker.open) {
+      const guarded = outcome.evidence === "rejected" && target.device.deliveredAt !== null;
+      const breaker = guarded ? await breakerOpen(context, platform, now) : null;
+      if (breaker?.open) {
         context.log.error("invalidation_breaker_open", {
           alert: true,
           platform,
@@ -239,7 +252,7 @@ export async function handlePush(
         return problem(502, "delivery_failed", "the platform push service rejected too many devices; not invalidating");
       }
       if (await context.store.invalidateDevice(target.device.deviceId, sentToken, now)) {
-        context.log.info("push_device_invalid", { ...fields, reason: outcome.reason });
+        context.log.info("push_device_invalid", { ...fields, reason: outcome.reason, evidence: outcome.evidence });
         return gone();
       }
       // Nothing changed: either another push invalidated the same token first,

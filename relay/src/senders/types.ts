@@ -31,8 +31,13 @@ export interface DeliveryRequest {
 export type DeliveryOutcome =
   /** APNs/FCM accepted the message. */
   | { kind: "delivered" }
-  /** APNs/FCM says the token is no longer valid for this app. */
-  | { kind: "device-invalid"; reason: string }
+  /**
+   * APNs/FCM says the token is not valid for this app. `expired`: a token that
+   * was once registered is not any more (the app was uninstalled or the token
+   * expired); platforms answer this only for tokens they issued. `rejected`: the
+   * platform does not accept the token at all (malformed, wrong environment).
+   */
+  | { kind: "device-invalid"; reason: string; evidence: "expired" | "rejected" }
   /** APNs/FCM asked us to slow down. */
   | { kind: "throttled"; retryAfter: number; reason: string }
   /** A transient upstream failure (network, 5xx). */

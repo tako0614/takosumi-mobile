@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { base64UrlEncode, sha256Hex } from "../src/encoding.ts";
 import { generateVapidKeys } from "../tools/web-push.ts";
-import { ipv6Prefix64 } from "../src/devices.ts";
+import { ipv6Prefix48, ipv6Prefix64 } from "../src/devices.ts";
 import { APNS_TOKEN, FCM_TOKEN, ORIGIN, createTestRelay, push, register, subscribe, uniqueFcmToken } from "./support/relay.ts";
 
 test("registers an APNs device and stores only the token and a secret hash", async () => {
@@ -257,13 +257,18 @@ test("the database refuses two active devices with one token", async () => {
   expect(device.deviceId.length).toBeGreaterThan(0);
 });
 
-test("caps how many device rows one token may accumulate", async () => {
-  const t = createTestRelay({ limits: { devicesPerToken: 3 } });
+test("re-registering one token never locks it out, and old rows are pruned", async () => {
+  const t = createTestRelay({ limits: { invalidRowsPerToken: 3 } });
   const token = uniqueFcmToken();
-  for (let index = 0; index < 3; index += 1) await register(t, { platform: "fcm", token });
-  const capped = await t.call("POST", "/v1/devices", { body: { platform: "fcm", token } });
-  expect(capped.status).toBe(429);
-  expect(((await capped.json()) as { error: string }).error).toBe("token_registration_limit");
+  let last = await register(t, { platform: "fcm", token });
+  const first = await subscribe(t, last);
+  for (let index = 0; index < 10; index += 1) last = await register(t, { platform: "fcm", token });
+  const rows = t.sqlite.query("SELECT invalidated_at FROM devices WHERE token = ?1").all(token) as { invalidated_at: number | null }[];
+  expect(rows.filter((row) => row.invalidated_at === null)).toHaveLength(1);
+  expect(rows.filter((row) => row.invalidated_at !== null)).toHaveLength(3);
+  // The pruned first device's endpoint is unknown now (404, which apps treat like 410).
+  expect((await push(t, first)).status).toBe(404);
+  expect((await push(t, await subscribe(t, last))).status).toBe(201);
 });
 
 test("counts registrations per IPv6 /64 and per IPv4 address", async () => {
@@ -320,4 +325,66 @@ test("devices unseen for the inactivity period are deleted; any authenticated ca
 test("a device holds at most 64 subscriptions by default", async () => {
   const { DEFAULT_LIMITS } = await import("../src/context.ts");
   expect(DEFAULT_LIMITS.subscriptionsPerDevice).toBe(64);
+});
+
+test("counts IPv6 registrations per /48 as well as per /64", async () => {
+  expect(ipv6Prefix48("2001:db8:1:2::1")).toBe("2001:db8:1");
+  expect(ipv6Prefix48("192.0.2.1")).toBeNull();
+  const t = createTestRelay({ limits: { registrationsPerHour: 30, registrationsPerHourPer48: 4 } });
+  // One client walking through /64s of its /57 (or /48): each /64 is fresh, the /48 is not.
+  for (let index = 0; index < 4; index += 1) {
+    await register(t, undefined, { "cf-connecting-ip": `2001:db8:1:${(0x80 + index).toString(16)}::1` });
+  }
+  const walked = await t.call("POST", "/v1/devices", {
+    headers: { "cf-connecting-ip": "2001:db8:1:ff::1" },
+    body: { platform: "fcm", token: uniqueFcmToken() },
+  });
+  expect(walked.status).toBe(429);
+  await register(t, undefined, { "cf-connecting-ip": "2001:db8:2:80::1" });
+});
+
+test("the global registration threshold alerts once and keeps serving below the hard ceiling", async () => {
+  const t = createTestRelay({ limits: { registrationsAlertPerHour: 2, registrationsPerHourGlobal: 5 } });
+  for (let index = 1; index <= 5; index += 1) await register(t, undefined, { "cf-connecting-ip": `198.51.100.${index}` });
+  const alerts = t.log.lines.filter((line) => line.includes("registration_rate_alert"));
+  expect(alerts).toHaveLength(1);
+  expect(JSON.parse(alerts[0] as string)).toMatchObject({ level: "error", alert: true, perHour: 3 });
+  const ceiling = await t.call("POST", "/v1/devices", {
+    headers: { "cf-connecting-ip": "198.51.100.99" },
+    body: { platform: "fcm", token: uniqueFcmToken() },
+  });
+  expect(ceiling.status).toBe(429);
+});
+
+test("successful deliveries keep a device alive, written at most once a day", async () => {
+  const t = createTestRelay({ limits: { inactiveDeviceSeconds: 2 * 86400 } });
+  const device = await register(t);
+  const subscription = await subscribe(t, device);
+  const seen = () =>
+    t.sqlite.query("SELECT seen_at, delivered_at FROM devices WHERE device_id = ?1").get(device.deviceId) as {
+      seen_at: number;
+      delivered_at: number | null;
+    };
+  const start = t.clock.now;
+  expect(seen().delivered_at).toBeNull();
+
+  t.clock.now = start + 100;
+  expect((await push(t, subscription)).status).toBe(201);
+  expect(seen()).toEqual({ seen_at: start + 100, delivered_at: start + 100 });
+  t.clock.now = start + 5000;
+  expect((await push(t, subscription)).status).toBe(201);
+  expect(seen()).toEqual({ seen_at: start + 100, delivered_at: start + 100 }); // no second write the same day
+
+  // The device itself never calls again, but pushes keep reaching it.
+  for (let day = 1; day <= 4; day += 1) {
+    t.clock.now = start + 100 + day * 86400;
+    expect((await push(t, subscription)).status).toBe(201);
+    await t.relay.scheduled();
+  }
+  expect(seen().delivered_at).toBe(start + 100 + 4 * 86400);
+
+  // Once pushes stop, the inactivity period runs out.
+  t.clock.now += 2 * 86400 + 1;
+  await t.relay.scheduled();
+  expect((await push(t, subscription)).status).toBe(404);
 });

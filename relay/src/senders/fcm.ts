@@ -132,9 +132,10 @@ export class FcmSender implements PushSender {
     // SENDER_ID_MISMATCH means the token belongs to another Firebase project:
     // with a wrong FCM_PROJECT_ID every device would answer it, so it is a relay
     // configuration failure, like any authentication or permission error.
-    if (fcmErrorCode === "UNREGISTERED") return { kind: "device-invalid", reason };
+    // UNREGISTERED comes only for tokens FCM once issued.
+    if (fcmErrorCode === "UNREGISTERED") return { kind: "device-invalid", reason, evidence: "expired" };
     if (fcmErrorCode === "INVALID_ARGUMENT" && /registration token/iu.test(body?.error?.message ?? "")) {
-      return { kind: "device-invalid", reason };
+      return { kind: "device-invalid", reason, evidence: "rejected" };
     }
     if (response.status === 401 || response.status === 403) {
       this.cached = null;
