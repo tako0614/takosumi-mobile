@@ -3,9 +3,34 @@ import type {
   MobileWorkspace,
   TakosumiMobileHome,
 } from "./api.ts";
+import type { LauncherApp } from "./app-screens.ts";
 
 export function mobileHomeTitle(_home?: TakosumiMobileHome): string {
   return "Takosumi";
+}
+
+/**
+ * Apps for the launcher: the per-app list when the host serves it, else the
+ * legacy Workspace's Capsules (production hosts before TASK-0118).
+ */
+export function launcherAppsFromHome(
+  home: TakosumiMobileHome | undefined,
+  locale?: string,
+): readonly LauncherApp[] {
+  if (!home) return [];
+  if (home.apps.length > 0) {
+    return home.apps.map((app) => ({
+      capsuleId: app.capsuleId,
+      label: appDisplayName(app, locale),
+      ...(app.iconUrl === undefined ? {} : { iconUrl: app.iconUrl }),
+      state: app.state,
+    }));
+  }
+  return home.capsules.map((capsule) => ({
+    capsuleId: capsule.id,
+    label: capsule.name,
+    state: capsule.status,
+  }));
 }
 
 export function legacyWorkspaceOptions(

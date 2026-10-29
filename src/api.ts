@@ -15,9 +15,17 @@ import {
   type PublicSessionRun,
   type PublicSessionWorkspace,
 } from "../../takosumi/contract/public-session-control.ts";
+import {
+  appMayHaveScreens,
+  CAPSULE_APP_SCREENS_DECODER,
+  type CapsuleAppScreens,
+  type LauncherApp,
+} from "./app-screens.ts";
 import { productAdapter } from "./product.ts";
 
 const WORKSPACE_PAGE_SIZE = 100;
+const APP_SCREEN_CONCURRENCY = 6;
+export const MAX_LAUNCHER_APPS = 100;
 const APP_PAGE_SIZE = 100;
 const CAPSULE_PAGE_SIZE = 100;
 const RUN_PAGE_SIZE = 50;
@@ -314,6 +322,62 @@ async function listApps(session: MobileSession): Promise<readonly MobileApp[]> {
     maximumItems: MAX_APPS,
     label: "apps",
   });
+}
+
+export interface AppScreensLoad {
+  /** Launchable screens by Capsule id, for apps whose view could be read. */
+  readonly screens: ReadonlyMap<string, CapsuleAppScreens>;
+  /** Apps whose view failed for a reason other than absence or access. */
+  readonly failedCapsuleIds: readonly string[];
+}
+
+/**
+ * Read each app's launchable screens from the installed-app view
+ * (`GET /api/v1/capsules/{capsuleId}/app`). Hosts without the view (404) or
+ * apps the session may not read (403) simply have no screens; the home keeps
+ * working without them.
+ */
+export async function loadAppScreens(
+  session: MobileSession,
+  apps: readonly LauncherApp[],
+): Promise<AppScreensLoad> {
+  const api = createMobileApiClient({ session });
+  const candidates = apps
+    .filter((app) => appMayHaveScreens(app.state))
+    .slice(0, MAX_LAUNCHER_APPS);
+  const screens = new Map<string, CapsuleAppScreens>();
+  const failedCapsuleIds: string[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < candidates.length) {
+      const app = candidates[next++]!;
+      try {
+        const view = await api.wire(
+          `/api/v1/capsules/${encodeURIComponent(app.capsuleId)}/app`,
+          CAPSULE_APP_SCREENS_DECODER,
+        );
+        if (view.capsuleId !== app.capsuleId) {
+          throw new Error("App view id does not match the listed app.");
+        }
+        screens.set(app.capsuleId, view);
+      } catch (error) {
+        if (
+          error instanceof MobileApiError &&
+          (error.status === 404 || error.status === 403)
+        ) {
+          continue;
+        }
+        failedCapsuleIds.push(app.capsuleId);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(APP_SCREEN_CONCURRENCY, candidates.length) },
+      worker,
+    ),
+  );
+  return { screens, failedCapsuleIds };
 }
 
 export interface MobileRunMutationInput {

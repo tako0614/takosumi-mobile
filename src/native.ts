@@ -25,10 +25,30 @@ import {
   isTauriMobilePlatform,
   type NativeBridge,
 } from "@takosjp/mobile-kit";
+import {
+  type AppScreenInvoke,
+  type AppScreenOpener,
+  createAppScreenOpener,
+} from "./app-screen-native.ts";
 import { productAdapter } from "./product.ts";
 
 export function isUnsupportedTauriDesktop(): boolean {
   return detectTauriRuntime() && !isTauriMobilePlatform(platform());
+}
+
+/**
+ * App screens open in the product's native webview plugin on iOS/Android and
+ * in the external browser in the web preview.
+ */
+export function createProductAppScreenOpener(
+  bridge: Pick<NativeBridge, "openExternalUrl">,
+): AppScreenOpener {
+  const mobile = detectTauriRuntime() && isTauriMobilePlatform(platform());
+  return createAppScreenOpener({
+    ...(mobile ? { invoke: invoke as AppScreenInvoke } : {}),
+    platform: mobile ? platform() : "web",
+    openExternalUrl: (url) => bridge.openExternalUrl(url),
+  });
 }
 
 export function createProductNativeBridge(): NativeBridge {

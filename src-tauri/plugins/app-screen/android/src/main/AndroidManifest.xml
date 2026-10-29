@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!--
+          One app screen per installed app. Launched with FLAG_ACTIVITY_NEW_DOCUMENT
+          so each app is its own task in Recents; popups (window.open) stack in the
+          opener's task. Not exported: only Takosumi Mobile and its own launcher
+          shortcuts start it; external takosumi://app links go through the shell.
+        -->
+        <activity
+            android:name="com.takosumi.appscreen.AppScreenActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
+            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>

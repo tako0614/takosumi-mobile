@@ -1,0 +1,18 @@
+[package]
+name = "tauri-plugin-app-screen"
+version = "0.1.0-takosumi.1"
+authors = ["Takos"]
+description = "Takosumi-owned native app screens (WKWebView / Android WebView) for installed apps"
+edition = "2021"
+rust-version = "1.89"
+license = "AGPL-3.0-only"
+publish = false
+links = "tauri-plugin-app-screen"
+
+[dependencies]
+serde = "1.0"
+tauri = { version = "2.11.5", default-features = false }
+thiserror = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }
