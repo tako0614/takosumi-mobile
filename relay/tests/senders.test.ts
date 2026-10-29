@@ -261,3 +261,31 @@ test("FCM: reads a service account JSON and rejects anything else", () => {
   expect(parseServiceAccount("{}")).toBeNull();
   expect(parseServiceAccount("not json")).toBeNull();
 });
+
+test("invalidations say whether the token expired or was rejected", async () => {
+  const key = await apnsKey();
+  const apnsCases: [number, string | undefined, string][] = [
+    [410, "Unregistered", "expired"],
+    [410, "ExpiredToken", "expired"],
+    [410, undefined, "expired"],
+    [400, "BadDeviceToken", "rejected"],
+  ];
+  for (const [status, reason, evidence] of apnsCases) {
+    const { fetcher } = mockFetch([() => new Response(reason ? JSON.stringify({ reason }) : null, { status })]);
+    const sender = new ApnsSender({ teamId: "T", keyId: "K", privateKeyPem: key.pem, topic: "t" }, fetcher);
+    expect(await sender.send(request())).toMatchObject({ kind: "device-invalid", evidence });
+  }
+  const account = await serviceAccountKey();
+  const fcmCases: [number, string, string, string][] = [
+    [404, "UNREGISTERED", "Requested entity was not found.", "expired"],
+    [400, "INVALID_ARGUMENT", "The registration token is not a valid FCM registration token", "rejected"],
+  ];
+  for (const [status, errorCode, message, evidence] of fcmCases) {
+    const { fetcher } = mockFetch([
+      () => Response.json({ access_token: "t", expires_in: 3600 }),
+      () => Response.json({ error: { code: status, message, status: errorCode, details: [{ errorCode }] } }, { status }),
+    ]);
+    const sender = new FcmSender({ projectId: "p", serviceAccount: { client_email: "e", private_key: account.pem } }, fetcher);
+    expect(await sender.send(request({ platform: "fcm" }))).toMatchObject({ kind: "device-invalid", evidence });
+  }
+});

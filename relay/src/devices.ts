@@ -11,7 +11,7 @@
 import type { RelayContext } from "./context.ts";
 import { base64UrlDecode, base64UrlEncode, constantTimeEqual, randomId, sha256Hex, utf8 } from "./encoding.ts";
 import { BodyTooLarge, json, noContent, problem, readJsonObject } from "./http.ts";
-import { limit } from "./rate-limit.ts";
+import { limit, secondsLeft } from "./rate-limit.ts";
 import type { ApnsEnvironment, DeviceRecord, Platform } from "./store.ts";
 import { importApplicationServerKey } from "./vapid.ts";
 
@@ -51,12 +51,8 @@ async function readBodyOrProblem(request: Request): Promise<Record<string, unkno
   }
 }
 
-/**
- * The first four groups of an IPv6 address (its /64), or null when the text is
- * not IPv6. One subscriber usually holds a whole /64, so counting addresses
- * inside it would let one client register without limit.
- */
-export function ipv6Prefix64(address: string): string | null {
+/** The eight groups of an IPv6 address, or null when the text is not IPv6. */
+function ipv6Groups(address: string): string[] | null {
   if (!address.includes(":")) return null;
   let text = address.trim().toLowerCase().replace(/^\[|\]$/gu, "").split("%")[0] ?? "";
   // An embedded IPv4 tail (::ffff:192.0.2.1) is two groups.
@@ -73,14 +69,31 @@ export function ipv6Prefix64(address: string): string | null {
   if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
   const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill("0"), ...tail];
   if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/u.test(group))) return null;
-  return groups.slice(0, 4).map((group) => group.replace(/^0+(?=.)/u, "")).join(":");
+  return groups.map((group) => group.replace(/^0+(?=.)/u, ""));
 }
 
-async function clientKey(request: Request): Promise<string> {
+/**
+ * The /64 of an IPv6 address, or null when the text is not IPv6. One
+ * subscriber usually holds a whole /64, so counting addresses inside it would
+ * let one client register without limit.
+ */
+export function ipv6Prefix64(address: string): string | null {
+  return ipv6Groups(address)?.slice(0, 4).join(":") ?? null;
+}
+
+/** The /48 of an IPv6 address: a site's whole allocation (65,536 /64s). */
+export function ipv6Prefix48(address: string): string | null {
+  return ipv6Groups(address)?.slice(0, 3).join(":") ?? null;
+}
+
+const hashed = async (text: string) => (await sha256Hex(`client:${text}`)).slice(0, 32);
+
+/** Rate-limit keys for a client: its IPv4 address, or its IPv6 /64 and /48. */
+async function clientKeys(request: Request): Promise<{ client: string; site: string | null }> {
   const address = request.headers.get("cf-connecting-ip") ?? "unknown";
-  const prefix = ipv6Prefix64(address);
-  const client = prefix ? `v6/64:${prefix}` : `v4:${address}`;
-  return (await sha256Hex(`client:${client}`)).slice(0, 32);
+  const prefix64 = ipv6Prefix64(address);
+  if (!prefix64) return { client: await hashed(`v4:${address}`), site: null };
+  return { client: await hashed(`v6/64:${prefix64}`), site: await hashed(`v6/48:${ipv6Prefix48(address)}`) };
 }
 
 function rateLimited(retryAfter: number): Response {
@@ -113,21 +126,38 @@ async function authenticate(
 
 export async function registerDevice(request: Request, context: RelayContext): Promise<Response> {
   const now = context.now();
-  // The per-client limit first: a refused client does not use up the global one.
+  const { limits } = context;
+  // Narrowest first: a refused client does not use up the wider budgets.
+  // These limits only slow abuse down. The defense before production is WAF
+  // rate limiting at Cloudflare and device attestation on registration (App
+  // Attest on iOS, Play Integrity on Android); see relay/README.md.
+  const keys = await clientKeys(request);
   const perClient = await limit(
     context.counters,
-    { scope: "register", key: await clientKey(request), limit: context.limits.registrationsPerHour, windowSeconds: 3600 },
+    { scope: "register", key: keys.client, limit: limits.registrationsPerHour, windowSeconds: 3600 },
     now,
   );
   if (!perClient.allowed) return rateLimited(perClient.retryAfter);
-  const global = await limit(
-    context.counters,
-    { scope: "register-global", key: "all", limit: context.limits.registrationsPerHourGlobal, windowSeconds: 3600 },
+  if (keys.site) {
+    const perSite = await limit(
+      context.counters,
+      { scope: "register-48", key: keys.site, limit: limits.registrationsPerHourPer48, windowSeconds: 3600 },
+      now,
+    );
+    if (!perSite.allowed) return rateLimited(perSite.retryAfter);
+  }
+  // Over all clients: an alert well before a hard ceiling, so that one /32's
+  // worth of clients cannot lock everyone else out of registering.
+  const [global = 0] = await context.counters.run(
+    [{ counter: { bucket: "register-global:all", windowSeconds: 3600 }, increment: true }],
     now,
   );
-  if (!global.allowed) {
+  if (global === limits.registrationsAlertPerHour + 1) {
+    context.log.error("registration_rate_alert", { alert: true, perHour: global });
+  }
+  if (global > limits.registrationsPerHourGlobal) {
     context.log.warn("registration_global_limit", {});
-    return rateLimited(global.retryAfter);
+    return rateLimited(secondsLeft(now, 3600));
   }
 
   const body = await readBodyOrProblem(request);
@@ -138,11 +168,6 @@ export async function registerDevice(request: Request, context: RelayContext): P
   }
   const fields = parseToken(platform, body);
   if (fields instanceof Response) return fields;
-  if ((await context.store.countDevicesWithToken(platform, fields.token)) >= context.limits.devicesPerToken) {
-    return problem(429, "token_registration_limit", "this token was registered too many times", {
-      "retry-after": "86400",
-    });
-  }
 
   const deviceId = randomId(16);
   const deviceSecret = randomId(32);
@@ -156,6 +181,7 @@ export async function registerDevice(request: Request, context: RelayContext): P
     apnsEnvironment: fields.apnsEnvironment,
     createdAt: now,
   });
+  await context.store.pruneInvalidRowsForToken(platform, fields.token, limits.invalidRowsPerToken);
   context.log.info("device_registered", { platform, superseded });
   return json(201, { device_id: deviceId, device_secret: deviceSecret });
 }
@@ -170,15 +196,8 @@ export async function updateDevice(request: Request, deviceId: string, context: 
   }
   const fields = parseToken(device.platform, body);
   if (fields instanceof Response) return fields;
-  if (fields.token !== device.token) {
-    const holders = await context.store.countDevicesWithToken(device.platform, fields.token);
-    if (holders >= context.limits.devicesPerToken) {
-      return problem(429, "token_registration_limit", "this token was registered too many times", {
-        "retry-after": "86400",
-      });
-    }
-  }
   const superseded = await context.store.updateDeviceToken(device, fields.token, fields.apnsEnvironment, context.now());
+  await context.store.pruneInvalidRowsForToken(device.platform, fields.token, context.limits.invalidRowsPerToken);
   context.log.info("device_token_updated", {
     platform: device.platform,
     revived: device.invalidatedAt !== null,

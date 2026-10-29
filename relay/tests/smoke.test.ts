@@ -44,7 +44,7 @@ async function smoke(origin: string, ...args: string[]) {
 }
 
 test("live smoke passes when APNs/FCM reject the fake token (410)", async () => {
-  const origin = serve({ kind: "device-invalid", reason: "BadDeviceToken" });
+  const origin = serve({ kind: "device-invalid", reason: "BadDeviceToken", evidence: "rejected" });
   const result = await smoke(origin, "--expect", "live", "--platform", "apns", "--platform", "fcm");
   expect(result.code).toBe(0);
   expect(result.report.ok).toBe(true);

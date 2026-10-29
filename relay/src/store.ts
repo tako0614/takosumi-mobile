@@ -13,6 +13,8 @@ export interface DeviceRecord {
   createdAt: number;
   updatedAt: number;
   seenAt: number;
+  /** When a push to the device last succeeded (written at most daily), or null. */
+  deliveredAt: number | null;
 }
 
 export interface SubscriptionTarget {
@@ -32,6 +34,7 @@ interface DeviceRow {
   created_at: number;
   updated_at: number;
   seen_at: number;
+  delivered_at: number | null;
 }
 
 interface TargetRow extends DeviceRow {
@@ -51,11 +54,12 @@ function toDevice(row: DeviceRow): DeviceRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     seenAt: row.seen_at,
+    deliveredAt: row.delivered_at ?? null,
   };
 }
 
 const DEVICE_COLUMNS =
-  "d.device_id, d.secret_hash, d.platform, d.token, d.apns_environment, d.invalidated_at, d.created_at, d.updated_at, d.seen_at";
+  "d.device_id, d.secret_hash, d.platform, d.token, d.apns_environment, d.invalidated_at, d.created_at, d.updated_at, d.seen_at, d.delivered_at";
 
 // Marks every other active device holding the token as superseded.
 const SUPERSEDE =
@@ -70,7 +74,7 @@ export class RelayStore {
    * token, in one transaction. Returns how many devices were superseded.
    */
   async createDevice(
-    device: Omit<DeviceRecord, "invalidatedAt" | "updatedAt" | "seenAt">,
+    device: Omit<DeviceRecord, "invalidatedAt" | "updatedAt" | "seenAt" | "deliveredAt">,
   ): Promise<number> {
     const [superseded] = await this.db.batch<{ device_id: string }>([
       this.db.prepare(SUPERSEDE).bind(device.platform, device.token, device.createdAt, device.deviceId),
@@ -98,13 +102,30 @@ export class RelayStore {
     return row ? toDevice(row) : null;
   }
 
-  /** How many device rows (active or superseded) hold this token. */
-  async countDevicesWithToken(platform: Platform, token: string): Promise<number> {
-    const row = await this.db
-      .prepare("SELECT COUNT(*) AS n FROM devices WHERE platform = ?1 AND token = ?2")
-      .bind(platform, token)
-      .first<{ n: number }>();
-    return Number(row?.n ?? 0);
+  /**
+   * Keeps at most `keep` invalid rows for this token (the newest) and deletes
+   * the older ones with their subscriptions; their endpoints then answer 404,
+   * which apps treat like 410. Re-registering one token many times therefore
+   * cannot grow the table, and never locks the token out.
+   */
+  async pruneInvalidRowsForToken(platform: Platform, token: string, keep: number) {
+    const older =
+      "SELECT device_id FROM devices WHERE platform = ?1 AND token = ?2 AND invalidated_at IS NOT NULL ORDER BY invalidated_at DESC, created_at DESC, rowid DESC LIMIT -1 OFFSET ?3";
+    await this.db.batch([
+      this.db.prepare(`DELETE FROM subscriptions WHERE device_id IN (${older})`).bind(platform, token, keep),
+      this.db.prepare(`DELETE FROM devices WHERE device_id IN (${older})`).bind(platform, token, keep),
+    ]);
+  }
+
+  /**
+   * Records a successful delivery: the device is in use. Callers write this at
+   * most once a day per device.
+   */
+  async recordDelivery(deviceId: string, now: number) {
+    await this.db
+      .prepare("UPDATE devices SET delivered_at = ?2, seen_at = MAX(seen_at, ?2) WHERE device_id = ?1")
+      .bind(deviceId, now)
+      .run();
   }
 
   /** Records an authenticated call from the device. */

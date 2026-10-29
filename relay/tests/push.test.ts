@@ -13,6 +13,7 @@ import {
   pushInit,
   register,
   subscribe,
+  type Subscribed,
 } from "./support/relay.ts";
 
 async function ready(platform: "apns" | "fcm" = "fcm", limits = {}) {
@@ -173,7 +174,7 @@ test("rejects a body that is not a single-record aes128gcm Web Push message", as
 
 test("answers 410 once APNs/FCM reports the device invalid, until the token is replaced", async () => {
   const { t, device, subscription } = await ready("apns");
-  t.apns.next({ kind: "device-invalid", reason: "Unregistered" });
+  t.apns.next({ kind: "device-invalid", reason: "Unregistered", evidence: "expired" });
   expect((await push(t, subscription)).status).toBe(410);
   expect((await push(t, subscription)).status).toBe(410);
   expect(t.apns.requests).toHaveLength(1);
@@ -196,7 +197,7 @@ test("answers 410 once APNs/FCM reports the device invalid, until the token is r
 
 test("purges invalid devices after the retention period, after which endpoints answer 404", async () => {
   const { t, subscription } = await ready("fcm", { invalidRetentionSeconds: 3600 });
-  t.fcm.next({ kind: "device-invalid", reason: "UNREGISTERED" });
+  t.fcm.next({ kind: "device-invalid", reason: "UNREGISTERED", evidence: "expired" });
   expect((await push(t, subscription)).status).toBe(410);
   t.clock.now += 3601;
   await t.relay.scheduled();
@@ -275,7 +276,7 @@ test("never logs the body, the VAPID JWT or sub, the token, or an app origin", a
   const init = await pushInit(t, subscription);
   await t.call("POST", subscription.path, init);
   await push(t, subscription, { vapid: await generateVapidKeys() });
-  t.apns.next({ kind: "device-invalid", reason: "BadDeviceToken" });
+  t.apns.next({ kind: "device-invalid", reason: "BadDeviceToken", evidence: "rejected" });
   await push(t, subscription);
 
   const logged = t.log.text();
@@ -327,10 +328,20 @@ async function devicesOn(t: ReturnType<typeof createTestRelay>, count: number) {
   return subscriptions;
 }
 
-test("the invalidation breaker stops mass invalidation after an absolute count and alerts", async () => {
-  const t = createTestRelay({ limits: { breakerMaxInvalidations: 2 } });
-  const subscriptions = await devicesOn(t, 4);
-  t.fcm.always({ kind: "device-invalid", reason: "UNREGISTERED" });
+/** Devices that each received one push already, so the breaker guards them. */
+async function deliveredDevices(t: ReturnType<typeof createTestRelay>, count: number) {
+  const subscriptions = await devicesOn(t, count);
+  for (const subscription of subscriptions) expect((await push(t, subscription)).status).toBe(201);
+  return subscriptions;
+}
+
+const REJECTED = { kind: "device-invalid", reason: "BadDeviceToken", evidence: "rejected" } as const;
+const EXPIRED = { kind: "device-invalid", reason: "UNREGISTERED", evidence: "expired" } as const;
+
+test("the invalidation breaker stops mass rejection of working devices after an absolute count and alerts", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 2, breakerMinDeliveries: 1000 } });
+  const subscriptions = await deliveredDevices(t, 4);
+  t.fcm.always(REJECTED);
   const statuses = [];
   for (const subscription of subscriptions) statuses.push((await push(t, subscription)).status);
   expect(statuses).toEqual([410, 410, 502, 502]);
@@ -343,23 +354,52 @@ test("the invalidation breaker stops mass invalidation after an absolute count a
   expect((await push(t, subscriptions[2] as (typeof subscriptions)[number])).status).toBe(410);
 });
 
-test("the invalidation breaker opens when invalidations exceed a share of deliveries", async () => {
-  const t = createTestRelay({ limits: { breakerMaxInvalidations: 100, breakerMinDeliveries: 4, breakerMaxRatio: 0.25 } });
-  const subscriptions = await devicesOn(t, 5);
-  const [a, b, c, d, e] = subscriptions as [typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number]];
-  for (const subscription of [a, b, c]) expect((await push(t, subscription)).status).toBe(201);
-  t.fcm.always({ kind: "device-invalid", reason: "UNREGISTERED" });
-  // 1 of 4 deliveries invalid: at the limit, still trusted.
-  expect((await push(t, d)).status).toBe(410);
-  // 2 of 5: above a quarter, the breaker opens.
-  expect((await push(t, e)).status).toBe(502);
-  expect(t.sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE invalidated_at IS NULL").get()).toEqual({ n: 4 });
+test("the invalidation breaker opens when rejections exceed a share of deliveries", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 100, breakerMinDeliveries: 6, breakerMaxRatio: 0.25 } });
+  const [a, b, c] = (await deliveredDevices(t, 3)) as [Subscribed, Subscribed, Subscribed];
+  t.fcm.always(REJECTED);
+  // 3 deliveries before, then a's rejection: 1 of 4, below the minimum count, trusted.
+  expect((await push(t, a)).status).toBe(410);
+  // 1 delivery more each: b is the 5th delivery and 2nd rejection, still under 6.
+  expect((await push(t, b)).status).toBe(410);
+  // c: 6 deliveries, 3 rejections, half of them: the breaker opens.
+  expect((await push(t, c)).status).toBe(502);
 });
+
+test("expired tokens always invalidate, even while the breaker is open", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 1, breakerMinDeliveries: 1000 } });
+  const working = await deliveredDevices(t, 3);
+  t.fcm.always(REJECTED);
+  expect((await push(t, working[0] as Subscribed)).status).toBe(410);
+  expect((await push(t, working[1] as Subscribed)).status).toBe(502); // breaker open
+  t.fcm.always(EXPIRED);
+  expect((await push(t, working[2] as Subscribed)).status).toBe(410);
+  expect(t.log.text()).toContain('"evidence":"expired"');
+});
+
+test("junk tokens that never worked cannot hold the breaker open", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 2, breakerMinDeliveries: 1000 } });
+  // An attacker registers many tokens that APNs/FCM reject on the first push.
+  const junk = await devicesOn(t, 25);
+  t.fcm.always(REJECTED);
+  for (const subscription of junk) expect((await push(t, subscription)).status).toBe(410);
+  expect(t.log.text()).not.toContain("invalidation_breaker_open");
+
+  // A real device that was uninstalled is still invalidated.
+  const [real] = (await deliveredDevicesWith(t, 1)) as [Subscribed];
+  t.fcm.always(EXPIRED);
+  expect((await push(t, real)).status).toBe(410);
+});
+
+async function deliveredDevicesWith(t: ReturnType<typeof createTestRelay>, count: number) {
+  t.fcm.always({ kind: "delivered" });
+  return deliveredDevices(t, count);
+}
 
 test("a token replaced while a push is in flight is not invalidated by the old token's rejection", async () => {
   const { t, device, subscription } = await ready("apns");
   const fresh = "d4".repeat(32);
-  t.apns.next({ kind: "device-invalid", reason: "Unregistered" });
+  t.apns.next({ kind: "device-invalid", reason: "Unregistered", evidence: "expired" });
   t.apns.during = async () => {
     t.apns.during = null;
     const update = await t.call("PUT", `/v1/devices/${device.deviceId}`, {

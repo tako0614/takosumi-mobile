@@ -44,15 +44,25 @@ what the repository already has; `relay/tsconfig.json` checks it, and
   Accepted trade-off: someone who knows a device's push token can reset that
   device's subscriptions; push tokens are not public.
 - **Activity.** Every authenticated call (token update, subscription changes)
-  refreshes the device's `seen_at`. Devices unseen for 180 days are deleted by
-  the daily cron, and their endpoints answer 404. Takosumi Mobile should `PUT`
-  its token on launch and whenever it changes.
+  refreshes the device's `seen_at`, and so does a successful delivery (written
+  at most once a day, with `delivered_at`). Devices with neither for 180 days
+  are deleted by the daily cron, and their endpoints answer 404. Takosumi
+  Mobile should still `PUT` its token on launch and whenever it changes.
 - Token formats: APNs exactly 64 hex characters; FCM at most 1,024 characters
   of `[A-Za-z0-9_:-]`.
 - Limits: 30 registrations per hour per client (an IPv4 address, or an IPv6
-  /64, since one subscriber usually holds a whole /64), 3,000 registrations per
-  hour over all clients, 120 new subscriptions per device per hour, 64
-  subscriptions per device, 8 device rows (active or superseded) per token.
+  /64, since one subscriber usually holds a whole /64) and 120 per IPv6 /48;
+  over all clients an alert (`registration_rate_alert`) past 3,000 an hour and
+  a hard ceiling of 60,000 an hour, so that one network cannot lock everyone
+  else out; 120 new subscriptions per device per hour; 64 subscriptions per
+  device. Re-registering a token is never refused: of its invalid (superseded
+  or rejected) rows only the newest 8 are kept, and older ones are deleted
+  (their endpoints answer 404, which apps treat like 410).
+- **These limits only slow abuse down.** Registration is open to anyone who
+  can reach the relay. Before production, put Cloudflare WAF rate limiting in
+  front of `/v1/devices`, and require device attestation on registration (App
+  Attest on iOS, Play Integrity on Android) so that only Takosumi Mobile on a
+  real device can register.
 
 ## Push resource (application servers)
 
@@ -105,11 +115,16 @@ Both platforms carry only `{s: subscription_id, b: base64url(body)}`.
   per isolate.
 ### Which answers invalidate a device
 
-Only answers about the one token may invalidate a device: APNs
-`BadDeviceToken`, `Unregistered`, `ExpiredToken` (410), and FCM `UNREGISTERED`
-or an invalid registration token. Pushes then answer 410 until the device sends
-a new token; after 30 days the daily cron deletes the device and its endpoints
-answer 404.
+Only answers about the one token may invalidate a device. Pushes then answer
+410 until the device sends a new token; after 30 days the daily cron deletes
+the device and its endpoints answer 404. They come in two kinds:
+
+- **Expired**: APNs `Unregistered`, `ExpiredToken` (410) and FCM
+  `UNREGISTERED`. Platforms answer these only for tokens they once issued (the
+  app was uninstalled or the token expired), so they always invalidate.
+- **Rejected**: APNs `BadDeviceToken` and FCM's invalid registration token. A
+  token that never worked is invalidated at once; for a device that was
+  delivered to before, the invalidation breaker (below) decides.
 
 Answers about the relay's own configuration are relay failures, answered 502,
 and never touch the device: APNs `DeviceTokenNotForTopic` (a wrong
@@ -122,12 +137,14 @@ and keep their subscriptions.
 
 Two more guards keep a mistake from erasing subscriptions:
 
-- **Invalidation breaker.** Per platform, in a 10-minute window, if
-  invalidations exceed 20, or exceed a quarter of deliveries once there were
-  20 deliveries, the relay stops invalidating, answers 502 and logs
-  `invalidation_breaker_open` at error level with `alert: true` and the counts.
-  It closes when the window passes. Tune the thresholds in `DEFAULT_LIMITS`
-  (`src/context.ts`) as traffic grows.
+- **Invalidation breaker.** Per platform, in a 10-minute window, it counts
+  rejections of devices that were delivered to before. If they exceed 20, or
+  exceed a quarter of deliveries once there were 20 deliveries, the relay stops
+  invalidating on rejections, answers 502 and logs `invalidation_breaker_open`
+  at error level with `alert: true` and the counts. It closes when the window
+  passes. Because junk tokens never had a delivery and expired answers bypass
+  it, registering junk cannot hold it open and turn real uninstalls into 502s.
+  Tune the thresholds in `DEFAULT_LIMITS` (`src/context.ts`) as traffic grows.
 - **Token check.** A device is invalidated only while it still holds the token
   that was rejected. If the device replaced its token while the push was in
   flight, nothing is invalidated and the push answers 503 to be retried.
@@ -156,6 +173,7 @@ runtime with an HTTP/2 `fetch` (Bun, Node with undici) behind a small forwarder.
 D1 holds the device token, a SHA-256 hash of the device secret, the APNs
 environment, an invalidation time, the last authenticated call, and per
 subscription the application server key and the endpoint id (`migrations/`).
+The last successful delivery is kept as a day-granular time, not per message.
 Counters are keyed by endpoint id, device id, platform, or a hash of the client
 address (IPv4 address or IPv6 /64), and expire. The relay never stores an app's origin or a message body, and never
 logs a body, a token, a device secret, a VAPID JWT or its `sub` (the claim is

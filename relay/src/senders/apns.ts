@@ -35,7 +35,9 @@ export const APNS_HOSTS = {
 const TOKEN_BUCKET_SECONDS = 40 * 60;
 
 // Answers about this one device token. Only these may invalidate a device.
-export const APNS_DEVICE_INVALID_REASONS = new Set(["BadDeviceToken", "Unregistered", "ExpiredToken"]);
+// Unregistered and ExpiredToken (410) come only for tokens APNs once issued.
+export const APNS_EXPIRED_REASONS = new Set(["Unregistered", "ExpiredToken"]);
+export const APNS_REJECTED_REASONS = new Set(["BadDeviceToken"]);
 
 // Answers about the relay's own configuration: key, team, topic, environment.
 // A wrong APNS_TOPIC makes APNs answer DeviceTokenNotForTopic for every device,
@@ -140,8 +142,11 @@ export class ApnsSender implements PushSender {
       if (PROVIDER_TOKEN_REASONS.has(reason)) this.cached = null;
       return { kind: "failed", reason };
     }
-    if (APNS_DEVICE_INVALID_REASONS.has(reason) || response.status === 410) {
-      return { kind: "device-invalid", reason };
+    if (APNS_EXPIRED_REASONS.has(reason) || response.status === 410) {
+      return { kind: "device-invalid", reason, evidence: "expired" };
+    }
+    if (APNS_REJECTED_REASONS.has(reason)) {
+      return { kind: "device-invalid", reason, evidence: "rejected" };
     }
     if (response.status === 429) {
       return { kind: "throttled", retryAfter: retryAfterSeconds(response) ?? 60, reason };
