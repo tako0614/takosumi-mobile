@@ -91,7 +91,9 @@
 }
 
 [data-status="waiting_approval"],
-[data-status="stale"] {
+[data-status="stale"],
+[data-status="needs_attention"],
+[data-status="uninstall_scheduled"] {
   background: #2a1f08 !important;
   color: #e0a53a !important; /* --tg-warn */
 }
@@ -104,13 +106,17 @@
 
 [data-status="running"],
 [data-status="queued"],
-[data-status="pending"] {
+[data-status="pending"],
+[data-status="installing"],
+[data-status="updating"],
+[data-status="uninstalling"] {
   background: #101a2a !important;
   color: #6ea8ff !important; /* --tg-info */
 }
 
 [data-status="succeeded"],
-[data-status="active"] {
+[data-status="active"],
+[data-status="installed"] {
   background: #0e2213 !important;
   color: #54d16a !important; /* --tg-success-text */
 }
@@ -186,4 +192,22 @@
   margin: 0;
   color: var(--shell-subtle);
   font-size: 0.78rem;
+}
+
+.workspace-picker {
+  display: grid;
+  gap: 8px;
+  color: var(--shell-muted);
+  font-size: 0.78rem;
+}
+
+.workspace-picker select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--shell-control-border);
+  border-radius: 12px;
+  padding: 8px 12px;
+  background: var(--shell-card);
+  color: var(--shell-text);
+  font: inherit;
 }

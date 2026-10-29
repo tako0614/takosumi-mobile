@@ -20,6 +20,7 @@ import {
   canCancelRun,
   cancelRun,
   loadHome,
+  loadWorkspaceHome,
   type MobileApp,
   type MobileCapsule,
   type MobileRun,
@@ -31,6 +32,13 @@ import {
   createProductNativeBridge,
   isUnsupportedTauriDesktop,
 } from "./native.ts";
+import {
+  appDisplayName,
+  appRoleLabel,
+  appStateLabel,
+  legacyWorkspaceOptions,
+  mobileHomeTitle,
+} from "./home-presentation.ts";
 import { productAdapter } from "./product.ts";
 import { authorizeRunMutation } from "./security.ts";
 import "./styles.css";
@@ -100,7 +108,7 @@ function startTakosumiMobile() {
       discoveredHeading: "Takosumiが見つかりました",
       homeFallbackTitle: "Takosumi",
       refreshLabel: "更新",
-      homeTitle: (home) => home?.apps[0]?.displayName ?? home?.apps[0]?.name,
+      homeTitle: mobileHomeTitle,
       metricsLabel: "現在の状態",
       shortcutsLabel: "メニュー",
     },
@@ -146,17 +154,28 @@ function TakosumiControlHome(props: {
     (current()?.runs ?? []).filter(isAttentionRun),
   );
   const recentRuns = createMemo(() => (current()?.runs ?? []).slice(0, 8));
-  const capsuleName = (run: MobileRun) =>
-    current()?.apps.find((app) => app.capsuleId === run.capsuleId)?.displayName ??
-    current()?.apps.find((app) => app.capsuleId === run.capsuleId)?.name ??
-    current()?.capsules.find((capsule) => capsule.id === run.capsuleId)?.name ??
-    "Takosumi operation";
+  const capsuleName = (run: MobileRun) => {
+    const app = current()?.apps.find((app) => app.capsuleId === run.capsuleId);
+    return app
+      ? appDisplayName(app)
+      : current()?.capsules.find((capsule) => capsule.id === run.capsuleId)?.name ??
+          "Takosumi operation";
+  };
 
-  async function reload() {
+  async function reload(workspaceId?: string) {
     setLoading(true);
     setStatus(undefined);
     try {
-      setCurrent(await loadHome(activeSession()));
+      const home = current();
+      setCurrent(
+        home?.workspace
+          ? await loadWorkspaceHome(
+              activeSession(),
+              workspaceId ?? home.workspace.id,
+              home.workspaces,
+            )
+          : await loadHome(activeSession()),
+      );
     } catch (error) {
       setStatus(mobileErrorMessage(error, "更新できませんでした。"));
     } finally {
@@ -226,6 +245,23 @@ function TakosumiControlHome(props: {
 
   return (
     <div class="takosumi-control-home">
+      <Show when={legacyWorkspaceOptions(current()).length > 1}>
+        <label class="workspace-picker">
+          <span>ワークスペース</span>
+          <select
+            value={current()?.workspace?.id}
+            disabled={loading()}
+            onChange={(event) => void reload(event.currentTarget.value)}
+          >
+            <For each={legacyWorkspaceOptions(current())}>
+              {(workspace) => (
+                <option value={workspace.id}>{workspace.displayName}</option>
+              )}
+            </For>
+          </select>
+        </label>
+      </Show>
+
       <Show when={status()}>
         {(message) => <p class="mobile-status">{message()}</p>}
       </Show>
@@ -331,10 +367,12 @@ function TakosumiControlHome(props: {
                   >
                     <AppMark app={app} />
                     <span>
-                      <strong>{app.displayName ?? app.name}</strong>
-                      <small>{app.role === "owner" ? "Owner" : "Member"} · {app.ownerDisplayName}</small>
+                      <strong>{appDisplayName(app)}</strong>
+                      <small>
+                        {appRoleLabel(app.role)} · {app.ownerDisplayName}
+                      </small>
                     </span>
-                    <em data-status={app.state}>{app.state}</em>
+                    <em data-status={app.state}>{appStateLabel(app.state)}</em>
                   </button>
                 </li>
               )}
@@ -392,7 +430,7 @@ function TakosumiControlHome(props: {
 function AppMark(props: { app: MobileApp }) {
   return (
     <span class="capsule-mark" aria-hidden="true">
-      {(props.app.displayName ?? props.app.name).slice(0, 1).toUpperCase()}
+      {appDisplayName(props.app).slice(0, 1).toUpperCase()}
     </span>
   );
 }

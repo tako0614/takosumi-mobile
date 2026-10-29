@@ -37,7 +37,7 @@ export type MobileRunType = MobileRun["type"];
 export interface MobileApp {
   readonly capsuleId: string;
   readonly name: string;
-  readonly displayName?: string;
+  readonly displayName?: string | Readonly<{ ja: string; en: string }>;
   readonly iconUrl?: string;
   readonly role: "owner" | "member";
   readonly ownerDisplayName: string;
@@ -59,19 +59,45 @@ export interface LoadHomeOptions {
 
 export async function loadHome(
   session: MobileSession,
-  _options: LoadHomeOptions = {},
+  options: LoadHomeOptions = {},
 ): Promise<TakosumiMobileHome> {
   let apps: readonly MobileApp[];
   try {
     apps = await listApps(session);
   } catch (error) {
-    if (error instanceof MobileApiError && error.status === 404) {
-      return await loadLegacyHome(session, _options);
+    if (error instanceof MobileApiError) {
+      const workspaceId = workspaceClaim(session.accessToken);
+      if (error.status === 404 || (error.status === 403 && workspaceId)) {
+        return await loadLegacyHome(session, {
+          preferredWorkspaceId: options.preferredWorkspaceId ?? workspaceId,
+        });
+      }
     }
     throw error;
   }
   const runs = await listAppRuns(session, apps);
   return { apps, workspaces: [], capsules: [], runs };
+}
+
+function workspaceClaim(accessToken: string): string | undefined {
+  // This unverified claim only selects a compatibility route. The server still
+  // authorizes every legacy request; it never grants local mutation authority.
+  const parts = accessToken.split(".");
+  if (parts.length !== 3 || !parts[1]) return undefined;
+  try {
+    const payload: unknown = JSON.parse(
+      atob(parts[1].replaceAll("-", "+").replaceAll("_", "/")),
+    );
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return undefined;
+    }
+    const workspaceId = (payload as Record<string, unknown>).workspaceId;
+    return typeof workspaceId === "string" && workspaceId.trim()
+      ? workspaceId
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function listAppRuns(
@@ -481,12 +507,14 @@ function optionalString(value: unknown, label: string): string | undefined {
   return requireString(value, label);
 }
 
-function decodeAppDisplayName(value: unknown): string | undefined {
+function decodeAppDisplayName(value: unknown): MobileApp["displayName"] {
   if (value === undefined) return undefined;
   if (typeof value === "string") return requireString(value, "app.displayName");
   const localized = requireRecord(value, "app.displayName");
-  requireString(localized.en, "app.displayName.en");
-  return requireString(localized.ja, "app.displayName.ja");
+  return {
+    ja: requireString(localized.ja, "app.displayName.ja"),
+    en: requireString(localized.en, "app.displayName.en"),
+  };
 }
 
 async function mutateRun(
