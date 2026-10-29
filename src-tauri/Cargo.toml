@@ -27,6 +27,7 @@ tauri-plugin-store = "2"
 tauri-plugin-stronghold = "2.3.1"
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-app-screen = { path = "plugins/app-screen" }
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-biometric = "2.3.2"
 tauri-plugin-keystore = { path = "plugins/keystore" }

@@ -6,7 +6,18 @@ public-client OIDC PKCE.
 
 ## What you can do
 
-The first slice keeps the daily control loop inside the app:
+The home lists your installed apps as icons, and each opens like an app:
+
+- launchable screens come from each app's view
+  (`GET /api/v1/capsules/{capsuleId}/app`, the Interface `display.icon` and URL);
+  you can also add any https URL, kept only on the device;
+- an app opens in its own native webview (the `app-screen` plugin) under a thin
+  bar that always shows the current host, with back, reload, share, open in the
+  browser and close; all app screens share one sign-in profile;
+- on Android, each app gets its own entry in Recents and can be added to the
+  home screen; `takosumi://app?url=<https URL>` opens an app screen directly.
+
+It also keeps the daily control loop inside the app:
 
 - switch Workspaces;
 - see installed Capsules and recent Runs;

@@ -29,6 +29,7 @@ import {
   type TakosumiMobileHome,
 } from "./api.ts";
 import {
+  createProductAppScreenOpener,
   createProductNativeBridge,
   isUnsupportedTauriDesktop,
 } from "./native.ts";
@@ -36,12 +37,25 @@ import {
   appDisplayName,
   appRoleLabel,
   appStateLabel,
+  launcherAppsFromHome,
   legacyWorkspaceOptions,
   mobileHomeTitle,
 } from "./home-presentation.ts";
+import { AppLauncher } from "./app-launcher.tsx";
+import { fetchIconDataUrl, rasterizeIconPng } from "./app-icons.ts";
+import type { AppUnreadCounts } from "./app-screens.ts";
+import type { AppScreenOpener } from "./app-screen-native.ts";
+import { withAppScreenDeepLinks } from "./deep-links.ts";
+import {
+  createLauncherController,
+  type LauncherController,
+} from "./launcher-controller.ts";
 import { productAdapter } from "./product.ts";
 import { authorizeRunMutation } from "./security.ts";
 import "./styles.css";
+
+/** Filled by push delivery (TASK-0119 U4 step 4); empty until then. */
+const [unreadCounts] = createSignal<AppUnreadCounts>(new Map());
 
 const metrics = [
   {
@@ -75,7 +89,22 @@ if (isUnsupportedTauriDesktop()) {
 }
 
 function startTakosumiMobile() {
-  const nativeBridge = createProductNativeBridge();
+  const baseBridge = createProductNativeBridge();
+  const opener = createProductAppScreenOpener(baseBridge);
+  const launcher = createLauncherController({
+    opener,
+    fetchIcon: (url) => fetchIconDataUrl(url),
+    rasterize: (source) => rasterizeIconPng(source),
+  });
+  const nativeBridge = withAppScreenDeepLinks(baseBridge, (link) => {
+    if (!link.ok) {
+      console.warn(`Ignored app screen link: ${link.error}`);
+      return;
+    }
+    void launcher.openUrl(link.url).catch((error) => {
+      console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。"));
+    });
+  });
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
     createNativeBridge: () => nativeBridge,
@@ -120,6 +149,8 @@ function startTakosumiMobile() {
         session={session}
         nativeBridge={nativeBridge}
         openHostRoute={openHostRoute}
+        launcher={launcher}
+        opener={opener}
       />
     ),
   });
@@ -141,8 +172,11 @@ function TakosumiControlHome(props: {
   session: MobileSession;
   nativeBridge: NativeBridge;
   openHostRoute: (path: string) => Promise<void>;
+  launcher: LauncherController;
+  opener: AppScreenOpener;
 }) {
   const [current, setCurrent] = createSignal(props.home);
+  const launcherApps = createMemo(() => launcherAppsFromHome(current()));
   const [activeSession, setActiveSession] = createSignal(props.session);
   const [loading, setLoading] = createSignal(false);
   const [status, setStatus] = createSignal<string>();
@@ -265,6 +299,15 @@ function TakosumiControlHome(props: {
       <Show when={status()}>
         {(message) => <p class="mobile-status">{message()}</p>}
       </Show>
+
+      <AppLauncher
+        session={activeSession()}
+        apps={launcherApps()}
+        store={props.nativeBridge.storage}
+        controller={props.launcher}
+        opener={props.opener}
+        unreadCounts={unreadCounts}
+      />
 
       <MobilePreviewSection
         title="要対応"
