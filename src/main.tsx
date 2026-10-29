@@ -247,7 +247,7 @@ function TakosumiControlHome(props: {
     <div class="takosumi-control-home">
       <Show when={legacyWorkspaceOptions(current()).length > 1}>
         <label class="workspace-picker">
-          <span>ワークスペース</span>
+          <span>スペース</span>
           <select
             value={current()?.workspace?.id}
             disabled={loading()}

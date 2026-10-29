@@ -65,39 +65,17 @@ export async function loadHome(
   try {
     apps = await listApps(session);
   } catch (error) {
-    if (error instanceof MobileApiError) {
-      const workspaceId = workspaceClaim(session.accessToken);
-      if (error.status === 404 || (error.status === 403 && workspaceId)) {
-        return await loadLegacyHome(session, {
-          preferredWorkspaceId: options.preferredWorkspaceId ?? workspaceId,
-        });
-      }
+    if (
+      error instanceof MobileApiError &&
+      (error.status === 404 ||
+        (error.status === 403 && error.detail === "app_access_denied"))
+    ) {
+      return await loadLegacyHome(session, options);
     }
     throw error;
   }
   const runs = await listAppRuns(session, apps);
   return { apps, workspaces: [], capsules: [], runs };
-}
-
-function workspaceClaim(accessToken: string): string | undefined {
-  // This unverified claim only selects a compatibility route. The server still
-  // authorizes every legacy request; it never grants local mutation authority.
-  const parts = accessToken.split(".");
-  if (parts.length !== 3 || !parts[1]) return undefined;
-  try {
-    const payload: unknown = JSON.parse(
-      atob(parts[1].replaceAll("-", "+").replaceAll("_", "/")),
-    );
-    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-      return undefined;
-    }
-    const workspaceId = (payload as Record<string, unknown>).workspaceId;
-    return typeof workspaceId === "string" && workspaceId.trim()
-      ? workspaceId
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 async function listAppRuns(

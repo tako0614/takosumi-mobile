@@ -26,7 +26,7 @@ export function appDisplayName(
 }
 
 export function appRoleLabel(role: MobileApp["role"]): string {
-  return role === "owner" ? "オーナー" : "メンバー";
+  return role === "owner" ? "所有者" : "メンバー";
 }
 
 export function appStateLabel(state: MobileApp["state"]): string {

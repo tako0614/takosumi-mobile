@@ -24,7 +24,7 @@ afterEach(() => {
 const session: MobileSession = {
   hostUrl: "https://operator.example",
   product: "takosumi",
-  accessToken: "mobile-access",
+  accessToken: "takat_fixture_mobile_access",
   tokenType: "Bearer",
   scope:
     "workspaces:read capsules:read runs:read runs:approve runs:cancel offline_access",
@@ -89,7 +89,7 @@ test("app-scoped Runs paginate without Capsule detail or Workspace lookups", asy
   ]);
 });
 
-test("only a missing apps route falls back to the legacy Workspace API", async () => {
+test("a missing apps route falls back to the legacy Workspace API", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
@@ -149,49 +149,61 @@ test("legacy fallback exposes every Workspace and can select the second one", as
   expect(paths).toContain("/api/v1/workspaces/ws_b/runs");
 });
 
-test("a Workspace-bound mobile token can use the legacy home after apps returns 403", async () => {
+test("an opaque mobile token uses the legacy home once after app_access_denied", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     paths.push(url.pathname);
     if (url.pathname === "/api/v1/apps") {
-      return Response.json({ error: "forbidden" }, { status: 403 });
+      return Response.json({ error: "app_access_denied" }, { status: 403 });
     }
     if (url.pathname === "/api/v1/workspaces") {
       return Response.json({ workspaces: [workspace(), workspace({ id: "ws_b" })] });
     }
-    if (url.pathname === "/api/v1/workspaces/ws_b/capsules") {
+    if (
+      url.pathname === "/api/v1/workspaces/ws_a/capsules" ||
+      url.pathname === "/api/v1/workspaces/ws_b/capsules"
+    ) {
       return Response.json({ capsules: [capsule()] });
     }
-    if (url.pathname === "/api/v1/workspaces/ws_b/runs") {
+    if (
+      url.pathname === "/api/v1/workspaces/ws_a/runs" ||
+      url.pathname === "/api/v1/workspaces/ws_b/runs"
+    ) {
       return Response.json({ runs: [] });
     }
     throw new Error(`Unexpected request: ${url.pathname}`);
   }) as typeof fetch;
 
-  const home = await loadHome({
-    ...session,
-    accessToken: workspaceBoundToken("ws_b"),
-  });
-  expect(home.workspace?.id).toBe("ws_b");
+  const home = await loadHome(session);
+  expect(home.workspace?.id).toBe("ws_a");
   expect(home.capsules).toHaveLength(1);
-  expect(paths).toContain("/api/v1/workspaces/ws_b/capsules");
+  expect(paths).toEqual([
+    "/api/v1/apps",
+    "/api/v1/workspaces",
+    "/api/v1/workspaces/ws_a/capsules",
+    "/api/v1/workspaces/ws_a/runs",
+  ]);
+
+  paths.length = 0;
+  const selected = await loadHome(session, { preferredWorkspaceId: "ws_b" });
+  expect(selected.workspace?.id).toBe("ws_b");
+  expect(paths).toEqual([
+    "/api/v1/apps",
+    "/api/v1/workspaces",
+    "/api/v1/workspaces/ws_b/capsules",
+    "/api/v1/workspaces/ws_b/runs",
+  ]);
 });
 
-test("apps errors do not trigger legacy fallback for other tokens or statuses", async () => {
-  for (const accessToken of [
-    session.accessToken,
-    workspaceBoundToken(undefined),
-    workspaceBoundToken(""),
-    workspaceBoundToken(42),
-    "header.invalid-json.signature",
-  ]) {
+test("other apps errors do not trigger legacy fallback", async () => {
+  for (const error of ["forbidden", "insufficient_scope", "permission_denied"]) {
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       paths.push(new URL(String(input)).pathname);
-      return Response.json({ error: "forbidden" }, { status: 403 });
+      return Response.json({ error }, { status: 403 });
     }) as typeof fetch;
-    await expect(loadHome({ ...session, accessToken })).rejects.toThrow(
+    await expect(loadHome(session)).rejects.toThrow(
       "403 /api/v1/apps",
     );
     expect(paths).toEqual(["/api/v1/apps"]);
@@ -201,32 +213,21 @@ test("apps errors do not trigger legacy fallback for other tokens or statuses", 
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       paths.push(new URL(String(input)).pathname);
-      return new Response(null, { status });
+      return Response.json({ error: "app_access_denied" }, { status });
     }) as typeof fetch;
-    await expect(loadHome({
-      ...session,
-      accessToken: workspaceBoundToken("ws_a"),
-    })).rejects.toThrow(`${status} /api/v1/apps`);
+    await expect(loadHome(session)).rejects.toThrow(`${status} /api/v1/apps`);
     expect(paths).toEqual(["/api/v1/apps"]);
   }
 });
-
-function workspaceBoundToken(workspaceId: unknown): string {
-  // Synthetic payload is only a routing hint; the legacy API still authorizes it.
-  return `header.${btoa(JSON.stringify({ workspaceId })).replace(/=+$/u, "").replaceAll("+", "-").replaceAll("/", "_")}.signature`;
-}
 
 test("legacy authorization and network failures are still surfaced", async () => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     paths.push(url.pathname);
-    return new Response(null, { status: 403 });
+    return Response.json({ error: "app_access_denied" }, { status: 403 });
   }) as typeof fetch;
-  await expect(loadHome({
-    ...session,
-    accessToken: workspaceBoundToken("ws_a"),
-  })).rejects.toThrow("403 /api/v1/workspaces");
+  await expect(loadHome(session)).rejects.toThrow("403 /api/v1/workspaces");
   expect(paths).toEqual(["/api/v1/apps", "/api/v1/workspaces"]);
 
   paths.length = 0;
@@ -405,7 +406,7 @@ test("home follows opaque pages and restores the preferred Workspace", async () 
     const url = new URL(String(input));
     paths.push(url.pathname + url.search);
     expect(new Headers(init?.headers).get("authorization")).toBe(
-      "Bearer mobile-access",
+      `Bearer ${session.accessToken}`,
     );
     if (url.pathname === "/api/v1/apps") {
       return new Response(null, { status: 404 });

@@ -58,7 +58,7 @@ test("the Japanese home labels every app lifecycle state and membership role", (
   expect(appStateLabel("active")).toBe("稼働中");
   expect(appStateLabel("future_state")).toBe("状態不明");
   expect(appStateLabel("__proto__")).toBe("状態不明");
-  expect(appRoleLabel("owner")).toBe("オーナー");
+  expect(appRoleLabel("owner")).toBe("所有者");
   expect(appRoleLabel("member")).toBe("メンバー");
 });
 
