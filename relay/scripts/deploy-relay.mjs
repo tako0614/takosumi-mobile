@@ -103,7 +103,7 @@ export const RELAY_CONTRACT_SURFACES = [
       provenance:
         "production-routine lineage: refuses a dirty worktree, a branch other than main, or a HEAD that is not origin/main or an ancestor of it after a fresh fetch. Runs `bun run relay:check` once, bundles relay/src/index.ts with Bun.build once, records the commit and bundle sha256, and uploads exactly that file with `wrangler versions upload --no-bundle --keep-vars`. The generated config carries only the Worker name, the bundle, the compatibility date and the D1 binding to PUSH_RELAY_D1_DATABASE_ID; vars, secrets, the custom domain for PUSH_RELAY_ORIGIN and the purge cron belong to provisioning and are left as they are",
       "post-conditions":
-        "deploys the new version at 100 percent, reads `wrangler deployments status` back and requires exactly that version, then runs `bun run relay:smoke` against PUSH_RELAY_ORIGIN with live expectations: a push to a fake token of each configured platform must come back 410 from APNs/FCM; the smoke deletes the device it registered",
+        "deploys the new version at 100 percent, reads `wrangler deployments status` back and requires exactly that version, then runs `bun run relay:smoke` against PUSH_RELAY_ORIGIN with live expectations: a push to a fake token of each platform named with `--platform` (default both apns and fcm) must come back 410 from APNs/FCM; the smoke deletes the device it registered",
       reversal:
         "refuses to upload unless a current production version is readable, prints it, and restores with `wrangler rollback <previous-version-id> --name takosumi-push-relay`; code versions do not change D1, so rollback is safe while the schema stays additive",
       "failure-handling":
@@ -278,7 +278,19 @@ function smoke(origin, expectation, platforms) {
   return run("bun", args, { env: gateEnv() }).status === 0;
 }
 
-export async function runWorkerSurface(kind) {
+/** `--platform apns --platform fcm`: which platforms production has credentials for. */
+function platformArgs(args) {
+  const platforms = [];
+  args.forEach((arg, index) => {
+    if (arg !== "--platform") return;
+    const value = args[index + 1];
+    if (value !== "apns" && value !== "fcm") die("--platform is apns or fcm");
+    if (!platforms.includes(value)) platforms.push(value);
+  });
+  return platforms.length > 0 ? platforms : ["apns", "fcm"];
+}
+
+export async function runWorkerSurface(kind, args = []) {
   const target = kind === "staging" ? S.staging : S.production;
   requireLineage(target.lineage);
 
@@ -332,7 +344,7 @@ export async function runWorkerSurface(kind) {
       origin = process.env.PUSH_RELAY_ORIGIN ?? null;
       if (!origin || !/^https:\/\/[a-z0-9.-]+$/u.test(origin)) die("PUSH_RELAY_ORIGIN must be the relay's https origin");
       expectation = "live";
-      platforms = [];
+      platforms = platformArgs(args);
       config = {
         name: target.worker,
         main: "worker.js",

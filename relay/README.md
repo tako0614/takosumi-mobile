@@ -148,7 +148,7 @@ surfaces and how each obligation is met (`takos.deploy-contract@v3`).
 
 ```bash
 PUSH_RELAY_STAGING_D1_DATABASE_ID=<id> bun run deploy -- push-relay-staging
-PUSH_RELAY_D1_DATABASE_ID=<id> PUSH_RELAY_ORIGIN=https://<relay> bun run deploy -- push-relay
+PUSH_RELAY_D1_DATABASE_ID=<id> PUSH_RELAY_ORIGIN=https://<relay> bun run deploy -- push-relay --platform apns --platform fcm
 bun run deploy -- push-relay-staging-schema --reviewed-by <name>
 bun run deploy -- push-relay-schema --reviewed-by <name>
 ```

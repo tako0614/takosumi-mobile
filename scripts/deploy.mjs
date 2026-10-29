@@ -7,7 +7,7 @@
 // (relay/README.md); app-store delivery of the mobile app is not a surface here.
 //
 //   bun run deploy -- push-relay-staging
-//   bun run deploy -- push-relay
+//   bun run deploy -- push-relay [--platform apns] [--platform fcm]
 //   bun run deploy -- push-relay-staging-schema --reviewed-by <name>
 //   bun run deploy -- push-relay-schema --reviewed-by <name>
 //
@@ -52,10 +52,10 @@ const { runSchemaSurface, runWorkerSurface } = await import("../relay/scripts/de
 const args = process.argv.slice(3);
 switch (requested) {
   case RELAY_SURFACES.staging.surface:
-    await runWorkerSurface("staging");
+    await runWorkerSurface("staging", args);
     break;
   case RELAY_SURFACES.production.surface:
-    await runWorkerSurface("production");
+    await runWorkerSurface("production", args);
     break;
   case RELAY_SURFACES.stagingSchema.surface:
     await runSchemaSurface("staging", args);
