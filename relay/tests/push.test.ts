@@ -297,3 +297,100 @@ test("never logs the body, the VAPID JWT or sub, the token, or an app origin", a
   expect(logged).toContain("push_delivered");
   expect(base64UrlDecode(base64UrlEncode(init.body))?.length).toBe(init.body.length);
 });
+
+test("configuration errors from APNs/FCM answer 502 and never invalidate the device", async () => {
+  for (const [platform, reason] of [
+    ["apns", "DeviceTokenNotForTopic"],
+    ["apns", "InvalidProviderToken"],
+    ["apns", "TopicDisallowed"],
+    ["fcm", "SENDER_ID_MISMATCH"],
+    ["fcm", "PERMISSION_DENIED"],
+  ] as const) {
+    const { t, subscription } = await ready(platform);
+    const sender = platform === "apns" ? t.apns : t.fcm;
+    sender.always({ kind: "failed", reason });
+    for (let index = 0; index < 3; index += 1) {
+      expect((await push(t, subscription)).status).toBe(502);
+    }
+    expect(t.sqlite.query("SELECT invalidated_at FROM devices").get()).toEqual({ invalidated_at: null });
+    expect(t.log.text()).toContain(`"reason":"${reason}"`);
+    sender.always({ kind: "delivered" });
+    expect((await push(t, subscription)).status).toBe(201);
+  }
+});
+
+async function devicesOn(t: ReturnType<typeof createTestRelay>, count: number) {
+  const subscriptions = [];
+  for (let index = 0; index < count; index += 1) {
+    subscriptions.push(await subscribe(t, await register(t)));
+  }
+  return subscriptions;
+}
+
+test("the invalidation breaker stops mass invalidation after an absolute count and alerts", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 2 } });
+  const subscriptions = await devicesOn(t, 4);
+  t.fcm.always({ kind: "device-invalid", reason: "UNREGISTERED" });
+  const statuses = [];
+  for (const subscription of subscriptions) statuses.push((await push(t, subscription)).status);
+  expect(statuses).toEqual([410, 410, 502, 502]);
+  expect(t.sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE invalidated_at IS NULL").get()).toEqual({ n: 2 });
+  const alert = t.log.lines.map((line) => JSON.parse(line)).find((line) => line.event === "invalidation_breaker_open");
+  expect(alert).toMatchObject({ level: "error", alert: true, platform: "fcm", invalidations: 3 });
+
+  // The window passes and the breaker closes.
+  t.clock.now += 600;
+  expect((await push(t, subscriptions[2] as (typeof subscriptions)[number])).status).toBe(410);
+});
+
+test("the invalidation breaker opens when invalidations exceed a share of deliveries", async () => {
+  const t = createTestRelay({ limits: { breakerMaxInvalidations: 100, breakerMinDeliveries: 4, breakerMaxRatio: 0.25 } });
+  const subscriptions = await devicesOn(t, 5);
+  const [a, b, c, d, e] = subscriptions as [typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number], typeof subscriptions[number]];
+  for (const subscription of [a, b, c]) expect((await push(t, subscription)).status).toBe(201);
+  t.fcm.always({ kind: "device-invalid", reason: "UNREGISTERED" });
+  // 1 of 4 deliveries invalid: at the limit, still trusted.
+  expect((await push(t, d)).status).toBe(410);
+  // 2 of 5: above a quarter, the breaker opens.
+  expect((await push(t, e)).status).toBe(502);
+  expect(t.sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE invalidated_at IS NULL").get()).toEqual({ n: 4 });
+});
+
+test("a token replaced while a push is in flight is not invalidated by the old token's rejection", async () => {
+  const { t, device, subscription } = await ready("apns");
+  const fresh = "d4".repeat(32);
+  t.apns.next({ kind: "device-invalid", reason: "Unregistered" });
+  t.apns.during = async () => {
+    t.apns.during = null;
+    const update = await t.call("PUT", `/v1/devices/${device.deviceId}`, {
+      headers: device.auth,
+      body: { token: fresh, apns_environment: "development" },
+    });
+    expect(update.status).toBe(204);
+  };
+  const raced = await push(t, subscription);
+  expect(raced.status).toBe(503);
+  expect(raced.headers.get("retry-after")).toBe("5");
+  expect(t.sqlite.query("SELECT token, invalidated_at FROM devices").get()).toEqual({ token: fresh, invalidated_at: null });
+  expect((await push(t, subscription)).status).toBe(201);
+  expect(t.apns.requests.at(-1)?.token).toBe(fresh);
+});
+
+test("busy endpoints cannot starve another app on the same device (fair share)", async () => {
+  const { t, device, subscription: busy } = await ready("fcm", { endpointPerMinute: 5, devicePerMinute: 6 });
+  const quiet = await subscribe(t, device);
+  for (let index = 0; index < 5; index += 1) expect((await push(t, busy)).status).toBe(201);
+  expect((await push(t, busy)).status).toBe(429); // its own endpoint limit
+  // One more from the quiet app reaches the device ceiling (6)...
+  expect((await push(t, quiet)).status).toBe(201);
+  // ...past which the quiet app may still send up to its fair share, 6 / 2 = 3.
+  expect((await push(t, quiet)).status).toBe(201);
+  expect((await push(t, quiet)).status).toBe(201);
+  expect((await push(t, quiet)).status).toBe(429);
+
+  // A third app arriving now still gets its share, 6 / 3 = 2.
+  const late = await subscribe(t, device);
+  expect((await push(t, late)).status).toBe(201);
+  expect((await push(t, late)).status).toBe(201);
+  expect((await push(t, late)).status).toBe(429);
+});

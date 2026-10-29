@@ -34,7 +34,27 @@ export const APNS_HOSTS = {
 // issue time, and no token is ever older than 40 minutes.
 const TOKEN_BUCKET_SECONDS = 40 * 60;
 
-const DEVICE_INVALID_REASONS = new Set(["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered", "ExpiredToken"]);
+// Answers about this one device token. Only these may invalidate a device.
+export const APNS_DEVICE_INVALID_REASONS = new Set(["BadDeviceToken", "Unregistered", "ExpiredToken"]);
+
+// Answers about the relay's own configuration: key, team, topic, environment.
+// A wrong APNS_TOPIC makes APNs answer DeviceTokenNotForTopic for every device,
+// so treating these as "device invalid" would erase every subscription after
+// one bad deploy. They are relay failures (502) and never touch the device.
+export const APNS_CONFIGURATION_REASONS = new Set([
+  "DeviceTokenNotForTopic",
+  "TopicDisallowed",
+  "MissingTopic",
+  "BadTopic",
+  "BadCertificate",
+  "BadCertificateEnvironment",
+  "BadEnvironmentKeyInToken",
+  "Forbidden",
+  "InvalidProviderToken",
+  "ExpiredProviderToken",
+  "MissingProviderToken",
+  "UnrelatedKeyIdInToken",
+]);
 const PROVIDER_TOKEN_REASONS = new Set(["ExpiredProviderToken", "InvalidProviderToken", "MissingProviderToken"]);
 
 export function apnsPriority(urgency: DeliveryRequest["urgency"]): "10" | "5" {
@@ -116,12 +136,12 @@ export class ApnsSender implements PushSender {
       // Keep the status-derived reason.
     }
 
-    if (response.status === 410 || DEVICE_INVALID_REASONS.has(reason)) {
-      return { kind: "device-invalid", reason };
-    }
-    if (PROVIDER_TOKEN_REASONS.has(reason)) {
-      this.cached = null;
+    if (APNS_CONFIGURATION_REASONS.has(reason)) {
+      if (PROVIDER_TOKEN_REASONS.has(reason)) this.cached = null;
       return { kind: "failed", reason };
+    }
+    if (APNS_DEVICE_INVALID_REASONS.has(reason) || response.status === 410) {
+      return { kind: "device-invalid", reason };
     }
     if (response.status === 429) {
       return { kind: "throttled", retryAfter: retryAfterSeconds(response) ?? 60, reason };

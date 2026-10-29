@@ -21,7 +21,31 @@ test("sink delivery is allowed only in staging", () => {
   expect(resolveConfig(env({ DELIVERY_MODE: "sink", RELAY_ENVIRONMENT: "production" })).problems).toContain(
     "DELIVERY_MODE=sink is allowed only when RELAY_ENVIRONMENT=staging",
   );
-  expect(resolveConfig(env({ DELIVERY_MODE: "sink", RELAY_ENVIRONMENT: undefined })).problems.length).toBe(1);
+  expect(resolveConfig(env({ DELIVERY_MODE: "sink", RELAY_ENVIRONMENT: undefined })).problems).toContain(
+    "DELIVERY_MODE=sink is allowed only when RELAY_ENVIRONMENT=staging",
+  );
+});
+
+test("RELAY_ENVIRONMENT is required, and production requires RELAY_ORIGIN", () => {
+  expect(resolveConfig(env({ RELAY_ENVIRONMENT: undefined })).problems).toContain(
+    "RELAY_ENVIRONMENT must be staging or production",
+  );
+  expect(resolveConfig(env({ RELAY_ENVIRONMENT: "prod" })).problems).toContain(
+    "RELAY_ENVIRONMENT must be staging or production",
+  );
+  expect(resolveConfig(env({ RELAY_ENVIRONMENT: "production", RELAY_ORIGIN: undefined })).problems).toEqual([
+    "RELAY_ORIGIN is required in production",
+  ]);
+  expect(resolveConfig(env({ RELAY_ENVIRONMENT: "production" })).problems).toEqual([]);
+  expect(resolveConfig(env({ RELAY_ENVIRONMENT: "staging", RELAY_ORIGIN: undefined })).problems).toEqual([]);
+});
+
+test("a production Worker without RELAY_ORIGIN refuses requests instead of using the request host", async () => {
+  const response = await call(env({ RELAY_ENVIRONMENT: "production", RELAY_ORIGIN: undefined }))(
+    "https://attacker-chosen-host.example/v1/devices",
+    { method: "POST", body: JSON.stringify({ platform: "fcm", token: "smoke-token-0123456789abcdef" }) },
+  );
+  expect(response.status).toBe(503);
 });
 
 test("live delivery configures each platform only when all of its settings are present", () => {

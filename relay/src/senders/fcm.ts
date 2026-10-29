@@ -124,19 +124,19 @@ export class FcmSender implements PushSender {
     if (response.ok) return { kind: "delivered" };
 
     const body = (await response.json().catch(() => null)) as FcmErrorBody | null;
-    const errorCode =
-      body?.error?.details?.find((detail) => typeof detail.errorCode === "string")?.errorCode ??
-      body?.error?.status ??
-      `http-${response.status}`;
+    const fcmErrorCode = body?.error?.details?.find((detail) => typeof detail.errorCode === "string")?.errorCode;
+    const errorCode = fcmErrorCode ?? body?.error?.status ?? `http-${response.status}`;
     const reason = /^[A-Z_0-9-]{1,64}$/iu.test(errorCode) ? errorCode : `http-${response.status}`;
 
-    if (reason === "UNREGISTERED" || reason === "SENDER_ID_MISMATCH") {
+    // Only answers about this one registration token invalidate a device.
+    // SENDER_ID_MISMATCH means the token belongs to another Firebase project:
+    // with a wrong FCM_PROJECT_ID every device would answer it, so it is a relay
+    // configuration failure, like any authentication or permission error.
+    if (fcmErrorCode === "UNREGISTERED") return { kind: "device-invalid", reason };
+    if (fcmErrorCode === "INVALID_ARGUMENT" && /registration token/iu.test(body?.error?.message ?? "")) {
       return { kind: "device-invalid", reason };
     }
-    if (reason === "INVALID_ARGUMENT" && /registration token/iu.test(body?.error?.message ?? "")) {
-      return { kind: "device-invalid", reason };
-    }
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       this.cached = null;
       return { kind: "failed", reason };
     }

@@ -8,8 +8,11 @@
 //
 // With `--expect sink` (staging without APNs/FCM) an encrypted Web Push must be
 // answered 201. With `--expect live` the device token is fake, so APNs/FCM must
-// reject it and the relay must answer 410: that proves the relay reached the
-// platform with credentials it accepted. Every device the smoke registers is
+// reject that token and the relay must answer 410: that proves the relay reached
+// the platform with credentials it accepted. A configuration or credential
+// error (wrong key, team, topic or project) comes back as 502 and fails the
+// smoke. A fake token cannot prove the APNs topic or Firebase project binding
+// itself; a real device's first push does. Every device the smoke registers is
 // deleted again. Prints one JSON summary; exits non-zero on any mismatch.
 
 import { base64UrlEncode, randomId } from "../src/encoding.ts";
@@ -42,7 +45,10 @@ function parseArgs(argv: string[]) {
       throw new Error(`unknown argument ${arg}`);
     }
   }
-  if (!origin || !/^https:\/\//u.test(origin)) throw new Error("--origin https://<relay> is required");
+  // http is accepted only for a relay on this machine (the tests run one).
+  if (!origin || !/^(?:https:\/\/|http:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?$)/u.test(origin)) {
+    throw new Error("--origin https://<relay> is required");
+  }
   return { origin, expectation, platforms: platforms.length > 0 ? platforms : (["fcm"] as ("apns" | "fcm")[]) };
 }
 
@@ -110,6 +116,10 @@ async function main() {
 
       const sent = await sendWebPush({ endpoint, vapid, userAgent, payload, ttl: 60, urgency: "high", topic: "smoke" });
       check(`${platform}: Web Push`, expectation === "sink" ? 201 : 410, sent.status);
+      if (sent.status === 502) {
+        const detail = (await sent.json().catch(() => ({}))) as { error?: string };
+        check(`${platform}: relay configuration (502 means APNs/FCM refused our key, team, topic or project)`, "accepted", `refused:${detail.error ?? "unknown"}`);
+      }
       if (sent.status === 201) {
         check(`${platform}: Location`, "present", sent.headers.get("location") ? "present" : "missing");
       }

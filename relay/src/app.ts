@@ -71,7 +71,11 @@ export function createRelay(context: RelayContext) {
     },
     async scheduled(): Promise<void> {
       const now = context.now();
-      await context.store.purge(now - context.limits.invalidRetentionSeconds, now - 2 * 3600);
+      await context.store.purge(
+        now - context.limits.invalidRetentionSeconds,
+        now - context.limits.inactiveDeviceSeconds,
+        now - 2 * 3600,
+      );
       context.log.info("purged", {});
     },
   };

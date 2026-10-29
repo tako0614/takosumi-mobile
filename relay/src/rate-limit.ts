@@ -1,9 +1,30 @@
 import type { D1Database } from "./d1.ts";
 
+/** A fixed-window counter: `bucket` counts events in windows of `windowSeconds`. */
+export interface WindowCounter {
+  bucket: string;
+  windowSeconds: number;
+}
+
+export interface CounterOp {
+  counter: WindowCounter;
+  /** true adds one and returns the new count; false only reads the count. */
+  increment: boolean;
+}
+
+/**
+ * Fixed-window counters. Counts are global (not per colo), which is what
+ * per-endpoint, per-device, per-address and breaker counts need.
+ */
+export interface Counters {
+  /** Runs every op in one round trip and returns the counts in order. */
+  run(ops: CounterOp[], now: number): Promise<number[]>;
+}
+
 export interface RateRule {
-  /** What is being limited, for example `push-endpoint`. */
+  /** What is being limited, for example `register`. */
   scope: string;
-  /** Who is being limited: an endpoint id, a device id, or a hashed address. */
+  /** Who is being limited: a device id or a hashed address. */
   key: string;
   limit: number;
   windowSeconds: number;
@@ -11,12 +32,27 @@ export interface RateRule {
 
 export interface RateDecision {
   allowed: boolean;
-  /** Seconds until the most restrictive exceeded window ends (0 when allowed). */
+  /** Seconds until the window ends (0 when allowed). */
   retryAfter: number;
 }
 
-export interface RateLimiter {
-  hit(rules: RateRule[], now: number): Promise<RateDecision>;
+export function windowStart(now: number, windowSeconds: number): number {
+  return now - (now % windowSeconds);
+}
+
+export function secondsLeft(now: number, windowSeconds: number): number {
+  return Math.max(windowStart(now, windowSeconds) + windowSeconds - now, 1);
+}
+
+/** Counts one event against `rule` and says whether it is within the limit. */
+export async function limit(counters: Counters, rule: RateRule, now: number): Promise<RateDecision> {
+  const [count = 0] = await counters.run(
+    [{ counter: { bucket: `${rule.scope}:${rule.key}`, windowSeconds: rule.windowSeconds }, increment: true }],
+    now,
+  );
+  return count > rule.limit
+    ? { allowed: false, retryAfter: secondsLeft(now, rule.windowSeconds) }
+    : { allowed: true, retryAfter: 0 };
 }
 
 const UPSERT =
@@ -25,31 +61,20 @@ const UPSERT =
   "count = CASE WHEN rate_windows.window_start = excluded.window_start THEN rate_windows.count + 1 ELSE 1 END, " +
   "window_start = excluded.window_start " +
   "RETURNING count";
+const PEEK = "SELECT count FROM rate_windows WHERE bucket = ?1 AND window_start = ?2";
 
-/**
- * Fixed-window counters in D1. Every rule is counted in one batch, so a push
- * costs one round trip for its limits. Counters are global (not per colo), which
- * is what a per-endpoint and per-device limit needs.
- */
-export class D1RateLimiter implements RateLimiter {
+export class D1Counters implements Counters {
   constructor(private readonly db: D1Database) {}
 
-  async hit(rules: RateRule[], now: number): Promise<RateDecision> {
-    if (rules.length === 0) return { allowed: true, retryAfter: 0 };
-    const windows = rules.map((rule) => now - (now % rule.windowSeconds));
+  async run(ops: CounterOp[], now: number): Promise<number[]> {
+    if (ops.length === 0) return [];
     const results = await this.db.batch<{ count: number }>(
-      rules.map((rule, index) =>
-        this.db.prepare(UPSERT).bind(`${rule.scope}:${rule.key}`, windows[index]),
+      ops.map((op) =>
+        this.db
+          .prepare(op.increment ? UPSERT : PEEK)
+          .bind(op.counter.bucket, windowStart(now, op.counter.windowSeconds)),
       ),
     );
-    let retryAfter = 0;
-    rules.forEach((rule, index) => {
-      const count = Number(results[index]?.results[0]?.count ?? 0);
-      if (count > rule.limit) {
-        const windowStart = windows[index] ?? now;
-        retryAfter = Math.max(retryAfter, windowStart + rule.windowSeconds - now, 1);
-      }
-    });
-    return { allowed: retryAfter === 0, retryAfter };
+    return ops.map((_, index) => Number(results[index]?.results[0]?.count ?? 0));
   }
 }

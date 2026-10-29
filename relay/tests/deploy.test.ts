@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { databaseMismatch } from "../scripts/deploy-relay.mjs";
 import { lineageVerdict } from "../scripts/lineage.mjs";
 
 const repo = join(import.meta.dir, "..", "..");
@@ -18,13 +19,32 @@ for (const tool of ["bun", "git"]) {
   symlinkSync(found, join(safeBin, tool));
 }
 
-function entrypoint(args: string[]) {
+function entrypoint(args: string[], extraEnv: Record<string, string> = {}, path = safeBin) {
   return spawnSync("bun", ["scripts/deploy.mjs", ...args], {
     cwd: repo,
     encoding: "utf8",
-    env: { PATH: safeBin, HOME: process.env.HOME ?? scratch, LANG: "C", GIT_TERMINAL_PROMPT: "0", TMPDIR: scratch },
+    env: { PATH: path, HOME: process.env.HOME ?? scratch, LANG: "C", GIT_TERMINAL_PROMPT: "0", TMPDIR: scratch, ...extraEnv },
   });
 }
+
+const STAGING_ID = "4b8934da-2782-4101-b510-81187e47ed96";
+const PRODUCTION_ID = "11111111-2222-4333-8444-555555555555";
+const DATABASES = [
+  { uuid: STAGING_ID, name: "takosumi-push-relay-staging" },
+  { uuid: PRODUCTION_ID, name: "takosumi-push-relay" },
+  { uuid: "99999999-2222-4333-8444-555555555555", name: "someone-elses-database" },
+];
+
+// A Wrangler that answers only `d1 list --json` and records every other call.
+const fakeBin = join(scratch, "fake-wrangler-bin");
+const wranglerCalls = join(scratch, "wrangler-calls.log");
+mkdirSync(fakeBin);
+for (const tool of ["bun", "git"]) symlinkSync(join(safeBin, tool), join(fakeBin, tool));
+writeFileSync(
+  join(fakeBin, "wrangler"),
+  `#!/bin/sh\nif [ "$1 $2 $3" = "d1 list --json" ]; then printf '%s' '${JSON.stringify(DATABASES)}'; exit 0; fi\necho "$@" >> ${wranglerCalls}\nexit 2\n`,
+  { mode: 0o755 },
+);
 
 interface Surface {
   surface: string;
@@ -190,4 +210,28 @@ test("surfaces refuse before touching Cloudflare when their inputs are missing",
   const unknown = entrypoint(["push-relay-everything"]);
   expect(unknown.status).toBe(1);
   expect(unknown.stderr).toContain("known surfaces: push-relay-staging, push-relay, push-relay-staging-schema, push-relay-schema");
+});
+
+test("a database id must name the expected database, and production must not be staging", () => {
+  expect(databaseMismatch(DATABASES, STAGING_ID, "takosumi-push-relay-staging")).toBeNull();
+  expect(databaseMismatch(DATABASES, PRODUCTION_ID, "takosumi-push-relay", [STAGING_ID])).toBeNull();
+  expect(databaseMismatch(DATABASES, STAGING_ID, "takosumi-push-relay", [STAGING_ID])).toBe(
+    `D1 database ${STAGING_ID} is takosumi-push-relay-staging, not takosumi-push-relay`,
+  );
+  expect(databaseMismatch(DATABASES, "99999999-2222-4333-8444-555555555555", "takosumi-push-relay")).toContain(
+    "is someone-elses-database",
+  );
+  expect(databaseMismatch(DATABASES, "00000000-0000-4000-8000-000000000000", "takosumi-push-relay")).toContain("no D1 database");
+  expect(databaseMismatch([{ uuid: STAGING_ID, name: "takosumi-push-relay" }], STAGING_ID, "takosumi-push-relay", [STAGING_ID])).toContain(
+    "is the staging database",
+  );
+  expect(databaseMismatch(null, PRODUCTION_ID, "takosumi-push-relay")).toBe("the D1 database list is unreadable");
+});
+
+test("the staging deploy refuses a database id that is not the staging database, before any mutation", () => {
+  const refused = entrypoint(["push-relay-staging"], { PUSH_RELAY_STAGING_D1_DATABASE_ID: PRODUCTION_ID }, fakeBin);
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain(`deploy blocked: D1 database ${PRODUCTION_ID} is takosumi-push-relay, not takosumi-push-relay-staging`);
+  // Only `d1 list` ran: no gate, no upload.
+  expect(() => readFileSync(wranglerCalls, "utf8")).toThrow();
 });

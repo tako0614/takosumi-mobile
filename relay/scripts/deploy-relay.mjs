@@ -82,7 +82,7 @@ export const RELAY_CONTRACT_SURFACES = [
     ],
     obligations: {
       provenance:
-        "integration lineage: accepts the exact worktree, dirty or not, and records its commit and dirty flag. Runs `bun run relay:check` once (relay typecheck and every relay test), bundles relay/src/index.ts with Bun.build once, records the bundle sha256, and uploads exactly that file with `wrangler deploy --no-bundle`. The Wrangler config is generated in a temporary directory from PUSH_RELAY_STAGING_D1_DATABASE_ID (required), PUSH_RELAY_STAGING_DELIVERY_MODE (`sink` by default, or `live`), the optional PUSH_RELAY_STAGING_ORIGIN, and, for live delivery, PUSH_RELAY_APNS_TEAM_ID, PUSH_RELAY_APNS_KEY_ID, PUSH_RELAY_APNS_TOPIC and PUSH_RELAY_FCM_PROJECT_ID; the staging Worker's vars, workers.dev route and purge cron are wholly generated on every deploy because the target is disposable",
+        "integration lineage: accepts the exact worktree, dirty or not, and records its commit and dirty flag. Refuses unless `wrangler d1 list` shows PUSH_RELAY_STAGING_D1_DATABASE_ID is the database named takosumi-push-relay-staging. Runs `bun run relay:check` once (relay typecheck and every relay test), bundles relay/src/index.ts with Bun.build once, records the bundle sha256, and uploads exactly that file with `wrangler deploy --no-bundle`. The Wrangler config is generated in a temporary directory from PUSH_RELAY_STAGING_D1_DATABASE_ID (required), PUSH_RELAY_STAGING_DELIVERY_MODE (`sink` by default, or `live`), the optional PUSH_RELAY_STAGING_ORIGIN, and, for live delivery, PUSH_RELAY_APNS_TEAM_ID, PUSH_RELAY_APNS_KEY_ID, PUSH_RELAY_APNS_TOPIC and PUSH_RELAY_FCM_PROJECT_ID; the staging Worker's vars, workers.dev route and purge cron are wholly generated on every deploy because the target is disposable",
       "post-conditions":
         "reads `wrangler deployments status` back and requires the uploaded version at 100 percent, then runs `bun run relay:smoke` against the deployed origin: health, device registration, subscription, VAPID 401/403, unknown endpoint 404, an RFC 8291 encrypted Web Push answered 201 in sink mode (410 per configured platform in live mode, which proves APNs/FCM accepted our credentials and rejected the fake token), and device deletion",
       reversal:
@@ -98,10 +98,10 @@ export const RELAY_CONTRACT_SURFACES = [
     lineage: S.production.lineage,
     requiresScripts: ["relay:check", "relay:smoke"],
     requiresTools: ["git", "bun", "wrangler"],
-    requiresEnv: ["PUSH_RELAY_D1_DATABASE_ID", "PUSH_RELAY_ORIGIN"],
+    requiresEnv: ["PUSH_RELAY_D1_DATABASE_ID", "PUSH_RELAY_ORIGIN", "PUSH_RELAY_STAGING_D1_DATABASE_ID"],
     obligations: {
       provenance:
-        "production-routine lineage: refuses a dirty worktree, a branch other than main, or a HEAD that is not origin/main or an ancestor of it after a fresh fetch. Runs `bun run relay:check` once, bundles relay/src/index.ts with Bun.build once, records the commit and bundle sha256, and uploads exactly that file with `wrangler versions upload --no-bundle --keep-vars`. The generated config carries only the Worker name, the bundle, the compatibility date and the D1 binding to PUSH_RELAY_D1_DATABASE_ID; vars, secrets, the custom domain for PUSH_RELAY_ORIGIN and the purge cron belong to provisioning and are left as they are",
+        "production-routine lineage: refuses a dirty worktree, a branch other than main, or a HEAD that is not origin/main or an ancestor of it after a fresh fetch. Before anything else it reads `wrangler d1 list` and refuses unless PUSH_RELAY_D1_DATABASE_ID is the database named takosumi-push-relay and differs from the takosumi-push-relay-staging database and from PUSH_RELAY_STAGING_D1_DATABASE_ID when that is set. Runs `bun run relay:check` once, bundles relay/src/index.ts with Bun.build once, records the commit and bundle sha256, and uploads exactly that file with `wrangler versions upload --no-bundle --keep-vars`. The generated config carries only the Worker name, the bundle, the compatibility date and the D1 binding to PUSH_RELAY_D1_DATABASE_ID; vars, secrets, the custom domain for PUSH_RELAY_ORIGIN and the purge cron belong to provisioning and are left as they are",
       "post-conditions":
         "deploys the new version at 100 percent, reads `wrangler deployments status` back and requires exactly that version, then runs `bun run relay:smoke` against PUSH_RELAY_ORIGIN with live expectations: a push to a fake token of each platform named with `--platform` (default both apns and fcm) must come back 410 from APNs/FCM; the smoke deletes the device it registered",
       reversal:
@@ -120,7 +120,7 @@ export const RELAY_CONTRACT_SURFACES = [
     requiresEnv: ["PUSH_RELAY_STAGING_D1_DATABASE_ID"],
     obligations: {
       provenance:
-        "production-routine lineage (the SQL must be merged to main before it touches any shared database); applies relay/migrations from that commit to PUSH_RELAY_STAGING_D1_DATABASE_ID with `wrangler d1 migrations apply --remote` and prints the commit",
+        "production-routine lineage (the SQL must be merged to main before it touches any shared database); refuses unless `wrangler d1 list` shows PUSH_RELAY_STAGING_D1_DATABASE_ID is the database named takosumi-push-relay-staging; applies relay/migrations from that commit with `wrangler d1 migrations apply --remote` and prints the commit",
       "pre-mutation-proof":
         "`bun run relay:check` applies every migration to SQLite and runs the relay against it; the same migrations are then applied to a fresh local D1 (`wrangler d1 migrations apply --local --persist-to <temporary directory>`); the pending list on the target is printed before applying",
       "independent-review":
@@ -143,7 +143,7 @@ export const RELAY_CONTRACT_SURFACES = [
     requiresEnv: ["PUSH_RELAY_D1_DATABASE_ID", "PUSH_RELAY_STAGING_D1_DATABASE_ID", "PUSH_RELAY_BACKUP_DIR"],
     obligations: {
       provenance:
-        "production-routine lineage; applies relay/migrations from that commit to PUSH_RELAY_D1_DATABASE_ID with `wrangler d1 migrations apply --remote` and prints the commit",
+        "production-routine lineage; refuses unless `wrangler d1 list` shows PUSH_RELAY_D1_DATABASE_ID is the database named takosumi-push-relay and not the staging database; applies relay/migrations from that commit with `wrangler d1 migrations apply --remote` and prints the commit",
       "pre-mutation-proof":
         "`bun run relay:check` and a fresh local D1 apply as for staging, and the staging database PUSH_RELAY_STAGING_D1_DATABASE_ID must already report nothing pending for the same migrations (rehearsed through push-relay-staging-schema); a full `wrangler d1 export --remote` is written to PUSH_RELAY_BACKUP_DIR (outside the repository) before applying",
       "independent-review":
@@ -203,6 +203,41 @@ function requireDatabaseId(name, value) {
   if (!value) die(`${name} is not set`, ["create the database with `wrangler d1 create` (provisioning) and export its id"]);
   if (!UUID.test(value)) die(`${name} is not a D1 database id`);
   return value;
+}
+
+/**
+ * Why `databaseId` must not be bound as `expectedName`, or null when it may.
+ * `databases` is `wrangler d1 list --json`. Production must also differ from
+ * every staging id it can see: a UUID-shaped variable is not proof of identity.
+ */
+export function databaseMismatch(databases, databaseId, expectedName, forbiddenIds = []) {
+  if (!Array.isArray(databases)) return "the D1 database list is unreadable";
+  const entry = databases.find((database) => database?.uuid === databaseId);
+  if (!entry) return `no D1 database ${databaseId} exists in this account`;
+  if (entry.name !== expectedName) return `D1 database ${databaseId} is ${entry.name}, not ${expectedName}`;
+  if (forbiddenIds.includes(databaseId)) return `D1 database ${databaseId} is the staging database`;
+  return null;
+}
+
+function requireDatabase(databaseId, expectedName, environment) {
+  const listed = spawnSync("wrangler", ["d1", "list", "--json"], { cwd: repo, encoding: "utf8" });
+  let databases = null;
+  try {
+    databases = listed.status === 0 ? JSON.parse(listed.stdout) : null;
+  } catch {
+    databases = null;
+  }
+  const forbidden = [];
+  if (environment === "production") {
+    const staging = Array.isArray(databases)
+      ? databases.find((database) => database?.name === S.staging.database)
+      : null;
+    if (staging?.uuid) forbidden.push(staging.uuid);
+    if (process.env.PUSH_RELAY_STAGING_D1_DATABASE_ID) forbidden.push(process.env.PUSH_RELAY_STAGING_D1_DATABASE_ID);
+  }
+  const mismatch = databaseMismatch(databases, databaseId, expectedName, forbidden);
+  if (mismatch) die(mismatch, ["the target was not touched"]);
+  process.stdout.write(`database ${expectedName} = ${databaseId}\n`);
 }
 
 function optionValue(args, name) {
@@ -306,6 +341,7 @@ export async function runWorkerSurface(kind, args = []) {
   try {
     if (kind === "staging") {
       const databaseId = requireDatabaseId("PUSH_RELAY_STAGING_D1_DATABASE_ID", process.env.PUSH_RELAY_STAGING_D1_DATABASE_ID);
+      requireDatabase(databaseId, target.database, "staging");
       const mode = process.env.PUSH_RELAY_STAGING_DELIVERY_MODE ?? "sink";
       if (mode !== "sink" && mode !== "live") die("PUSH_RELAY_STAGING_DELIVERY_MODE is sink or live");
       const vars = { RELAY_ENVIRONMENT: "staging", DELIVERY_MODE: mode };
@@ -341,6 +377,7 @@ export async function runWorkerSurface(kind, args = []) {
       };
     } else {
       const databaseId = requireDatabaseId("PUSH_RELAY_D1_DATABASE_ID", process.env.PUSH_RELAY_D1_DATABASE_ID);
+      requireDatabase(databaseId, target.database, "production");
       origin = process.env.PUSH_RELAY_ORIGIN ?? null;
       if (!origin || !/^https:\/\/[a-z0-9.-]+$/u.test(origin)) die("PUSH_RELAY_ORIGIN must be the relay's https origin");
       expectation = "live";
@@ -471,6 +508,7 @@ export async function runSchemaSurface(kind, args) {
     kind === "staging"
       ? requireDatabaseId("PUSH_RELAY_STAGING_D1_DATABASE_ID", process.env.PUSH_RELAY_STAGING_D1_DATABASE_ID)
       : requireDatabaseId("PUSH_RELAY_D1_DATABASE_ID", process.env.PUSH_RELAY_D1_DATABASE_ID);
+  requireDatabase(databaseId, target.database, target.environment);
   let backupDir = null;
   let stagingId = null;
   if (kind === "production") {

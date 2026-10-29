@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { createRelay } from "../../src/app.ts";
 import { DEFAULT_LIMITS, type RelayLimits } from "../../src/context.ts";
 import type { LogFields, RelayLog } from "../../src/log.ts";
-import { D1RateLimiter } from "../../src/rate-limit.ts";
+import { D1Counters } from "../../src/rate-limit.ts";
 import type { DeliveryOutcome, DeliveryRequest, PushSender } from "../../src/senders/types.ts";
 import { RelayStore, type Platform } from "../../src/store.ts";
 import { base64UrlEncode, toArrayBuffer } from "../../src/encoding.ts";
@@ -22,15 +22,24 @@ export const START = 1_800_000_000;
 export class MockSender implements PushSender {
   readonly requests: DeliveryRequest[] = [];
   private readonly queued: DeliveryOutcome[] = [];
+  private fallback: DeliveryOutcome = { kind: "delivered" };
+  /** Runs inside send(), before the outcome is returned (to stage races). */
+  during: ((request: DeliveryRequest) => Promise<void>) | null = null;
 
   next(outcome: DeliveryOutcome): this {
     this.queued.push(outcome);
     return this;
   }
 
+  always(outcome: DeliveryOutcome): this {
+    this.fallback = outcome;
+    return this;
+  }
+
   async send(request: DeliveryRequest): Promise<DeliveryOutcome> {
     this.requests.push(request);
-    return this.queued.shift() ?? { kind: "delivered" };
+    if (this.during) await this.during(request);
+    return this.queued.shift() ?? this.fallback;
   }
 }
 
@@ -75,7 +84,7 @@ export function createTestRelay(
   const fcm = new MockSender();
   const relay = createRelay({
     store,
-    rateLimiter: new D1RateLimiter(db),
+    counters: new D1Counters(db),
     senders: { apns, fcm, ...options.senders },
     origin: options.origin === undefined ? ORIGIN : options.origin,
     limits: { ...DEFAULT_LIMITS, ...options.limits },
@@ -115,11 +124,19 @@ export interface RegisteredDevice {
   auth: Record<string, string>;
 }
 
+let tokens = 0;
+/** A distinct FCM token per call: registering a token again supersedes its holder. */
+export function uniqueFcmToken(): string {
+  tokens += 1;
+  return `${FCM_TOKEN}-${tokens}`;
+}
+
 export async function register(
   t: TestRelay,
-  body: Record<string, unknown> = { platform: "fcm", token: FCM_TOKEN },
+  body: Record<string, unknown> = { platform: "fcm", token: uniqueFcmToken() },
+  headers: Record<string, string> = {},
 ): Promise<RegisteredDevice> {
-  const response = await t.call("POST", "/v1/devices", { body });
+  const response = await t.call("POST", "/v1/devices", { body, headers });
   if (response.status !== 201) throw new Error(`register failed: ${response.status} ${await response.text()}`);
   const json = (await response.json()) as { device_id: string; device_secret: string };
   return {

@@ -35,10 +35,24 @@ what the repository already has; `relay/tsconfig.json` checks it, and
   on the curve.
 - `endpoint` is `https://<relay>/push/<endpoint_id>` with 256 random bits.
   Replacing the token never changes an endpoint, so apps never re-register.
-- A device whose token APNs/FCM rejected cannot add subscriptions (409) until it
-  sends a new token.
-- Limits: 30 registrations per client address per hour, 120 new subscriptions
-  per device per hour, 200 subscriptions per device.
+- A device whose token APNs/FCM rejected, or that was superseded, cannot add
+  subscriptions (409) until it sends a new token.
+- **One active device per token.** Registering (or moving a device to) a token
+  that another active device holds supersedes that device: it is marked invalid,
+  its endpoints answer 410, and the apps behind them subscribe again. A partial
+  unique index enforces it (`migrations/0002_one_active_device_per_token.sql`).
+  Accepted trade-off: someone who knows a device's push token can reset that
+  device's subscriptions; push tokens are not public.
+- **Activity.** Every authenticated call (token update, subscription changes)
+  refreshes the device's `seen_at`. Devices unseen for 180 days are deleted by
+  the daily cron, and their endpoints answer 404. Takosumi Mobile should `PUT`
+  its token on launch and whenever it changes.
+- Token formats: APNs exactly 64 hex characters; FCM at most 1,024 characters
+  of `[A-Za-z0-9_:-]`.
+- Limits: 30 registrations per hour per client (an IPv4 address, or an IPv6
+  /64, since one subscriber usually holds a whole /64), 3,000 registrations per
+  hour over all clients, 120 new subscriptions per device per hour, 64
+  subscriptions per device, 8 device rows (active or superseded) per token.
 
 ## Push resource (application servers)
 
@@ -54,14 +68,19 @@ what the repository already has; `relay/tsconfig.json` checks it, and
 | No `TTL`, or not whole seconds; bad `Urgency`; `Topic` not ≤ 32 base64url characters | 400 |
 | Body above 2,800 bytes (declared or streamed) | 413 |
 | Body is not one aes128gcm record with a 65-byte key id | 400 |
-| More than 60 messages per endpoint or 240 per device per minute | 429 with `Retry-After` |
+| More than 60 messages per endpoint per minute, or past the device's ceiling and fair share (below) | 429 with `Retry-After` |
 | No sender configured for the device's platform | 503 |
-| APNs/FCM throttled / unavailable / refused | 429 / 503 / 502 |
+| APNs/FCM throttled / unavailable | 429 / 503 |
+| APNs/FCM refused the relay's own configuration, or the invalidation breaker is open | 502 (the device is not touched) |
+| The device replaced its token while the push was in flight | 503 with `Retry-After: 5` |
 | Accepted | 201 with `Location` and the applied `TTL` |
 
-- Only requests that pass VAPID count against the limits, and the per-device
-  budget counts only messages that passed their endpoint's limit, so one app
-  cannot use up the budget of the other apps on a device.
+- Only requests that pass VAPID count against the limits.
+- **Fair share per device.** A device may receive 240 messages a minute over
+  all its endpoints. Past that ceiling an endpoint may still send while it is
+  within its fair share: 240 divided by the device's endpoints that sent this
+  minute. Busy apps can use the device's budget, but an app that sends little
+  always gets its share. Refused messages do not count against the device.
 - `TTL` above 28 days is reduced and the response says so in `TTL`.
 - 2,800 bytes is what fits APNs's and FCM's 4,096-byte payload once base64url
   encoded with the envelope; the sender tests check both at exactly this size.
@@ -84,10 +103,34 @@ Both platforms carry only `{s: subscription_id, b: base64url(body)}`.
   NORMAL otherwise; `android.ttl` from `TTL`; `android.collapse_key` from
   `Topic`. OAuth 2.0 with the service account key; the access token is cached
   per isolate.
-- APNs `Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic`, 410 and FCM
-  `UNREGISTERED`, `SENDER_ID_MISMATCH`, or an invalid registration token mark the
-  device invalid. Pushes then answer 410 until the device sends a new token;
-  after 30 days the daily cron deletes the device and its endpoints answer 404.
+### Which answers invalidate a device
+
+Only answers about the one token may invalidate a device: APNs
+`BadDeviceToken`, `Unregistered`, `ExpiredToken` (410), and FCM `UNREGISTERED`
+or an invalid registration token. Pushes then answer 410 until the device sends
+a new token; after 30 days the daily cron deletes the device and its endpoints
+answer 404.
+
+Answers about the relay's own configuration are relay failures, answered 502,
+and never touch the device: APNs `DeviceTokenNotForTopic` (a wrong
+`APNS_TOPIC` gets this for every device), `TopicDisallowed`, `MissingTopic`,
+`BadTopic`, `InvalidProviderToken`, `ExpiredProviderToken`,
+`MissingProviderToken`, `BadEnvironmentKeyInToken`, `Forbidden`, certificate
+errors, and FCM `SENDER_ID_MISMATCH` (a wrong Firebase project gets this for
+every device) and any 401/403. Unknown answers are failures too. Apps retry 5xx
+and keep their subscriptions.
+
+Two more guards keep a mistake from erasing subscriptions:
+
+- **Invalidation breaker.** Per platform, in a 10-minute window, if
+  invalidations exceed 20, or exceed a quarter of deliveries once there were
+  20 deliveries, the relay stops invalidating, answers 502 and logs
+  `invalidation_breaker_open` at error level with `alert: true` and the counts.
+  It closes when the window passes. Tune the thresholds in `DEFAULT_LIMITS`
+  (`src/context.ts`) as traffic grows.
+- **Token check.** A device is invalidated only while it still holds the token
+  that was rejected. If the device replaced its token while the push was in
+  flight, nothing is invalidated and the push answers 503 to be retried.
 
 The senders implement one interface (`PushSender` in `src/senders/types.ts`)
 and take their `fetch` as a parameter; the tests drive them with mocks.
@@ -111,10 +154,10 @@ runtime with an HTTP/2 `fetch` (Bun, Node with undici) behind a small forwarder.
 ## What is stored and logged
 
 D1 holds the device token, a SHA-256 hash of the device secret, the APNs
-environment, an invalidation time, and per subscription the application server
-key and the endpoint id (`migrations/0001_initial.sql`). Rate-limit counters
-are keyed by endpoint id, device id, or a hash of the client address, and
-expire. The relay never stores an app's origin or a message body, and never
+environment, an invalidation time, the last authenticated call, and per
+subscription the application server key and the endpoint id (`migrations/`).
+Counters are keyed by endpoint id, device id, platform, or a hash of the client
+address (IPv4 address or IPv6 /64), and expire. The relay never stores an app's origin or a message body, and never
 logs a body, a token, a device secret, a VAPID JWT or its `sub` (the claim is
 never read). The tests capture every log line and check this.
 
@@ -123,8 +166,8 @@ never read). The tests capture every log line and check this.
 | Name | Kind | Meaning |
 | --- | --- | --- |
 | `DB` | D1 binding | the relay database |
-| `RELAY_ENVIRONMENT` | var | `staging` or `production` |
-| `RELAY_ORIGIN` | var | the public https origin; endpoints are issued under it and VAPID `aud` must equal it. Unset: the request's origin (workers.dev staging) |
+| `RELAY_ENVIRONMENT` | var | `staging` or `production` (required) |
+| `RELAY_ORIGIN` | var | the public https origin; endpoints are issued under it and VAPID `aud` must equal it. Required in production; in staging, unset means the request's origin (workers.dev) |
 | `DELIVERY_MODE` | var | `live` (default) or `sink` (accept and drop; staging only, refused elsewhere) |
 | `APNS_TEAM_ID`, `APNS_KEY_ID`, `APNS_TOPIC` | var | Apple team, `.p8` key id, app bundle id (`com.takosumi`) |
 | `APNS_PRIVATE_KEY` | secret | the `.p8` key (PKCS#8 PEM) |
@@ -153,11 +196,19 @@ bun run deploy -- push-relay-staging-schema --reviewed-by <name>
 bun run deploy -- push-relay-schema --reviewed-by <name>
 ```
 
+Every surface first reads `wrangler d1 list` and refuses unless the database
+id is the database with the expected name (`takosumi-push-relay-staging` or
+`takosumi-push-relay`); production also refuses the staging database's id.
 Each Worker deploy runs `bun run relay:check` once, bundles `src/index.ts` with
 Bun once, uploads that exact file with `--no-bundle`, reads the serving version
 back, and runs `bun run relay:smoke` (health, device, subscription, VAPID 401
 and 403, unknown endpoint 404, an encrypted Web Push answered 201 in sink mode
-or 410 per platform in live mode, device deletion). Staging defaults to
+or 410 per platform in live mode, device deletion). In live mode a
+configuration or credential error comes back 502 and fails the smoke (tested
+against a relay with mock senders). A fake token cannot prove the APNs topic or
+Firebase project binding itself — APNs answers `BadDeviceToken` before it
+checks the topic — so the first push to a real device is the last check; a
+wrong binding then answers 502 and leaves every device valid. Staging defaults to
 `DELIVERY_MODE=sink` (`PUSH_RELAY_STAGING_DELIVERY_MODE=live` with the
 `PUSH_RELAY_APNS_*` / `PUSH_RELAY_FCM_PROJECT_ID` identifiers switches it).
 
@@ -175,7 +226,9 @@ entrypoint:
    `wrangler secret put FCM_SERVICE_ACCOUNT_JSON --name <worker>`.
 
 The staging Worker `takosumi-push-relay-staging` on workers.dev runs in sink
-mode until APNs and Firebase credentials exist.
+mode until APNs and Firebase credentials exist. It was deployed from 39ca885
+(before migration 0002); after this branch is merged, run
+`push-relay-staging-schema` and then `push-relay-staging` to bring it current.
 
 ## What the publisher must provide
 
@@ -187,7 +240,7 @@ mode until APNs and Firebase credentials exist.
 
 - Takosumi Mobile's relay client, the injected Push API, key storage and
   decryption on the device (design steps 4 and 5).
-- The device must drop a push whose `s` it does not know (another installation
-  could register the same token); the iOS Notification Service Extension must
-  show nothing app-specific for it.
+- The device must drop a push whose `s` it does not know (a superseded
+  installation's subscription, for example); the iOS Notification Service
+  Extension must show nothing app-specific for it.
 - A delivery through real APNs/FCM credentials and a real device.

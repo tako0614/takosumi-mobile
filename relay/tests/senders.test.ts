@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { base64UrlDecode, toArrayBuffer, utf8 } from "../src/encoding.ts";
-import { APNS_HOSTS, ApnsSender, apnsPayload } from "../src/senders/apns.ts";
+import { APNS_CONFIGURATION_REASONS, APNS_HOSTS, ApnsSender, apnsPayload } from "../src/senders/apns.ts";
 import { FCM_SCOPE, FcmSender, GOOGLE_TOKEN_URL, fcmMessage, parseServiceAccount } from "../src/senders/fcm.ts";
 import { MAX_PUSH_BODY_BYTES, type DeliveryOutcome, type DeliveryRequest } from "../src/senders/types.ts";
 
@@ -114,9 +114,20 @@ test("APNs: maps Apple's answers to relay outcomes", async () => {
     new Response(reason ? JSON.stringify({ reason }) : null, { status, headers: { "apns-id": "x" } });
   const cases: [() => Response, DeliveryOutcome["kind"]][] = [
     [answer(410, "Unregistered"), "device-invalid"],
+    [answer(410, "ExpiredToken"), "device-invalid"],
+    [answer(410), "device-invalid"],
     [answer(400, "BadDeviceToken"), "device-invalid"],
-    [answer(400, "DeviceTokenNotForTopic"), "device-invalid"],
+    // Configuration of the relay, not of the device: never invalidate.
+    [answer(400, "DeviceTokenNotForTopic"), "failed"],
+    [answer(400, "TopicDisallowed"), "failed"],
+    [answer(400, "MissingTopic"), "failed"],
+    [answer(400, "BadTopic"), "failed"],
     [answer(403, "InvalidProviderToken"), "failed"],
+    [answer(403, "ExpiredProviderToken"), "failed"],
+    [answer(403, "MissingProviderToken"), "failed"],
+    [answer(403, "BadEnvironmentKeyInToken"), "failed"],
+    [answer(403, "Forbidden"), "failed"],
+    [answer(400, "SomethingNew"), "failed"],
     [answer(400, "PayloadTooLarge"), "failed"],
     [answer(429, "TooManyRequests"), "throttled"],
     [answer(503, "ServiceUnavailable"), "unavailable"],
@@ -133,6 +144,17 @@ test("APNs: maps Apple's answers to relay outcomes", async () => {
   expect(await unreachable.send(request())).toEqual({ kind: "unavailable", retryAfter: null, reason: "apns-unreachable" });
   const badKey = new ApnsSender({ teamId: "T", keyId: "K", privateKeyPem: "not a key", topic: "t" }, mockFetch([]).fetcher);
   expect(await badKey.send(request())).toEqual({ kind: "failed", reason: "apns-key-unusable" });
+});
+
+test("APNs: no configuration reason can invalidate a device, whatever the status", async () => {
+  const key = await apnsKey();
+  for (const reason of APNS_CONFIGURATION_REASONS) {
+    for (const status of [400, 403, 410]) {
+      const { fetcher } = mockFetch([() => Response.json({ reason }, { status })]);
+      const sender = new ApnsSender({ teamId: "T", keyId: "K", privateKeyPem: key.pem, topic: "t" }, fetcher);
+      expect(`${reason}/${status}:${(await sender.send(request())).kind}`).toBe(`${reason}/${status}:failed`);
+    }
+  }
 });
 
 test("APNs and FCM payloads for the largest accepted body fit in 4096 bytes", () => {
@@ -208,8 +230,11 @@ test("FCM: maps Google's answers to relay outcomes", async () => {
     );
   const cases: [() => Response, DeliveryOutcome["kind"]][] = [
     [error(404, "UNREGISTERED"), "device-invalid"],
-    [error(403, "SENDER_ID_MISMATCH"), "device-invalid"],
     [error(400, "INVALID_ARGUMENT", "The registration token is not a valid FCM registration token"), "device-invalid"],
+    // Configuration of the relay (wrong project, credentials, permissions).
+    [error(403, "SENDER_ID_MISMATCH"), "failed"],
+    [error(403, "PERMISSION_DENIED"), "failed"],
+    [error(404, null, "Requested entity was not found."), "failed"],
     [error(400, "INVALID_ARGUMENT", "Invalid value at 'message.data'"), "failed"],
     [error(429, "QUOTA_EXCEEDED", "x", { "retry-after": "30" }), "throttled"],
     [error(503, "UNAVAILABLE"), "unavailable"],

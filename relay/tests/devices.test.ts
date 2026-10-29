@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { base64UrlEncode, sha256Hex } from "../src/encoding.ts";
 import { generateVapidKeys } from "../tools/web-push.ts";
-import { APNS_TOKEN, FCM_TOKEN, ORIGIN, createTestRelay, push, register, subscribe } from "./support/relay.ts";
+import { ipv6Prefix64 } from "../src/devices.ts";
+import { APNS_TOKEN, FCM_TOKEN, ORIGIN, createTestRelay, push, register, subscribe, uniqueFcmToken } from "./support/relay.ts";
 
 test("registers an APNs device and stores only the token and a secret hash", async () => {
   const t = createTestRelay();
@@ -37,7 +38,10 @@ test("rejects malformed registrations", async () => {
     [{ platform: "webpush", token: FCM_TOKEN }, "invalid_platform"],
     [{ platform: "apns", token: "not-hex" }, "invalid_token"],
     [{ platform: "apns", token: APNS_TOKEN, apns_environment: "sandbox" }, "invalid_apns_environment"],
+    [{ platform: "apns", token: "a1".repeat(31) }, "invalid_token"],
+    [{ platform: "apns", token: "a1".repeat(33) }, "invalid_token"],
     [{ platform: "fcm", token: "short" }, "invalid_token"],
+    [{ platform: "fcm", token: "f".repeat(1025) }, "invalid_token"],
     [{ platform: "fcm", token: FCM_TOKEN, apns_environment: "production" }, "invalid_apns_environment"],
     [["not", "an", "object"], "invalid_json"],
   ];
@@ -205,4 +209,115 @@ test("never stores or logs device secrets or tokens", async () => {
   expect(logged).not.toContain(device.secret);
   expect(logged).not.toContain(APNS_TOKEN);
   expect(logged).not.toContain("b2".repeat(32));
+});
+
+test("registering a token another device holds supersedes that device", async () => {
+  const t = createTestRelay();
+  const token = uniqueFcmToken();
+  const first = await register(t, { platform: "fcm", token });
+  const oldSubscription = await subscribe(t, first);
+  const second = await register(t, { platform: "fcm", token });
+  const newSubscription = await subscribe(t, second);
+
+  expect((await push(t, oldSubscription)).status).toBe(410);
+  expect((await push(t, newSubscription)).status).toBe(201);
+  expect(t.sqlite.query("SELECT device_id FROM devices WHERE token = ?1 AND invalidated_at IS NULL").all(token)).toEqual([
+    { device_id: second.deviceId },
+  ]);
+  // The superseded device must send a new token before it can subscribe again.
+  const key = base64UrlEncode((await generateVapidKeys()).publicKey);
+  const blocked = await t.call("POST", `/v1/devices/${first.deviceId}/subscriptions`, {
+    headers: first.auth,
+    body: { application_server_key: key },
+  });
+  expect(blocked.status).toBe(409);
+});
+
+test("moving a device to a token another device holds supersedes that device", async () => {
+  const t = createTestRelay();
+  const holder = await register(t);
+  const holderSubscription = await subscribe(t, holder);
+  const mover = await register(t);
+  const moverSubscription = await subscribe(t, mover);
+  const holderToken = (t.sqlite.query("SELECT token FROM devices WHERE device_id = ?1").get(holder.deviceId) as { token: string }).token;
+  expect((await t.call("PUT", `/v1/devices/${mover.deviceId}`, { headers: mover.auth, body: { token: holderToken } })).status).toBe(204);
+  expect((await push(t, holderSubscription)).status).toBe(410);
+  expect((await push(t, moverSubscription)).status).toBe(201);
+  expect(t.fcm.requests.at(-1)?.token).toBe(holderToken);
+});
+
+test("the database refuses two active devices with one token", async () => {
+  const t = createTestRelay();
+  const device = await register(t, { platform: "fcm", token: FCM_TOKEN });
+  expect(() =>
+    t.sqlite
+      .query("INSERT INTO devices (device_id, secret_hash, platform, token, created_at, updated_at, seen_at) VALUES ('x', 'h', 'fcm', ?1, 0, 0, 0)")
+      .run(FCM_TOKEN),
+  ).toThrow();
+  expect(device.deviceId.length).toBeGreaterThan(0);
+});
+
+test("caps how many device rows one token may accumulate", async () => {
+  const t = createTestRelay({ limits: { devicesPerToken: 3 } });
+  const token = uniqueFcmToken();
+  for (let index = 0; index < 3; index += 1) await register(t, { platform: "fcm", token });
+  const capped = await t.call("POST", "/v1/devices", { body: { platform: "fcm", token } });
+  expect(capped.status).toBe(429);
+  expect(((await capped.json()) as { error: string }).error).toBe("token_registration_limit");
+});
+
+test("counts registrations per IPv6 /64 and per IPv4 address", async () => {
+  expect(ipv6Prefix64("2001:db8:1:2::1")).toBe("2001:db8:1:2");
+  expect(ipv6Prefix64("2001:0db8:0001:0002:ffff:0:0:5")).toBe("2001:db8:1:2");
+  expect(ipv6Prefix64("::1")).toBe("0:0:0:0");
+  expect(ipv6Prefix64("::ffff:192.0.2.1")).toBe("0:0:0:0");
+  expect(ipv6Prefix64("192.0.2.1")).toBeNull();
+  expect(ipv6Prefix64("1:2:3")).toBeNull();
+
+  const t = createTestRelay({ limits: { registrationsPerHour: 2 } });
+  const from = (address: string) => ({ "cf-connecting-ip": address });
+  await register(t, undefined, from("2001:db8:1:2::1"));
+  await register(t, undefined, from("2001:db8:1:2:aaaa:bbbb:cccc:dddd"));
+  const sameNetwork = await t.call("POST", "/v1/devices", {
+    headers: from("2001:db8:1:2:ffff::5"),
+    body: { platform: "fcm", token: uniqueFcmToken() },
+  });
+  expect(sameNetwork.status).toBe(429);
+  await register(t, undefined, from("2001:db8:1:3::1"));
+  await register(t, undefined, from("192.0.2.1"));
+  await register(t, undefined, from("192.0.2.2"));
+});
+
+test("a global registration limit holds over all clients", async () => {
+  const t = createTestRelay({ limits: { registrationsPerHourGlobal: 3 } });
+  for (let index = 1; index <= 3; index += 1) await register(t, undefined, { "cf-connecting-ip": `198.51.100.${index}` });
+  const limited = await t.call("POST", "/v1/devices", {
+    headers: { "cf-connecting-ip": "198.51.100.200" },
+    body: { platform: "fcm", token: uniqueFcmToken() },
+  });
+  expect(limited.status).toBe(429);
+  expect(t.log.text()).toContain("registration_global_limit");
+});
+
+test("devices unseen for the inactivity period are deleted; any authenticated call keeps one alive", async () => {
+  const t = createTestRelay({ limits: { inactiveDeviceSeconds: 1000 } });
+  const idle = await register(t);
+  const idleSubscription = await subscribe(t, idle);
+  const active = await register(t);
+  const activeSubscription = await subscribe(t, active);
+
+  t.clock.now += 900;
+  const token = (t.sqlite.query("SELECT token FROM devices WHERE device_id = ?1").get(active.deviceId) as { token: string }).token;
+  expect((await t.call("PUT", `/v1/devices/${active.deviceId}`, { headers: active.auth, body: { token } })).status).toBe(204);
+  t.clock.now += 200;
+  await t.relay.scheduled();
+
+  expect((await push(t, idleSubscription)).status).toBe(404);
+  expect((await push(t, activeSubscription)).status).toBe(201);
+  expect(t.sqlite.query("SELECT device_id FROM devices").all()).toEqual([{ device_id: active.deviceId }]);
+});
+
+test("a device holds at most 64 subscriptions by default", async () => {
+  const { DEFAULT_LIMITS } = await import("../src/context.ts");
+  expect(DEFAULT_LIMITS.subscriptionsPerDevice).toBe(64);
 });

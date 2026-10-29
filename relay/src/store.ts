@@ -12,6 +12,7 @@ export interface DeviceRecord {
   invalidatedAt: number | null;
   createdAt: number;
   updatedAt: number;
+  seenAt: number;
 }
 
 export interface SubscriptionTarget {
@@ -30,6 +31,7 @@ interface DeviceRow {
   invalidated_at: number | null;
   created_at: number;
   updated_at: number;
+  seen_at: number;
 }
 
 interface TargetRow extends DeviceRow {
@@ -48,30 +50,44 @@ function toDevice(row: DeviceRow): DeviceRecord {
     invalidatedAt: row.invalidated_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    seenAt: row.seen_at,
   };
 }
 
 const DEVICE_COLUMNS =
-  "d.device_id, d.secret_hash, d.platform, d.token, d.apns_environment, d.invalidated_at, d.created_at, d.updated_at";
+  "d.device_id, d.secret_hash, d.platform, d.token, d.apns_environment, d.invalidated_at, d.created_at, d.updated_at, d.seen_at";
+
+// Marks every other active device holding the token as superseded.
+const SUPERSEDE =
+  "UPDATE devices SET invalidated_at = ?3, updated_at = ?3 WHERE platform = ?1 AND token = ?2 AND invalidated_at IS NULL AND device_id != ?4 RETURNING device_id";
 
 /** D1-backed storage for devices and subscriptions. Times are Unix seconds. */
 export class RelayStore {
   constructor(private readonly db: D1Database) {}
 
-  async createDevice(device: Omit<DeviceRecord, "invalidatedAt" | "updatedAt">) {
-    await this.db
-      .prepare(
-        "INSERT INTO devices (device_id, secret_hash, platform, token, apns_environment, invalidated_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6)",
-      )
-      .bind(
-        device.deviceId,
-        device.secretHash,
-        device.platform,
-        device.token,
-        device.apnsEnvironment,
-        device.createdAt,
-      )
-      .run();
+  /**
+   * Inserts the device and supersedes any other active device with the same
+   * token, in one transaction. Returns how many devices were superseded.
+   */
+  async createDevice(
+    device: Omit<DeviceRecord, "invalidatedAt" | "updatedAt" | "seenAt">,
+  ): Promise<number> {
+    const [superseded] = await this.db.batch<{ device_id: string }>([
+      this.db.prepare(SUPERSEDE).bind(device.platform, device.token, device.createdAt, device.deviceId),
+      this.db
+        .prepare(
+          "INSERT INTO devices (device_id, secret_hash, platform, token, apns_environment, invalidated_at, created_at, updated_at, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?6)",
+        )
+        .bind(
+          device.deviceId,
+          device.secretHash,
+          device.platform,
+          device.token,
+          device.apnsEnvironment,
+          device.createdAt,
+        ),
+    ]);
+    return superseded?.results.length ?? 0;
   }
 
   async getDevice(deviceId: string): Promise<DeviceRecord | null> {
@@ -82,28 +98,55 @@ export class RelayStore {
     return row ? toDevice(row) : null;
   }
 
-  /** Replaces the token. A new token also clears an earlier invalidation. */
+  /** How many device rows (active or superseded) hold this token. */
+  async countDevicesWithToken(platform: Platform, token: string): Promise<number> {
+    const row = await this.db
+      .prepare("SELECT COUNT(*) AS n FROM devices WHERE platform = ?1 AND token = ?2")
+      .bind(platform, token)
+      .first<{ n: number }>();
+    return Number(row?.n ?? 0);
+  }
+
+  /** Records an authenticated call from the device. */
+  async touchDevice(deviceId: string, now: number) {
+    await this.db.prepare("UPDATE devices SET seen_at = ?2 WHERE device_id = ?1").bind(deviceId, now).run();
+  }
+
+  /**
+   * Replaces the token. A new token also clears an earlier invalidation, and
+   * supersedes any other active device holding the same token. Returns how many
+   * devices were superseded.
+   */
   async updateDeviceToken(
-    deviceId: string,
+    device: Pick<DeviceRecord, "deviceId" | "platform">,
     token: string,
     apnsEnvironment: ApnsEnvironment | null,
     now: number,
-  ) {
-    await this.db
-      .prepare(
-        "UPDATE devices SET token = ?2, apns_environment = ?3, invalidated_at = NULL, updated_at = ?4 WHERE device_id = ?1",
-      )
-      .bind(deviceId, token, apnsEnvironment, now)
-      .run();
+  ): Promise<number> {
+    const [superseded] = await this.db.batch<{ device_id: string }>([
+      this.db.prepare(SUPERSEDE).bind(device.platform, token, now, device.deviceId),
+      this.db
+        .prepare(
+          "UPDATE devices SET token = ?2, apns_environment = ?3, invalidated_at = NULL, updated_at = ?4, seen_at = ?4 WHERE device_id = ?1",
+        )
+        .bind(device.deviceId, token, apnsEnvironment, now),
+    ]);
+    return superseded?.results.length ?? 0;
   }
 
-  async invalidateDevice(deviceId: string, now: number) {
-    await this.db
+  /**
+   * Marks the device invalid, but only while it still holds `token`, the token
+   * APNs/FCM rejected. Returns false when nothing changed: the device replaced
+   * its token meanwhile, was already invalid, or is gone.
+   */
+  async invalidateDevice(deviceId: string, token: string, now: number): Promise<boolean> {
+    const row = await this.db
       .prepare(
-        "UPDATE devices SET invalidated_at = ?2, updated_at = ?2 WHERE device_id = ?1 AND invalidated_at IS NULL",
+        "UPDATE devices SET invalidated_at = ?3, updated_at = ?3 WHERE device_id = ?1 AND token = ?2 AND invalidated_at IS NULL RETURNING device_id",
       )
-      .bind(deviceId, now)
-      .run();
+      .bind(deviceId, token, now)
+      .first<{ device_id: string }>();
+    return row !== null;
   }
 
   /** Deletes the device and every subscription it holds. */
@@ -171,20 +214,20 @@ export class RelayStore {
   }
 
   /**
-   * Removes devices whose token was reported invalid before `invalidBefore`
-   * (with their subscriptions; their endpoints then answer 404), and rate-limit
-   * windows that started before `windowsBefore`.
+   * Deletes devices (with their subscriptions; their endpoints then answer 404)
+   * that were invalidated before `invalidBefore` or last seen before
+   * `unseenBefore`, and counter windows that started before `windowsBefore`.
    */
-  async purge(invalidBefore: number, windowsBefore: number) {
+  async purge(invalidBefore: number, unseenBefore: number, windowsBefore: number) {
+    const expired =
+      "SELECT device_id FROM devices WHERE (invalidated_at IS NOT NULL AND invalidated_at < ?1) OR seen_at < ?2";
     await this.db.batch([
       this.db
-        .prepare(
-          "DELETE FROM subscriptions WHERE device_id IN (SELECT device_id FROM devices WHERE invalidated_at IS NOT NULL AND invalidated_at < ?1)",
-        )
-        .bind(invalidBefore),
+        .prepare(`DELETE FROM subscriptions WHERE device_id IN (${expired})`)
+        .bind(invalidBefore, unseenBefore),
       this.db
-        .prepare("DELETE FROM devices WHERE invalidated_at IS NOT NULL AND invalidated_at < ?1")
-        .bind(invalidBefore),
+        .prepare("DELETE FROM devices WHERE (invalidated_at IS NOT NULL AND invalidated_at < ?1) OR seen_at < ?2")
+        .bind(invalidBefore, unseenBefore),
       this.db.prepare("DELETE FROM rate_windows WHERE window_start < ?1").bind(windowsBefore),
     ]);
   }

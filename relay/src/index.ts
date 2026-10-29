@@ -5,7 +5,7 @@ import { DEFAULT_LIMITS } from "./context.ts";
 import type { D1Database } from "./d1.ts";
 import { problem } from "./http.ts";
 import { consoleLog, type RelayLog } from "./log.ts";
-import { D1RateLimiter } from "./rate-limit.ts";
+import { D1Counters } from "./rate-limit.ts";
 import { ApnsSender } from "./senders/apns.ts";
 import { FcmSender, parseServiceAccount } from "./senders/fcm.ts";
 import { SinkSender } from "./senders/sink.ts";
@@ -14,9 +14,9 @@ import { RelayStore, type Platform } from "./store.ts";
 
 export interface RelayEnv {
   DB: D1Database;
-  /** `staging` or `production`. Only staging may use DELIVERY_MODE=sink. */
+  /** `staging` or `production` (required). Only staging may use DELIVERY_MODE=sink. */
   RELAY_ENVIRONMENT?: string;
-  /** Public https origin; endpoints are issued under it and VAPID aud must match. */
+  /** Public https origin; endpoints are issued under it and VAPID aud must match. Required in production. */
   RELAY_ORIGIN?: string;
   /** `live` (default) delivers through APNs/FCM; `sink` accepts and drops. */
   DELIVERY_MODE?: string;
@@ -61,6 +61,14 @@ function cached(key: string, build: () => PushSender): PushSender {
 
 export function resolveConfig(env: RelayEnv): ResolvedConfig {
   const problems: string[] = [];
+  if (env.RELAY_ENVIRONMENT !== "staging" && env.RELAY_ENVIRONMENT !== "production") {
+    problems.push("RELAY_ENVIRONMENT must be staging or production");
+  }
+  if (env.RELAY_ENVIRONMENT === "production" && !env.RELAY_ORIGIN) {
+    // Without it, endpoints and the VAPID audience would follow whatever host a
+    // request arrived on.
+    problems.push("RELAY_ORIGIN is required in production");
+  }
   let origin: string | null = null;
   if (env.RELAY_ORIGIN) {
     try {
@@ -120,7 +128,7 @@ export function relayForEnv(env: RelayEnv, log: RelayLog = consoleLog) {
     config,
     relay: createRelay({
       store: new RelayStore(env.DB),
-      rateLimiter: new D1RateLimiter(env.DB),
+      counters: new D1Counters(env.DB),
       senders: config.senders,
       origin: config.origin,
       limits: DEFAULT_LIMITS,
