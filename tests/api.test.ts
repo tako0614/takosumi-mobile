@@ -149,13 +149,20 @@ test("legacy fallback exposes every Workspace and can select the second one", as
   expect(paths).toContain("/api/v1/workspaces/ws_b/runs");
 });
 
-test("an opaque mobile token uses the legacy home once after app_access_denied", async () => {
+test.each([
+  ["the canonical nested error", {
+    code: "app_access_denied",
+    message: "App access is required.",
+    requestId: "00000000-0000-4000-8000-000000000118",
+  }],
+  ["the legacy flat error", "app_access_denied"],
+] as const)("an opaque mobile token uses the legacy home once after %s", async (_label, error) => {
   const paths: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     paths.push(url.pathname);
     if (url.pathname === "/api/v1/apps") {
-      return Response.json({ error: "app_access_denied" }, { status: 403 });
+      return Response.json({ error }, { status: 403 });
     }
     if (url.pathname === "/api/v1/workspaces") {
       return Response.json({ workspaces: [workspace(), workspace({ id: "ws_b" })] });
@@ -197,7 +204,17 @@ test("an opaque mobile token uses the legacy home once after app_access_denied",
 });
 
 test("other apps errors do not trigger legacy fallback", async () => {
-  for (const error of ["forbidden", "insufficient_scope", "permission_denied"]) {
+  for (const error of [
+    "forbidden",
+    "insufficient_scope",
+    "permission_denied",
+    "{invalid-json",
+    { code: "forbidden", message: "app_access_denied" },
+    { message: "app_access_denied" },
+    { code: 403, message: "App access is required." },
+    [{ code: "app_access_denied" }],
+    null,
+  ]) {
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       paths.push(new URL(String(input)).pathname);
@@ -213,7 +230,9 @@ test("other apps errors do not trigger legacy fallback", async () => {
     const paths: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       paths.push(new URL(String(input)).pathname);
-      return Response.json({ error: "app_access_denied" }, { status });
+      return Response.json({
+        error: { code: "app_access_denied", message: "App access is required." },
+      }, { status });
     }) as typeof fetch;
     await expect(loadHome(session)).rejects.toThrow(`${status} /api/v1/apps`);
     expect(paths).toEqual(["/api/v1/apps"]);
@@ -225,9 +244,25 @@ test("legacy authorization and network failures are still surfaced", async () =>
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     paths.push(url.pathname);
-    return Response.json({ error: "app_access_denied" }, { status: 403 });
+    return Response.json({
+      error: { code: "app_access_denied", message: "App access is required." },
+    }, { status: 403 });
   }) as typeof fetch;
   await expect(loadHome(session)).rejects.toThrow("403 /api/v1/workspaces");
+  expect(paths).toEqual(["/api/v1/apps", "/api/v1/workspaces"]);
+
+  paths.length = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const url = new URL(String(input));
+    paths.push(url.pathname);
+    if (url.pathname === "/api/v1/apps") {
+      return Response.json({
+        error: { code: "app_access_denied", message: "App access is required." },
+      }, { status: 403 });
+    }
+    throw new Error("Legacy network unavailable");
+  }) as typeof fetch;
+  await expect(loadHome(session)).rejects.toThrow("Legacy network unavailable");
   expect(paths).toEqual(["/api/v1/apps", "/api/v1/workspaces"]);
 
   paths.length = 0;

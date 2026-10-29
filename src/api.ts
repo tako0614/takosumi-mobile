@@ -68,7 +68,7 @@ export async function loadHome(
     if (
       error instanceof MobileApiError &&
       (error.status === 404 ||
-        (error.status === 403 && error.detail === "app_access_denied"))
+        (error.status === 403 && isAppAccessDenied(error.detail)))
     ) {
       return await loadLegacyHome(session, options);
     }
@@ -76,6 +76,18 @@ export async function loadHome(
   }
   const runs = await listAppRuns(session, apps);
   return { apps, workspaces: [], capsules: [], runs };
+}
+
+function isAppAccessDenied(detail: string | null): boolean {
+  if (detail === "app_access_denied") return true;
+  if (!detail) return false;
+  // mobile-kit retains structured server error envelopes as raw JSON detail.
+  try {
+    const body = requireRecord(JSON.parse(detail), "error response");
+    return requireRecord(body.error, "error").code === "app_access_denied";
+  } catch {
+    return false;
+  }
 }
 
 async function listAppRuns(
