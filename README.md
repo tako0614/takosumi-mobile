@@ -175,5 +175,7 @@ P-256 key pair and `auth` per subscription, decryption
 shared `web-push-cases.json`), the notification channels and taps. A tap
 intent carries only an opaque token the plugin issued for that notification,
 and a tap the shell has not taken within five minutes is not used. CI runs the
-decryption tests on the plain JVM (`src-tauri/plugins/push/jvm-tests`) and the
-plugins' `cargo test`, which `bun run check` does not cover.
+decryption tests on the plain JVM (`src-tauri/plugins/push/jvm-tests`), the
+iOS decryption (`TakosumiWebPush.swift`) against the same table with
+swift-crypto on Linux (`src-tauri/plugins/push/ios/WebPushTests`), and the
+plugins' `cargo test`, none of which `bun run check` covers.

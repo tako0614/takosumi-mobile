@@ -66,7 +66,31 @@ jobs:
         with:
           gradle-version: "8.14.3"
       - name: Kotlin JVM tests (takosumi-push)
-        run: gradle --project-dir src-tauri/plugins/push/jvm-tests test
+        shell: bash
+        run: |
+          gradle --project-dir src-tauri/plugins/push/jvm-tests test
+          # A task that found no sources (NO-SOURCE) passes silently: require
+          # both suites' reports and at least one test.
+          results=src-tauri/plugins/push/jvm-tests/build/test-results/test
+          for suite in WebPushCryptoTest WebPushCasesTest; do
+            test -f "$results/TEST-com.takosumi.push.$suite.xml" || { echo "::error::$suite did not run"; exit 1; }
+          done
+          total=$(cat "$results"/TEST-*.xml | grep -o '<testsuite [^>]*' | sed -E 's/.* tests="([0-9]+)".*/\1/' | awk '{ sum += $1 } END { print sum + 0 }')
+          echo "Kotlin JVM tests run: $total"
+          test "$total" -ge 1
+      # The iOS plugin's RFC 8291 decryption and Declarative Web Push parsing
+      # (TakosumiWebPush.swift) against the same table, with swift-crypto in
+      # place of CryptoKit. The image ships Swift; nothing else is installed.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/plugins/push/ios/WebPushTests/.build
+          key: webpush-swift-${{ runner.os }}-${{ hashFiles('src-tauri/plugins/push/ios/WebPushTests/Package.swift') }}
+      - name: Swift tests (takosumi-push)
+        shell: bash
+        run: |
+          swift --version
+          swift test --package-path src-tauri/plugins/push/ios/WebPushTests 2>&1 | tee "$RUNNER_TEMP/swift-test.log"
+          grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/swift-test.log"
       - name: System libraries for Tauri on Linux
         run: |
           sudo apt-get update

@@ -137,8 +137,12 @@ internal class PushStore(context: Context) {
         taps.put(token, entry)
         prune(taps, now)
         root.put("taps", taps)
-        // Request codes count up (and wrap) across the store's life.
-        val requestCode = root.optInt("nextRequestCode", 1).coerceAtLeast(1)
+        // Request codes count up (and wrap) across the store's life. A new or
+        // reset store starts at a random point: notifications still on screen
+        // from before the reset keep PendingIntents with the old codes, and a
+        // restart at 1 would hand them the new notifications' tokens.
+        val stored = root.optInt("nextRequestCode", 0)
+        val requestCode = if (stored >= 1) stored else 1 + random.nextInt(Int.MAX_VALUE / 2)
         root.put("nextRequestCode", if (requestCode == Int.MAX_VALUE) 1 else requestCode + 1)
         write(root)
         TapTicket(token, requestCode)
