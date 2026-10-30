@@ -130,6 +130,20 @@ client off (and selected no other) advertises no `oidcClientId`; the app then
 says that the instance has not enabled Takosumi Mobile sign-in and links to the
 operator instructions. The app has no fallback client id.
 
+A shared-account host (Takosumi Hosted, app.takosumi.com) works differently:
+people sign in there only through the host's private relying party, and the
+host accepts no bearer token. It advertises no `oidcClientId` but
+`shared_account_sign_in` instead. The app then signs in at that issuer (the one
+the browser uses) as the Takosumi Mobile client registered there, with PKCE,
+a nonce and a consent screen, and the host's HTTPS redirect page hands the
+response back to `takosumi://oauth/callback`. The app does not redeem the code:
+it sends `{code, code_verifier, nonce}` to the host's `session_exchange`, whose
+relying party redeems it and returns a session of the browser's kind. The app
+keeps that session in Stronghold like any other and sends it only to that host,
+in `x-takosumi-native-session` (never as `Authorization`). Signing out revokes
+it at the host; when it expires the app asks for a new sign-in
+(`src/shared-account-sign-in.ts`, takosumi `docs/reference/api.md`).
+
 ## Push relay
 
 `relay/` holds the Web Push relay that carries Takosumi's own notifications to

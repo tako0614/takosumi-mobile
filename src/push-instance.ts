@@ -9,6 +9,7 @@ import {
   sameOriginApiBaseUrl,
   type MobileSession,
 } from "@takosjp/mobile-kit";
+import { takosumiSessionHeaders } from "./shared-account-sign-in.ts";
 
 export type InstanceFetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -75,7 +76,9 @@ async function call(
     method: init.method,
     headers: {
       accept: "application/json",
-      authorization: `${session.tokenType} ${session.accessToken}`,
+      // A bearer for a self-hosted instance; the native session header on a
+      // shared-account host.
+      ...takosumiSessionHeaders(session),
       ...(init.body === undefined ? {} : { "content-type": "application/json" }),
     },
     ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),

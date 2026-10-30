@@ -22,15 +22,18 @@ import {
   type LauncherApp,
 } from "./app-screens.ts";
 import { productAdapter } from "./product.ts";
+import { takosumiSessionFetch } from "./shared-account-sign-in.ts";
 
 /**
  * Takosumi API client for one instance's session. Paths are relative to the
  * API root the instance advertised in `/.well-known/takosumi` (`apiBaseUrl`),
  * which mobile-kit only accepts on the instance's own origin; `/api/v1` on the
- * instance is the fallback for sessions saved before it was recorded.
+ * instance is the fallback for sessions saved before it was recorded. A
+ * shared-account session travels in its own header, never as a bearer.
  */
 function takosumiApi(session: MobileSession) {
-  return createMobileApiClient({ session, apiBasePath: "/api/v1" });
+  const fetch = takosumiSessionFetch(session);
+  return createMobileApiClient({ session, apiBasePath: "/api/v1", ...(fetch ? { fetch } : {}) });
 }
 
 const WORKSPACE_PAGE_SIZE = 100;
