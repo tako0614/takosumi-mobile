@@ -1,3 +1,12 @@
 [default]
-description = "Allows Takosumi mobile to open installed apps in native app screens and pin their home-screen shortcuts"
-permissions = ["allow-capabilities", "allow-open", "allow-pin-shortcut"]
+description = "Allows Takosumi mobile to open installed apps in native app screens, hand them to their declared native apps, open the browser view, pin home-screen shortcuts and take the actions an app screen's bar leaves for the shell"
+permissions = [
+  "allow-capabilities",
+  "allow-open",
+  "allow-pin-shortcut",
+  "allow-open-client",
+  "allow-open-browser-view",
+  "allow-open-web",
+  "allow-take-pending-action",
+  "allow-register-listener",
+]

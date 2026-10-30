@@ -5,8 +5,12 @@ import android.net.Uri
 /**
  * Mirror of `src/url-policy.ts`. The shared table is
  * `navigation-policy-cases.json`; keep the three implementations equal.
+ * BROWSER_VIEW: an https page the screen does not show (another site such as
+ * an external sign-in, or a Takosumi page outside sign-in: the dashboard,
+ * account pages, `/api/v1`) goes to the browser view instead of this WebView.
+ * `AppScreenPolicyTest` runs this file against the shared table (Robolectric).
  */
-internal enum class NavigationKind { IN_APP, EXTERNAL_CONFIRM, BLOCK }
+internal enum class NavigationKind { IN_APP, BROWSER_VIEW, EXTERNAL_CONFIRM, BLOCK }
 
 internal data class NavigationDecision(
     val kind: NavigationKind,
@@ -23,7 +27,11 @@ internal object AppScreenPolicy {
     )
     private val subframeWebSchemes = setOf("about", "blob", "data", "http", "https", "javascript")
 
-    fun decide(rawUrl: String, mainFrame: Boolean): NavigationDecision {
+    fun decide(
+        rawUrl: String,
+        mainFrame: Boolean,
+        origins: ScreenOrigins? = null,
+    ): NavigationDecision {
         val trimmed = rawUrl.trim()
         val uri = try {
             Uri.parse(trimmed)
@@ -33,12 +41,27 @@ internal object AppScreenPolicy {
         val scheme = uri.scheme?.lowercase() ?: return block("")
         if (!scheme.matches(Regex("[a-z][a-z0-9+.-]*"))) return block("")
 
+        val web = scheme == "http" || scheme == "https"
+        // The shell's own hosts, in every frame and both web schemes.
+        if (web && AppScreenRules.isShellHost(uri.host)) return block(scheme)
+
         if (!mainFrame) {
-            return if (scheme in subframeWebSchemes) inApp(scheme) else block(scheme)
+            if (scheme !in subframeWebSchemes) return block(scheme)
+            if (web && origins != null &&
+                AppScreenRules.isTakosumiPageOutsideSignIn(AppScreenRules.originOf(trimmed), uri.encodedPath, origins)
+            ) {
+                return block(scheme)
+            }
+            return inApp(scheme)
         }
         if (scheme == "https") {
-            if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
-            return if (uri.host.isNullOrEmpty()) block(scheme) else inApp(scheme)
+            if (!uri.userInfo.isNullOrEmpty() || AppScreenRules.hasRawUserInfo(trimmed)) return block(scheme)
+            if (uri.host.isNullOrEmpty()) return block(scheme)
+            if (origins != null) {
+                val kind = AppScreenRules.mainFrameDecision(AppScreenRules.originOf(trimmed), uri.encodedPath, origins)
+                if (kind != NavigationKind.IN_APP) return NavigationDecision(kind, scheme)
+            }
+            return inApp(scheme)
         }
         if (scheme == "about" && trimmed.lowercase() in inScreenAbout) return inApp(scheme)
         if (scheme == SHELL_SCHEME || scheme in localContentSchemes) return block(scheme)
@@ -50,7 +73,7 @@ internal object AppScreenPolicy {
             }
         }
         if (scheme == "http") {
-            if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
+            if (!uri.userInfo.isNullOrEmpty() || AppScreenRules.hasRawUserInfo(trimmed)) return block(scheme)
             return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme, insecureHttp = true)
         }
         return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme)
@@ -72,6 +95,10 @@ internal object AppScreenPolicy {
         val data = rawUrl.substring(rawUrl.indexOf(':') + 1, hash)
         return Regex("^([a-zA-Z][a-zA-Z0-9+.-]*):").find(data)?.groupValues?.get(1)?.lowercase()
     }
+
+    /** True when a screen with [origins] shows [rawUrl] itself. */
+    fun isInScreen(rawUrl: String, origins: ScreenOrigins?): Boolean =
+        isLaunchable(rawUrl) && decide(rawUrl, mainFrame = true, origins).kind == NavigationKind.IN_APP
 
     /** https with a host and no user info: the only URLs a screen opens with. */
     fun isLaunchable(rawUrl: String): Boolean {

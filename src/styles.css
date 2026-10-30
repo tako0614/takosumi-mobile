@@ -277,20 +277,15 @@
   font-weight: 400;
 }
 
-.launcher-badge {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  min-width: 20px;
-  border: 2px solid var(--shell-bg);
-  border-radius: 999px;
-  padding: 1px 5px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 0.66rem;
-  font-weight: 800;
-  line-height: 1.4;
-  text-align: center;
+.launcher-subheading {
+  margin: 4px 0 10px;
+  color: var(--shell-muted);
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.launcher-recent {
+  margin-bottom: 16px;
 }
 
 .launcher-label {
@@ -354,4 +349,112 @@
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+/* The chooser (選ぶ画面): how to open one app. */
+.open-chooser-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.55);
+}
+
+.open-chooser {
+  display: grid;
+  width: 100%;
+  max-width: 560px;
+  max-height: 88vh;
+  box-sizing: border-box;
+  gap: 12px;
+  overflow-y: auto;
+  border: 1px solid var(--shell-border);
+  border-radius: 18px 18px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  background: var(--shell-card);
+  color: var(--shell-text);
+}
+
+.open-chooser-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.open-chooser-host {
+  margin: 4px 0 0;
+  color: var(--shell-muted);
+  font-size: 0.76rem;
+  word-break: break-all;
+}
+
+.open-option {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  border-top: 1px solid var(--shell-border);
+  padding-top: 10px;
+}
+
+.open-option h3 {
+  display: flex;
+  margin: 0;
+  gap: 8px;
+  align-items: center;
+  color: var(--shell-label);
+  font-size: 0.82rem;
+}
+
+.open-option-flag {
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--accent);
+  font-size: 0.68rem;
+}
+
+.open-option-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  margin: 0;
+  gap: 4px 10px;
+  font-size: 0.76rem;
+}
+
+.open-option-facts dt {
+  color: var(--shell-muted);
+}
+
+.open-option-facts dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.open-option-note,
+.open-option-push {
+  margin: 0;
+  color: var(--shell-muted);
+  font-size: 0.74rem;
+}
+
+.open-confirm {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 0.78rem;
+}
+
+.open-confirm p {
+  margin: 0;
+  word-break: break-all;
+}
+
+.open-remember {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.8rem;
 }

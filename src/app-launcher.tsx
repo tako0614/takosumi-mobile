@@ -16,23 +16,34 @@ import { MobilePreviewSection } from "@takosjp/mobile-kit/solid";
 import { loadAppScreens } from "./api.ts";
 import {
   type AppLauncherEntry,
-  type AppUnreadCounts,
   buildLauncherEntries,
   type CapsuleAppScreens,
   type CustomAppEntry,
   type LauncherApp,
   stabilizeLauncherEntries,
-  unreadBadgeLabel,
 } from "./app-screens.ts";
-import type { AppScreenCapabilities, AppScreenOpener } from "./app-screen-native.ts";
+import type {
+  AppScreenAction,
+  AppScreenCapabilities,
+  AppScreenOpener,
+} from "./app-screen-native.ts";
 import { addCustomApp, readCustomApps, removeCustomApp } from "./custom-apps.ts";
 import type { LauncherController } from "./launcher-controller.ts";
+import { OpenChooser } from "./open-chooser.tsx";
+import {
+  type ChooserRequest,
+  type OpenContext,
+  type OpenRouter,
+  type RecentApp,
+  recentLauncherEntries,
+} from "./open-routing.ts";
 
 /**
  * The home's app grid: each installed app's launchable screens and the URLs
- * the person added, as icons with names. Tapping one opens it in a native
- * app screen. Unread badges read `unreadCounts`, which push delivery
- * (TASK-0119 U4 step 4) fills; it is empty until then.
+ * the person added, as icons with names, with the recently used apps above
+ * them. Tapping one opens it the way the open router decides (the remembered
+ * choice, the app's verified native app, or inside Takosumi), and the
+ * chooser lets the person pick another way.
  */
 export function AppLauncher(props: {
   readonly session: MobileSession;
@@ -40,13 +51,26 @@ export function AppLauncher(props: {
   readonly store?: MobilePersistentStore;
   readonly controller: LauncherController;
   readonly opener: AppScreenOpener;
-  readonly unreadCounts: () => AppUnreadCounts;
+  readonly router: OpenRouter;
+  readonly platform: string;
+  readonly context?: OpenContext;
+  readonly chooser: () => ChooserRequest | undefined;
+  readonly closeChooser: () => void;
+  readonly recent: () => readonly RecentApp[];
+  readonly setRecent: (recent: readonly RecentApp[]) => void;
+  /** A bar action waiting for the app list (開き方を変える from an app screen). */
+  readonly pendingAction: () => AppScreenAction | undefined;
+  readonly clearPendingAction: () => void;
+  readonly openStore: (url: string) => Promise<void>;
+  readonly copyText?: (text: string) => Promise<void>;
 }) {
   const [screens, setScreens] = createSignal<ReadonlyMap<string, CapsuleAppScreens>>(
     new Map(),
   );
   const [custom, setCustom] = createSignal<readonly CustomAppEntry[]>([]);
   const [loading, setLoading] = createSignal(false);
+  /** The app list has been read once, so bar actions can find their app. */
+  const [ready, setReady] = createSignal(false);
   const [editing, setEditing] = createSignal(false);
   const [adding, setAdding] = createSignal(false);
   const [draftUrl, setDraftUrl] = createSignal("");
@@ -64,6 +88,16 @@ export function AppLauncher(props: {
     void props.opener.capabilities().then(setCapabilities);
   });
 
+  // Recent apps belong to the current (instance, account).
+  createEffect(
+    on(
+      () => props.context?.scope,
+      () => {
+        void props.router.recentApps().then(props.setRecent);
+      },
+    ),
+  );
+
   // Reload screens only when the set of apps changes, not on every Run poll.
   const appsKey = createMemo(() =>
     props.apps.map((app) => `${app.capsuleId}:${app.state}`).join("\n"),
@@ -75,6 +109,7 @@ export function AppLauncher(props: {
       const apps = props.apps;
       if (apps.length === 0) {
         setScreens(new Map());
+        setReady(true);
         return;
       }
       setLoading(true);
@@ -91,7 +126,10 @@ export function AppLauncher(props: {
           setStatus(mobileErrorMessage(error, "アプリの画面を読み込めませんでした。"));
         })
         .finally(() => {
-          if (generation === loadGeneration) setLoading(false);
+          if (generation === loadGeneration) {
+            setLoading(false);
+            setReady(true);
+          }
         });
     }),
   );
@@ -105,20 +143,40 @@ export function AppLauncher(props: {
     [],
   );
   createEffect(() => props.controller.setEntries(entries()));
+  const recentEntries = createMemo(() => recentLauncherEntries(props.recent(), entries()));
+
+  // An app screen's 「開き方を変える」 waits until the app list is loaded, so
+  // the chooser knows the app's declared native app.
+  createEffect(() => {
+    const action = props.pendingAction();
+    if (!action || !ready() || loading()) return;
+    props.clearPendingAction();
+    void props.router.handleAction(action, entries());
+  });
 
   async function open(entry: AppLauncherEntry) {
     setStatus(undefined);
     try {
-      await props.controller.openEntry(entry);
+      await props.router.open(entry);
     } catch (error) {
       setStatus(mobileErrorMessage(error, `${entry.label} を開けませんでした。`));
     }
   }
 
+  async function chooseFor(entry: AppLauncherEntry) {
+    setStatus(undefined);
+    await props.router.choose(entry, "change");
+  }
+
   async function pin(entry: AppLauncherEntry) {
     setStatus(undefined);
     try {
-      const requested = await props.controller.pinEntry(entry);
+      const context = props.context;
+      const requested = await props.controller.pinEntry(entry, {
+        platform: props.platform,
+        resume: true,
+        ...(context ? { accountsOrigins: context.accountsOrigins, scope: context.scope } : {}),
+      });
       setStatus(
         requested
           ? `${entry.label} をホーム画面に追加する確認を表示しました。`
@@ -162,7 +220,7 @@ export function AppLauncher(props: {
       class="app-launcher"
       detail={loading() ? "読み込み中" : `${entries().length}件`}
       actions={
-        <Show when={entries().some((entry) => entry.source === "custom") || capabilities().pinShortcut}>
+        <Show when={entries().length > 0}>
           <button
             type="button"
             class="text-button"
@@ -177,16 +235,36 @@ export function AppLauncher(props: {
       <Show when={status()}>
         {(message) => <p class="mobile-status">{message()}</p>}
       </Show>
+      <Show when={recentEntries().length > 0 && !editing()}>
+        <h3 class="launcher-subheading">最近使ったアプリ</h3>
+        <ul class="launcher-grid launcher-recent">
+          <For each={recentEntries()}>
+            {(entry) => (
+              <LauncherTile
+                entry={entry}
+                controller={props.controller}
+                editing={false}
+                canPin={false}
+                onOpen={() => void open(entry)}
+                onChoose={() => void chooseFor(entry)}
+                onPin={() => undefined}
+                onRemove={() => undefined}
+              />
+            )}
+          </For>
+        </ul>
+        <h3 class="launcher-subheading">すべてのアプリ</h3>
+      </Show>
       <ul class="launcher-grid">
         <For each={entries()}>
           {(entry) => (
             <LauncherTile
               entry={entry}
               controller={props.controller}
-              badge={unreadBadgeLabel(props.unreadCounts(), entry.key)}
               editing={editing()}
               canPin={capabilities().pinShortcut}
               onOpen={() => void open(entry)}
+              onChoose={() => void chooseFor(entry)}
               onPin={() => void pin(entry)}
               onRemove={() => void remove(entry)}
             />
@@ -247,6 +325,18 @@ export function AppLauncher(props: {
           </div>
         </form>
       </Show>
+      <Show when={props.chooser()} keyed>
+        {(request) => (
+          <OpenChooser
+            request={request}
+            router={props.router}
+            platform={props.platform}
+            openStore={props.openStore}
+            {...(props.copyText ? { copyText: props.copyText } : {})}
+            onClose={() => props.closeChooser()}
+          />
+        )}
+      </Show>
     </MobilePreviewSection>
   );
 }
@@ -254,10 +344,10 @@ export function AppLauncher(props: {
 function LauncherTile(props: {
   readonly entry: AppLauncherEntry;
   readonly controller: LauncherController;
-  readonly badge?: string;
   readonly editing: boolean;
   readonly canPin: boolean;
   readonly onOpen: () => void;
+  readonly onChoose: () => void;
   readonly onPin: () => void;
   readonly onRemove: () => void;
 }) {
@@ -284,18 +374,15 @@ function LauncherTile(props: {
           <Show when={imageSrc()} fallback={<span class="launcher-glyph">{glyph()}</span>}>
             {(src) => <img src={src()} alt="" draggable={false} />}
           </Show>
-          <Show when={props.badge}>
-            {(badge) => <span class="launcher-badge">{badge()}</span>}
-          </Show>
         </span>
         <span class="launcher-label">{props.entry.label}</span>
-        <span class="visually-hidden">
-          {props.badge ? `未読 ${props.badge}件、` : ""}
-          {props.entry.host}
-        </span>
+        <span class="visually-hidden">{props.entry.host}</span>
       </button>
-      <Show when={props.editing && (props.canPin || props.entry.source === "custom")}>
+      <Show when={props.editing}>
         <div class="launcher-tile-actions">
+          <button type="button" class="text-button" onClick={() => props.onChoose()}>
+            開き方
+          </button>
           <Show when={props.canPin}>
             <button type="button" class="text-button" onClick={() => props.onPin()}>
               ホームに追加

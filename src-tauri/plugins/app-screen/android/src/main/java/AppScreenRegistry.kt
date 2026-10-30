@@ -9,20 +9,26 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 
 /**
- * Process-wide app screen webviews, kept alive across activity changes so
- * switching apps keeps each page's state. Only [MAX_ALIVE] stay alive; the
- * least recently used one is closed first, and its activity reloads the last
- * URL when it comes back.
+ * Process-wide app screen webviews. One app screen stays alive at a time
+ * (with the popups it opened): opening another app closes the previous
+ * one's webview, and its activity reopens its last page by URL when it comes
+ * back. Keeping several live webviews and switching between them waits for
+ * device testing (TASK-0119 step 3).
  *
  * Every webview uses the process's single WebView profile (one cookie jar and
  * storage area), so a Takosumi sign-in made in one app screen carries over to
  * the others. Do not give screens their own data directory or profile.
  *
+ * The webviews are plain `android.webkit.WebView`s, not Tauri webviews: no
+ * JavaScript interface, no web message listener and no Tauri IPC, so a page
+ * can reach neither native plugins nor the instance's tokens.
+ *
  * Each webview lives in a [MutableContextWrapper]: it points at the activity
  * that shows it (dialogs, pickers) and back at the application while detached.
  */
 internal object AppScreenRegistry {
-    const val MAX_ALIVE = 4
+    /** Live app screens, not counting the popups each one opened. */
+    const val MAX_ALIVE_SCREENS = 1
 
     class Entry(
         val key: String,
@@ -41,6 +47,19 @@ internal object AppScreenRegistry {
         var popupTargetDecided = false
         val createdAt: Long = android.os.SystemClock.elapsedRealtime()
         var destroyed = false
+        /** (instance, account) the screen was opened for. */
+        var scope: String? = null
+
+        /**
+         * What the main frame may show (the app's origin, the Takosumi
+         * origins' sign-in pages); the rest goes to the browser view. Read on
+         * WebView threads.
+         */
+        @Volatile
+        var origins: ScreenOrigins? = null
+
+        /** The policy while no activity shows this webview. */
+        val detachedClient = DetachedScreenClient(this)
     }
 
     // Access-ordered: iteration starts at the least recently used entry.
@@ -52,8 +71,11 @@ internal object AppScreenRegistry {
         get(key)?.let { return it }
         val wrapper = MutableContextWrapper(context.applicationContext)
         val entry = Entry(key, createWebView(wrapper), wrapper, popup)
+        // A webview without a client hands navigations to other apps; keep the
+        // policy from the first navigation (a popup loads before its activity).
+        entry.webView.webViewClient = entry.detachedClient
         entries[key] = entry
-        evictExcept(key)
+        if (!popup) evictOtherScreens(key)
         return entry
     }
 
@@ -87,18 +109,29 @@ internal object AppScreenRegistry {
         removeCrashed(entry.key)
     }
 
-    /** Close the oldest screens beyond the limit, never [keepKey] or a visible one. */
-    private fun evictExcept(keepKey: String) {
-        if (entries.size <= MAX_ALIVE) return
-        val candidates = entries.values.filter { entry ->
-            entry.key != keepKey && entry.host?.isVisibleScreen() != true
+    /**
+     * Close every other app screen that is not visible (split screen keeps a
+     * visible one), with the popups it opened. Their activities reload their
+     * last page when they come back.
+     */
+    private fun evictOtherScreens(keepKey: String) {
+        // MAX_ALIVE_SCREENS: only [keepKey] stays, unless another is on screen.
+        val victims = entries.values.filter { entry ->
+            !entry.popup && entry.key != keepKey && entry.host?.isVisibleScreen() != true
         }
-        for (entry in candidates) {
-            if (entries.size <= MAX_ALIVE) break
-            entries.remove(entry.key)
-            entry.host?.releaseEvictedWebView(entry)
-            destroy(entry, crashed = false)
+        for (victim in victims) {
+            for (entry in withPopups(victim)) {
+                entries.remove(entry.key)
+                entry.host?.releaseEvictedWebView(entry)
+                destroy(entry, crashed = false)
+            }
         }
+    }
+
+    /** [screen]'s popups (and theirs), innermost first, then [screen]. */
+    private fun withPopups(screen: Entry): List<Entry> {
+        val children = entries.values.filter { it.popup && it.openerKey == screen.key }
+        return children.flatMap { withPopups(it) } + screen
     }
 
     private fun destroy(entry: Entry, crashed: Boolean) {
@@ -137,10 +170,6 @@ internal object AppScreenRegistry {
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         cookies.setAcceptThirdPartyCookies(webView, false)
-        // A webview without a client hands navigations to other apps; keep the
-        // policy from the first navigation (a popup loads before its activity).
-        webView.webViewClient = DetachedScreenClient
-        // TASK-0119 U4 step 4 adds the document-start Push API bridge here.
         return webView
     }
 }

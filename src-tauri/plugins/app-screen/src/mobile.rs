@@ -4,7 +4,10 @@ use tauri::{
     AppHandle, Runtime,
 };
 
-use crate::models::{CapabilitiesResponse, OpenRequest, PinShortcutResponse};
+use crate::models::{
+    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
+    OpenClientResponse, OpenRequest, OpenWebRequest, PendingActionResponse, PinShortcutResponse,
+};
 
 #[cfg(target_os = "ios")]
 tauri::ios_plugin_binding!(init_plugin_app_screen);
@@ -38,6 +41,33 @@ impl<R: Runtime> AppScreen<R> {
     pub fn pin_shortcut(&self, payload: OpenRequest) -> crate::Result<PinShortcutResponse> {
         self.0
             .run_mobile_plugin("pinShortcut", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn open_client(&self, payload: OpenClientRequest) -> crate::Result<OpenClientResponse> {
+        self.0
+            .run_mobile_plugin("openClient", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn open_browser_view(
+        &self,
+        payload: BrowserViewRequest,
+    ) -> crate::Result<BrowserViewResponse> {
+        self.0
+            .run_mobile_plugin("openBrowserView", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn open_web(&self, payload: OpenWebRequest) -> crate::Result<BrowserViewResponse> {
+        self.0
+            .run_mobile_plugin("openWeb", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn take_pending_action(&self) -> crate::Result<PendingActionResponse> {
+        self.0
+            .run_mobile_plugin("takePendingAction", ())
             .map_err(Into::into)
     }
 }

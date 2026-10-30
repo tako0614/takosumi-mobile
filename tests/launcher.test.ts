@@ -8,8 +8,10 @@ import {
   sniffIconFormat,
 } from "../src/app-icons.ts";
 import {
+  APP_SCREEN_BAR_COLOR,
   type AppScreenInvoke,
   createAppScreenOpener,
+  decodeAction,
 } from "../src/app-screen-native.ts";
 import type { AppLauncherEntry, AppScreenOpenRequest } from "../src/app-screens.ts";
 import {
@@ -328,6 +330,78 @@ test("Android and iOS open screens through the app-screen plugin", async () => {
   ).rejects.toThrow("one browsing profile");
 });
 
+test("native apps, the browser view and bar actions go through the app-screen plugin", async () => {
+  const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+  let pending: unknown = {
+    kind: "choose",
+    key: "app:cap_a:web",
+    url: "https://a.example/inbox",
+    reason: "not-installed",
+  };
+  const invoke = (async (command: string, args?: Record<string, unknown>) => {
+    calls.push({ command, ...(args ? { args } : {}) });
+    if (command === "plugin:app-screen|open_client") return { result: "not_installed" };
+    if (command === "plugin:app-screen|open_browser_view") return { result: "browser" };
+    if (command === "plugin:app-screen|take_pending_action") {
+      const action = pending;
+      pending = undefined;
+      return action ? { action } : {};
+    }
+    return null;
+  }) as AppScreenInvoke;
+  const listened: string[] = [];
+  const android = createAppScreenOpener({
+    invoke,
+    listen: async (plugin, event, handler) => {
+      listened.push(`${plugin}:${event}`);
+      handler(undefined);
+      return { unregister: async () => undefined };
+    },
+    platform: "android",
+    openExternalUrl: async () => {},
+  });
+  const client = { platform: "android" as const, package: "com.yurucommu", open: "yurucommu://x" };
+  expect(await android.openClient(client)).toBe("not_installed");
+  // A request for the other phone is never sent.
+  expect(await android.openClient({ platform: "ios", open: "yurucommu://x" })).toBe("not_installed");
+  expect(await android.openBrowserView("https://accounts.google.com/")).toBe("browser");
+  await android.openWeb("https://a.example/");
+  await expect(android.openWeb("http://a.example/")).rejects.toThrow("https");
+  await expect(android.openBrowserView("http://a.example/")).rejects.toThrow("https");
+  expect(await android.takePendingAction()).toEqual({
+    kind: "choose",
+    key: "app:cap_a:web",
+    url: "https://a.example/inbox",
+    reason: "not-installed",
+  });
+  expect(await android.takePendingAction()).toBeUndefined();
+  let nudged = 0;
+  await android.onActionPending(() => void nudged++);
+  expect(nudged).toBe(1);
+  expect(listened).toEqual(["app-screen:actionPending"]);
+  expect(calls.slice(0, 3)).toEqual([
+    { command: "plugin:app-screen|open_client", args: { payload: client } },
+    {
+      command: "plugin:app-screen|open_browser_view",
+      args: { payload: { url: "https://accounts.google.com/", toolbarColor: APP_SCREEN_BAR_COLOR } },
+    },
+    { command: "plugin:app-screen|open_web", args: { payload: { url: "https://a.example/" } } },
+  ]);
+});
+
+test("bar actions are taken only in their known shape", () => {
+  expect(decodeAction({ kind: "choose", key: "k", url: "https://a.example/", reason: "x" })).toEqual({
+    kind: "choose",
+    key: "k",
+    url: "https://a.example/",
+    reason: "change",
+  });
+  expect(decodeAction({ kind: "open", key: "k", url: "https://a.example/" })).toBeUndefined();
+  expect(decodeAction({ kind: "choose", key: "k", url: "javascript:alert(1)" })).toBeUndefined();
+  expect(decodeAction({ kind: "choose", key: "", url: "https://a.example/" })).toBeUndefined();
+  expect(decodeAction(null)).toBeUndefined();
+});
+
 test("the web preview opens screens in the external browser", async () => {
   const external: string[] = [];
   const web = createAppScreenOpener({
@@ -337,7 +411,12 @@ test("the web preview opens screens in the external browser", async () => {
   expect(await web.capabilities()).toEqual({ inApp: false, pinShortcut: false });
   await web.open(request);
   expect(await web.pinShortcut(request)).toBe(false);
-  expect(external).toEqual(["https://a.example/"]);
+  expect(await web.openClient({ platform: "android", package: "com.a", open: "a://x" })).toBe(
+    "not_installed",
+  );
+  expect(await web.openBrowserView("https://b.example/")).toBe("browser");
+  expect(await web.takePendingAction()).toBeUndefined();
+  expect(external).toEqual(["https://a.example/", "https://b.example/"]);
 });
 
 // --- Launcher controller ------------------------------------------------------
@@ -367,6 +446,11 @@ function recordingOpener() {
         pinned.push(value);
         return true;
       },
+      openClient: async () => "not_installed" as const,
+      openBrowserView: async () => "browser-view" as const,
+      openWeb: async () => undefined,
+      takePendingAction: async () => undefined,
+      onActionPending: async () => () => undefined,
     },
   };
 }
@@ -383,7 +467,7 @@ test("opening an entry passes its rasterized icon and caches the icon fetch", as
     rasterize: async (source) => (source.kind === "data-url" ? "UE5HLWltYWdl" : "UE5HLWdseXBo"),
   });
   controller.setEntries([yurucommu]);
-  await controller.openEntry(yurucommu);
+  await controller.openTarget(yurucommu);
   await controller.pinEntry(yurucommu);
   expect(await controller.iconDataUrl(yurucommu.icon)).toBe("data:image/svg+xml;base64,PHN2Zy8+");
   expect(fetched).toEqual(["https://yuru.example/icon.svg"]);
@@ -416,6 +500,38 @@ test("deep-linked URLs open in the matching app's screen; slow icons do not bloc
       profile: "shared",
     },
   ]);
+});
+
+test("a Takosumi page outside sign-in opens in the browser view, never in an app screen", async () => {
+  const { opener, opened } = recordingOpener();
+  const browserViews: string[] = [];
+  const controller = createLauncherController({
+    opener: {
+      ...opener,
+      openBrowserView: async (url: string) => {
+        browserViews.push(url);
+        return "browser-view" as const;
+      },
+    },
+    fetchIcon: async () => undefined,
+    rasterize: async () => undefined,
+    iconWaitMs: 5,
+  });
+  const accountsOrigins = ["https://app.takosumi.example"];
+  await controller.openUrl("https://app.takosumi.example/apps", { accountsOrigins });
+  await controller.openUrl("https://app.takosumi.example/oauth/authorize?client_id=x", {
+    accountsOrigins,
+  });
+  expect(browserViews).toEqual(["https://app.takosumi.example/apps"]);
+  expect(opened.map((request) => request.url)).toEqual([
+    "https://app.takosumi.example/oauth/authorize?client_id=x",
+  ]);
+  await expect(
+    controller.pinEntry(
+      { ...yurucommu, key: "custom:dash", url: "https://app.takosumi.example/" },
+      { accountsOrigins },
+    ),
+  ).rejects.toThrow("ホーム画面に追加できません");
 });
 
 // --- Deep links -----------------------------------------------------------------

@@ -13,11 +13,26 @@ The home lists your installed apps as icons, and each opens like an app:
 - launchable screens come from each app's view
   (`GET /api/v1/capsules/{capsuleId}/app`, the Interface `display.icon` and URL);
   you can also add any https URL, kept only on the device;
-- an app opens in its own native webview (the `app-screen` plugin) under a thin
-  bar that always shows the current host, with back, reload, share, open in the
-  browser and close; all app screens share one sign-in profile;
+- tapping an app opens it the way you chose on this device, else in the app's
+  own native app when the app declares one and the instance verified it, else
+  inside Takosumi Mobile; the chooser (「開き方」) offers the native app (and
+  its store page), the browser, the browser view (Custom Tabs /
+  `SFSafariViewController`) and the screen inside Takosumi, and can remember
+  the choice. A native app the instance did not verify is never opened without
+  asking: the chooser shows it as 「未確認のアプリ」 (or its checked name) with
+  the app, host and store it really goes to;
+- inside Takosumi an app opens in its own native webview (the `app-screen`
+  plugin) under a thin bar that always shows the current host, with back,
+  reload and a menu (share, the browser view, the browser, the declared native
+  app, 開き方を変える, switch apps, close); all app screens share one sign-in
+  profile. Pages of other sites, such as a Google sign-in, open in the browser
+  view instead, and closing it returns to the app;
+- the home shows your recently used apps, and an app reopens at the page you
+  left (remembered per instance and account, never with credentials in it);
 - on Android, each app gets its own entry in Recents and can be added to the
   home screen; `takosumi://app?url=<https URL>` opens an app screen directly.
+- app screens have no access to Takosumi Mobile itself: no Tauri capability,
+  no IPC and no JavaScript bridge.
 
 Instances and accounts:
 
@@ -56,7 +71,9 @@ is distributed for iOS and Android.
 ## Getting started
 
 A Takosumi source checkout is also required at `../takosumi`; `src/api.ts`
-imports the public session contract directly from that checkout.
+and `src/app-clients.ts` import the public session contract and the native
+app declaration contract (`contract/interface-clients.ts`) directly from that
+checkout.
 
 ```bash
 bun install

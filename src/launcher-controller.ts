@@ -1,12 +1,14 @@
 import {
   type AppLauncherEntry,
   type AppScreenIcon,
+  type AppScreenOpenOptions,
   type AppScreenTarget,
   appScreenOpenRequest,
   resolveAppScreenTarget,
 } from "./app-screens.ts";
 import type { AppScreenOpener } from "./app-screen-native.ts";
 import { type NativeIconSource, nativeIconSource } from "./app-icons.ts";
+import { opensInAppScreen } from "./url-policy.ts";
 
 /**
  * Launcher behavior without UI: open an entry or a deep-linked URL in an app
@@ -16,9 +18,17 @@ import { type NativeIconSource, nativeIconSource } from "./app-icons.ts";
 export interface LauncherController {
   readonly setEntries: (entries: readonly AppLauncherEntry[]) => void;
   readonly entries: () => readonly AppLauncherEntry[];
-  readonly openEntry: (entry: AppLauncherEntry) => Promise<void>;
-  readonly openUrl: (url: string) => Promise<void>;
-  readonly pinEntry: (entry: AppLauncherEntry) => Promise<boolean>;
+  /** Open in an app screen (中で見る); the open router decides when. */
+  readonly openTarget: (
+    target: AppScreenTarget,
+    options?: AppScreenOpenOptions,
+  ) => Promise<void>;
+  /** A deep-linked URL: the known app with that origin, else its own screen. */
+  readonly openUrl: (url: string, options?: AppScreenOpenOptions) => Promise<void>;
+  readonly pinEntry: (
+    entry: AppLauncherEntry,
+    options?: AppScreenOpenOptions,
+  ) => Promise<boolean>;
   /** Cached `data:` URL of an image icon, for `<img>` in the launcher. */
   readonly iconDataUrl: (icon: AppScreenIcon | undefined) => Promise<string | undefined>;
 }
@@ -73,9 +83,15 @@ export function createLauncherController(input: {
       new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), iconWaitMs)),
     ]);
 
-  const open = async (target: AppScreenTarget) => {
+  const open = async (target: AppScreenTarget, options?: AppScreenOpenOptions) => {
+    // A Takosumi page outside sign-in (the dashboard, account pages) never
+    // runs in an app screen; it opens in the browser view.
+    if (!opensInAppScreen(target.url, options?.accountsOrigins ?? [])) {
+      await input.opener.openBrowserView(target.url);
+      return;
+    }
     const png = await withinBudget(iconPng(target));
-    await input.opener.open(appScreenOpenRequest(target, png));
+    await input.opener.open(appScreenOpenRequest(target, png, options));
   };
 
   return {
@@ -84,15 +100,18 @@ export function createLauncherController(input: {
     },
     entries: () => entries,
     iconDataUrl,
-    async openEntry(entry) {
-      await open(entry);
+    async openTarget(target, options) {
+      await open(target, options);
     },
-    async openUrl(url) {
-      await open(resolveAppScreenTarget(url, entries));
+    async openUrl(url, options) {
+      await open(resolveAppScreenTarget(url, entries), options);
     },
-    async pinEntry(entry) {
+    async pinEntry(entry, options) {
+      if (!opensInAppScreen(entry.url, options?.accountsOrigins ?? [])) {
+        throw new Error("このページはTakosumiの中では開けないため、ホーム画面に追加できません。");
+      }
       const png = await withinBudget(iconPng(entry));
-      return await input.opener.pinShortcut(appScreenOpenRequest(entry, png));
+      return await input.opener.pinShortcut(appScreenOpenRequest(entry, png, options));
     },
   };
 }
