@@ -4,14 +4,14 @@ import { productAdapter } from "../src/product.ts";
 test("Takosumi mobile owns the Takosumi PKCE client identity", () => {
   expect(productAdapter.product).toBe("takosumi");
   expect(productAdapter.mobileScheme).toBe("takosumi");
+  // Must equal the scopes Takosumi registers for the Takosumi Mobile client
+  // (accounts/service/src/mobile-oidc-client.ts); any other scope is refused.
   expect(productAdapter.oidcScopes).toEqual([
     "openid",
+    "profile",
     "offline_access",
-    "workspaces:read",
     "capsules:read",
-    "runs:read",
-    "runs:approve",
-    "runs:cancel",
+    "capsules:write",
   ]);
   expect(productAdapter.discoveryProduct).toBe("takosumi");
   expect(productAdapter.strictDiscoveryProduct).toBe(true);

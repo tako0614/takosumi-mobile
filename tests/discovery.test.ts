@@ -11,17 +11,18 @@ test("Takosumi Mobile discovers the host-published PKCE client", async () => {
       return Response.json({
         product: "takosumi",
         name: "Takosumi",
-        oidcClientId: "takosumi-mobile-operator",
+        oidcClientId: "takosumi-mobile",
         auth: { oidc: true, password: false },
+        apiBaseUrl: "https://operator.example/api/v1",
         endpoints: {
-          api: "https://operator.example/api",
-          capabilities: "https://operator.example/v1/capabilities",
+          api: "https://operator.example/api/v1",
+          capabilities: "https://operator.example/api/v1/capabilities",
           oidc_issuer: "https://operator.example",
+          extensions: {
+            "takosumi.tcs-store.v1": "https://store.example/",
+          },
         },
       });
-    }
-    if (url.pathname === "/v1/capabilities") {
-      return Response.json({ identity: { oidc_issuer: true } });
     }
     throw new Error(`Unexpected discovery path: ${url.pathname}`);
   };
@@ -33,14 +34,12 @@ test("Takosumi Mobile discovers the host-published PKCE client", async () => {
   });
 
   expect(discovery.detectedProduct).toBe("takosumi");
-  expect(discovery.oidcClientId).toBe("takosumi-mobile-operator");
+  expect(discovery.oidcClientId).toBe("takosumi-mobile");
   expect(discovery.oidcIssuer).toBe("https://operator.example");
+  expect(discovery.apiBaseUrl).toBe("https://operator.example/api/v1");
   expect(discovery.authMethods).toEqual({ oidc: true, password: false });
-  expect(paths.sort()).toEqual([
-    "/.well-known/takosumi",
-    "/.well-known/takosumi",
-    "/v1/capabilities",
-  ]);
+  // One read of the instance document; the retired /v1/capabilities is gone.
+  expect(paths).toEqual(["/.well-known/takosumi"]);
 });
 
 test("Takosumi Mobile rejects a producer without an exact public-client id", async () => {

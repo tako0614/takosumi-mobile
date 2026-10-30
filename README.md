@@ -1,8 +1,10 @@
 # Takosumi Mobile
 
-The mobile-first Takosumi client for iOS and Android. It connects to Takosumi
-Hosted or an operator/self-hosted Takosumi deployment through host discovery and
-public-client OIDC PKCE.
+The mobile-first Takosumi client for iOS and Android. Like a Mastodon client,
+it connects to any Takosumi instance — Takosumi Hosted or an operator or
+self-hosted deployment — through `/.well-known/takosumi` discovery and
+public-client OIDC PKCE, and keeps several instances and accounts signed in at
+once.
 
 ## What you can do
 
@@ -16,6 +18,18 @@ The home lists your installed apps as icons, and each opens like an app:
   browser and close; all app screens share one sign-in profile;
 - on Android, each app gets its own entry in Recents and can be added to the
   home screen; `takosumi://app?url=<https URL>` opens an app screen directly.
+
+Instances and accounts:
+
+- add an instance by URL, QR, a recent host, or a
+  `takosumi://connect?host_url=https://X` link; a connect link that arrives
+  while you are signed in elsewhere is shown with "サインインして追加", not hidden;
+- each (instance, account) keeps its own session in the device's secure store;
+  the top of the home shows the current instance and account, and tapping it
+  switches, adds another instance, or signs one out (its tokens are revoked at
+  that instance);
+- the home, approvals and app list always come from the current instance, and
+  a token for one instance is never sent to another.
 
 It also keeps the daily control loop inside the app:
 
@@ -50,17 +64,23 @@ bun run mobile:check
 bun run tauri:dev
 ```
 
-The host must register a public OIDC client for
-`takosumi://oauth/callback` and publish its id with
-`/.well-known/takosumi`. Its exact allowed scope set is:
+Every Takosumi instance includes the built-in public OIDC client
+`takosumi-mobile` (redirect exactly `takosumi://oauth/callback`, PKCE S256) and
+publishes it as `oidcClientId` in `/.well-known/takosumi`; no per-instance
+registration is needed. The app requests exactly the scopes that client is
+registered for:
 
 ```text
-openid offline_access workspaces:read capsules:read runs:read runs:approve runs:cancel
+openid profile offline_access capsules:read capsules:write
 ```
 
-The host derives the published client id from the one registered public client
-whose redirect URI is exactly `takosumi://oauth/callback`; the app has no
-fallback client id. See the Takosumi platform deployment runbook.
+`capsules:write` covers Run approval and cancellation. Each authorization shows
+an instance consent screen, because another app could claim the same custom
+scheme. API calls use the instance's advertised `apiBaseUrl` (accepted only on
+the instance's own origin). An instance whose operator turned the built-in
+client off (and selected no other) advertises no `oidcClientId`; the app then
+says that the instance has not enabled Takosumi Mobile sign-in and links to the
+operator instructions. The app has no fallback client id.
 
 ## Push relay
 
