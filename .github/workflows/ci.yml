@@ -46,3 +46,47 @@ jobs:
         working-directory: takosumi-mobile
       - run: bun run check
         working-directory: takosumi-mobile
+
+  # The native plugin tests `bun run check` does not run: the takosumi-push
+  # plugin's RFC 8291 decryption and Declarative Web Push parsing (Kotlin on
+  # the plain JVM, with the RFC 8291 Appendix A vector and the shared
+  # web-push-cases.json), and the plugins' Rust tests.
+  native-plugins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          gradle-version: "8.14.3"
+      - name: Kotlin JVM tests (takosumi-push)
+        run: gradle --project-dir src-tauri/plugins/push/jvm-tests test
+      - name: System libraries for Tauri on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-plugins
+          key: native-plugins-cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/plugins/*/Cargo.toml') }}
+          restore-keys: native-plugins-cargo-${{ runner.os }}-
+      - name: cargo test (takosumi-push, app-screen)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-plugins
+        # The plugins have no lockfile of their own; the app's pins the same
+        # versions the app builds with.
+        run: |
+          for plugin in push app-screen; do
+            cp src-tauri/Cargo.lock "src-tauri/plugins/$plugin/Cargo.lock"
+            cargo test --manifest-path "src-tauri/plugins/$plugin/Cargo.toml"
+          done

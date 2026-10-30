@@ -262,15 +262,18 @@ mode until APNs and Firebase credentials exist. It was deployed from 39ca885
 
 Takosumi Mobile's relay client is `src/push-relay.ts`, the per-instance
 subscriptions `src/push-manager.ts`, and the Android receiver (decryption with
-the RFC 8291 Appendix A vector, display, taps) `src-tauri/plugins/push`. A push
-whose `s` the device does not know, or that does not decrypt, shows generic
-text and nothing from the message (Android). The token is sent with
-`PUT /v1/devices/{id}` when it changes and at least weekly.
+the RFC 8291 Appendix A vector, display, taps) `src-tauri/plugins/push`. The
+envelope (`s`, and on APNs anything beside it) is not authenticated, so only a
+message that decrypts with the subscription's key and `auth` may switch the
+app to an instance or open a page. On Android a push whose `s` the device does
+not know is dropped, and one that does not decrypt shows generic text that
+only opens the app. The token is sent with `PUT /v1/devices/{id}` when it
+changes and at least weekly.
 
 ## Not yet done
 
 - The iOS Notification Service Extension (design step 8): it decrypts with the
   keys in the shared Keychain access group and replaces the placeholder text;
-  until then iOS shows 「Takosumi / 新しい通知」 and a tap opens the instance's
-  home.
+  until then iOS shows 「Takosumi / 新しい通知」, and a tap decrypts the
+  message in the app and opens its instance and page.
 - A delivery through real APNs/FCM credentials and a real device.

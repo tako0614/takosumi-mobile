@@ -41,7 +41,8 @@ internal class PushNotifier(private val context: Context) {
             ?.deleteNotificationChannel(channelId(record))
     }
 
-    fun show(record: SubscriptionRecord, notification: DeclarativeNotification, tapToken: String) {
+    /** A decrypted notification; its tap opens `ticket`'s page (no ticket: the app). */
+    fun show(record: SubscriptionRecord, notification: DeclarativeNotification, ticket: TapTicket?) {
         ensureChannel(record)
         val channel = channelId(record)
         post(
@@ -50,16 +51,16 @@ internal class PushNotifier(private val context: Context) {
             tag = "$channel:${notification.tag ?: randomTag()}",
             title = notification.title,
             body = notification.body,
-            tapToken = tapToken,
+            ticket = ticket,
         )
     }
 
     /**
-     * A message this device cannot attribute (unknown `s`) or read: generic
-     * text, never the instance's words. A known subscription still opens its
-     * instance when tapped.
+     * A message this device could not read: generic text, never the
+     * instance's words, and a tap that only opens the app (the unread
+     * envelope proves nothing about which instance or account it is for).
      */
-    fun showGeneric(record: SubscriptionRecord?, tapToken: String) {
+    fun showGeneric(record: SubscriptionRecord?) {
         val channel = if (record != null) {
             ensureChannel(record)
             channelId(record)
@@ -67,17 +68,19 @@ internal class PushNotifier(private val context: Context) {
             ensureGeneralChannel()
             GENERAL_CHANNEL
         }
-        post(channel, "$channel:${randomTag()}", "Takosumi", genericBody(), tapToken)
+        post(channel, "$channel:${randomTag()}", "Takosumi", genericBody(), null)
     }
 
-    private fun post(channel: String, tag: String, title: String, body: String?, tapToken: String) {
+    private fun post(channel: String, tag: String, title: String, body: String?, ticket: TapTicket?) {
         if (!canPost()) return
         val launch = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: return
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        launch.putExtra(EXTRA_TAP_TOKEN, tapToken)
+        if (ticket != null) launch.putExtra(EXTRA_TAP_TOKEN, ticket.token)
+        // A request code of its own per ticket: two notifications never share a
+        // PendingIntent, so FLAG_UPDATE_CURRENT cannot swap their tokens.
         val pending = PendingIntent.getActivity(
             context,
-            tapToken.hashCode(),
+            ticket?.requestCode ?: 0,
             launch,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )

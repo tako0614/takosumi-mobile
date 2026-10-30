@@ -1,0 +1,54 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        // The Kotlin version the generated Android project builds the plugin with.
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25"
+    }
+}
+
+apply plugin: "org.jetbrains.kotlin.jvm"
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        kotlin {
+            srcDirs = ["../android/src/main/java"]
+            include "WebPushCrypto.kt", "DeclarativePush.kt"
+        }
+    }
+    test {
+        kotlin {
+            srcDirs = ["../android/src/test/java"]
+            include "WebPushCryptoTest.kt", "WebPushCasesTest.kt"
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    kotlinOptions.jvmTarget = "17"
+}
+
+dependencies {
+    // Android ships org.json; on the plain JVM the original library stands in.
+    implementation "org.json:json:20240303"
+    testImplementation "junit:junit:4.13.2"
+}
+
+test {
+    // web-push-cases.json is found as ../web-push-cases.json, as from ../android.
+    workingDir = projectDir
+    testLogging {
+        events "passed", "failed"
+        exceptionFormat "full"
+    }
+}

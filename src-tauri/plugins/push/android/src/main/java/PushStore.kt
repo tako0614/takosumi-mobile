@@ -5,8 +5,10 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.AtomicFile
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
+import java.io.FileNotFoundException
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.Base64
@@ -36,7 +38,12 @@ internal class TapRecord(
     val account: String,
     val navigate: String?,
     val createdAt: Long,
+    /** When it was tapped (0 until then). */
+    val tappedAt: Long = 0,
 )
+
+/** What a posted notification's tap intent carries, and its PendingIntent request code. */
+internal class TapTicket(val token: String, val requestCode: Int)
 
 /**
  * Subscriptions and taps, in one small JSON file under `noBackupFilesDir`
@@ -110,25 +117,31 @@ internal class PushStore(context: Context) {
     fun privateKey(record: SubscriptionRecord): ByteArray = KeyWrapper.unwrap(record.wrappedPrivateKey)
 
     /**
-     * Remembers what a posted notification opens and returns the opaque token
-     * its tap intent carries. An intent from anywhere else has no known token
-     * and is ignored, so another app cannot fake a Takosumi notification tap.
+     * Remembers what a posted notification opens (only notifications this
+     * device could read: the subscription is then authentic) and returns the
+     * opaque token its tap intent carries. An intent from anywhere else has no
+     * known token and is ignored, so another app cannot fake a Takosumi
+     * notification tap. Each ticket gets its own PendingIntent request code,
+     * so one notification's PendingIntent never takes over another's extras.
      */
-    fun rememberTap(record: SubscriptionRecord?, navigate: String?, now: Long): String = synchronized(LOCK) {
+    fun rememberTap(record: SubscriptionRecord, navigate: String?, now: Long): TapTicket = synchronized(LOCK) {
         val root = read()
         val taps = root.optJSONObject("taps") ?: JSONObject()
         val token = randomToken()
         val entry = JSONObject()
-            .put("subscriptionId", record?.subscriptionId ?: "")
-            .put("instance", record?.instance ?: "")
-            .put("account", record?.account ?: "")
+            .put("subscriptionId", record.subscriptionId)
+            .put("instance", record.instance)
+            .put("account", record.account)
             .put("createdAt", now)
         if (navigate != null) entry.put("navigate", navigate)
         taps.put(token, entry)
         prune(taps, now)
         root.put("taps", taps)
+        // Request codes count up (and wrap) across the store's life.
+        val requestCode = root.optInt("nextRequestCode", 1).coerceAtLeast(1)
+        root.put("nextRequestCode", if (requestCode == Int.MAX_VALUE) 1 else requestCode + 1)
         write(root)
-        token
+        TapTicket(token, requestCode)
     }
 
     /** Takes the tap for `token` (once) and keeps it as the pending tap. */
@@ -142,19 +155,24 @@ internal class PushStore(context: Context) {
             write(root)
             return null
         }
-        root.put("pendingTap", entry.put("token", token))
+        root.put("pendingTap", entry.put("token", token).put("tappedAt", now))
         write(root)
         tap
     }
 
-    /** The tap the shell has not handled yet (cold start), at most once. */
+    /**
+     * The tap the shell has not handled yet (a cold start), at most once and
+     * only for a few minutes after the tap: a tap the shell never took must not
+     * switch accounts at some later launch.
+     */
     fun takePendingTap(now: Long): TapRecord? = synchronized(LOCK) {
         val root = read()
         val entry = root.optJSONObject("pendingTap") ?: return null
         root.remove("pendingTap")
         write(root)
         val tap = decodeTap(entry.optString("token"), entry) ?: return null
-        if (now - tap.createdAt > TAP_TTL_MILLIS) null else tap
+        val fresh = now - tap.tappedAt in 0..PENDING_TAP_TTL_MILLIS && now - tap.createdAt <= TAP_TTL_MILLIS
+        if (fresh) tap else null
     }
 
     private fun prune(taps: JSONObject, now: Long) {
@@ -169,14 +187,26 @@ internal class PushStore(context: Context) {
         if (excess > 0) remaining.take(excess).forEach { taps.remove(it.first) }
     }
 
-    private fun read(): JSONObject =
-        try {
-            JSONObject(String(file.readFully(), Charsets.UTF_8))
-        } catch (error: Exception) {
-            // No file yet, or an unreadable one that holds nothing usable: start
-            // over. The shell notices missing keys on its next check.
+    /**
+     * The stored state. No file yet is an empty state. A read that fails
+     * (I/O) throws, so the caller writes nothing and a passing failure cannot
+     * replace the subscriptions with an empty file. Only content that is not
+     * JSON at all, which AtomicFile's whole-file replacement makes unlikely and
+     * which holds nothing usable, starts over; the shell notices the missing
+     * keys on its next check and subscribes again.
+     */
+    private fun read(): JSONObject {
+        val bytes = try {
+            file.readFully()
+        } catch (error: FileNotFoundException) {
+            return JSONObject().put("version", VERSION)
+        }
+        return try {
+            JSONObject(String(bytes, Charsets.UTF_8))
+        } catch (error: JSONException) {
             JSONObject().put("version", VERSION)
         }
+    }
 
     private fun write(root: JSONObject) {
         root.put("version", VERSION)
@@ -232,6 +262,7 @@ internal class PushStore(context: Context) {
             account = json.optString("account"),
             navigate = if (json.has("navigate")) json.optString("navigate") else null,
             createdAt = json.optLong("createdAt"),
+            tappedAt = json.optLong("tappedAt"),
         )
     }
 
@@ -242,6 +273,8 @@ internal class PushStore(context: Context) {
         private const val MAX_SUBSCRIPTIONS = 64
         private const val MAX_TAPS = 64
         private const val TAP_TTL_MILLIS = 30L * 24 * 60 * 60 * 1000
+        /** How long a tap waits for the shell to take it (a cold start). */
+        private const val PENDING_TAP_TTL_MILLIS = 5L * 60 * 1000
         private val LOCK = Any()
         private val random = SecureRandom()
 

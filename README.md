@@ -59,8 +59,10 @@ Notifications from Takosumi itself (TASK-0119 step 7):
   it with a key that never leaves it (Android: wrapped by the Android Keystore;
   iOS: the Keychain, in an access group a Notification Service Extension can
   share) and shows the Declarative Web Push message on that instance's own
-  notification channel. A message it cannot attribute or read shows generic
-  text;
+  notification channel. Only a message that decrypts with a subscription's
+  key may switch accounts or open a page (the relay's envelope is not
+  authenticated): one this device cannot read shows generic text and opens
+  just the app, and one for a subscription it does not have is dropped;
 - tapping a notification switches to its instance and account, also when the
   app was not running, and opens the page: a Run opens in the app's Run
   screen (approve / cancel there), any other page of the instance in the
@@ -155,14 +157,23 @@ Native setup the build does not provide:
   it the app runs and reports that this build cannot receive notifications.
   The relay sends FCM registration tokens (`message.token`), which the app
   takes from `FirebaseMessaging.getToken()`.
-- iOS: the Push Notifications capability (`aps-environment`), and for the
-  Notification Service Extension (not built yet) a shared Keychain access
-  group listed in `keychain-access-groups` and in Info.plist as
+- iOS: the Push Notifications capability (`aps-environment`). The APNs
+  environment the relay is told comes from Info.plist
+  `TakosumiApnsEnvironment` (`development` / `production`, per build
+  configuration), else the embedded provisioning profile's `aps-environment`,
+  else production (App Store / TestFlight). For the Notification Service
+  Extension (not built yet): a shared Keychain access group listed in
+  `keychain-access-groups` and in Info.plist as
   `TakosumiPushKeychainAccessGroup` (for example
-  `$(AppIdentifierPrefix)com.takosumi.push`).
+  `$(AppIdentifierPrefix)com.takosumi.push`); the extension links the
+  plugin's `TakosumiPushKeychain` target, which holds the keys and the same
+  decryption.
 
 The native side is `src-tauri/plugins/push` (`takosumi-push`): the token, one
 P-256 key pair and `auth` per subscription, decryption
 (`WebPushCrypto.kt`, checked against the RFC 8291 Appendix A vector and the
 shared `web-push-cases.json`), the notification channels and taps. A tap
-intent carries only an opaque token the plugin issued for that notification.
+intent carries only an opaque token the plugin issued for that notification,
+and a tap the shell has not taken within five minutes is not used. CI runs the
+decryption tests on the plain JVM (`src-tauri/plugins/push/jvm-tests`) and the
+plugins' `cargo test`, which `bun run check` does not cover.

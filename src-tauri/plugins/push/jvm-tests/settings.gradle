@@ -1,0 +1,4 @@
+// The plugin's plain-JVM code (RFC 8291 decryption, Declarative Web Push
+// parsing) and its tests, built without Android or Tauri so CI can run them.
+// The Android build compiles and tests the same files in ../android.
+rootProject.name = "takosumi-push-jvm-tests"

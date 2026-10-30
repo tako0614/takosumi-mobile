@@ -6,9 +6,6 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.annotation.Config
 import java.io.File
 import java.util.Base64
 
@@ -16,11 +13,9 @@ import java.util.Base64
  * Every case of `web-push-cases.json` (messages encrypted by the relay's
  * standards Web Push tool, the same table `tests/push-cases.test.ts` reads):
  * decryption with the subscription's key, then the Declarative Web Push parse
- * that decides what the notification shows and opens. Robolectric supplies
- * Android's own org.json.
+ * that decides what the notification shows and opens. Plain JVM with the real
+ * org.json, so it also runs in CI without Android (`jvm-tests`).
  */
-@RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], manifest = Config.NONE)
 class WebPushCasesTest {
     private fun fixture(): JSONObject {
         val file = listOf(File("../web-push-cases.json"), File("web-push-cases.json")).first { it.isFile }
