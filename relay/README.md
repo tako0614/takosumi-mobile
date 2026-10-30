@@ -1,16 +1,20 @@
 # Takosumi Mobile push relay
 
-The push relay lets apps opened inside Takosumi Mobile use standard Web Push.
-To an app it is an ordinary RFC 8030 push service, like FCM's or Apple's: the
-app sends an RFC 8291 `aes128gcm` message with RFC 8292 VAPID to the endpoint
-its page received from `pushManager.subscribe()`. The relay forwards the still
+The push relay carries a Takosumi instance's own notifications (Runs waiting
+for approval, failures, finished installs) to Takosumi Mobile. To the instance
+it is an ordinary RFC 8030 push service, like FCM's or Apple's: the instance
+sends an RFC 8291 `aes128gcm` message with RFC 8292 VAPID to the endpoint the
+device registered as its pusher (`data.url`). The relay forwards the still
 encrypted body to the device through APNs or FCM, and Takosumi Mobile decrypts
 and shows it on the device.
 
 The relay is part of Takosumi Mobile and is run by its publisher. It is not part
-of Takosumi: Takosumi's control plane, API and dashboard never see a push.
-Design: takos-control `docs/platform/takosumi-mobile-browser.md` (「push中継」)
-and ADR 0026.
+of Takosumi: an instance only knows the relay's origin (its operator lists it in
+`TAKOSUMI_NOTIFICATION_PUSH_RELAY_ORIGINS`) and never sees a device token.
+Design: takos-control `docs/platform/takosumi-app-clients.md`
+(「Takosumi自身の通知」) and ADR 0026. One subscription per (instance, account);
+its `application_server_key` is that instance's VAPID public key
+(`web_push_public_key`).
 
 It is a Cloudflare Worker with a D1 database. It needs no dependency beyond
 what the repository already has; `relay/tsconfig.json` checks it, and
@@ -254,11 +258,19 @@ mode until APNs and Firebase credentials exist. It was deployed from 39ca885
 - A Firebase project for Android and a service account key for FCM HTTP v1.
 - The relay's domain, and the go-ahead for the production deploy.
 
+## Device side
+
+Takosumi Mobile's relay client is `src/push-relay.ts`, the per-instance
+subscriptions `src/push-manager.ts`, and the Android receiver (decryption with
+the RFC 8291 Appendix A vector, display, taps) `src-tauri/plugins/push`. A push
+whose `s` the device does not know, or that does not decrypt, shows generic
+text and nothing from the message (Android). The token is sent with
+`PUT /v1/devices/{id}` when it changes and at least weekly.
+
 ## Not yet done
 
-- Takosumi Mobile's relay client, the injected Push API, key storage and
-  decryption on the device (design steps 4 and 5).
-- The device must drop a push whose `s` it does not know (a superseded
-  installation's subscription, for example); the iOS Notification Service
-  Extension must show nothing app-specific for it.
+- The iOS Notification Service Extension (design step 8): it decrypts with the
+  keys in the shared Keychain access group and replaces the placeholder text;
+  until then iOS shows 「Takosumi / 新しい通知」 and a tap opens the instance's
+  home.
 - A delivery through real APNs/FCM credentials and a real device.

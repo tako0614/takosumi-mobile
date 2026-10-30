@@ -458,3 +458,51 @@
   align-items: center;
   font-size: 0.8rem;
 }
+
+/* Notifications (通知): one switch per Takosumi (instance and account). */
+.push-settings {
+  display: grid;
+  gap: 10px;
+}
+
+.push-switch {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.push-switch > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.push-switch strong {
+  color: var(--shell-label);
+  font-size: 0.86rem;
+}
+
+.push-switch small {
+  color: var(--shell-muted);
+  font-size: 0.74rem;
+}
+
+.push-prompt {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 0.8rem;
+}
+
+.push-prompt p {
+  margin: 0;
+}
+
+/* The Run screen a notification opens. */
+.run-sheet-facts dd[data-status="waiting_approval"],
+.run-sheet-facts dd[data-status="failed"] {
+  color: var(--accent);
+}

@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
-import type { MobileApp, MobileWorkspace, TakosumiMobileHome } from "../src/api.ts";
+import type { MobileApp, MobileRun, MobileWorkspace, TakosumiMobileHome } from "../src/api.ts";
 import {
   appDisplayName,
   appRoleLabel,
   appStateLabel,
+  isAttentionRun,
   legacyWorkspaceOptions,
   mobileHomeTitle,
+  pendingApprovalCount,
 } from "../src/home-presentation.ts";
 
 const app: MobileApp = {
@@ -82,4 +84,36 @@ test("Workspace controls are absent from app-scoped and empty app homes", () => 
     workspace,
     workspaces: [workspace],
   })).toEqual([workspace]);
+});
+
+function run(input: Partial<MobileRun>): MobileRun {
+  return {
+    id: "run_a",
+    workspaceId: "ws_a",
+    capsuleId: "cap_a",
+    type: "plan",
+    status: "waiting_approval",
+    createdBy: "acct_a",
+    createdAt: "2026-07-20T00:00:00.000Z",
+    ...input,
+  };
+}
+
+test("the home's unread badge counts Runs this account can approve, from Takosumi's own data", () => {
+  expect(pendingApprovalCount(undefined)).toBe(0);
+  expect(
+    pendingApprovalCount({
+      runs: [
+        run({ id: "1" }),
+        run({ id: "2", type: "destroy_plan" }),
+        run({ id: "3", type: "restore" }),
+        // Not approvable: an apply waiting, a failed plan, a finished plan.
+        run({ id: "4", type: "apply" }),
+        run({ id: "5", status: "failed" }),
+        run({ id: "6", status: "succeeded" }),
+      ],
+    }),
+  ).toBe(3);
+  expect(isAttentionRun(run({ status: "failed" }))).toBe(true);
+  expect(isAttentionRun(run({ status: "running" }))).toBe(false);
 });

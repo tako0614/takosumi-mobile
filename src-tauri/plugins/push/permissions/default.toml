@@ -1,0 +1,14 @@
+[default]
+description = "Allows Takosumi Mobile to ask for notification permission, read its APNs/FCM token, keep one Web Push key pair per Takosumi instance subscription, and take notification taps"
+permissions = [
+  "allow-permission-state",
+  "allow-request-permission",
+  "allow-get-token",
+  "allow-device-name",
+  "allow-create-subscription-keys",
+  "allow-delete-subscription-keys",
+  "allow-list-subscriptions",
+  "allow-take-pending-tap",
+  "allow-register-listener",
+  "allow-remove-listener",
+]

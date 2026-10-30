@@ -1,7 +1,11 @@
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js";
 import {
+  ensureFreshMobileSession,
   formatMobilePreviewDate,
+  loadMobileAccounts,
+  mobileAccountIdentity,
   mobileErrorMessage,
+  setActiveMobileAccount,
   type MobileSession,
   type NativeBridge,
 } from "@takosjp/mobile-kit";
@@ -20,17 +24,17 @@ import {
   canCancelRun,
   cancelRun,
   loadHome,
+  loadRun,
   loadWorkspaceHome,
   type MobileApp,
   type MobileCapsule,
   type MobileRun,
-  type MobileRunStatus,
-  type MobileRunType,
   type TakosumiMobileHome,
 } from "./api.ts";
 import {
   createProductAppScreenOpener,
   createProductNativeBridge,
+  createProductPushNative,
   createProductStoreOpener,
   isUnsupportedTauriDesktop,
   productPlatform,
@@ -39,9 +43,13 @@ import {
   appDisplayName,
   appRoleLabel,
   appStateLabel,
+  isAttentionRun,
   launcherAppsFromHome,
   legacyWorkspaceOptions,
   mobileHomeTitle,
+  pendingApprovalCount,
+  runStatusLabel,
+  runTypeLabel,
 } from "./home-presentation.ts";
 import { AppLauncher } from "./app-launcher.tsx";
 import { fetchIconDataUrl, rasterizeIconPng } from "./app-icons.ts";
@@ -60,6 +68,20 @@ import {
   type RecentApp,
 } from "./open-routing.ts";
 import { productAdapter } from "./product.ts";
+import { withAccountRemovalHook } from "./push-account-hook.ts";
+import { deviceLanguage } from "./push-instance.ts";
+import { createPushManager, pushOrigins, type PushManager } from "./push-manager.ts";
+import type { NotificationReceived, NotificationTap, PushNative } from "./push-native.ts";
+import { normalizeRelayOrigin } from "./push-relay.ts";
+import {
+  accountForTap,
+  createPendingNotification,
+  routeNotification,
+  tapIsForSession,
+  type PendingNotifications,
+} from "./push-routing.ts";
+import { PushSettings } from "./push-settings.tsx";
+import { RunScreen } from "./run-screen.tsx";
 import { authorizeRunMutation } from "./security.ts";
 import {
   createDeepLinkOpener,
@@ -69,6 +91,14 @@ import {
 } from "./takosumi-origins.ts";
 import { takosumiOrigins } from "./url-policy.ts";
 import "./styles.css";
+
+/** Takosumi's own notifications, as the home needs them. */
+interface NotificationWiring {
+  readonly manager: PushManager;
+  readonly pending: PendingNotifications;
+  /** Subscribe to notifications that arrived while the app is open. */
+  readonly onReceived: (handler: (event: NotificationReceived) => void) => () => void;
+}
 
 /** How apps open: the router, its chooser, recent apps and bar actions. */
 interface OpenRouting {
@@ -101,6 +131,12 @@ const metrics = [
   {
     label: "要対応",
     value: (home) => home?.runs.filter(isAttentionRun).length,
+  },
+  {
+    // The unread count is Takosumi's own data (Runs waiting for this
+    // account's approval), never a count of notifications.
+    label: "承認待ち",
+    value: (home) => pendingApprovalCount(home),
   },
 ] satisfies readonly MobileShellMetric<TakosumiMobileHome>[];
 
@@ -183,16 +219,104 @@ function startTakosumiMobile() {
   };
   void opener.onActionPending(takeAction).catch(() => undefined);
   takeAction();
-  const nativeBridge = withAppScreenDeepLinks(baseBridge, (link) => {
-    if (!link.ok) {
-      console.warn(`Ignored app screen link: ${link.error}`);
-      return;
+  const pushNative = createProductPushNative();
+  // Signing out of an instance removes its pusher and relay subscription
+  // while the session it had can still authenticate.
+  const nativeBridge = withAccountRemovalHook(
+    withAppScreenDeepLinks(baseBridge, (link) => {
+      if (!link.ok) {
+        console.warn(`Ignored app screen link: ${link.error}`);
+        return;
+      }
+      // A link names a page to show inside Takosumi, judged with every known
+      // Takosumi origin. It neither resumes nor becomes the app's remembered
+      // last page: only pages the person reaches from the app itself are.
+      void deepLinks.open(link.url);
+    }),
+    productAdapter,
+    (session) => push.manager.accountRemoving(session),
+  );
+  const push = createNotificationWiring(pushNative, nativeBridge);
+  const render = () => renderShell({ nativeBridge, launcher, opener, routing, push });
+
+  // A tapped notification names its instance and account: make that account
+  // the active one, then (re)start the shell, which restores its session and
+  // opens the notification's page. Taps that arrive while the shell runs for
+  // the same account open at once.
+  const takeTap = async (tap: NotificationTap | undefined): Promise<boolean> => {
+    if (!tap) return false;
+    const list = await loadMobileAccounts({ adapter: productAdapter, nativeBridge });
+    const account = accountForTap(tap, list.accounts);
+    if (!account) return false;
+    const switching = list.activeId !== account.id;
+    if (switching) {
+      await setActiveMobileAccount({ adapter: productAdapter, nativeBridge, accountId: account.id });
     }
-    // A link names a page to show inside Takosumi, judged with every known
-    // Takosumi origin. It neither resumes nor becomes the app's remembered
-    // last page: only pages the person reaches from the app itself are.
-    void deepLinks.open(link.url);
+    push.pending.set({
+      identity: mobileAccountIdentity(account),
+      ...(tap.navigate ? { navigate: tap.navigate } : {}),
+    });
+    return switching;
+  };
+  void (async () => {
+    // Cold start: the tap that launched the app is waiting natively.
+    await takeTap(await pushNative?.takePendingTap().catch(() => undefined)).catch(() => false);
+    render();
+    if (!pushNative) return;
+    await pushNative
+      .onTap(() => {
+        void pushNative
+          .takePendingTap()
+          .then(takeTap)
+          .then((switched) => {
+            if (switched) render();
+          })
+          .catch((error) => console.warn(mobileErrorMessage(error, "通知を開けませんでした。")));
+      })
+      .catch(() => undefined);
+    await pushNative.onTokenRefresh((token) => void push.manager.tokenRefreshed(token)).catch(() => undefined);
+    // Subscriptions of accounts that are gone, orphaned keys, failed deletions.
+    const accounts = await loadMobileAccounts({ adapter: productAdapter, nativeBridge }).catch(() => undefined);
+    if (accounts) await push.manager.reconcile(accounts.accounts).catch(() => undefined);
+  })();
+}
+
+function createNotificationWiring(native: PushNative | undefined, nativeBridge: NativeBridge): NotificationWiring {
+  const env = import.meta.env as Record<string, string | undefined>;
+  const manager = createPushManager({
+    native,
+    relayOrigin: normalizeRelayOrigin(env.VITE_TAKOSUMI_PUSH_RELAY_ORIGIN),
+    fetch: (input, init) => globalThis.fetch(input, init),
+    store: nativeBridge.storage,
+    secureStore: nativeBridge.secureStore,
+    freshSession: (session) =>
+      ensureFreshMobileSession({ adapter: productAdapter, nativeBridge, session }),
+    lang: () => deviceLanguage(typeof navigator === "undefined" ? undefined : navigator.language),
   });
+  const receivedHandlers = new Set<(event: NotificationReceived) => void>();
+  void native
+    ?.onReceived((event) => {
+      for (const handler of receivedHandlers) handler(event);
+    })
+    .catch(() => undefined);
+  return {
+    manager,
+    pending: createPendingNotification(),
+    onReceived(handler) {
+      receivedHandlers.add(handler);
+      return () => receivedHandlers.delete(handler);
+    },
+  };
+}
+
+function renderShell(input: {
+  readonly nativeBridge: NativeBridge;
+  readonly launcher: LauncherController;
+  readonly opener: AppScreenOpener;
+  readonly routing: OpenRouting;
+  readonly push: NotificationWiring;
+}) {
+  const { nativeBridge, launcher, opener, routing, push } = input;
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
     createNativeBridge: () => nativeBridge,
@@ -251,6 +375,7 @@ function startTakosumiMobile() {
         launcher={launcher}
         opener={opener}
         routing={routing}
+        push={push}
       />
     ),
   });
@@ -275,12 +400,15 @@ function TakosumiControlHome(props: {
   launcher: LauncherController;
   opener: AppScreenOpener;
   routing: OpenRouting;
+  push: NotificationWiring;
 }) {
   const [current, setCurrent] = createSignal(props.home);
   const launcherApps = createMemo(() => launcherAppsFromHome(current()));
   const [activeSession, setActiveSession] = createSignal(props.session);
   const [loading, setLoading] = createSignal(false);
   const [status, setStatus] = createSignal<string>();
+  /** The Run screen: a Run id and the dashboard page it mirrors. */
+  const [runScreen, setRunScreen] = createSignal<{ readonly runId: string; readonly url: string }>();
 
   createEffect(() => setCurrent(props.home));
   createEffect(() => setActiveSession(props.session));
@@ -296,6 +424,48 @@ function TakosumiControlHome(props: {
       if (activeSession() === session) props.routing.setContext(context);
     })().catch(() => props.routing.setContext(undefined));
   });
+
+  // A tapped notification for this instance and account opens here: a Run in
+  // the Run screen, any other page of the instance in the browser view.
+  const openPendingNotification = () => {
+    const session = activeSession();
+    const pending = props.push.pending.takeFor(session);
+    if (!pending) return;
+    const route = routeNotification(pending.navigate, pushOrigins(session));
+    if (route.kind === "run") {
+      setRunScreen({ runId: route.runId, url: route.url });
+    } else if (route.kind === "page") {
+      void openTakosumiPage(route.url);
+    }
+    void reload();
+  };
+  createEffect(on(activeSession, () => openPendingNotification()));
+  onCleanup(props.push.pending.subscribe(openPendingNotification));
+  // A notification for this account while the app is open: the home's counts
+  // come from Takosumi, so read them again.
+  onCleanup(
+    props.push.onReceived((event) => {
+      if (tapIsForSession(event, activeSession())) void reload();
+    }),
+  );
+
+  /** A Takosumi page outside sign-in: the browser view (#7). */
+  async function openTakosumiPage(url: string) {
+    const accountsOrigins = props.routing.context()?.accountsOrigins ?? pushOrigins(activeSession());
+    try {
+      await props.launcher.openUrl(url, { platform: props.routing.platform, accountsOrigins: [...accountsOrigins] });
+    } catch (error) {
+      setStatus(mobileErrorMessage(error, "ページを開けませんでした。"));
+    }
+  }
+
+  function openRun(run: MobileRun) {
+    // The dashboard is served where the instance's notifications point: its
+    // Accounts (issuer) origin, which is usually the instance origin too.
+    const origins = pushOrigins(activeSession());
+    const origin = origins[1] ?? origins[0]!;
+    setRunScreen({ runId: run.id, url: `${origin}/runs/${encodeURIComponent(run.id)}` });
+  }
 
   const attentionRuns = createMemo(() =>
     (current()?.runs ?? []).filter(isAttentionRun),
@@ -330,7 +500,7 @@ function TakosumiControlHome(props: {
     }
   }
 
-  async function approve(run: MobileRun) {
+  async function approve(run: MobileRun): Promise<boolean> {
     setLoading(true);
     try {
       const input = {
@@ -358,13 +528,15 @@ function TakosumiControlHome(props: {
           : "変更を承認しました。",
       );
       await reload();
+      return true;
     } catch (error) {
       setStatus(mobileErrorMessage(error, "承認できませんでした。"));
       setLoading(false);
+      return false;
     }
   }
 
-  async function cancel(run: MobileRun) {
+  async function cancel(run: MobileRun): Promise<boolean> {
     setLoading(true);
     try {
       const result = await cancelRun({
@@ -384,9 +556,11 @@ function TakosumiControlHome(props: {
       setActiveSession(result.session);
       setStatus("キャンセルを受け付けました。");
       await reload();
+      return true;
     } catch (error) {
       setStatus(mobileErrorMessage(error, "キャンセルできませんでした。"));
       setLoading(false);
+      return false;
     }
   }
 
@@ -411,6 +585,21 @@ function TakosumiControlHome(props: {
 
       <Show when={status()}>
         {(message) => <p class="mobile-status">{message()}</p>}
+      </Show>
+
+      <Show when={runScreen()}>
+        {(screen) => (
+          <RunScreen
+            runId={screen().runId}
+            host={new URL(activeSession().hostUrl).host}
+            loadRun={(runId) => loadRun(activeSession(), runId)}
+            appName={capsuleName}
+            approve={approve}
+            cancel={cancel}
+            openDashboard={() => void openTakosumiPage(screen().url)}
+            onClose={() => setRunScreen(undefined)}
+          />
+        )}
       </Show>
 
       <AppLauncher
@@ -439,7 +628,7 @@ function TakosumiControlHome(props: {
 
       <MobilePreviewSection
         title="要対応"
-        detail={attentionRuns().length ? `${attentionRuns().length}件` : "なし"}
+        detail={attentionDetail(attentionRuns(), pendingApprovalCount(current()))}
       >
         <Show
           when={attentionRuns().length}
@@ -456,9 +645,7 @@ function TakosumiControlHome(props: {
                       <button
                         type="button"
                         class="text-button"
-                        onClick={() =>
-                          void props.openHostRoute(`/runs/${run.id}`)
-                        }
+                        onClick={() => openRun(run)}
                       >
                         詳細
                       </button>
@@ -482,6 +669,8 @@ function TakosumiControlHome(props: {
           </MobilePreviewList>
         </Show>
       </MobilePreviewSection>
+
+      <PushSettings session={activeSession()} manager={props.push.manager} />
 
       <MobilePreviewSection
         title="サービス"
@@ -580,9 +769,7 @@ function TakosumiControlHome(props: {
                       <button
                         type="button"
                         class="text-button"
-                        onClick={() =>
-                          void props.openHostRoute(`/runs/${run.id}`)
-                        }
+                        onClick={() => openRun(run)}
                       >
                         開く
                       </button>
@@ -640,10 +827,6 @@ function CapsuleMark(props: { capsule: MobileCapsule }) {
   );
 }
 
-function isAttentionRun(run: MobileRun): boolean {
-  return run.status === "waiting_approval" || run.status === "failed";
-}
-
 function capsuleStatusLabel(capsule: MobileCapsule): string {
   const labels: Record<MobileCapsule["status"], string> = {
     pending: "準備中",
@@ -657,32 +840,12 @@ function capsuleStatusLabel(capsule: MobileCapsule): string {
   return labels[capsule.status];
 }
 
-function runStatusLabel(status: MobileRunStatus): string {
-  const labels: Record<MobileRunStatus, string> = {
-    queued: "待機中",
-    running: "実行中",
-    waiting_approval: "承認待ち",
-    succeeded: "完了",
-    failed: "失敗",
-    cancelled: "中止",
-    expired: "期限切れ",
-  };
-  return labels[status];
-}
-
-function runTypeLabel(type: MobileRunType): string {
-  const labels: Record<MobileRunType, string> = {
-    source_sync: "ソース同期",
-    compatibility_check: "互換性確認",
-    plan: "変更確認",
-    apply: "反映",
-    destroy_plan: "削除確認",
-    destroy_apply: "削除",
-    drift_check: "差分確認",
-    backup: "バックアップ",
-    restore: "復元",
-    artifact: "実行準備",
-    state_recovery: "状態復旧",
-  };
-  return labels[type];
+function attentionDetail(runs: readonly MobileRun[], approvals: number): string {
+  if (!runs.length) return "なし";
+  const failed = runs.filter((run) => run.status === "failed").length;
+  const parts = [
+    ...(approvals ? [`承認待ち ${approvals}件`] : []),
+    ...(failed ? [`失敗 ${failed}件`] : []),
+  ];
+  return parts.length ? parts.join("・") : `${runs.length}件`;
 }

@@ -27,6 +27,8 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_keystore::init())?;
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_app_screen::init())?;
+            #[cfg(mobile)]
+            app.handle().plugin(tauri_plugin_takosumi_push::init())?;
             Ok(())
         })
         .run(tauri::generate_context!())
