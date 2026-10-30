@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import type {
-  MobileSecureStore,
-  MobileSession,
-  NativeBridge,
+import {
+  persistMobileSession,
+  type MobileSecureStore,
+  type MobileSession,
+  type NativeBridge,
 } from "@takosjp/mobile-kit";
+import { productAdapter } from "../src/product.ts";
 import { legacyWorkspaceOptions } from "../src/home-presentation.ts";
 import {
   approveRun,
@@ -616,6 +618,8 @@ test("approval and cancellation authorize, refresh, then use narrow Run routes",
     expiresAt: "2026-07-20T00:00:00.000Z",
   };
   const bridge = memoryBridge();
+  // The app refreshes the saved session of the current instance.
+  await persistMobileSession({ adapter: productAdapter, nativeBridge: bridge, session: expired });
   const approve = await approveRun({
     session: expired,
     nativeBridge: bridge,
