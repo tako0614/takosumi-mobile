@@ -1,0 +1,121 @@
+{
+  "description": "Web Push messages (RFC 8291 aes128gcm, one record) as a Takosumi instance sends them, and what the device shows. Generated with relay/tools/web-push.ts; read by tests/push-cases.test.ts and the Android plugin's WebPushCasesTest.",
+  "rfc8291": {
+    "plaintext": "When I grow up, I want to be a watermelon",
+    "uaPublic": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+    "uaPrivate": "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94",
+    "authSecret": "BTBZMqHH6r4Tts7J_aSIgg",
+    "body": "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN"
+  },
+  "subscription": {
+    "uaPublic": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+    "uaPrivate": "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94",
+    "authSecret": "BTBZMqHH6r4Tts7J_aSIgg",
+    "origins": [
+      "https://takosumi.example",
+      "https://accounts.takosumi.example"
+    ]
+  },
+  "cases": [
+    {
+      "name": "an approval wait opens its Run",
+      "body": "AQEBAQEBAQEBAQEBAQEBAQAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A9PLQfv49iB5ZciRNZF8OIhcPLXx_iY4kmUA5eKiyWdXKz6hz4goeUotJDM961qsf3OIrpf79RK8kbhGciMZ2n8WpJ13nqeSVJFNKYg06AK4EJzXbCYXirLADX064PVi4hvRv1tQ3hgicfU_Xa4Cxg-3smmvByMMuByIhjFPUkrpwWEOhsJCjPPJrbnywGldUU_EkE2BnxVGMeBxEcb9tw1tPYYg4fpYIYZQYZRBOjFDrjchhrlKnzreI6ae3AOpQZSykV946_CDuAv_8Q26F3_OBGuWp_YLTLb5iS-cb9UR2uM2tsoV6Ju1pSWp5seTLNRdW-Q",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"title\":\"承認を待っています\",\"body\":\"yurucommu の変更に、削除を含むplanがあります\",\"navigate\":\"https://takosumi.example/runs/run_123\",\"lang\":\"ja-JP\",\"tag\":\"run:run_123\"}}",
+      "notification": {
+        "title": "承認を待っています",
+        "body": "yurucommu の変更に、削除を含むplanがあります",
+        "navigate": "https://takosumi.example/runs/run_123",
+        "lang": "ja-JP",
+        "tag": "run:run_123"
+      }
+    },
+    {
+      "name": "a page on the Accounts origin is kept",
+      "body": "AgICAgICAgICAgICAgICAgAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A9NBv4hA_YUQ41oQ_55vuEG8rlmwNR6SrLsc4pUy0tU9DNyUhIqtksuFBekmXcvbRwrsLqEUbh-S5uylCINsFWC4MjQmwIQLsjWJ1cTtBSN4Uh0EPlRmjFqTINhRZyq4bo6lZ016_TmHk98Y8bvh-Fjf3TRSBsV1CGgHowZja7AXwM",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"title\":\"Ownership\",\"navigate\":\"https://accounts.takosumi.example/apps/cap_1\"}}",
+      "notification": {
+        "title": "Ownership",
+        "navigate": "https://accounts.takosumi.example/apps/cap_1"
+      }
+    },
+    {
+      "name": "a page on another origin is dropped, the text stays",
+      "body": "AwMDAwMDAwMDAwMDAwMDAwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A80n4d411ZofT7LnjU0rYUo7KTZLZ1kU-Jw1SQVaUqj4X7HeCe_aERPygvXwmWmxlEI2uNwgd4ZCTs8YP9HZo7JlnbgESZJ5ci5U_Q60z5Ojd-zriJdQrp28A_AAuE_eolu9q4sHKRlJIJAy73UFNP-r8XnCgqdP1qnSys",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"title\":\"Look here\",\"body\":\"b\",\"navigate\":\"https://evil.example/runs/1\"}}",
+      "notification": {
+        "title": "Look here",
+        "body": "b"
+      }
+    },
+    {
+      "name": "user info in navigate is dropped",
+      "body": "BAQEBAQEBAQEBAQEBAQEBAAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_5b_uEy4qJc9lYXSw545TD8ppfY_uEe5QDT0HocWB3vbfOsZRhMiaNmrS6py_xkwFRoCnWX5dVjUHS8yNrjwgYFiFxs85kBS8tmoNorq8Ps-W6V03nqJdmPoDRPAbro7mc5GDJem3ywBxDXrliZK43uw",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"title\":\"T\",\"navigate\":\"https://user@takosumi.example/runs/1\"}}",
+      "notification": {
+        "title": "T"
+      }
+    },
+    {
+      "name": "whitespace collapses and a bad lang is dropped",
+      "body": "BQUFBQUFBQUFBQUFBQUFBQAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_rby8EiOm_PZDYcZFtDVRjjpeLgAtwMBaoOUoCsYhtnbf5I_DmXW6tknan0s9wQEqwbEOlTYeSG4lWgfcwCoNT8wLhrGI6ZSirZy7qPoCugBo2bsu283xjvK153Wumw4z6-ymE1etpNgfX2e5JB7khNt7wn8HBbgomOn5Ym-e-sktQV2hpW7I8GdBTlOyknoRNXc5ARAYoKkbQ5yn6gAFQ1wz7GWcpTtfzOQs",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"title\":\"  Run\\n failed\\t \",\"body\":\"a\\n\\nb\",\"lang\":\"not a lang!\",\"navigate\":\"https://takosumi.example/apps/x#attention\"}}",
+      "notification": {
+        "title": "Run failed",
+        "body": "a b",
+        "navigate": "https://takosumi.example/apps/x#attention"
+      }
+    },
+    {
+      "name": "not a Declarative Web Push message",
+      "body": "BgYGBgYGBgYGBgYGBgYGBgAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A-sTxk6pRMvAppSi6RXgyaLruyjOUlG69eVUIHhZDBRui4WbIO_AGksKw",
+      "decrypts": true,
+      "plaintext": "{\"title\":\"x\",\"body\":\"y\"}",
+      "notification": null
+    },
+    {
+      "name": "the wrong magic number",
+      "body": "BwcHBwcHBwcHBwcHBwcHBwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8hpmBZSNvjv3cgHy33qimurkOr6dXoUa5vgV9Xqt-c4lS0SQLAcKTuK8DAFb937XfMPXVoqKwmNiKM4vpY9OxEvx7avmHX8e_WDMGOIzc_J6Uy3qqIjWbIWU85ZhsC2SIH7MjbAWQ",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8031,\"notification\":{\"title\":\"x\",\"navigate\":\"https://takosumi.example/\"}}",
+      "notification": null
+    },
+    {
+      "name": "the magic number as a string",
+      "body": "CAgICAgICAgICAgICAgICAAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A-FYMbdl07zdXmkTFb6y5FX4UAXhnJI3SVhg85Q2wJGQmjqZNvAKiUv7_CuHV7rkfH_BOoQsnSDGYkeJCn0u3tpvaTH6GwFGHBsoHI63RtUWzad_G2QPF8kKw1oh2MRdM-GhLGt3ZzbhA",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":\"8030\",\"notification\":{\"title\":\"x\",\"navigate\":\"https://takosumi.example/\"}}",
+      "notification": null
+    },
+    {
+      "name": "no title",
+      "body": "CQkJCQkJCQkJCQkJCQkJCQAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_IpfJCiIDmlR8NUp0CTuqfTxO7NlF21iH10QM04gfZXiVjyRCVuyclk4qLTjLdI3bfdYaMfEjUHxavIzeseUb78ZiDvr4w4YY2UYhAHkG4O2t2KJNKc62GYQKSMeRDxbSzy8bAfg",
+      "decrypts": true,
+      "plaintext": "{\"web_push\":8030,\"notification\":{\"body\":\"x\",\"navigate\":\"https://takosumi.example/\"}}",
+      "notification": null
+    },
+    {
+      "name": "not JSON",
+      "body": "CgoKCgoKCgoKCgoKCgoKCgAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A-CVs9zGQc_XjlbqT1q6OeYWr4s4grD",
+      "decrypts": true,
+      "plaintext": "hello",
+      "notification": null
+    },
+    {
+      "name": "another subscription's auth secret does not decrypt",
+      "body": "CwsLCwsLCwsLCwsLCwsLCwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A9U2A5kpEuUsTJmhsHE9la4HE0qaPo3a1UDO4Dgz6y4FVlCQHN7XNBiGiNa2Rdc1h8_mX0Xoe4NBJMFEHX2xPrTuOKfn3djgHNrU8GhFhgR2rEqBKrCjMivOfC3nVfWXumkrcIbSmjsiJ9qzL9crX3hr1RCMpipdG-SZ724EHGGoB4w4MrTGgL9h-SfczelAvQsjIKlH3sfe9KeyJ1k3mXLqXdB2oXXkebZqlczs81bhFpBgHX32SnOYXUhemWcl68Z9YH6lNZB7lJ31I_5cR2cxh079wO2W03vErYi7jMfnpsPdDPJDvH7-Sq0NocY_y_-iHmb",
+      "decrypts": false,
+      "notification": null
+    },
+    {
+      "name": "a tampered record does not authenticate",
+      "body": "DAwMDAwMDAwMDAwMDAwMDAAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yIwzp0b0I5W14kGpUSE3BRjUnNJ6Xn1D8745nA-FPR4KkQ-7BpmfrKzyPxqdeC0Yqo1oZlCukygTxrrLdnIku-DcsSKuFnvDjoTCADPgUQMWLUHAPBxQoLBPhpykoTh-haQStBNm48bi6OWkPseIu5n4uXkdov409AZKhsjuIJP2C01D0RTRCJCf2QH3wn7x0B5tXpoTROygruIZq1HQgV2255t5X-lLioqYWMn-8rPH7F7KEYNatC5_HXlulpqIcOEPuywm94tDMi_qTVij_wFgOT9xznPSSd_XTxob9fCjQh4pe6L_iSSdmIdPMmjfID6jk",
+      "decrypts": false,
+      "notification": null
+    }
+  ]
+}

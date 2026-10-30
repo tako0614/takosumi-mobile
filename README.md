@@ -46,6 +46,35 @@ Instances and accounts:
 - the home, approvals and app list always come from the current instance, and
   a token for one instance is never sent to another.
 
+Notifications from Takosumi itself (TASK-0119 step 7):
+
+- each (instance, account) has its own switch on the home (「通知」), and the
+  app asks once after signing in to a new one; turning it on asks for the OS
+  notification permission;
+- the instance tells this device about Runs waiting for approval, failed Runs,
+  finished installs and other events of its own (takosumi
+  `docs/reference/api.md`「Takosumi Mobile の通知の登録」). It sends standard
+  Web Push (RFC 8291 `aes128gcm`, VAPID) to the push relay below, which
+  forwards the still-encrypted message through FCM / APNs. The device decrypts
+  it with a key that never leaves it (Android: wrapped by the Android Keystore;
+  iOS: the Keychain, in an access group a Notification Service Extension can
+  share) and shows the Declarative Web Push message on that instance's own
+  notification channel. A message it cannot attribute or read shows generic
+  text;
+- tapping a notification switches to its instance and account, also when the
+  app was not running, and opens the page: a Run opens in the app's Run
+  screen (approve / cancel there), any other page of the instance in the
+  browser view;
+- signing out of an instance removes its pusher and relay subscription; when
+  the instance's key changes (its operator rotated the secret), the app
+  subscribes again on the next launch; removing this device in the instance's
+  account settings turns the switch off;
+- the home's 「承認待ち」 count comes from Takosumi's own Run list, not from
+  notifications.
+
+Apps opened inside Takosumi Mobile do not get Web Push (the webviews have no
+Push API); the chooser shows how to get an app's own notifications.
+
 It also keeps the daily control loop inside the app:
 
 - switch Workspaces;
@@ -101,7 +130,39 @@ operator instructions. The app has no fallback client id.
 
 ## Push relay
 
-`relay/` holds the Web Push relay that lets apps opened inside Takosumi Mobile
-receive standard Web Push through APNs and FCM (a Cloudflare Worker with D1).
+`relay/` holds the Web Push relay that carries Takosumi's own notifications to
+Takosumi Mobile through APNs and FCM (a Cloudflare Worker with D1).
 See [relay/README.md](relay/README.md); `bun run deploy -- --contract` lists its
 deploy surfaces.
+
+The app talks to one relay, fixed at build time:
+
+```bash
+VITE_TAKOSUMI_PUSH_RELAY_ORIGIN=https://<relay origin> bun run tauri:android:build
+```
+
+Without it the 「通知」 section says that this build has no relay. Each instance
+accepts devices only for relay origins its operator listed in
+`TAKOSUMI_NOTIFICATION_PUSH_RELAY_ORIGINS`, so the operator lists the same
+origin. The production relay domain is not decided yet; the staging relay
+(`takosumi-push-relay-staging`, sink delivery) works for development.
+
+Native setup the build does not provide:
+
+- Android: a Firebase project for `com.takosumi` and its
+  `google-services.json` in `src-tauri/gen/android/app/` (with the Google
+  Services Gradle plugin, as `bun run tauri:android:init` wires it). Without
+  it the app runs and reports that this build cannot receive notifications.
+  The relay sends FCM registration tokens (`message.token`), which the app
+  takes from `FirebaseMessaging.getToken()`.
+- iOS: the Push Notifications capability (`aps-environment`), and for the
+  Notification Service Extension (not built yet) a shared Keychain access
+  group listed in `keychain-access-groups` and in Info.plist as
+  `TakosumiPushKeychainAccessGroup` (for example
+  `$(AppIdentifierPrefix)com.takosumi.push`).
+
+The native side is `src-tauri/plugins/push` (`takosumi-push`): the token, one
+P-256 key pair and `auth` per subscription, decryption
+(`WebPushCrypto.kt`, checked against the RFC 8291 Appendix A vector and the
+shared `web-push-cases.json`), the notification channels and taps. A tap
+intent carries only an opaque token the plugin issued for that notification.

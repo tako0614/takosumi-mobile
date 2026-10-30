@@ -4757,6 +4757,7 @@ dependencies = [
  "tauri-plugin-os",
  "tauri-plugin-store",
  "tauri-plugin-stronghold",
+ "tauri-plugin-takosumi-push",
 ]
 
 [[package]]
@@ -5183,6 +5184,16 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.19",
  "zeroize",
+]
+
+[[package]]
+name = "tauri-plugin-takosumi-push"
+version = "0.1.0-takosumi.1"
+dependencies = [
+ "serde",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

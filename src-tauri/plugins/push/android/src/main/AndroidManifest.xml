@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+        <!--
+          No FCM token is created until the person turns notifications on for a
+          Takosumi instance (getToken enables auto init from then on).
+        -->
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <!--
+          Receives the relay's data messages ({s, b}), decrypts them with the
+          subscription's key and shows the notification. Not exported: only
+          Firebase's own receiver starts it.
+        -->
+        <service
+            android:name="com.takosumi.push.TakosumiMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

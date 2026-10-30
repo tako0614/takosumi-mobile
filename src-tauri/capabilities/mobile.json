@@ -49,6 +49,7 @@
     "os:default",
     "store:default",
     "stronghold:default",
-    "stronghold:allow-remove-store-record"
+    "stronghold:allow-remove-store-record",
+    "takosumi-push:default"
   ]
 }

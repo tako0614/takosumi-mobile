@@ -32,6 +32,12 @@ import {
   createAppScreenOpener,
 } from "./app-screen-native.ts";
 import { productAdapter } from "./product.ts";
+import {
+  createTauriPushNative,
+  type PushInvoke,
+  type PushListen,
+  type PushNative,
+} from "./push-native.ts";
 
 export function isUnsupportedTauriDesktop(): boolean {
   return detectTauriRuntime() && !isTauriMobilePlatform(platform());
@@ -72,6 +78,15 @@ export function createProductStoreOpener(
 ): (url: string) => Promise<void> {
   if (productPlatform() === "web") return (url) => bridge.openExternalUrl(url);
   return async (url) => await openUrl(url);
+}
+
+/** Takosumi's own notifications (the takosumi-push plugin); none in the web preview. */
+export function createProductPushNative(): PushNative | undefined {
+  if (productPlatform() === "web") return undefined;
+  return createTauriPushNative({
+    invoke: invoke as PushInvoke,
+    listen: addPluginListener as unknown as PushListen,
+  });
 }
 
 export function createProductNativeBridge(): NativeBridge {

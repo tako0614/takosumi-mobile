@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-takosumi-push"
+version = "0.1.0-takosumi.1"
+authors = ["Takos"]
+description = "Takosumi Mobile's own notifications: APNs/FCM token, Web Push subscription keys, decryption and taps"
+edition = "2021"
+rust-version = "1.89"
+license = "AGPL-3.0-only"
+publish = false
+links = "tauri-plugin-takosumi-push"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "2.11.5", default-features = false }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }

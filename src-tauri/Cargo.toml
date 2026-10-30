@@ -31,6 +31,7 @@ tauri-plugin-app-screen = { path = "plugins/app-screen" }
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-biometric = "2.3.2"
 tauri-plugin-keystore = { path = "plugins/keystore" }
+tauri-plugin-takosumi-push = { path = "plugins/push" }
 
 [patch.crates-io]
 tauri-winrt-notification = { git = "https://github.com/tauri-apps/winrt-notification", rev = "09a4135a871c6ead29832dca5698948fb30bf94b" }

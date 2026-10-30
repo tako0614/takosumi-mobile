@@ -390,6 +390,18 @@ export async function loadAppScreens(
   return { screens, failedCapsuleIds };
 }
 
+/** One Run (`GET /api/v1/runs/{runId}`), for the Run screen a notification opens. */
+export async function loadRun(session: MobileSession, runId: string): Promise<MobileRun> {
+  const response = await takosumiApi(session).wire(
+    `/runs/${encodeURIComponent(runId)}`,
+    PUBLIC_SESSION_RUN_RESPONSE_DECODER,
+  );
+  if (response.run.id !== runId) {
+    throw new Error("Run id does not match the requested Run.");
+  }
+  return response.run;
+}
+
 export interface MobileRunMutationInput {
   readonly session: MobileSession;
   readonly nativeBridge: NativeBridge;
