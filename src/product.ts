@@ -24,4 +24,8 @@ export const productAdapter: MobileProductAdapter = {
     "capsules:read",
     "capsules:write",
   ],
+  // The issuer's token is an API credential for this same instance. Refuse an
+  // instance that names another instance's issuer, which would otherwise
+  // receive that instance's token after a genuine consent there.
+  requireHostIssuer: true,
 };

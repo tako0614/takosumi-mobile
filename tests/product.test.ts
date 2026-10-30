@@ -13,6 +13,7 @@ test("Takosumi mobile owns the Takosumi PKCE client identity", () => {
     "capsules:read",
     "capsules:write",
   ]);
+  expect(productAdapter.requireHostIssuer).toBe(true);
   expect(productAdapter.discoveryProduct).toBe("takosumi");
   expect(productAdapter.strictDiscoveryProduct).toBe(true);
 });
