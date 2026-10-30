@@ -82,6 +82,7 @@ import {
 } from "./push-routing.ts";
 import { PushSettings } from "./push-settings.tsx";
 import { RunScreen } from "./run-screen.tsx";
+import { createSharedAccountSignIn } from "./shared-account-sign-in.ts";
 import { authorizeRunMutation } from "./security.ts";
 import {
   createDeepLinkOpener,
@@ -320,6 +321,9 @@ function renderShell(input: {
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
     createNativeBridge: () => nativeBridge,
+    // app.takosumi.com and other shared-account hosts: sign in at the issuer
+    // the browser uses and hold an RP session; other hosts keep the standard flow.
+    customSignIn: createSharedAccountSignIn(),
     loadHome,
     sessionUnlock: {
       restoreMode: "required",
@@ -357,8 +361,10 @@ function renderShell(input: {
       addAccountLabel: "別のTakosumiを追加",
       discoveredWhileSignedInHeading: "別のTakosumiが見つかりました",
       signInToAddLabel: "サインインして追加",
-      // Every Takosumi accepts the built-in `takosumi-mobile` client unless its
-      // operator turned it off (TAKOSUMI_MOBILE_OIDC_BUILTIN_CLIENT=false).
+      // A self-hosted Takosumi accepts the built-in `takosumi-mobile` client
+      // unless its operator turned it off (TAKOSUMI_MOBILE_OIDC_BUILTIN_CLIENT=false);
+      // a shared-account host offers sign-in once its operator configured
+      // Takosumi Mobile's client at its issuer (`shared_account_sign_in`).
       signInUnavailableMessage:
         "このTakosumiはTakosumi Mobileのサインインを有効にしていません。運用者に確認してください。",
       signInUnavailableHelpUrl: "https://takosumi.com/docs/reference/api",
