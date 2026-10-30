@@ -51,6 +51,12 @@ export interface AppScreenOpener {
   readonly openClient: (request: OpenClientRequest) => Promise<OpenClientResult>;
   /** Open an https page in the browser view over Takosumi Mobile. */
   readonly openBrowserView: (url: string) => Promise<BrowserViewResult>;
+  /**
+   * Open an https page in the phone's own browser (「ブラウザで開く」), never
+   * in an app that claims the link (Android; iOS cannot prevent a universal
+   * link from opening its app).
+   */
+  readonly openWeb: (url: string) => Promise<void>;
   /** Take the bar action waiting for the shell, if any (once). */
   readonly takePendingAction: () => Promise<AppScreenAction | undefined>;
   /** Called when an app screen's bar leaves an action for the shell. */
@@ -97,6 +103,9 @@ export function createAppScreenOpener(input: {
       async openBrowserView(url) {
         await input.openExternalUrl(checkedBrowserUrl(url));
         return "browser";
+      },
+      async openWeb(url) {
+        await input.openExternalUrl(checkedBrowserUrl(url));
       },
       async takePendingAction() {
         return undefined;
@@ -149,6 +158,9 @@ export function createAppScreenOpener(input: {
         payload: { url: checkedBrowserUrl(url), toolbarColor: APP_SCREEN_BAR_COLOR },
       });
       return recordField(result, "result") === "browser" ? "browser" : "browser-view";
+    },
+    async openWeb(url) {
+      await native("plugin:app-screen|open_web", { payload: { url: checkedBrowserUrl(url) } });
     },
     async takePendingAction() {
       const result = await native<unknown>("plugin:app-screen|take_pending_action");

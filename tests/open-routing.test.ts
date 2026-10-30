@@ -100,6 +100,7 @@ function harness(input: {
       calls.push({ kind: "browser-view", value: url });
       return "browser-view";
     },
+    openWeb: async () => undefined,
     takePendingAction: async () => undefined,
     onActionPending: async () => () => undefined,
   };

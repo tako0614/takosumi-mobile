@@ -68,7 +68,7 @@ enum AppScreenPolicy {
             return subframeWebSchemes.contains(scheme) ? .inApp : .block
         }
         if scheme == "https" {
-            if hasUserInfo(url) { return .block }
+            if hasUserInfo(url) || hasRawUserInfo(trimmed) { return .block }
             guard let host = url.host, !host.isEmpty, !isShellHost(host) else { return .block }
             if let allowed = allowedOrigins {
                 guard let origin = origin(of: trimmed), allowed.contains(origin) else {
@@ -89,7 +89,7 @@ enum AppScreenPolicy {
             return .block
         }
         if scheme == "http" {
-            if hasUserInfo(url) { return .block }
+            if hasUserInfo(url) || hasRawUserInfo(trimmed) { return .block }
             return .externalConfirm(insecureHttp: true)
         }
         return .externalConfirm(insecureHttp: false)
@@ -122,6 +122,12 @@ enum AppScreenPolicy {
 
     private static func hasUserInfo(_ url: URL) -> Bool {
         !(url.user ?? "").isEmpty || !(url.password ?? "").isEmpty
+    }
+
+    /// An `@` in the authority, even with empty user info (`https://:@host/`).
+    static func hasRawUserInfo(_ rawUrl: String) -> Bool {
+        guard let separator = rawUrl.range(of: "://") else { return false }
+        return rawUrl[separator.upperBound...].prefix { !"/?#\\".contains($0) }.contains("@")
     }
 
     static func isShellHost(_ host: String) -> Bool {

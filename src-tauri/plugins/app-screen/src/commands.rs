@@ -2,7 +2,7 @@ use tauri::{command, AppHandle, Runtime};
 
 use crate::models::{
     BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
-    OpenClientResponse, OpenRequest, PendingActionResponse, PinShortcutResponse,
+    OpenClientResponse, OpenRequest, OpenWebRequest, PendingActionResponse, PinShortcutResponse,
 };
 use crate::{AppScreenExt, Result};
 
@@ -42,6 +42,15 @@ pub(crate) async fn open_browser_view<R: Runtime>(
 ) -> Result<BrowserViewResponse> {
     payload.validate()?;
     app.app_screen().open_browser_view(payload)
+}
+
+#[command]
+pub(crate) async fn open_web<R: Runtime>(
+    app: AppHandle<R>,
+    payload: OpenWebRequest,
+) -> Result<BrowserViewResponse> {
+    payload.validate()?;
+    app.app_screen().open_web(payload)
 }
 
 #[command]

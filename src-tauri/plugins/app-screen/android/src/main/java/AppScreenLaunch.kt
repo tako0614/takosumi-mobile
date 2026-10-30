@@ -99,14 +99,24 @@ internal data class ScreenRequest(
     val allowedOrigins: Set<String>
         get() = setOfNotNull(appOrigin, accountsOrigin)
 
-    fun toJson(): JSONObject = JSONObject()
-        .put("url", url)
-        .put("title", title)
-        .apply {
-            accountsOrigin?.let { put("accountsOrigin", it) }
-            scope?.let { put("scope", it) }
-            client?.let { put("client", it.toJson().toString()) }
-        }
+    /**
+     * What is kept beyond this launch (task restore, shortcuts): the declared
+     * app only as a label, never its links, so an app the operator stops
+     * trusting is not opened from a stale copy; the bar then asks the shell,
+     * which reads the current declaration.
+     */
+    fun persisted(): ScreenRequest = copy(client = client?.let { BannerClient(it.name, verified = false) })
+
+    fun toJson(): JSONObject = persisted().let { kept ->
+        JSONObject()
+            .put("url", kept.url)
+            .put("title", kept.title)
+            .apply {
+                kept.accountsOrigin?.let { put("accountsOrigin", it) }
+                kept.scope?.let { put("scope", it) }
+                kept.client?.let { put("client", it.toJson().toString()) }
+            }
+    }
 
     companion object {
         const val SCOPE_MAX_LENGTH = 512
@@ -391,7 +401,7 @@ internal object AppScreenShortcuts {
             .setShortLabel(label.take(25))
             .setLongLabel(label.take(64))
             .setIcon(icon)
-            .setIntent(AppScreenLaunch.documentIntent(context, request))
+            .setIntent(AppScreenLaunch.documentIntent(context, request.persisted()))
             .setRank(rank)
             .build()
     }

@@ -48,6 +48,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::pin_shortcut,
             commands::open_client,
             commands::open_browser_view,
+            commands::open_web,
             commands::take_pending_action
         ])
         .setup(|app, api| {

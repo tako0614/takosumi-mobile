@@ -132,6 +132,22 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    /** Open an https page in the phone's browser, never in an app claiming it. */
+    @Command
+    fun openWeb(invoke: Invoke) {
+        val args = invoke.parseArgs(BrowserViewArgs::class.java)
+        if (!AppScreenPolicy.isLaunchable(args.url)) {
+            invoke.reject("Only https URLs can be opened in the browser.")
+            return
+        }
+        try {
+            BrowserView.openInBrowser(activity, args.url)
+            invoke.resolve(JSObject().apply { put("result", BrowserView.BROWSER) })
+        } catch (_: Exception) {
+            invoke.reject("No browser can open this page.")
+        }
+    }
+
     /** The action an app screen's bar left for the shell, once. */
     @Command
     fun takePendingAction(invoke: Invoke) {

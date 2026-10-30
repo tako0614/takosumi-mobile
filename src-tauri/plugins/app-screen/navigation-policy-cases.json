@@ -10,6 +10,8 @@
     { "url": "https://user:pass@example.com/", "mainFrame": true, "decision": "block" },
     { "url": "http://example.com/", "mainFrame": true, "decision": "external-confirm" },
     { "url": "http://user@example.com/", "mainFrame": true, "decision": "block" },
+    { "url": "https://:@app.example/", "mainFrame": true, "decision": "block" },
+    { "url": "http://:@app.example/", "mainFrame": true, "decision": "block" },
     { "url": "tel:+81312345678", "mainFrame": true, "decision": "external-confirm" },
     { "url": "mailto:someone@example.com", "mainFrame": true, "decision": "external-confirm" },
     { "url": "sms:+81312345678", "mainFrame": true, "decision": "external-confirm" },

@@ -100,8 +100,7 @@ class AppScreenActivity : AppCompatActivity() {
                 override fun handleOnBackPressed() = goBackOrLeave()
             },
         )
-        val restored = savedInstanceState?.getString(STATE_URL)
-            ?.takeIf { AppScreenPolicy.isInScreen(it, request.allowedOrigins) }
+        val restored = savedInstanceState?.getString(STATE_URL)?.let { restorable(it) }
         show(target = restored ?: startUrl(), keepLivePage = keepsLivePage(request))
         applyTaskDescription()
         container.post { reportOpened() }
@@ -123,7 +122,7 @@ class AppScreenActivity : AppCompatActivity() {
         super.onStart()
         visible = true
         if (evicted) {
-            show(target = lastKnownUrl.ifEmpty { startUrl() }, keepLivePage = false)
+            show(target = restorable(lastKnownUrl) ?: startUrl(), keepLivePage = false)
         }
     }
 
@@ -134,7 +133,7 @@ class AppScreenActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        if (AppScreenPolicy.isLaunchable(lastKnownUrl)) outState.putString(STATE_URL, lastKnownUrl)
+        restorable(lastKnownUrl)?.let { outState.putString(STATE_URL, it) }
     }
 
     override fun onDestroy() {
@@ -168,6 +167,16 @@ class AppScreenActivity : AppCompatActivity() {
 
     /** Started (visible, even when not focused in split screen). */
     internal fun isVisibleScreen(): Boolean = visible
+
+    /**
+     * A page this screen may reload after the system recreated it, a renderer
+     * crash or eviction: the app's own origin without credentials (not an
+     * OAuth callback whose code is spent, not an Accounts authorize page).
+     */
+    private fun restorable(url: String): String? =
+        url.takeIf { candidate ->
+            !request.popup && request.appOrigin?.let { AppScreenRules.isRememberable(candidate, it) } == true
+        }
 
     /** The page to open at: the app's last page when resuming, else its URL. */
     private fun startUrl(): String =
@@ -337,7 +346,7 @@ class AppScreenActivity : AppCompatActivity() {
             when (item.itemId) {
                 MENU_SHARE -> share()
                 MENU_BROWSER_VIEW -> openBrowserView(currentUrl() ?: appRequest().url)
-                MENU_BROWSER -> currentUrl()?.let { openExternally(it) }
+                MENU_BROWSER -> currentUrl()?.let { openInBrowser(it) }
                 MENU_CLIENT -> client?.let { openClient(it) }
                 MENU_CHOOSE -> askShell(AppScreenActions.CHANGE)
                 MENU_PIN -> pinShortcut()
@@ -384,6 +393,14 @@ class AppScreenActivity : AppCompatActivity() {
         if (!userGesture && now - lastBrowserViewAt < BROWSER_VIEW_COOLDOWN_MS) return
         lastBrowserViewAt = now
         openBrowserView(url)
+    }
+
+    private fun openInBrowser(url: String) {
+        try {
+            BrowserView.openInBrowser(this, url)
+        } catch (_: Exception) {
+            Toast.makeText(this, "開けるブラウザがありません", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun openBrowserView(url: String) {
@@ -519,8 +536,10 @@ class AppScreenActivity : AppCompatActivity() {
             startActivity(intent)
         } catch (_: ActivityNotFoundException) {
             val fallback = intent.getStringExtra("browser_fallback_url")
-            if (fallback != null && AppScreenPolicy.isLaunchable(fallback)) {
+            if (fallback != null && AppScreenPolicy.isInScreen(fallback, entry?.allowedOrigins)) {
                 entry?.webView?.loadUrl(fallback)
+            } else if (fallback != null && AppScreenPolicy.isLaunchable(fallback)) {
+                handOffToBrowserView(fallback, userGesture = true)
             } else {
                 Toast.makeText(this, "開けるアプリがありません", Toast.LENGTH_SHORT).show()
             }
@@ -671,7 +690,7 @@ class AppScreenActivity : AppCompatActivity() {
             if (current.key == this@AppScreenActivity.request.key) {
                 when {
                     this@AppScreenActivity.request.popup -> finish()
-                    visible -> show(target = lastKnownUrl.ifEmpty { startUrl() }, keepLivePage = false)
+                    visible -> show(target = restorable(lastKnownUrl) ?: startUrl(), keepLivePage = false)
                     else -> evicted = true
                 }
             }

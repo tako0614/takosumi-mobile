@@ -111,7 +111,7 @@ export function decideAppScreenNavigation(
   }
 
   if (scheme === "https") {
-    if (url.username || url.password) {
+    if (url.username || url.password || hasRawUserInfo(rawUrl)) {
       return { kind: "block", reason: "user-info" };
     }
     if (!url.hostname) return { kind: "block", reason: "invalid-url" };
@@ -142,12 +142,20 @@ export function decideAppScreenNavigation(
     }
   }
   if (scheme === "http") {
-    if (url.username || url.password) {
+    if (url.username || url.password || hasRawUserInfo(rawUrl)) {
       return { kind: "block", reason: "user-info" };
     }
     return { kind: "external-confirm", reason: "insecure-http", scheme };
   }
   return { kind: "external-confirm", reason: "other-scheme", scheme };
+}
+
+/**
+ * An `@` in the authority, even when the user info parses as empty
+ * (`https://:@host/`); Android's and Apple's parsers see user info there.
+ */
+function hasRawUserInfo(rawUrl: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\/[^/?#\\]*@/iu.test(rawUrl.trim());
 }
 
 /**

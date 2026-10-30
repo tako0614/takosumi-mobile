@@ -44,7 +44,7 @@ internal object AppScreenPolicy {
             return if (scheme in subframeWebSchemes) inApp(scheme) else block(scheme)
         }
         if (scheme == "https") {
-            if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
+            if (!uri.userInfo.isNullOrEmpty() || AppScreenRules.hasRawUserInfo(trimmed)) return block(scheme)
             if (uri.host.isNullOrEmpty() || AppScreenRules.isShellHost(uri.host)) return block(scheme)
             if (allowedOrigins != null && !AppScreenRules.isAllowedOrigin(trimmed, allowedOrigins)) {
                 return NavigationDecision(NavigationKind.BROWSER_VIEW, scheme)
@@ -61,7 +61,7 @@ internal object AppScreenPolicy {
             }
         }
         if (scheme == "http") {
-            if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
+            if (!uri.userInfo.isNullOrEmpty() || AppScreenRules.hasRawUserInfo(trimmed)) return block(scheme)
             return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme, insecureHttp = true)
         }
         return NavigationDecision(NavigationKind.EXTERNAL_CONFIRM, scheme)

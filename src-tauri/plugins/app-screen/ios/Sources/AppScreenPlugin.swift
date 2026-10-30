@@ -114,11 +114,32 @@ final class AppScreenPlugin: Plugin {
         }
     }
 
+    /// Open an https page with the system (Safari). iOS has no way to keep an
+    /// app that claims the URL as a universal link from taking it.
+    @objc func openWeb(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(BrowserViewArgs.self)
+        guard AppScreenPolicy.isLaunchable(args.url), let url = URL(string: args.url) else {
+            throw requestError("Only https URLs can be opened in the browser.")
+        }
+        DispatchQueue.main.async {
+            UIApplication.shared.open(url, options: [:]) { opened in
+                if opened {
+                    invoke.resolve(["result": "browser"])
+                } else {
+                    invoke.reject("No browser can open this page.")
+                }
+            }
+        }
+    }
+
     /// The action an app screen's bar left for the shell, once.
     @objc func takePendingAction(_ invoke: Invoke) {
-        var response: JsonObject = [:]
-        if let action = AppScreenActions.take() { response["action"] = action.json }
-        invoke.resolve(response)
+        // The bar writes the action on the main thread; take it there too.
+        DispatchQueue.main.async {
+            var response: JsonObject = [:]
+            if let action = AppScreenActions.take() { response["action"] = action.json }
+            invoke.resolve(response)
+        }
     }
 
     /// Tell the shell an action waits (`actionPending`).

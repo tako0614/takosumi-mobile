@@ -63,11 +63,11 @@ export function createProductAppScreenOpener(
 }
 
 /**
- * The phone's own browser (Safari, Chrome ...), not the browser view: a web
- * app the person adds to the home screen there can receive its Web Push.
- * `NativeBridge.openExternalUrl` prefers the in-app browser on phones.
+ * Store pages (App Store, Google Play, F-Droid) through the system, so the
+ * store app takes its own links. `NativeBridge.openExternalUrl` would prefer
+ * the in-app browser on phones. Web pages go to `AppScreenOpener.openWeb`.
  */
-export function createProductWebOpener(
+export function createProductStoreOpener(
   bridge: Pick<NativeBridge, "openExternalUrl">,
 ): (url: string) => Promise<void> {
   if (productPlatform() === "web") return (url) => bridge.openExternalUrl(url);

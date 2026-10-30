@@ -672,7 +672,11 @@ final class AppScreenViewController: UIViewController {
         coordinator.setVisible(session.key, false)
         session = next
         coordinator.setVisible(next.key, true)
-        if isViewLoaded { attach(next) }
+        if isViewLoaded {
+            attach(next)
+            // The same session may come back with another declared app.
+            menuButton.menu = makeMenu()
+        }
     }
 
     /// Close popups opened from this screen (they are transient).

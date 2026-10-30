@@ -84,6 +84,10 @@ internal object AppScreenRules {
         return "$scheme://${host.lowercase()}$shownPort"
     }
 
+    /** An `@` in the authority, even with empty user info (`https://:@host/`). */
+    fun hasRawUserInfo(rawUrl: String): Boolean =
+        AUTHORITY.find(rawUrl.trim())?.groupValues?.get(2)?.contains('@') == true
+
     fun isShellHost(host: String?): Boolean =
         host != null && host.lowercase().trimEnd('.') in SHELL_HOSTS
 

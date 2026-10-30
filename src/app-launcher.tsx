@@ -61,7 +61,7 @@ export function AppLauncher(props: {
   /** A bar action waiting for the app list (開き方を変える from an app screen). */
   readonly pendingAction: () => AppScreenAction | undefined;
   readonly clearPendingAction: () => void;
-  readonly openWeb: (url: string) => Promise<void>;
+  readonly openStore: (url: string) => Promise<void>;
   readonly copyText?: (text: string) => Promise<void>;
 }) {
   const [screens, setScreens] = createSignal<ReadonlyMap<string, CapsuleAppScreens>>(
@@ -332,7 +332,7 @@ export function AppLauncher(props: {
             request={request}
             router={props.router}
             platform={props.platform}
-            openWeb={props.openWeb}
+            openStore={props.openStore}
             {...(props.copyText ? { copyText: props.copyText } : {})}
             onClose={() => props.closeChooser()}
           />

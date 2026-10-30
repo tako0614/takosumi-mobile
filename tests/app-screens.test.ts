@@ -271,3 +271,13 @@ test("a home refresh keeps unchanged tiles and replaces changed ones", () => {
   expect(renamed[1]).not.toBe(first[1]!);
   expect(renamed[1]?.label).toBe("B2");
 });
+
+test("screen URLs are kept canonical, as the native webviews report pages", () => {
+  const decoded = view({
+    screens: [{ interfaceId: "w", name: "web", url: "https://BÜCHER.example:443/a b" }],
+  });
+  expect(decoded.screens[0]?.url).toBe("https://xn--bcher-kva.example/a%20b");
+  expect(
+    appScreenOpenRequest({ key: "custom:x", label: "X", url: "https://Example.COM:443/" }).url,
+  ).toBe("https://example.com/");
+});

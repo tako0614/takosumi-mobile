@@ -6,7 +6,7 @@ use tauri::{
 
 use crate::models::{
     BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
-    OpenClientResponse, OpenRequest, PendingActionResponse, PinShortcutResponse,
+    OpenClientResponse, OpenRequest, OpenWebRequest, PendingActionResponse, PinShortcutResponse,
 };
 
 #[cfg(target_os = "ios")]
@@ -56,6 +56,12 @@ impl<R: Runtime> AppScreen<R> {
     ) -> crate::Result<BrowserViewResponse> {
         self.0
             .run_mobile_plugin("openBrowserView", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn open_web(&self, payload: OpenWebRequest) -> crate::Result<BrowserViewResponse> {
+        self.0
+            .run_mobile_plugin("openWeb", payload)
             .map_err(Into::into)
     }
 

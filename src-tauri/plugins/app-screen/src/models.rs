@@ -312,6 +312,24 @@ impl BrowserViewRequest {
     }
 }
 
+/// `open_web`: the phone's own browser, never an app that claims the link.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWebRequest {
+    pub url: String,
+}
+
+impl OpenWebRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !is_launchable_url(&self.url) {
+            return Err(crate::Error::InvalidRequest(
+                "Only https URLs can be opened in the browser.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserViewResponse {
@@ -654,5 +672,9 @@ mod tests {
         assert!(view("https://tauri.localhost/", None).validate().is_err());
         assert!(view("https://a.example/", Some("red")).validate().is_err());
         assert!(view("https://a.example/", Some("#12345g")).validate().is_err());
+        let web = |url: &str| OpenWebRequest { url: url.into() };
+        assert!(web("https://a.example/").validate().is_ok());
+        assert!(web("http://a.example/").validate().is_err());
+        assert!(web("https://ipc.localhost/").validate().is_err());
     }
 }

@@ -6,6 +6,7 @@ permissions = [
   "allow-pin-shortcut",
   "allow-open-client",
   "allow-open-browser-view",
+  "allow-open-web",
   "allow-take-pending-action",
   "allow-register-listener",
 ]

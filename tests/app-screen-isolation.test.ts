@@ -75,6 +75,7 @@ test("the app-screen plugin's commands are granted to the shell's capability onl
     "pin_shortcut",
     "open_client",
     "open_browser_view",
+    "open_web",
     "take_pending_action",
     "register_listener",
   ]) {

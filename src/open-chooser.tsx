@@ -23,7 +23,8 @@ export function OpenChooser(props: {
   readonly request: ChooserRequest;
   readonly router: OpenRouter;
   readonly platform: string;
-  readonly openWeb: (url: string) => Promise<void>;
+  /** Store pages, through the system so the store app takes them. */
+  readonly openStore: (url: string) => Promise<void>;
   readonly copyText?: (text: string) => Promise<void>;
   readonly onClose: () => void;
 }) {
@@ -68,7 +69,7 @@ export function OpenChooser(props: {
     const url = client()?.storeUrl;
     if (!url) return;
     try {
-      await props.openWeb(url);
+      await props.openStore(url);
     } catch (error) {
       setStatus(mobileErrorMessage(error, "ストアを開けませんでした。"));
     }

@@ -365,6 +365,8 @@ test("native apps, the browser view and bar actions go through the app-screen pl
   // A request for the other phone is never sent.
   expect(await android.openClient({ platform: "ios", open: "yurucommu://x" })).toBe("not_installed");
   expect(await android.openBrowserView("https://accounts.google.com/")).toBe("browser");
+  await android.openWeb("https://a.example/");
+  await expect(android.openWeb("http://a.example/")).rejects.toThrow("https");
   await expect(android.openBrowserView("http://a.example/")).rejects.toThrow("https");
   expect(await android.takePendingAction()).toEqual({
     kind: "choose",
@@ -377,12 +379,13 @@ test("native apps, the browser view and bar actions go through the app-screen pl
   await android.onActionPending(() => void nudged++);
   expect(nudged).toBe(1);
   expect(listened).toEqual(["app-screen:actionPending"]);
-  expect(calls.slice(0, 2)).toEqual([
+  expect(calls.slice(0, 3)).toEqual([
     { command: "plugin:app-screen|open_client", args: { payload: client } },
     {
       command: "plugin:app-screen|open_browser_view",
       args: { payload: { url: "https://accounts.google.com/", toolbarColor: APP_SCREEN_BAR_COLOR } },
     },
+    { command: "plugin:app-screen|open_web", args: { payload: { url: "https://a.example/" } } },
   ]);
 });
 
@@ -445,6 +448,7 @@ function recordingOpener() {
       },
       openClient: async () => "not_installed" as const,
       openBrowserView: async () => "browser-view" as const,
+      openWeb: async () => undefined,
       takePendingAction: async () => undefined,
       onActionPending: async () => () => undefined,
     },

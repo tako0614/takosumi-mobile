@@ -29,6 +29,7 @@ Intents come later.
 | `pin_shortcut` | same as `open` | `{ requested }`; always `false` on iOS |
 | `open_client` | `{ platform, package?, appLink?, universalLink?, open? }` | `{ result: "opened" \| "not_installed" }` |
 | `open_browser_view` | `{ url, toolbarColor? }` | `{ result: "browser-view" \| "browser" }` |
+| `open_web` | `{ url }` | `{ result: "browser" }`: the phone's browser, never an app claiming the link (Android `CATEGORY_APP_BROWSER` selector; iOS cannot stop a universal link) |
 | `take_pending_action` | none | `{ action? }`: `{ kind: "choose", key, url, reason }` left by a bar |
 
 `key` is the screen's stable identity (`app:<capsuleId>:<interfaceId>`,
@@ -126,6 +127,11 @@ which skip `shouldOverrideUrlLoading`) are refused before they load.
   (Android 8+, launcher permitting). The most used apps are kept as dynamic
   shortcuts (long-press menu). Shortcuts start `AppScreenActivity` directly, so
   an app opens without the Tauri shell starting.
+- Task restore and shortcuts keep a declared native app only as its label,
+  never its links: 「{name}で開く」 from such a screen asks the shell, which
+  reads the current declaration. After the system recreates a screen, or its
+  webview was closed for another app, it reloads only a page that passes the
+  resume rule (no spent OAuth callback, no Accounts page).
 - `AppScreenActivity` is not exported. External `takosumi://app?url=...` links
   reach the shell's deep-link handler, which resolves the URL to a known app.
 - Files picked for `<input type=file>` are passed on only as content URIs from

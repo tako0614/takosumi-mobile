@@ -85,6 +85,9 @@ function decodeScreen(value: unknown): CapsuleAppScreen | undefined {
   if (!interfaceId || !name || !url || !isLaunchableAppScreenUrl(url)) {
     return undefined;
   }
+  // The canonical form (punycode host, default port dropped) is what the
+  // native webviews report, so origins compare equal there.
+  const canonicalUrl = new URL(url).href;
   const title = nonEmptyString(value.title);
   const icon = decodeIcon(value.icon);
   const sortOrder =
@@ -98,7 +101,7 @@ function decodeScreen(value: unknown): CapsuleAppScreen | undefined {
     ...(title === undefined ? {} : { title }),
     ...(icon === undefined ? {} : { icon }),
     ...(sortOrder === undefined ? {} : { sortOrder }),
-    url,
+    url: canonicalUrl,
     ...(clients === undefined ? {} : { clients }),
   };
 }
@@ -451,7 +454,8 @@ export function appScreenOpenRequest(
   const client = bannerClient(target.clients, options.platform);
   return {
     key: boundedKey(target.key),
-    url: target.url,
+    // Canonical, as the native webviews report pages (origins compare equal).
+    url: new URL(target.url).href,
     title: clampLabel(target.label) || displayHost(target.url),
     ...(iconPng ? { iconPng } : {}),
     profile: APP_SCREEN_PROFILE,

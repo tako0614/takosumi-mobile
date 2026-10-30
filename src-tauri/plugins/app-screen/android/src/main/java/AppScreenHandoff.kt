@@ -97,12 +97,24 @@ internal object BrowserView {
                 // Fall through to the normal browser.
             }
         }
-        val view = Intent(Intent.ACTION_VIEW, uri).apply {
+        openInBrowser(activity, url)
+        return BROWSER
+    }
+
+    /**
+     * The phone's own browser (「ブラウザで開く」, where a web app can be added
+     * to the home screen), never an app that claims the link as an App Link:
+     * the intent resolves only among browsers (`CATEGORY_APP_BROWSER`
+     * selector). Throws [ActivityNotFoundException] without a browser.
+     */
+    fun openInBrowser(activity: Activity, url: String) {
+        require(AppScreenPolicy.isLaunchable(url)) { "Only https pages open in the browser." }
+        val view = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
             addCategory(Intent.CATEGORY_BROWSABLE)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            selector = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER)
         }
         activity.startActivity(view)
-        return BROWSER
     }
 }
 

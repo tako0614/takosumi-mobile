@@ -31,7 +31,7 @@ import {
 import {
   createProductAppScreenOpener,
   createProductNativeBridge,
-  createProductWebOpener,
+  createProductStoreOpener,
   isUnsupportedTauriDesktop,
   productPlatform,
 } from "./native.ts";
@@ -68,6 +68,7 @@ interface OpenRouting {
   readonly router: OpenRouter;
   readonly platform: string;
   readonly openWeb: (url: string) => Promise<void>;
+  readonly openStore: (url: string) => Promise<void>;
   readonly setContext: (context: OpenContext | undefined) => void;
   readonly context: () => OpenContext | undefined;
   readonly chooser: () => ChooserRequest | undefined;
@@ -113,7 +114,8 @@ function startTakosumiMobile() {
   const baseBridge = createProductNativeBridge();
   const opener = createProductAppScreenOpener(baseBridge);
   const platform = productPlatform();
-  const openWeb = createProductWebOpener(baseBridge);
+  const openWeb = (url: string) => opener.openWeb(url);
+  const openStore = createProductStoreOpener(baseBridge);
   const launcher = createLauncherController({
     opener,
     fetchIcon: (url) => fetchIconDataUrl(url),
@@ -137,6 +139,7 @@ function startTakosumiMobile() {
     router,
     platform,
     openWeb,
+    openStore,
     setContext,
     context,
     chooser,
@@ -400,7 +403,7 @@ function TakosumiControlHome(props: {
         setRecent={props.routing.setRecent}
         pendingAction={props.routing.pendingAction}
         clearPendingAction={props.routing.clearPendingAction}
-        openWeb={props.routing.openWeb}
+        openStore={props.routing.openStore}
         {...(props.nativeBridge.writeClipboardText
           ? {
               copyText: (text: string) =>
