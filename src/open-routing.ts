@@ -17,7 +17,7 @@ import {
   type AppScreenOpenOptions,
   resolveAppScreenTarget,
 } from "./app-screens.ts";
-import { accountsOrigin, isLaunchableAppScreenUrl, screenOrigin } from "./url-policy.ts";
+import { isLaunchableAppScreenUrl, screenOrigin, takosumiOrigins } from "./url-policy.ts";
 
 /**
  * How Takosumi Mobile opens an app (TASK-0119 step 3, design
@@ -56,22 +56,38 @@ export interface OpenTarget {
 export interface OpenContext {
   /** The instance's origin; remembered choices are kept per instance. */
   readonly instanceOrigin: string;
-  /** The instance's Accounts origin, kept inside app screens. */
-  readonly accountsOrigin?: string;
-  /** (instance, account): recent apps and last pages are kept per account. */
+  /**
+   * The Takosumi origins (Accounts and the instance itself): app screens show
+   * only their sign-in pages.
+   */
+  readonly accountsOrigins: readonly string[];
+  /**
+   * (instance, account), as SHA-256 hex: recent apps and last pages are kept
+   * per account. Hashed so a long account id never merges accounts and the
+   * device stores no raw subject next to the pages.
+   */
   readonly scope: string;
 }
 
-export function openContextFromSession(session: MobileSession): OpenContext | undefined {
+export async function openContextFromSession(
+  session: MobileSession,
+): Promise<OpenContext | undefined> {
   const instanceOrigin = screenOrigin(session.hostUrl);
   if (!instanceOrigin) return undefined;
-  const scope = `${instanceOrigin}|${session.accountId ?? ""}`;
-  const accounts = accountsOrigin(session);
   return {
     instanceOrigin,
-    ...(accounts ? { accountsOrigin: accounts } : {}),
-    scope: scope.length <= APP_SCREEN_SCOPE_MAX_LENGTH ? scope : instanceOrigin,
+    accountsOrigins: takosumiOrigins(session),
+    scope: await openScope(instanceOrigin, session.accountId),
   };
+}
+
+/** SHA-256 hex of (instance origin, account subject). */
+export async function openScope(instanceOrigin: string, accountId: string | undefined): Promise<string> {
+  const bytes = new TextEncoder().encode(`${instanceOrigin}\n${accountId ?? ""}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const scope = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  if (scope.length > APP_SCREEN_SCOPE_MAX_LENGTH) throw new Error("scope is too long");
+  return scope;
 }
 
 // --- Plan ---------------------------------------------------------------------
@@ -407,8 +423,7 @@ export function createOpenRouter(input: {
         await input.openInApp(target, {
           platform: input.platform,
           resume: true,
-          ...(context?.accountsOrigin ? { accountsOrigin: context.accountsOrigin } : {}),
-          ...(context ? { scope: context.scope } : {}),
+          ...(context ? { accountsOrigins: context.accountsOrigins, scope: context.scope } : {}),
         });
         break;
       }

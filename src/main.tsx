@@ -166,13 +166,14 @@ function startTakosumiMobile() {
       console.warn(`Ignored app screen link: ${link.error}`);
       return;
     }
-    // A link names a page to show inside Takosumi; it never resumes elsewhere.
+    // A link names a page to show inside Takosumi. It neither resumes nor
+    // becomes the app's remembered last page (no scope): only pages the person
+    // reaches from the app itself are remembered.
     const current = context();
     void launcher
       .openUrl(link.url, {
         platform,
-        ...(current?.accountsOrigin ? { accountsOrigin: current.accountsOrigin } : {}),
-        ...(current ? { scope: current.scope } : {}),
+        ...(current ? { accountsOrigins: current.accountsOrigins } : {}),
       })
       .catch((error) => {
         console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。"));
@@ -270,7 +271,14 @@ function TakosumiControlHome(props: {
   createEffect(() => setCurrent(props.home));
   createEffect(() => setActiveSession(props.session));
   // Choices, recent apps and last pages follow the current instance/account.
-  createEffect(() => props.routing.setContext(openContextFromSession(activeSession())));
+  createEffect(() => {
+    const session = activeSession();
+    void openContextFromSession(session)
+      .then((context) => {
+        if (activeSession() === session) props.routing.setContext(context);
+      })
+      .catch(() => props.routing.setContext(undefined));
+  });
 
   const attentionRuns = createMemo(() =>
     (current()?.runs ?? []).filter(isAttentionRun),

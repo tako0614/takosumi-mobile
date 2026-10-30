@@ -11,6 +11,7 @@ const URL_MAX_LENGTH: usize = 8 * 1024;
 /// Base64 of a 192px PNG is far below this; anything larger is not an icon.
 const ICON_PNG_MAX_LENGTH: usize = 512 * 1024;
 const SCOPE_MAX_LENGTH: usize = 512;
+const ACCOUNTS_ORIGINS_MAX: usize = 4;
 const CLIENT_NAME_MAX_CHARS: usize = 64;
 const CLIENT_LINK_MAX_LENGTH: usize = 2_048;
 const CLIENT_IDENTIFIER_MAX_LENGTH: usize = 155;
@@ -19,6 +20,7 @@ const CLIENT_IDENTIFIER_MAX_LENGTH: usize = 155;
 const OWN_APP_ID: &str = "com.takosumi";
 
 /// Hosts the Tauri shell serves its own UI and IPC from; never an app screen.
+/// Any other `*.localhost` name is refused too (Tauri's custom protocols).
 pub const SHELL_HOSTS: &[&str] = &["tauri.localhost", "ipc.localhost", "asset.localhost"];
 
 /// Custom schemes a native app link may not use. Mirror of
@@ -117,10 +119,11 @@ pub struct OpenRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_png: Option<String>,
     pub profile: String,
-    /// The instance's Accounts origin; with the app's own origin it is all the
-    /// screen shows in its main frame.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accounts_origin: Option<String>,
+    /// The Takosumi origins (the instance's Accounts and the instance itself).
+    /// The screen shows only their sign-in pages; the rest goes to the
+    /// browser view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts_origins: Vec<String>,
     /// (instance, account) the last page is remembered for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -156,13 +159,14 @@ impl OpenRequest {
                 "Only https URLs can be opened in an app screen.",
             ));
         }
-        if self
-            .accounts_origin
-            .as_deref()
-            .is_some_and(|origin| !is_https_origin(origin))
+        if self.accounts_origins.len() > ACCOUNTS_ORIGINS_MAX
+            || self
+                .accounts_origins
+                .iter()
+                .any(|origin| !is_https_origin(origin))
         {
             return Err(crate::Error::InvalidRequest(
-                "The Accounts origin must be an https origin.",
+                "The Takosumi origins must be at most four https origins.",
             ));
         }
         if self.scope.as_deref().is_some_and(|scope| !is_valid_scope(scope)) {
@@ -375,7 +379,7 @@ pub fn is_launchable_url(raw: &str) -> bool {
 
 fn is_shell_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    SHELL_HOSTS.contains(&host.as_str())
+    SHELL_HOSTS.contains(&host.as_str()) || host.ends_with(".localhost")
 }
 
 /// Exactly an https origin (`https://host[:port]`), as `URL.origin` writes it.
@@ -484,7 +488,7 @@ mod tests {
             title: "App".into(),
             icon_png: None,
             profile: profile.into(),
-            accounts_origin: None,
+            accounts_origins: Vec::new(),
             scope: None,
             resume: false,
             client: None,
@@ -519,16 +523,22 @@ mod tests {
             "https://ipc.localhost/plugin%3Aapp-screen%7Copen",
             "https://asset.localhost/x",
             "https://TAURI.localhost./",
+            "https://custom-protocol.localhost/",
         ] {
             assert!(!is_launchable_url(url), "{url}");
             assert!(request(url, SHARED_PROFILE).validate().is_err(), "{url}");
         }
+        // Plain localhost (a development server) is not the shell.
+        assert!(is_launchable_url("https://localhost:8443/"));
     }
 
     #[test]
     fn the_accounts_origin_scope_and_banner_client_are_rechecked() {
         let mut ok = request("https://app.example/", SHARED_PROFILE);
-        ok.accounts_origin = Some("https://accounts.example".into());
+        ok.accounts_origins = vec![
+            "https://accounts.example".into(),
+            "https://takosumi.example".into(),
+        ];
         ok.scope = Some("https://takosumi.example|sub_1".into());
         ok.resume = true;
         ok.client = Some(verified_client());
@@ -543,9 +553,12 @@ mod tests {
             "https://ACCOUNTS.example",
         ] {
             let mut bad = request("https://app.example/", SHARED_PROFILE);
-            bad.accounts_origin = Some(origin.into());
+            bad.accounts_origins = vec![origin.into()];
             assert!(bad.validate().is_err(), "{origin}");
         }
+        let mut too_many = request("https://app.example/", SHARED_PROFILE);
+        too_many.accounts_origins = (0..5).map(|n| format!("https://a{n}.example")).collect();
+        assert!(too_many.validate().is_err());
         let mut bad_scope = request("https://app.example/", SHARED_PROFILE);
         bad_scope.scope = Some("a\nb".into());
         assert!(bad_scope.validate().is_err());

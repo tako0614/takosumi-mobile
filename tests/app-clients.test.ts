@@ -156,16 +156,16 @@ test("screens carry their clients into the launcher and the banner gets only wha
   const target = { key: "app:cap_a:web", label: "Yurucommu", url: "https://yc.example/" };
   expect(appScreenOpenRequest({ ...target, clients: view.screens[0]!.clients! }, undefined, {
     platform: "android",
-    accountsOrigin: "https://accounts.example",
-    scope: "https://takosumi.example|sub_1",
+    accountsOrigins: ["https://accounts.example", "https://takosumi.example"],
+    scope: "0".repeat(64),
     resume: true,
   })).toEqual({
     key: "app:cap_a:web",
     url: "https://yc.example/",
     title: "Yurucommu",
     profile: "shared",
-    accountsOrigin: "https://accounts.example",
-    scope: "https://takosumi.example|sub_1",
+    accountsOrigins: ["https://accounts.example", "https://takosumi.example"],
+    scope: "0".repeat(64),
     resume: true,
     client: {
       name: "Yurucommu",

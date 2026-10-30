@@ -59,22 +59,41 @@ the shell forward; the shell then takes the action and shows its chooser.
 
 ## Navigation rules
 
-`navigation-policy-cases.json` is the shared table. `src/url-policy.ts` is
-tested against it; `AppScreenPolicy.kt` and `AppScreenPolicy.swift` implement
-the same rules:
+`navigation-policy-cases.json` (and `resume-url-cases.json`) are the shared
+tables, and all three implementations are run against them:
+`tests/url-policy.test.ts` (`src/url-policy.ts`), `AppScreenPolicyTest`
+(`AppScreenPolicy.kt` with Android's own `Uri`, through Robolectric:
+`./gradlew :tauri-plugin-app-screen:testDebugUnitTest` in a `tauri android
+init` project) and `ios/PolicyTests` (`AppScreenPolicy.swift`, a package of
+its own that builds without UIKit: `swift test --package-path
+src-tauri/plugins/app-screen/ios/PolicyTests`, on macOS or Linux):
 
 - the main frame shows https only; `about:blank` / `about:srcdoc` stay (popups
   start there);
-- the main frame shows only the app's own origin and the instance's Accounts
-  origin. Any other https page (an external sign-in such as Google, which
-  forbids OAuth in embedded webviews) opens in the browser view over the
-  screen instead, and closing it comes back. Without a user gesture (a
-  redirect, a script) this happens at most once every few seconds. A form
-  POST to another origin is refused, with an offer to continue from the page
-  in the browser view. A `target=_blank` / `window.open` to another origin
-  goes to the browser view too, and popups keep their opener's origins;
+- the main frame shows the app's own origin. On the Takosumi origins (the
+  instance's Accounts, i.e. the OIDC issuer, and the instance itself, where
+  the dashboard, `/api/v1` and the `takosumi_session` cookie live) it shows
+  only the pages an app's Takosumi sign-in passes through:
+  `/oauth/authorize` (authorization and consent), `/sign-in` and
+  `/sign-in/callback` (the sign-in screen it redirects to) and
+  `/oauth/upstream/authorize` / `/oauth/upstream/callback`, compared exactly
+  on the percent-encoded path. Every other page there (`/`, `/apps`,
+  `/account`, `/api/v1/*` ...) goes to the browser view, and is refused in
+  subframes, so the management screens never run inside an app screen. The
+  sign-in screen is the dashboard's single-page app, so URL changes made with
+  `history.pushState` are checked too: a move to a dashboard page goes back
+  and opens that page in the browser view. An app screen is never opened on
+  such a page (tiles, deep links, shortcuts open it in the browser view);
+- any other https page (an external sign-in such as Google, which forbids
+  OAuth in embedded webviews) opens in the browser view over the screen
+  instead, and closing it comes back. Without a user gesture (a redirect, a
+  script) this happens at most once every few seconds. A form POST to
+  another origin is refused, with an offer to continue from the page in the
+  browser view. A `target=_blank` / `window.open` to another origin goes to
+  the browser view too, and popups keep their opener's origins;
 - the Tauri shell's own hosts (`tauri.localhost`, `ipc.localhost`,
-  `asset.localhost`) are refused;
+  `asset.localhost`, any other `*.localhost`) are refused in every frame and
+  over http as well as https;
 - `http:` and other schemes (`tel:`, `mailto:`, `intent:` ...) go to the OS only
   after a confirmation that names the page's host, and only from the main frame;
 - `javascript:`, `data:`, `file:`, `content:` and Takosumi Mobile's own
@@ -96,6 +115,37 @@ script or URL scheme handler. A page in an app screen therefore cannot call
 plugin commands, files, the control plane or the instance's tokens.
 `tests/app-screen-isolation.test.ts` and `tests/capabilities.rs` keep it so.
 
+## Known limits
+
+These follow from the platforms and from how trust is decided; they are not
+bugs the plugin can close.
+
+- **iOS custom schemes can be claimed by any app.** On iOS another installed
+  app may register the same custom scheme as a declared native app, and iOS
+  gives no way to pin the target (Android pins it with `setPackage`). Only the
+  instance URL travels in those links, never a credential, but a fake app
+  could imitate the real one. Universal links (`universalLinksOnly`) are the
+  safer declaration.
+- **"Verified" is decided by the instance.** A native app is verified when the
+  instance's operator list of trusted native clients says so
+  (`TAKOSUMI_ACCOUNTS_TRUSTED_NATIVE_CLIENTS`). A malicious or careless
+  instance can mark any scheme or package that is not on Takosumi's refused
+  list as verified, and Takosumi Mobile then opens it without asking. Signing
+  in to an instance means trusting its operator with this.
+- **One web profile for every app screen.** All app screens share one cookie
+  and storage profile, across instances and accounts; only the remembered
+  last pages and recent apps are kept per (instance, account). Signing out of
+  a Takosumi instance in the shell does not sign app screens out of the
+  apps' own sessions, and a sign-in made in an app screen for one instance's
+  account is visible to every app screen on the device.
+- **Browser-view sign-ins stay in the browser.** A sign-in completed in the
+  browser view (an external IdP such as Google, or a Takosumi page there)
+  lives in the browser's cookie jar, not in the app screen's profile, so the
+  app screen itself may still be signed out afterwards.
+- **iOS cannot force Safari.** 「Safariで開く」 / 「ブラウザで開く」 on iOS opens
+  the URL with the system, and an app that claims it as a universal link
+  takes it.
+
 ## Profile and lifetime
 
 All app screens share one cookie and storage profile (Android's process-wide
@@ -106,10 +156,15 @@ non-persistent store.
 
 One app screen stays alive at a time (with its popups). Opening another app
 closes the previous one's webview; it reopens by URL. Each app's last page is
-remembered per (instance, account) on the device (`resume-url-cases.json`:
+remembered per (instance, account; the key is a SHA-256 hash) on the device (`resume-url-cases.json`:
 the app's own origin only, no user info, fragment or credential-named query
-parameter), and reopening the app starts there. A deep link opens exactly the
-page it names. Keeping several pages alive and switching between them waits
+parameter), and reopening the app starts there. Only pages reached in an app
+opened as itself (a tile, a recent app, a shortcut, the chooser) are
+remembered; a deep link opens exactly the page it names and never becomes the
+last page. Sharing or handing the current page to the browser (view) removes
+credential-named query parameters and a fragment holding parameters
+(`resume-url-cases.json` `shareCases`), so a spent OAuth `code` is not passed
+on. Download prompts are limited to one every few seconds. Keeping several pages alive and switching between them waits
 for device testing.
 
 The host label shows the committed page only: on iOS it does not change while a

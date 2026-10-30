@@ -13,6 +13,7 @@ import {
   type OpenTarget,
   openChoiceKey,
   openContextFromSession,
+  openScope,
   planOpen,
   readOpenChoice,
   readRecentApps,
@@ -76,8 +77,8 @@ function entry(key: string, clients?: ScreenClients): AppLauncherEntry {
 
 const context: OpenContext = {
   instanceOrigin: "https://takosumi.example",
-  accountsOrigin: "https://accounts.takosumi.example",
-  scope: "https://takosumi.example|sub_1",
+  accountsOrigins: ["https://accounts.takosumi.example", "https://takosumi.example"],
+  scope: "a".repeat(64),
 };
 
 function harness(input: {
@@ -142,7 +143,7 @@ test("the plan follows the remembered choice, then a verified declaration, then 
   expect(planOpen({ remembered: "native" })).toEqual({ kind: "open", mode: "in-app" });
 });
 
-test("a tile without a declaration opens inside Takosumi at its last page, with the Accounts origin", async () => {
+test("a tile without a declaration opens inside Takosumi at its last page, with the Takosumi origins", async () => {
   const { router, calls } = harness();
   expect(await router.open(entry("app:cap_a:web"))).toEqual({ kind: "opened", mode: "in-app" });
   expect(calls).toEqual([
@@ -152,8 +153,8 @@ test("a tile without a declaration opens inside Takosumi at its last page, with 
         key: "app:cap_a:web",
         platform: "android",
         resume: true,
-        accountsOrigin: "https://accounts.takosumi.example",
-        scope: "https://takosumi.example|sub_1",
+        accountsOrigins: ["https://accounts.takosumi.example", "https://takosumi.example"],
+        scope: "a".repeat(64),
       },
     },
   ]);
@@ -296,7 +297,7 @@ test("recent apps are kept per (instance, account), newest first and bounded", a
   expect(await readRecentApps(store, "s1")).toEqual([]);
 });
 
-test("the open context follows the session's instance and account", () => {
+test("the open context follows the session's instance and account", async () => {
   const session: MobileSession = {
     hostUrl: "https://takosumi.example/",
     oidcIssuer: "https://accounts.takosumi.example",
@@ -306,8 +307,18 @@ test("the open context follows the session's instance and account", () => {
     tokenType: "Bearer",
     createdAt: "2026-10-30T00:00:00.000Z",
   };
-  expect(openContextFromSession(session)).toEqual(context);
-  expect(openContextFromSession({ ...session, accountId: undefined } as MobileSession)?.scope).toBe(
-    "https://takosumi.example|",
-  );
+  const opened = await openContextFromSession(session);
+  expect(opened).toEqual({
+    instanceOrigin: "https://takosumi.example",
+    accountsOrigins: ["https://accounts.takosumi.example", "https://takosumi.example"],
+    scope: await openScope("https://takosumi.example", "sub_1"),
+  });
+  // The scope is a SHA-256 hex digest: fixed length, no raw subject, and a
+  // long account id never merges two accounts.
+  expect(opened?.scope).toMatch(/^[0-9a-f]{64}$/u);
+  const longA = await openScope("https://takosumi.example", `${"x".repeat(600)}a`);
+  const longB = await openScope("https://takosumi.example", `${"x".repeat(600)}b`);
+  expect(longA).not.toBe(longB);
+  expect((await openContextFromSession({ ...session, accountId: undefined } as MobileSession))?.scope)
+    .toBe(await openScope("https://takosumi.example", undefined));
 });

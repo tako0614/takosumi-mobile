@@ -44,18 +44,39 @@ class AppScreenRulesTest {
     }
 
     @Test
-    fun originCasesMatchTheSharedTable() {
-        val lines = fixture("navigation-policy-cases.json").lines()
-            .filter { it.contains("\"allowedOrigins\"") && it.contains("\"url\": \"https://") }
-        assertTrue(lines.size > 8)
+    fun shareCasesMatchTheSharedTable() {
+        val text = fixture("resume-url-cases.json")
+        val block = text.substringAfter("\"shareCases\": [").substringBefore("],")
+        val lines = block.lines().filter { it.contains("\"shared\"") }
+        assertTrue(lines.size > 10)
         for (line in lines) {
-            val url = field(line, "url")!!
-            val allowed = Regex("\"allowedOrigins\": \\[([^\\]]*)]").find(line)!!.groupValues[1]
-                .split(',').map { it.trim().trim('"') }.toSet()
-            val decision = Regex("\"decision\": \"([a-z-]+)\"").find(line)!!.groupValues[1]
-            if (line.contains("\"mainFrame\": false") || decision == "block") continue
-            assertEquals(url, decision == "in-app", AppScreenRules.isAllowedOrigin(url, allowed))
+            assertEquals(field(line, "url"), field(line, "shared"), AppScreenRules.shareable(field(line, "url")!!))
         }
+    }
+
+    @Test
+    fun signInPathsMatchTheSharedTable() {
+        val text = fixture("navigation-policy-cases.json")
+        val block = text.substringAfter("\"accountsSignInPaths\": [").substringBefore("]")
+        val paths = Regex("\"([^\"]+)\"").findAll(block).map { it.groupValues[1] }.toSet()
+        assertEquals(paths, AppScreenRules.ACCOUNTS_SIGN_IN_PATHS)
+        val origins = ScreenOrigins("https://app.example", setOf("https://accounts.example"))
+        assertEquals(
+            NavigationKind.IN_APP,
+            AppScreenRules.mainFrameDecision("https://accounts.example", "/sign-in", origins),
+        )
+        assertEquals(
+            NavigationKind.BROWSER_VIEW,
+            AppScreenRules.mainFrameDecision("https://accounts.example", "/apps", origins),
+        )
+        assertEquals(
+            NavigationKind.IN_APP,
+            AppScreenRules.mainFrameDecision("https://app.example", "/anything", origins),
+        )
+        assertEquals(
+            NavigationKind.BROWSER_VIEW,
+            AppScreenRules.mainFrameDecision("https://other.example", "/", origins),
+        )
     }
 
     @Test
@@ -67,6 +88,8 @@ class AppScreenRulesTest {
         assertNull(AppScreenRules.originOf("about:blank"))
         assertNull(AppScreenRules.originOf("https://app.example:99999/"))
         assertTrue(AppScreenRules.isShellHost("TAURI.localhost."))
+        assertTrue(AppScreenRules.isShellHost("custom-protocol.localhost"))
+        assertFalse(AppScreenRules.isShellHost("localhost"))
         assertTrue(AppScreenRules.hasRawUserInfo("https://:@app.example/"))
         assertTrue(AppScreenRules.hasRawUserInfo("http://u@app.example/"))
         assertFalse(AppScreenRules.hasRawUserInfo("https://app.example/@user"))

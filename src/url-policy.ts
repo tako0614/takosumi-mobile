@@ -1,3 +1,4 @@
+import navigationRules from "../src-tauri/plugins/app-screen/navigation-policy-cases.json";
 import resumeRules from "../src-tauri/plugins/app-screen/resume-url-cases.json";
 
 /**
@@ -9,23 +10,29 @@ import resumeRules from "../src-tauri/plugins/app-screen/resume-url-cases.json";
  *
  * - The main frame shows https pages only. `about:blank` / `about:srcdoc`
  *   stay in the screen because `window.open()` popups start there.
- * - A screen shows only its app's own origin and the instance's Accounts
- *   origin in the main frame (`allowedOrigins`). Any other https page (an
- *   external sign-in such as Google, which forbids embedded webviews) goes to
- *   the browser view (Custom Tabs / `SFSafariViewController`) instead.
+ * - A screen shows its app's own origin in the main frame. On the Takosumi
+ *   origins (the instance's Accounts and the instance itself, where the
+ *   dashboard and its session live) it shows only the sign-in pages an app's
+ *   Takosumi sign-in passes through (`ACCOUNTS_SIGN_IN_PATHS`); every other
+ *   page there goes to the browser view and is refused in subframes, so the
+ *   management screens never run with the app screen's web profile. Any other
+ *   https page (an external sign-in such as Google, which forbids embedded
+ *   webviews) goes to the browser view (Custom Tabs /
+ *   `SFSafariViewController`) instead.
  * - `http:` and other schemes (`tel:`, `mailto:`, ...) leave the app only
  *   after the person confirms, and only from the main frame.
  * - Schemes that would run or read local content (`javascript:`, `data:`,
  *   `file:`, ...), Takosumi Mobile's own `takosumi:` scheme and the hosts the
- *   Tauri shell serves itself from (`tauri.localhost`, ...) are refused, so a
- *   page cannot drive the shell (for example a forged OIDC callback).
+ *   Tauri shell serves itself from (`tauri.localhost`, `ipc.localhost`, any
+ *   `*.localhost`) are refused in every frame, so a page cannot drive the
+ *   shell (for example a forged OIDC callback).
  * - URLs with user info (`https://bank.example@evil.example`) are refused in
  *   the main frame.
  */
 
 export type AppScreenNavigationDecision =
   | { readonly kind: "in-app" }
-  | { readonly kind: "browser-view"; readonly reason: "other-origin" }
+  | { readonly kind: "browser-view"; readonly reason: "other-origin" | "takosumi-page" }
   | {
       readonly kind: "external-confirm";
       readonly reason: "insecure-http" | "other-scheme";
@@ -39,31 +46,57 @@ export type AppScreenNavigationDecision =
         | "local-content"
         | "shell-scheme"
         | "shell-host"
+        | "takosumi-page"
         | "subframe-scheme";
     };
 
+/** What one app screen may show (see `decideAppScreenNavigation`). */
+export interface AppScreenOrigins {
+  /** The app's own origin, shown in full. */
+  readonly appOrigin: string;
+  /**
+   * The Takosumi origins (the instance's Accounts and the instance itself):
+   * only `ACCOUNTS_SIGN_IN_PATHS` are shown there.
+   */
+  readonly accountsOrigins: readonly string[];
+}
+
 export interface AppScreenNavigationContext {
   readonly mainFrame: boolean;
-  /**
-   * Origins the screen may show in its main frame: the app's own origin and
-   * the instance's Accounts origin. Other https pages go to the browser view.
-   * Without it only the scheme rules apply (launch URL checks).
-   */
-  readonly allowedOrigins?: readonly string[];
+  /** The screen's origins. Without it only the scheme rules apply (launch URL checks). */
+  readonly screen?: AppScreenOrigins;
 }
+
+/**
+ * The pages an app's Takosumi sign-in passes through on the Takosumi origins,
+ * compared exactly on the percent-encoded path: `/oauth/authorize`
+ * (authorization and consent), the sign-in screen it redirects to and its
+ * callback, and the upstream sign-in (`/oauth/upstream/*`). Takosumi's routes:
+ * `contract/identity-oidc.ts`, `accounts/contract` and the dashboard's
+ * `/sign-in` routes.
+ */
+export const ACCOUNTS_SIGN_IN_PATHS: ReadonlySet<string> = new Set(
+  navigationRules.accountsSignInPaths,
+);
 
 /** Takosumi Mobile's own deep-link scheme; pages must not navigate to it. */
 export const SHELL_SCHEME = "takosumi";
 
 /**
  * Hosts the Tauri shell serves its own UI and IPC from. App screens share the
- * device's web profile with the shell, so they never load these hosts.
+ * device's web profile with the shell, so they never load these hosts, nor
+ * any other `*.localhost` name (Tauri's custom protocols use them).
  */
 export const SHELL_HOSTS: ReadonlySet<string> = new Set([
   "tauri.localhost",
   "ipc.localhost",
   "asset.localhost",
 ]);
+
+export function isShellHost(host: string): boolean {
+  const name = host.toLowerCase().replace(/\.+$/u, "");
+  return SHELL_HOSTS.has(name) || name.endsWith(".localhost");
+}
 
 const IN_SCREEN_ABOUT_URLS = new Set(["about:blank", "about:srcdoc"]);
 
@@ -103,11 +136,17 @@ export function decideAppScreenNavigation(
   const url = parseUrl(rawUrl);
   if (!url) return { kind: "block", reason: "invalid-url" };
   const scheme = url.protocol.slice(0, -1).toLowerCase();
+  const web = scheme === "http" || scheme === "https";
+  if (web && isShellHost(url.hostname)) return { kind: "block", reason: "shell-host" };
 
   if (!context.mainFrame) {
-    return SUBFRAME_WEB_SCHEMES.has(scheme)
-      ? { kind: "in-app" }
-      : { kind: "block", reason: "subframe-scheme" };
+    if (!SUBFRAME_WEB_SCHEMES.has(scheme)) {
+      return { kind: "block", reason: "subframe-scheme" };
+    }
+    if (web && context.screen && isTakosumiPageOutsideSignIn(url, context.screen)) {
+      return { kind: "block", reason: "takosumi-page" };
+    }
+    return { kind: "in-app" };
   }
 
   if (scheme === "https") {
@@ -115,14 +154,16 @@ export function decideAppScreenNavigation(
       return { kind: "block", reason: "user-info" };
     }
     if (!url.hostname) return { kind: "block", reason: "invalid-url" };
-    if (SHELL_HOSTS.has(url.hostname.toLowerCase().replace(/\.$/u, ""))) {
-      return { kind: "block", reason: "shell-host" };
-    }
-    if (
-      context.allowedOrigins !== undefined &&
-      !context.allowedOrigins.includes(url.origin)
-    ) {
-      return { kind: "browser-view", reason: "other-origin" };
+    const screen = context.screen;
+    if (screen) {
+      if (screen.accountsOrigins.includes(url.origin)) {
+        return ACCOUNTS_SIGN_IN_PATHS.has(url.pathname)
+          ? { kind: "in-app" }
+          : { kind: "browser-view", reason: "takosumi-page" };
+      }
+      if (url.origin !== screen.appOrigin) {
+        return { kind: "browser-view", reason: "other-origin" };
+      }
     }
     return { kind: "in-app" };
   }
@@ -148,6 +189,11 @@ export function decideAppScreenNavigation(
     return { kind: "external-confirm", reason: "insecure-http", scheme };
   }
   return { kind: "external-confirm", reason: "other-scheme", scheme };
+}
+
+/** A page of a Takosumi origin that is not one of the sign-in pages. */
+function isTakosumiPageOutsideSignIn(url: URL, screen: AppScreenOrigins): boolean {
+  return screen.accountsOrigins.includes(url.origin) && !ACCOUNTS_SIGN_IN_PATHS.has(url.pathname);
 }
 
 /**
@@ -196,39 +242,50 @@ export function screenOrigin(rawUrl: string): string | undefined {
   return url.origin;
 }
 
-/**
- * The https origin of the instance's Accounts (the OIDC issuer, else the
- * instance itself). Only an https origin can be shown in an app screen.
- */
-export function accountsOrigin(input: {
-  readonly hostUrl?: string;
-  readonly oidcIssuer?: string;
-}): string | undefined {
-  for (const candidate of [input.oidcIssuer, input.hostUrl]) {
-    if (!candidate) continue;
-    const url = parseUrl(candidate);
-    if (url?.protocol === "https:" && !url.username && !url.password) {
-      return url.origin;
-    }
-  }
-  return undefined;
+/** The https origin of a URL without user info, else `undefined`. */
+export function httpsOrigin(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const url = parseUrl(raw);
+  return url?.protocol === "https:" && !url.username && !url.password ? url.origin : undefined;
 }
 
 /**
- * Origins an app screen keeps in its main frame: the app's own origin and the
- * instance's Accounts origin (Takosumi sign-in stays in the screen).
+ * The Takosumi origins of the current instance: its Accounts (the OIDC
+ * issuer) and the instance itself (dashboard and API, often the same origin).
+ * App screens show only the sign-in pages there.
  */
-export function appScreenAllowedOrigins(input: {
-  readonly appUrl: string;
-  readonly accountsOrigin?: string;
+export function takosumiOrigins(input: {
+  readonly hostUrl?: string;
+  readonly oidcIssuer?: string;
 }): readonly string[] {
   const origins: string[] = [];
-  for (const origin of [screenOrigin(input.appUrl), input.accountsOrigin]) {
-    if (origin && origin.startsWith("https://") && !origins.includes(origin)) {
-      origins.push(origin);
-    }
+  for (const origin of [httpsOrigin(input.oidcIssuer), httpsOrigin(input.hostUrl)]) {
+    if (origin && !origins.includes(origin)) origins.push(origin);
   }
   return origins;
+}
+
+/** The origins one app screen judges navigations by. */
+export function appScreenOrigins(input: {
+  readonly appUrl: string;
+  readonly accountsOrigins: readonly string[];
+}): AppScreenOrigins | undefined {
+  const appOrigin = screenOrigin(input.appUrl);
+  return appOrigin ? { appOrigin, accountsOrigins: input.accountsOrigins } : undefined;
+}
+
+/**
+ * True when the app screen of `appUrl` shows `appUrl` itself: false for a
+ * Takosumi page outside sign-in (the dashboard, `/api/v1`, account pages),
+ * which opens in the browser view instead, never in an app screen.
+ */
+export function opensInAppScreen(appUrl: string, accountsOrigins: readonly string[]): boolean {
+  const screen = appScreenOrigins({ appUrl, accountsOrigins });
+  return (
+    screen !== undefined &&
+    isLaunchableAppScreenUrl(appUrl) &&
+    decideAppScreenNavigation(appUrl, { mainFrame: true, screen }).kind === "in-app"
+  );
 }
 
 /** Longest URL a screen remembers as the place to return to. */
@@ -260,11 +317,61 @@ export function isRememberableAppScreenUrl(
     return false;
   }
   if (url.origin !== appOrigin || !isLaunchableAppScreenUrl(rawUrl)) return false;
-  for (const [name, value] of url.searchParams) {
-    const normalized = name.toLowerCase().replace(/[^a-z0-9]/gu, "");
-    if (value.trim() && CREDENTIAL_QUERY_NAMES.has(normalized)) return false;
+  if (/\s/u.test(rawUrl)) return false;
+  const query = rawUrl.includes("?") ? rawUrl.slice(rawUrl.indexOf("?") + 1) : "";
+  for (const pair of query.split("&")) {
+    if (!pair) continue;
+    const parsed = queryPair(pair);
+    if (!parsed || isCredentialPair(parsed)) return false;
   }
   return true;
+}
+
+/**
+ * `rawUrl` as it may be shared or handed to the browser: query parameters
+ * with a credential name and a value, and a fragment that holds parameters
+ * (where implicit-flow tokens travel), are removed; everything else is kept
+ * as written. A pair whose name cannot be decoded is removed too.
+ * `resume-url-cases.json` `shareCases` is the shared table.
+ */
+export function shareableAppScreenUrl(rawUrl: string): string {
+  const hash = rawUrl.indexOf("#");
+  const beforeHash = hash < 0 ? rawUrl : rawUrl.slice(0, hash);
+  const fragment = hash < 0 ? undefined : rawUrl.slice(hash + 1);
+  const question = beforeHash.indexOf("?");
+  const base = question < 0 ? beforeHash : beforeHash.slice(0, question);
+  const kept = (question < 0 ? "" : beforeHash.slice(question + 1))
+    .split("&")
+    .filter((pair) => {
+      if (!pair) return false;
+      const parsed = queryPair(pair);
+      return parsed !== undefined && !isCredentialPair(parsed);
+    });
+  return (
+    base +
+    (kept.length ? `?${kept.join("&")}` : "") +
+    (fragment !== undefined && !fragment.includes("=") ? `#${fragment}` : "")
+  );
+}
+
+/** As URLSearchParams decodes a pair, but `undefined` when it cannot. */
+function queryPair(pair: string): { readonly name: string; readonly value: string } | undefined {
+  const equals = pair.indexOf("=");
+  const decode = (part: string) => {
+    try {
+      return decodeURIComponent(part.replaceAll("+", " "));
+    } catch {
+      return undefined;
+    }
+  };
+  const name = decode(equals < 0 ? pair : pair.slice(0, equals));
+  const value = decode(equals < 0 ? "" : pair.slice(equals + 1));
+  return name === undefined || value === undefined ? undefined : { name, value };
+}
+
+function isCredentialPair(pair: { readonly name: string; readonly value: string }): boolean {
+  const normalized = pair.name.toLowerCase().replace(/[^a-z0-9]/gu, "");
+  return pair.value.trim() !== "" && CREDENTIAL_QUERY_NAMES.has(normalized);
 }
 
 export type NormalizedAppUrl =

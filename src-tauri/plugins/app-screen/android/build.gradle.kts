@@ -37,4 +37,6 @@ dependencies {
     // Custom Tabs for the browser view (the same version tauri-plugin-opener uses).
     implementation("androidx.browser:browser:1.8.0")
     testImplementation("junit:junit:4.13.2")
+    // Runs AppScreenPolicy (android.net.Uri) against the shared table on the JVM.
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }

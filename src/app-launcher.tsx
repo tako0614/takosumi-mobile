@@ -175,8 +175,7 @@ export function AppLauncher(props: {
       const requested = await props.controller.pinEntry(entry, {
         platform: props.platform,
         resume: true,
-        ...(context?.accountsOrigin ? { accountsOrigin: context.accountsOrigin } : {}),
-        ...(context ? { scope: context.scope } : {}),
+        ...(context ? { accountsOrigins: context.accountsOrigins, scope: context.scope } : {}),
       });
       setStatus(
         requested

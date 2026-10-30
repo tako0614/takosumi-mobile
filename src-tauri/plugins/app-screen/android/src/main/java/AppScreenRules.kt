@@ -11,9 +11,25 @@ import java.net.URLDecoder
  * canonical (lowercase scheme and host, punycode, default port dropped), so
  * origins are read from the text rather than with a second URL parser.
  */
+/**
+ * What one app screen may show: its app's origin in full, and on the Takosumi
+ * origins (the instance's Accounts and the instance itself) only
+ * [AppScreenRules.ACCOUNTS_SIGN_IN_PATHS].
+ */
+internal data class ScreenOrigins(val appOrigin: String?, val accountsOrigins: Set<String>)
+
 internal object AppScreenRules {
-    /** Hosts the Tauri shell serves its own UI and IPC from. */
+    /** Hosts the Tauri shell serves its own UI and IPC from (and any `*.localhost`). */
     val SHELL_HOSTS = setOf("tauri.localhost", "ipc.localhost", "asset.localhost")
+
+    /**
+     * The pages an app's Takosumi sign-in passes through on the Takosumi
+     * origins, compared exactly on the percent-encoded path.
+     */
+    val ACCOUNTS_SIGN_IN_PATHS = setOf(
+        "/oauth/authorize", "/oauth/upstream/authorize", "/oauth/upstream/callback",
+        "/sign-in", "/sign-in/callback",
+    )
 
     /** Takosumi's `hasCredentialQueryParams` names plus OAuth/SAML callback values. */
     val CREDENTIAL_QUERY_NAMES = setOf(
@@ -88,12 +104,54 @@ internal object AppScreenRules {
     fun hasRawUserInfo(rawUrl: String): Boolean =
         AUTHORITY.find(rawUrl.trim())?.groupValues?.get(2)?.contains('@') == true
 
-    fun isShellHost(host: String?): Boolean =
-        host != null && host.lowercase().trimEnd('.') in SHELL_HOSTS
+    fun isShellHost(host: String?): Boolean {
+        val name = host?.lowercase()?.trimEnd('.') ?: return false
+        return name in SHELL_HOSTS || name.endsWith(".localhost")
+    }
 
-    /** The screen keeps only these origins in its main frame. */
-    fun isAllowedOrigin(rawUrl: String, allowedOrigins: Set<String>): Boolean =
-        originOf(rawUrl)?.let { it in allowedOrigins } == true
+    /**
+     * An https main-frame page of a screen: IN_APP on the app's origin and on
+     * the sign-in paths of the Takosumi origins, BROWSER_VIEW otherwise (the
+     * dashboard, account pages, `/api/v1`, other sites).
+     */
+    fun mainFrameDecision(origin: String?, encodedPath: String?, origins: ScreenOrigins): NavigationKind {
+        if (origin == null) return NavigationKind.BROWSER_VIEW
+        if (origin in origins.accountsOrigins) {
+            return if (encodedPath in ACCOUNTS_SIGN_IN_PATHS) NavigationKind.IN_APP else NavigationKind.BROWSER_VIEW
+        }
+        return if (origin == origins.appOrigin) NavigationKind.IN_APP else NavigationKind.BROWSER_VIEW
+    }
+
+    /** A subframe on a Takosumi origin outside sign-in is refused. */
+    fun isTakosumiPageOutsideSignIn(origin: String?, encodedPath: String?, origins: ScreenOrigins): Boolean =
+        origin != null && origin in origins.accountsOrigins && encodedPath !in ACCOUNTS_SIGN_IN_PATHS
+
+    /**
+     * [rawUrl] as it may be shared or handed to the browser: credential-named
+     * query parameters with a value, undecodable pairs, empty pairs and a
+     * fragment holding parameters are removed; the rest is kept as written.
+     */
+    fun shareable(rawUrl: String): String {
+        val hash = rawUrl.indexOf('#')
+        val beforeHash = if (hash < 0) rawUrl else rawUrl.substring(0, hash)
+        val fragment = if (hash < 0) null else rawUrl.substring(hash + 1)
+        val question = beforeHash.indexOf('?')
+        val base = if (question < 0) beforeHash else beforeHash.substring(0, question)
+        val kept = (if (question < 0) "" else beforeHash.substring(question + 1))
+            .split('&')
+            .filter { pair ->
+                if (pair.isEmpty()) return@filter false
+                val name = decode(pair.substringBefore('=')) ?: return@filter false
+                val value = decode(if (pair.contains('=')) pair.substringAfter('=') else "") ?: return@filter false
+                !isCredential(name, value)
+            }
+        return base +
+            (if (kept.isEmpty()) "" else "?" + kept.joinToString("&")) +
+            (if (fragment != null && !fragment.contains('=')) "#$fragment" else "")
+    }
+
+    private fun isCredential(name: String, value: String): Boolean =
+        value.isNotBlank() && name.lowercase().filter { it in 'a'..'z' || it in '0'..'9' } in CREDENTIAL_QUERY_NAMES
 
     /** Exactly an https origin (`https://host[:port]`), not a shell host. */
     fun isHttpsOrigin(raw: String): Boolean {
@@ -117,8 +175,7 @@ internal object AppScreenRules {
             if (pair.isEmpty()) continue
             val name = decode(pair.substringBefore('=')) ?: return false
             val value = decode(if (pair.contains('=')) pair.substringAfter('=') else "") ?: return false
-            val normalized = name.lowercase().filter { it in 'a'..'z' || it in '0'..'9' }
-            if (value.isNotBlank() && normalized in CREDENTIAL_QUERY_NAMES) return false
+            if (isCredential(name, value)) return false
         }
         return true
     }

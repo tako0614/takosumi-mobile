@@ -2,9 +2,10 @@ import Foundation
 
 /// Mirror of `src/url-policy.ts`. The shared tables are
 /// `navigation-policy-cases.json` and `resume-url-cases.json`; keep the three
-/// implementations equal. `.browserView`: an https page outside the screen's
-/// allowed origins (its app and the instance's Accounts), such as an external
-/// sign-in, opens in `SFSafariViewController` instead of this webview.
+/// implementations equal (`ios/Tests/PolicyTests` runs this file against
+/// them). `.browserView`: an https page the screen does not show (another
+/// site such as an external sign-in, or a Takosumi page outside sign-in: the
+/// dashboard, account pages, `/api/v1`) opens in `SFSafariViewController`.
 enum AppScreenNavigation: Equatable {
     case inApp
     case browserView
@@ -12,10 +13,24 @@ enum AppScreenNavigation: Equatable {
     case block
 }
 
+/// What one app screen may show: its app's origin in full, and on the
+/// Takosumi origins (the instance's Accounts and the instance itself) only
+/// `AppScreenPolicy.accountsSignInPaths`.
+struct AppScreenOrigins: Equatable {
+    let appOrigin: String?
+    let accountsOrigins: Set<String>
+}
+
 enum AppScreenPolicy {
     private static let shellScheme = "takosumi"
-    /// Hosts the Tauri shell serves its own UI and IPC from.
+    /// Hosts the Tauri shell serves its own UI and IPC from (and any `*.localhost`).
     static let shellHosts: Set<String> = ["tauri.localhost", "ipc.localhost", "asset.localhost"]
+    /// The pages an app's Takosumi sign-in passes through on the Takosumi
+    /// origins, compared exactly on the percent-encoded path.
+    static let accountsSignInPaths: Set<String> = [
+        "/oauth/authorize", "/oauth/upstream/authorize", "/oauth/upstream/callback",
+        "/sign-in", "/sign-in/callback",
+    ]
     private static let inScreenAbout: Set<String> = ["about:blank", "about:srcdoc"]
     private static let localContentSchemes: Set<String> = [
         "about", "blob", "chrome", "chrome-extension", "content", "data", "file",
@@ -56,7 +71,7 @@ enum AppScreenPolicy {
     static func decide(
         _ rawUrl: String,
         mainFrame: Bool,
-        allowedOrigins: Set<String>? = nil
+        origins: AppScreenOrigins? = nil
     ) -> AppScreenNavigation {
         let trimmed = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed),
@@ -64,16 +79,22 @@ enum AppScreenPolicy {
               !scheme.isEmpty else {
             return .block
         }
+        let web = scheme == "http" || scheme == "https"
+        // The shell's own hosts, in every frame and both web schemes.
+        if web, let host = url.host, isShellHost(host) { return .block }
         if !mainFrame {
-            return subframeWebSchemes.contains(scheme) ? .inApp : .block
+            guard subframeWebSchemes.contains(scheme) else { return .block }
+            if web, let origins = origins,
+               isTakosumiPageOutsideSignIn(origin(of: trimmed), encodedPath(trimmed), origins) {
+                return .block
+            }
+            return .inApp
         }
         if scheme == "https" {
             if hasUserInfo(url) || hasRawUserInfo(trimmed) { return .block }
-            guard let host = url.host, !host.isEmpty, !isShellHost(host) else { return .block }
-            if let allowed = allowedOrigins {
-                guard let origin = origin(of: trimmed), allowed.contains(origin) else {
-                    return .browserView
-                }
+            guard let host = url.host, !host.isEmpty else { return .block }
+            if let origins = origins {
+                return mainFrameDecision(origin(of: trimmed), encodedPath(trimmed), origins)
             }
             return .inApp
         }
@@ -133,7 +154,61 @@ enum AppScreenPolicy {
     static func isShellHost(_ host: String) -> Bool {
         var normalized = host.lowercased()
         while normalized.hasSuffix(".") { normalized.removeLast() }
-        return shellHosts.contains(normalized)
+        return shellHosts.contains(normalized) || normalized.hasSuffix(".localhost")
+    }
+
+    /// An https main-frame page of a screen: in the screen on the app's origin
+    /// and on the sign-in paths of the Takosumi origins, else the browser view.
+    static func mainFrameDecision(
+        _ origin: String?, _ path: String?, _ origins: AppScreenOrigins
+    ) -> AppScreenNavigation {
+        guard let origin = origin else { return .browserView }
+        if origins.accountsOrigins.contains(origin) {
+            return accountsSignInPaths.contains(path ?? "") ? .inApp : .browserView
+        }
+        return origin == origins.appOrigin ? .inApp : .browserView
+    }
+
+    static func isTakosumiPageOutsideSignIn(
+        _ origin: String?, _ path: String?, _ origins: AppScreenOrigins
+    ) -> Bool {
+        guard let origin = origin else { return false }
+        return origins.accountsOrigins.contains(origin) && !accountsSignInPaths.contains(path ?? "")
+    }
+
+    /// The path as written (percent-encoded, dot segments kept).
+    static func encodedPath(_ rawUrl: String) -> String? {
+        URLComponents(string: rawUrl)?.percentEncodedPath
+    }
+
+    /// `rawUrl` as it may be shared or handed to the browser: credential-named
+    /// query parameters with a value, undecodable or empty pairs and a fragment
+    /// holding parameters are removed; the rest is kept as written.
+    static func shareable(_ rawUrl: String) -> String {
+        let hash = rawUrl.firstIndex(of: "#")
+        let beforeHash = hash.map { String(rawUrl[..<$0]) } ?? rawUrl
+        let fragment = hash.map { String(rawUrl[rawUrl.index(after: $0)...]) }
+        let question = beforeHash.firstIndex(of: "?")
+        let base = question.map { String(beforeHash[..<$0]) } ?? beforeHash
+        let query = question.map { String(beforeHash[beforeHash.index(after: $0)...]) } ?? ""
+        let kept = query.split(separator: "&", omittingEmptySubsequences: true).filter { pair in
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let name = decodeQueryPart(String(parts[0])),
+                  let value = decodeQueryPart(parts.count > 1 ? String(parts[1]) : "") else {
+                return false
+            }
+            return !isCredential(name: name, value: value)
+        }
+        var shared = base
+        if !kept.isEmpty { shared += "?" + kept.joined(separator: "&") }
+        if let fragment = fragment, !fragment.contains("=") { shared += "#" + fragment }
+        return shared
+    }
+
+    private static func isCredential(name: String, value: String) -> Bool {
+        let normalized = String(name.lowercased().filter { $0.isASCII && ($0.isLowercase || $0.isNumber) })
+        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            credentialQueryNames.contains(normalized)
     }
 
     /// https with a host and no user info: the only URLs a screen opens with.
@@ -145,9 +220,9 @@ enum AppScreenPolicy {
         return decide(rawUrl, mainFrame: true) == .inApp
     }
 
-    /// True when a screen with `allowedOrigins` shows `rawUrl` itself.
-    static func isInScreen(_ rawUrl: String, allowedOrigins: Set<String>?) -> Bool {
-        isLaunchable(rawUrl) && decide(rawUrl, mainFrame: true, allowedOrigins: allowedOrigins) == .inApp
+    /// True when a screen with `origins` shows `rawUrl` itself.
+    static func isInScreen(_ rawUrl: String, origins: AppScreenOrigins?) -> Bool {
+        isLaunchable(rawUrl) && decide(rawUrl, mainFrame: true, origins: origins) == .inApp
     }
 
     /// `scheme://host[:port]` as `URL.origin` writes it: lowercase, default port
@@ -220,11 +295,7 @@ enum AppScreenPolicy {
                   let value = decodeQueryPart(parts.count > 1 ? String(parts[1]) : "") else {
                 return false
             }
-            let normalized = String(name.lowercased().filter { $0.isASCII && ($0.isLowercase || $0.isNumber) })
-            if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-                credentialQueryNames.contains(normalized) {
-                return false
-            }
+            if isCredential(name: name, value: value) { return false }
         }
         return true
     }

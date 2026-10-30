@@ -5,9 +5,10 @@ import android.net.Uri
 /**
  * Mirror of `src/url-policy.ts`. The shared table is
  * `navigation-policy-cases.json`; keep the three implementations equal.
- * BROWSER_VIEW: an https page outside the screen's allowed origins (its app
- * and the instance's Accounts), such as an external sign-in, goes to the
- * browser view instead of this WebView.
+ * BROWSER_VIEW: an https page the screen does not show (another site such as
+ * an external sign-in, or a Takosumi page outside sign-in: the dashboard,
+ * account pages, `/api/v1`) goes to the browser view instead of this WebView.
+ * `AppScreenPolicyTest` runs this file against the shared table (Robolectric).
  */
 internal enum class NavigationKind { IN_APP, BROWSER_VIEW, EXTERNAL_CONFIRM, BLOCK }
 
@@ -29,7 +30,7 @@ internal object AppScreenPolicy {
     fun decide(
         rawUrl: String,
         mainFrame: Boolean,
-        allowedOrigins: Set<String>? = null,
+        origins: ScreenOrigins? = null,
     ): NavigationDecision {
         val trimmed = rawUrl.trim()
         val uri = try {
@@ -40,14 +41,25 @@ internal object AppScreenPolicy {
         val scheme = uri.scheme?.lowercase() ?: return block("")
         if (!scheme.matches(Regex("[a-z][a-z0-9+.-]*"))) return block("")
 
+        val web = scheme == "http" || scheme == "https"
+        // The shell's own hosts, in every frame and both web schemes.
+        if (web && AppScreenRules.isShellHost(uri.host)) return block(scheme)
+
         if (!mainFrame) {
-            return if (scheme in subframeWebSchemes) inApp(scheme) else block(scheme)
+            if (scheme !in subframeWebSchemes) return block(scheme)
+            if (web && origins != null &&
+                AppScreenRules.isTakosumiPageOutsideSignIn(AppScreenRules.originOf(trimmed), uri.encodedPath, origins)
+            ) {
+                return block(scheme)
+            }
+            return inApp(scheme)
         }
         if (scheme == "https") {
             if (!uri.userInfo.isNullOrEmpty() || AppScreenRules.hasRawUserInfo(trimmed)) return block(scheme)
-            if (uri.host.isNullOrEmpty() || AppScreenRules.isShellHost(uri.host)) return block(scheme)
-            if (allowedOrigins != null && !AppScreenRules.isAllowedOrigin(trimmed, allowedOrigins)) {
-                return NavigationDecision(NavigationKind.BROWSER_VIEW, scheme)
+            if (uri.host.isNullOrEmpty()) return block(scheme)
+            if (origins != null) {
+                val kind = AppScreenRules.mainFrameDecision(AppScreenRules.originOf(trimmed), uri.encodedPath, origins)
+                if (kind != NavigationKind.IN_APP) return NavigationDecision(kind, scheme)
             }
             return inApp(scheme)
         }
@@ -84,9 +96,9 @@ internal object AppScreenPolicy {
         return Regex("^([a-zA-Z][a-zA-Z0-9+.-]*):").find(data)?.groupValues?.get(1)?.lowercase()
     }
 
-    /** True when a screen with [allowedOrigins] shows [rawUrl] itself. */
-    fun isInScreen(rawUrl: String, allowedOrigins: Set<String>?): Boolean =
-        isLaunchable(rawUrl) && decide(rawUrl, mainFrame = true, allowedOrigins).kind == NavigationKind.IN_APP
+    /** True when a screen with [origins] shows [rawUrl] itself. */
+    fun isInScreen(rawUrl: String, origins: ScreenOrigins?): Boolean =
+        isLaunchable(rawUrl) && decide(rawUrl, mainFrame = true, origins).kind == NavigationKind.IN_APP
 
     /** https with a host and no user info: the only URLs a screen opens with. */
     fun isLaunchable(rawUrl: String): Boolean {

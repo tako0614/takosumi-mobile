@@ -31,7 +31,7 @@ class OpenScreenArgs {
     var title: String = ""
     var iconPng: String? = null
     var profile: String = ""
-    var accountsOrigin: String? = null
+    var accountsOrigins: Array<String>? = null
     var scope: String? = null
     var resume: Boolean = false
     var client: BannerClientArgs? = null
@@ -173,11 +173,9 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Only https URLs can be opened in an app screen.")
             return null
         }
-        val accountsOrigin = args.accountsOrigin?.let {
-            ScreenRequest.checkedAccountsOrigin(it) ?: run {
-                invoke.reject("The Accounts origin must be an https origin.")
-                return null
-            }
+        val accountsOrigins = ScreenRequest.checkedAccountsOrigins(args.accountsOrigins?.toList()) ?: run {
+            invoke.reject("The Takosumi origins must be at most four https origins.")
+            return null
         }
         val scope = args.scope?.let {
             ScreenRequest.checkedScope(it) ?: run {
@@ -204,7 +202,7 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             key = args.key,
             url = args.url,
             title = title,
-            accountsOrigin = accountsOrigin,
+            accountsOrigins = accountsOrigins,
             scope = scope,
             resume = args.resume,
             client = client,

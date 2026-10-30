@@ -13,6 +13,7 @@ import android.util.Base64
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -85,8 +86,11 @@ internal data class ScreenRequest(
     val url: String,
     val title: String,
     val popup: Boolean = false,
-    /** The instance's Accounts origin, kept in the screen with the app's own. */
-    val accountsOrigin: String? = null,
+    /**
+     * The Takosumi origins (the instance's Accounts and the instance itself):
+     * the screen shows only their sign-in pages.
+     */
+    val accountsOrigins: Set<String> = emptySet(),
     /** (instance, account) the last page is remembered for. */
     val scope: String? = null,
     /** Reopen at the last remembered page instead of [url]. */
@@ -95,9 +99,9 @@ internal data class ScreenRequest(
 ) {
     val appOrigin: String? get() = AppScreenRules.originOf(url)
 
-    /** The origins this screen shows in its main frame; others go to the browser view. */
-    val allowedOrigins: Set<String>
-        get() = setOfNotNull(appOrigin, accountsOrigin)
+    /** What this screen shows; everything else goes to the browser view. */
+    val origins: ScreenOrigins
+        get() = ScreenOrigins(appOrigin, accountsOrigins)
 
     /**
      * What is kept beyond this launch (task restore, shortcuts): the declared
@@ -112,7 +116,7 @@ internal data class ScreenRequest(
             .put("url", kept.url)
             .put("title", kept.title)
             .apply {
-                kept.accountsOrigin?.let { put("accountsOrigin", it) }
+                if (kept.accountsOrigins.isNotEmpty()) put("accountsOrigins", JSONArray(kept.accountsOrigins.toList()))
                 kept.scope?.let { put("scope", it) }
                 kept.client?.let { put("client", it.toJson().toString()) }
             }
@@ -121,8 +125,14 @@ internal data class ScreenRequest(
     companion object {
         const val SCOPE_MAX_LENGTH = 512
 
-        fun checkedAccountsOrigin(raw: String?): String? =
-            raw?.takeIf { AppScreenRules.isHttpsOrigin(it) }
+        const val ACCOUNTS_ORIGINS_MAX = 4
+
+        /** Null when any is not an https origin or there are too many. */
+        fun checkedAccountsOrigins(raw: List<String>?): Set<String>? {
+            if (raw == null) return emptySet()
+            if (raw.size > ACCOUNTS_ORIGINS_MAX || raw.any { !AppScreenRules.isHttpsOrigin(it) }) return null
+            return raw.toSet()
+        }
 
         fun checkedScope(raw: String?): String? =
             raw?.takeIf { it.isNotEmpty() && it.length <= SCOPE_MAX_LENGTH && it.none { c -> c.isISOControl() } }
@@ -132,7 +142,9 @@ internal data class ScreenRequest(
             key = key,
             url = json.optString("url"),
             title = json.optString("title"),
-            accountsOrigin = checkedAccountsOrigin(json.optString("accountsOrigin").ifEmpty { null }),
+            accountsOrigins = checkedAccountsOrigins(
+                json.optJSONArray("accountsOrigins")?.let { array -> List(array.length()) { array.optString(it) } },
+            ) ?: emptySet(),
             scope = checkedScope(json.optString("scope").ifEmpty { null }),
             resume = true,
             client = BannerClient.fromJson(json.optString("client").ifEmpty { null }),
@@ -145,7 +157,7 @@ internal object AppScreenLaunch {
     const val EXTRA_URL = "com.takosumi.appscreen.URL"
     const val EXTRA_TITLE = "com.takosumi.appscreen.TITLE"
     const val EXTRA_POPUP = "com.takosumi.appscreen.POPUP"
-    const val EXTRA_ACCOUNTS_ORIGIN = "com.takosumi.appscreen.ACCOUNTS_ORIGIN"
+    const val EXTRA_ACCOUNTS_ORIGINS = "com.takosumi.appscreen.ACCOUNTS_ORIGINS"
     const val EXTRA_SCOPE = "com.takosumi.appscreen.SCOPE"
     const val EXTRA_RESUME = "com.takosumi.appscreen.RESUME"
     const val EXTRA_CLIENT = "com.takosumi.appscreen.CLIENT"
@@ -168,7 +180,9 @@ internal object AppScreenLaunch {
             putExtra(EXTRA_URL, request.url)
             putExtra(EXTRA_TITLE, request.title)
             putExtra(EXTRA_RESUME, request.resume)
-            request.accountsOrigin?.let { putExtra(EXTRA_ACCOUNTS_ORIGIN, it) }
+            if (request.accountsOrigins.isNotEmpty()) {
+                putExtra(EXTRA_ACCOUNTS_ORIGINS, request.accountsOrigins.toTypedArray())
+            }
             request.scope?.let { putExtra(EXTRA_SCOPE, it) }
             request.client?.let { putExtra(EXTRA_CLIENT, it.toJson().toString()) }
             addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
@@ -222,7 +236,9 @@ internal object AppScreenLaunch {
             key = key,
             url = url,
             title = title,
-            accountsOrigin = ScreenRequest.checkedAccountsOrigin(intent.getStringExtra(EXTRA_ACCOUNTS_ORIGIN)),
+            accountsOrigins = ScreenRequest.checkedAccountsOrigins(
+                intent.getStringArrayExtra(EXTRA_ACCOUNTS_ORIGINS)?.toList(),
+            ) ?: emptySet(),
             scope = ScreenRequest.checkedScope(intent.getStringExtra(EXTRA_SCOPE)),
             // A bare `takosumi://app?url=` names a page; it never resumes elsewhere.
             resume = intent.getBooleanExtra(EXTRA_RESUME, false),

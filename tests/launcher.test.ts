@@ -502,6 +502,38 @@ test("deep-linked URLs open in the matching app's screen; slow icons do not bloc
   ]);
 });
 
+test("a Takosumi page outside sign-in opens in the browser view, never in an app screen", async () => {
+  const { opener, opened } = recordingOpener();
+  const browserViews: string[] = [];
+  const controller = createLauncherController({
+    opener: {
+      ...opener,
+      openBrowserView: async (url: string) => {
+        browserViews.push(url);
+        return "browser-view" as const;
+      },
+    },
+    fetchIcon: async () => undefined,
+    rasterize: async () => undefined,
+    iconWaitMs: 5,
+  });
+  const accountsOrigins = ["https://app.takosumi.example"];
+  await controller.openUrl("https://app.takosumi.example/apps", { accountsOrigins });
+  await controller.openUrl("https://app.takosumi.example/oauth/authorize?client_id=x", {
+    accountsOrigins,
+  });
+  expect(browserViews).toEqual(["https://app.takosumi.example/apps"]);
+  expect(opened.map((request) => request.url)).toEqual([
+    "https://app.takosumi.example/oauth/authorize?client_id=x",
+  ]);
+  await expect(
+    controller.pinEntry(
+      { ...yurucommu, key: "custom:dash", url: "https://app.takosumi.example/" },
+      { accountsOrigins },
+    ),
+  ).rejects.toThrow("ホーム画面に追加できません");
+});
+
 // --- Deep links -----------------------------------------------------------------
 
 test("app screen links are taken before the shared shell; other payloads pass", async () => {

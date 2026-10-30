@@ -51,11 +51,12 @@ internal object AppScreenRegistry {
         var scope: String? = null
 
         /**
-         * Origins the main frame may show (the app's and the instance's
-         * Accounts); others go to the browser view. Read on WebView threads.
+         * What the main frame may show (the app's origin, the Takosumi
+         * origins' sign-in pages); the rest goes to the browser view. Read on
+         * WebView threads.
          */
         @Volatile
-        var allowedOrigins: Set<String>? = null
+        var origins: ScreenOrigins? = null
 
         /** The policy while no activity shows this webview. */
         val detachedClient = DetachedScreenClient(this)

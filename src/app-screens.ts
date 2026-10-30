@@ -417,11 +417,12 @@ export interface AppScreenOpenRequest {
   readonly iconPng?: string;
   readonly profile: typeof APP_SCREEN_PROFILE;
   /**
-   * The instance's Accounts origin. With the app's own origin it is all the
-   * screen shows in its main frame; other pages go to the browser view.
+   * The Takosumi origins (the instance's Accounts and the instance itself).
+   * The screen shows only their sign-in pages; their other pages and other
+   * sites go to the browser view.
    */
-  readonly accountsOrigin?: string;
-  /** (instance, account) the screen remembers its last page for. */
+  readonly accountsOrigins?: readonly string[];
+  /** (instance, account), hashed: the screen remembers its last page for it. */
   readonly scope?: string;
   /** Reopen at the last remembered page of this app instead of `url`. */
   readonly resume?: boolean;
@@ -429,12 +430,15 @@ export interface AppScreenOpenRequest {
 }
 
 export interface AppScreenOpenOptions {
-  readonly accountsOrigin?: string;
+  readonly accountsOrigins?: readonly string[];
   readonly scope?: string;
   readonly resume?: boolean;
   /** The phone Takosumi Mobile runs on, to pick the declared client. */
   readonly platform?: string;
 }
+
+/** Most Takosumi origins the native side accepts. */
+export const APP_SCREEN_ACCOUNTS_ORIGINS_MAX = 4;
 
 /** Longest `scope` the native side accepts. */
 export const APP_SCREEN_SCOPE_MAX_LENGTH = 512;
@@ -459,7 +463,9 @@ export function appScreenOpenRequest(
     title: clampLabel(target.label) || displayHost(target.url),
     ...(iconPng ? { iconPng } : {}),
     profile: APP_SCREEN_PROFILE,
-    ...(options.accountsOrigin ? { accountsOrigin: options.accountsOrigin } : {}),
+    ...(options.accountsOrigins?.length
+      ? { accountsOrigins: options.accountsOrigins.slice(0, APP_SCREEN_ACCOUNTS_ORIGINS_MAX) }
+      : {}),
     ...(scope ? { scope } : {}),
     ...(options.resume ? { resume: true } : {}),
     ...(client ? { client } : {}),

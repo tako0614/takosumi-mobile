@@ -8,6 +8,7 @@ import {
 } from "./app-screens.ts";
 import type { AppScreenOpener } from "./app-screen-native.ts";
 import { type NativeIconSource, nativeIconSource } from "./app-icons.ts";
+import { opensInAppScreen } from "./url-policy.ts";
 
 /**
  * Launcher behavior without UI: open an entry or a deep-linked URL in an app
@@ -83,6 +84,12 @@ export function createLauncherController(input: {
     ]);
 
   const open = async (target: AppScreenTarget, options?: AppScreenOpenOptions) => {
+    // A Takosumi page outside sign-in (the dashboard, account pages) never
+    // runs in an app screen; it opens in the browser view.
+    if (!opensInAppScreen(target.url, options?.accountsOrigins ?? [])) {
+      await input.opener.openBrowserView(target.url);
+      return;
+    }
     const png = await withinBudget(iconPng(target));
     await input.opener.open(appScreenOpenRequest(target, png, options));
   };
@@ -100,6 +107,9 @@ export function createLauncherController(input: {
       await open(resolveAppScreenTarget(url, entries), options);
     },
     async pinEntry(entry, options) {
+      if (!opensInAppScreen(entry.url, options?.accountsOrigins ?? [])) {
+        throw new Error("このページはTakosumiの中では開けないため、ホーム画面に追加できません。");
+      }
       const png = await withinBudget(iconPng(entry));
       return await input.opener.pinShortcut(appScreenOpenRequest(entry, png, options));
     },

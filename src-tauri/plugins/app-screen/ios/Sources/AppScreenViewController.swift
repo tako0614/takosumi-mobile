@@ -38,8 +38,9 @@ struct AppScreenRequest {
     let key: String
     let url: URL
     let title: String
-    /// The instance's Accounts origin, kept in the screen with the app's own.
-    var accountsOrigin: String?
+    /// The Takosumi origins (the instance's Accounts and the instance itself):
+    /// the screen shows only their sign-in pages.
+    var accountsOrigins: [String] = []
     /// (instance, account) the last page is remembered for.
     var scope: String?
     /// Reopen at the last remembered page instead of `url`.
@@ -48,9 +49,9 @@ struct AppScreenRequest {
 
     var appOrigin: String? { AppScreenPolicy.origin(of: url.absoluteString) }
 
-    /// The origins this screen shows in its main frame; others go to the browser view.
-    var allowedOrigins: Set<String> {
-        Set([appOrigin, accountsOrigin].compactMap { $0 })
+    /// What this screen shows; everything else goes to the browser view.
+    var origins: AppScreenOrigins {
+        AppScreenOrigins(appOrigin: appOrigin, accountsOrigins: Set(accountsOrigins))
     }
 }
 
@@ -224,11 +225,15 @@ final class DialogCompletion {
 /// bar updates) goes to the controller currently showing the session.
 final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     weak var screen: AppScreenViewController?
-    /// Origins the main frame may show (the app's and the instance's
-    /// Accounts); other https pages go to the browser view.
-    var allowedOrigins: Set<String>?
-    /// Called with each committed page, to remember where to reopen.
+    /// What the main frame may show (the app's origin, the Takosumi origins'
+    /// sign-in pages); other https pages go to the browser view.
+    var origins: AppScreenOrigins?
+    /// Called with each committed page the screen shows, to remember where to
+    /// reopen; only set for an app opened as itself, never for a deep link.
     var onCommitted: ((URL) -> Void)?
+    /// Where to go when a page the screen does not show was reached in place.
+    var fallbackURL: URL?
+    private var lastDownloadPromptAt: Date?
     /// Last committed URL. The host label shows only this, never the URL of
     /// a navigation that has not committed yet (no spoofing by slow loads).
     private(set) var committedURL: URL?
@@ -273,11 +278,38 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     /// While a load is in flight, `url` may already be the next page's.
     private func refreshCommitted(_ webView: WKWebView) {
-        if !webView.isLoading {
+        if !webView.isLoading, let url = webView.url {
+            guard keepsCommitted(webView, url) else { return }
+            committedURL = url
+            onCommitted?(url)
+        } else if !webView.isLoading {
             committedURL = webView.url
-            if let url = webView.url { onCommitted?(url) }
         }
         screen?.updateBar()
+    }
+
+    /// A page the screen shows, else hand it over and go back. URL changes of
+    /// a single-page app (`history.pushState`) reach only here: the Takosumi
+    /// sign-in screen is the dashboard's app and could move to the dashboard
+    /// in place.
+    private func keepsCommitted(_ webView: WKWebView, _ url: URL) -> Bool {
+        let raw = url.absoluteString
+        if raw == "about:blank" || raw == "about:srcdoc" ||
+            AppScreenPolicy.isInScreen(raw, origins: origins) {
+            return true
+        }
+        if AppScreenPolicy.decide(raw, mainFrame: true, origins: origins) == .browserView {
+            screen?.handOffToBrowserView(url, userGesture: false)
+        }
+        if webView.canGoBack {
+            webView.goBack()
+        } else if let fallback = fallbackURL {
+            webView.load(URLRequest(url: fallback))
+        } else {
+            webView.stopLoading()
+            webView.load(URLRequest(url: URL(string: "about:blank")!))
+        }
+        return false
     }
 
     // MARK: WKNavigationDelegate
@@ -291,7 +323,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         // A nil target frame is a new window; it is judged as a main frame.
         let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
         switch AppScreenPolicy.decide(
-            url?.absoluteString ?? "", mainFrame: mainFrame, allowedOrigins: allowedOrigins)
+            url?.absoluteString ?? "", mainFrame: mainFrame, origins: origins)
         {
         case .inApp:
             decisionHandler(.allow)
@@ -328,6 +360,9 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
            let url = navigationResponse.response.url,
            AppScreenPolicy.isLaunchable(url.absoluteString) {
             decisionHandler(.cancel)
+            // A page cannot keep raising download prompts.
+            if let last = lastDownloadPromptAt, Date().timeIntervalSince(last) < 3 { return }
+            lastDownloadPromptAt = Date()
             screen?.confirmExternal(url, insecureHttp: false, download: true, userGesture: true)
             return
         }
@@ -335,16 +370,13 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        if let url = webView.url, !keepsCommitted(webView, url) { return }
         committedURL = webView.url
         screen?.updateBar()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if !webView.isLoading {
-            committedURL = webView.url
-            if let url = webView.url { onCommitted?(url) }
-        }
-        screen?.updateBar()
+        refreshCommitted(webView)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -367,7 +399,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         if let url = navigationAction.request.url, url.absoluteString != "about:blank",
            !url.absoluteString.isEmpty
         {
-            switch AppScreenPolicy.decide(url.absoluteString, mainFrame: true, allowedOrigins: allowedOrigins) {
+            switch AppScreenPolicy.decide(url.absoluteString, mainFrame: true, origins: origins) {
             case .inApp:
                 break
             case .browserView:
@@ -380,7 +412,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
                 return nil
             }
         }
-        return screen?.presentPopup(configuration: configuration, allowedOrigins: allowedOrigins)
+        return screen?.presentPopup(configuration: configuration, origins: origins)
     }
 
     func webViewDidClose(_ webView: WKWebView) {
@@ -495,6 +527,12 @@ final class AppScreenCoordinator {
     private weak var screen: AppScreenViewController?
 
     func open(_ request: AppScreenRequest, from presenter: UIViewController) {
+        // A Takosumi page outside sign-in (the dashboard, account pages) never
+        // runs in an app screen.
+        guard AppScreenPolicy.isInScreen(request.url.absoluteString, origins: request.origins) else {
+            BrowserView.present(request.url, from: presenter)
+            return
+        }
         let existing = sessions[request.key]
         // A live page is kept when the app is reopened (resume) or opened with
         // its own launch URL, for the same (instance, account).
@@ -505,13 +543,16 @@ final class AppScreenCoordinator {
         session.title = request.title
         session.scope = request.scope
         session.client = request.client
-        session.navigator.allowedOrigins = request.allowedOrigins
+        session.navigator.origins = request.origins
+        session.navigator.fallbackURL = request.url
         let key = request.key
         let scope = request.scope
         let appOrigin = request.appOrigin
-        session.navigator.onCommitted = { url in
+        // Only an app opened as itself (tile, recent) keeps its last page; a
+        // deep-linked page never becomes it.
+        session.navigator.onCommitted = request.resume ? { url in
             AppScreenResume.record(url, key: key, scope: scope, appOrigin: appOrigin)
-        }
+        } : nil
         touch(session.key)
         if !keep {
             let start = (request.resume ? AppScreenResume.recall(request) : nil) ?? request.url
@@ -533,11 +574,11 @@ final class AppScreenCoordinator {
 
     func makePopupSession(
         configuration: WKWebViewConfiguration,
-        allowedOrigins: Set<String>?
+        origins: AppScreenOrigins?
     ) -> AppScreenSession {
         let session = makeSession(key: "popup:\(UUID().uuidString)", popup: true, configuration: configuration)
         // A popup keeps its opener's origins.
-        session.navigator.allowedOrigins = allowedOrigins
+        session.navigator.origins = origins
         return session
     }
 
@@ -780,11 +821,11 @@ final class AppScreenViewController: UIViewController {
                 self?.share()
             },
             UIAction(title: "ブラウザの画面で開く", image: UIImage(systemName: "rectangle.portrait.on.rectangle.portrait")) { [weak self] _ in
-                guard let self = self, let url = self.currentLaunchableURL() ?? self.session.launchURL else { return }
+                guard let self = self, let url = self.shareableURL() ?? self.session.launchURL else { return }
                 self.presentBrowserView(url)
             },
             UIAction(title: "Safariで開く", image: UIImage(systemName: "safari")) { [weak self] _ in
-                guard let url = self?.currentLaunchableURL() else { return }
+                guard let url = self?.shareableURL() else { return }
                 self?.openExternally(url)
             },
         ]
@@ -841,7 +882,7 @@ final class AppScreenViewController: UIViewController {
 
     private func currentLaunchableURL() -> URL? {
         guard let url = session.navigator.committedURL,
-              AppScreenPolicy.isInScreen(url.absoluteString, allowedOrigins: session.navigator.allowedOrigins) else {
+              AppScreenPolicy.isInScreen(url.absoluteString, origins: session.navigator.origins) else {
             return nil
         }
         return url
@@ -901,14 +942,20 @@ final class AppScreenViewController: UIViewController {
             self?.lastExternalDeclinedAt = Date()
         })
         alert.addAction(UIAlertAction(title: "ブラウザの画面で開く", style: .default) { [weak self] _ in
-            guard let self = self, let page = self.currentLaunchableURL() ?? self.session.launchURL else { return }
+            guard let self = self, let page = self.shareableURL() ?? self.session.launchURL else { return }
             self.presentBrowserView(page)
         })
         present(alert, animated: true)
     }
 
+    /// The current page without a spent OAuth code or a token in its URL, as
+    /// it may be shared or handed to the browser.
+    private func shareableURL() -> URL? {
+        currentLaunchableURL().flatMap { URL(string: AppScreenPolicy.shareable($0.absoluteString)) }
+    }
+
     private func share() {
-        guard let url = currentLaunchableURL(), presentedViewController == nil else { return }
+        guard let url = shareableURL(), presentedViewController == nil else { return }
         let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         activity.popoverPresentationController?.sourceView = menuButton
         activity.popoverPresentationController?.sourceRect = menuButton.bounds
@@ -968,9 +1015,9 @@ final class AppScreenViewController: UIViewController {
             !isBeingDismissed && !isBeingPresented && transitionCoordinator == nil
     }
 
-    func presentPopup(configuration: WKWebViewConfiguration, allowedOrigins: Set<String>?) -> WKWebView? {
+    func presentPopup(configuration: WKWebViewConfiguration, origins: AppScreenOrigins?) -> WKWebView? {
         guard canPresent() else { return nil }
-        let popup = coordinator.makePopupSession(configuration: configuration, allowedOrigins: allowedOrigins)
+        let popup = coordinator.makePopupSession(configuration: configuration, origins: origins)
         popup.title = session.title
         let controller = AppScreenViewController(coordinator: coordinator, session: popup)
         controller.modalPresentationStyle = .fullScreen

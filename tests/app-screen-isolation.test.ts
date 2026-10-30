@@ -177,9 +177,16 @@ test("the native policies keep the shared credential list and the shell hosts", 
     expect({ name, kotlin: kotlin.includes(`"${name}"`), swift: swift.includes(`"${name}"`) })
       .toEqual({ name, kotlin: true, swift: true });
   }
-  for (const host of ["tauri.localhost", "ipc.localhost", "asset.localhost"]) {
+  for (const host of ["tauri.localhost", "ipc.localhost", "asset.localhost", ".localhost"]) {
     expect({ host, kotlin: kotlin.includes(`"${host}"`), swift: swift.includes(`"${host}"`) })
       .toEqual({ host, kotlin: true, swift: true });
+  }
+  const navigation = (await Bun.file(
+    new URL("plugins/app-screen/navigation-policy-cases.json", root),
+  ).json()) as { accountsSignInPaths: string[] };
+  for (const path of navigation.accountsSignInPaths) {
+    expect({ path, kotlin: kotlin.includes(`"${path}"`), swift: swift.includes(`"${path}"`) })
+      .toEqual({ path, kotlin: true, swift: true });
   }
 });
 
