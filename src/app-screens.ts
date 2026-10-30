@@ -437,8 +437,8 @@ export interface AppScreenOpenOptions {
   readonly platform?: string;
 }
 
-/** Most Takosumi origins the native side accepts. */
-export const APP_SCREEN_ACCOUNTS_ORIGINS_MAX = 4;
+/** Most Takosumi origins the native side accepts (every known instance's). */
+export const APP_SCREEN_ACCOUNTS_ORIGINS_MAX = 32;
 
 /** Longest `scope` the native side accepts. */
 export const APP_SCREEN_SCOPE_MAX_LENGTH = 512;

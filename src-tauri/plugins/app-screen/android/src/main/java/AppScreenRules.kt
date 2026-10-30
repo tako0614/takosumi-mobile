@@ -64,6 +64,7 @@ internal object AppScreenRules {
     private val CUSTOM_SCHEME = Regex("^[a-z][a-z0-9+.-]{1,31}$")
     private val PACKAGE_SEGMENT = Regex("^[A-Za-z][A-Za-z0-9_]*$")
     private val HEX_COLOR = Regex("^#[0-9A-Fa-f]{6}$")
+    private val TRAILING_DOT = Regex("\\.+(?=(?::\\d+)?$)")
 
     /**
      * `scheme://host[:port]` as `URL.origin` writes it: lowercase, default
@@ -116,7 +117,7 @@ internal object AppScreenRules {
      */
     fun mainFrameDecision(origin: String?, encodedPath: String?, origins: ScreenOrigins): NavigationKind {
         if (origin == null) return NavigationKind.BROWSER_VIEW
-        if (origin in origins.accountsOrigins) {
+        if (isTakosumiOrigin(origin, origins)) {
             return if (encodedPath in ACCOUNTS_SIGN_IN_PATHS) NavigationKind.IN_APP else NavigationKind.BROWSER_VIEW
         }
         return if (origin == origins.appOrigin) NavigationKind.IN_APP else NavigationKind.BROWSER_VIEW
@@ -124,7 +125,16 @@ internal object AppScreenRules {
 
     /** A subframe on a Takosumi origin outside sign-in is refused. */
     fun isTakosumiPageOutsideSignIn(origin: String?, encodedPath: String?, origins: ScreenOrigins): Boolean =
-        origin != null && origin in origins.accountsOrigins && encodedPath !in ACCOUNTS_SIGN_IN_PATHS
+        origin != null && isTakosumiOrigin(origin, origins) && encodedPath !in ACCOUNTS_SIGN_IN_PATHS
+
+    /** A Takosumi origin, also with a trailing dot in the host (the same server). */
+    fun isTakosumiOrigin(origin: String, origins: ScreenOrigins): Boolean {
+        val name = withoutTrailingDot(origin)
+        return origins.accountsOrigins.any { withoutTrailingDot(it) == name }
+    }
+
+    /** `https://host.:443` → `https://host` for comparison. */
+    fun withoutTrailingDot(origin: String): String = origin.replace(TRAILING_DOT, "")
 
     /**
      * [rawUrl] as it may be shared or handed to the browser: credential-named

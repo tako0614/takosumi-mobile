@@ -174,7 +174,7 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             return null
         }
         val accountsOrigins = ScreenRequest.checkedAccountsOrigins(args.accountsOrigins?.toList()) ?: run {
-            invoke.reject("The Takosumi origins must be at most four https origins.")
+            invoke.reject("The Takosumi origins must be at most 32 https origins.")
             return null
         }
         val scope = args.scope?.let {

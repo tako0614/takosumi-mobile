@@ -246,7 +246,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         webView.uiDelegate = self
         observations = [
             webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
-                self?.refreshCommitted(webView)
+                self?.urlChanged(webView)
             },
             webView.observe(\.isLoading, options: [.new]) { [weak self] webView, _ in
                 self?.refreshCommitted(webView)
@@ -276,6 +276,23 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         webView.reload()
     }
 
+    /// Every URL change, also while a load is in flight: a page the screen
+    /// does not show (a Takosumi page outside sign-in) is hidden at once and
+    /// reverted, never displayed.
+    private func urlChanged(_ webView: WKWebView) {
+        if let url = webView.url, !shows(url) {
+            _ = keepsCommitted(webView, url)
+            return
+        }
+        refreshCommitted(webView)
+    }
+
+    private func shows(_ url: URL) -> Bool {
+        let raw = url.absoluteString
+        return raw == "about:blank" || raw == "about:srcdoc" ||
+            AppScreenPolicy.isInScreen(raw, origins: origins)
+    }
+
     /// While a load is in flight, `url` may already be the next page's.
     private func refreshCommitted(_ webView: WKWebView) {
         if !webView.isLoading, let url = webView.url {
@@ -291,13 +308,16 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// A page the screen shows, else hand it over and go back. URL changes of
     /// a single-page app (`history.pushState`) reach only here: the Takosumi
     /// sign-in screen is the dashboard's app and could move to the dashboard
-    /// in place.
+    /// in place. The webview stays hidden until an allowed page has loaded.
     private func keepsCommitted(_ webView: WKWebView, _ url: URL) -> Bool {
-        let raw = url.absoluteString
-        if raw == "about:blank" || raw == "about:srcdoc" ||
-            AppScreenPolicy.isInScreen(raw, origins: origins) {
+        if shows(url) {
+            // Shown again only once an allowed page is in place, not while
+            // the revert is still loading.
+            if webView.isHidden && !webView.isLoading { webView.isHidden = false }
             return true
         }
+        let raw = url.absoluteString
+        webView.isHidden = true
         if AppScreenPolicy.decide(raw, mainFrame: true, origins: origins) == .browserView {
             screen?.handOffToBrowserView(url, userGesture: false)
         }

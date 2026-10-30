@@ -95,6 +95,12 @@
     { "url": "https://tauri.localhost/", "mainFrame": false, "decision": "block" },
     { "url": "http://tauri.localhost/", "mainFrame": false, "decision": "block" },
     { "url": "https://plugin-x.localhost/", "mainFrame": true, "decision": "block" },
-    { "url": "https://localhost:8443/", "mainFrame": true, "decision": "in-app" }
+    { "url": "https://localhost:8443/", "mainFrame": true, "decision": "in-app" },
+    { "url": "https://accounts.takosumi.example./apps", "mainFrame": false, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example"], "decision": "block" },
+    { "url": "https://accounts.takosumi.example./apps", "mainFrame": true, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example"], "decision": "browser-view" },
+    { "url": "https://accounts.takosumi.example.:443/api/v1/apps", "mainFrame": false, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example"], "decision": "block" },
+    { "url": "https://accounts.takosumi.example./oauth/authorize?x=1", "mainFrame": true, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example"], "decision": "in-app" },
+    { "url": "https://takosumi.example./apps", "mainFrame": false, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example", "https://takosumi.example"], "decision": "block" },
+    { "url": "https://takosumi.example./", "mainFrame": true, "appOrigin": "https://app.example", "accountsOrigins": ["https://accounts.takosumi.example", "https://takosumi.example"], "decision": "browser-view" }
   ]
 }

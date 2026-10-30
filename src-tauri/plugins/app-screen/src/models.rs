@@ -11,7 +11,8 @@ const URL_MAX_LENGTH: usize = 8 * 1024;
 /// Base64 of a 192px PNG is far below this; anything larger is not an icon.
 const ICON_PNG_MAX_LENGTH: usize = 512 * 1024;
 const SCOPE_MAX_LENGTH: usize = 512;
-const ACCOUNTS_ORIGINS_MAX: usize = 4;
+/// Every known Takosumi instance's Accounts and instance origins.
+const ACCOUNTS_ORIGINS_MAX: usize = 32;
 const CLIENT_NAME_MAX_CHARS: usize = 64;
 const CLIENT_LINK_MAX_LENGTH: usize = 2_048;
 const CLIENT_IDENTIFIER_MAX_LENGTH: usize = 155;
@@ -166,7 +167,7 @@ impl OpenRequest {
                 .any(|origin| !is_https_origin(origin))
         {
             return Err(crate::Error::InvalidRequest(
-                "The Takosumi origins must be at most four https origins.",
+                "The Takosumi origins must be at most 32 https origins.",
             ));
         }
         if self.scope.as_deref().is_some_and(|scope| !is_valid_scope(scope)) {
@@ -557,7 +558,7 @@ mod tests {
             assert!(bad.validate().is_err(), "{origin}");
         }
         let mut too_many = request("https://app.example/", SHARED_PROFILE);
-        too_many.accounts_origins = (0..5).map(|n| format!("https://a{n}.example")).collect();
+        too_many.accounts_origins = (0..33).map(|n| format!("https://a{n}.example")).collect();
         assert!(too_many.validate().is_err());
         let mut bad_scope = request("https://app.example/", SHARED_PROFILE);
         bad_scope.scope = Some("a\nb".into());

@@ -156,7 +156,7 @@ export function decideAppScreenNavigation(
     if (!url.hostname) return { kind: "block", reason: "invalid-url" };
     const screen = context.screen;
     if (screen) {
-      if (screen.accountsOrigins.includes(url.origin)) {
+      if (isTakosumiOrigin(url.origin, screen)) {
         return ACCOUNTS_SIGN_IN_PATHS.has(url.pathname)
           ? { kind: "in-app" }
           : { kind: "browser-view", reason: "takosumi-page" };
@@ -193,7 +193,21 @@ export function decideAppScreenNavigation(
 
 /** A page of a Takosumi origin that is not one of the sign-in pages. */
 function isTakosumiPageOutsideSignIn(url: URL, screen: AppScreenOrigins): boolean {
-  return screen.accountsOrigins.includes(url.origin) && !ACCOUNTS_SIGN_IN_PATHS.has(url.pathname);
+  return isTakosumiOrigin(url.origin, screen) && !ACCOUNTS_SIGN_IN_PATHS.has(url.pathname);
+}
+
+/**
+ * A Takosumi origin, also written with a trailing dot in the host
+ * (`https://app.takosumi.com./`), which reaches the same server.
+ */
+function isTakosumiOrigin(origin: string, screen: AppScreenOrigins): boolean {
+  const name = originWithoutTrailingDot(origin);
+  return screen.accountsOrigins.some((candidate) => originWithoutTrailingDot(candidate) === name);
+}
+
+/** `https://host.:443` → `https://host` for comparison. */
+export function originWithoutTrailingDot(origin: string): string {
+  return origin.replace(/\.+(?=(?::\d+)?$)/u, "");
 }
 
 /**

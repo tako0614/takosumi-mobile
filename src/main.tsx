@@ -61,6 +61,13 @@ import {
 } from "./open-routing.ts";
 import { productAdapter } from "./product.ts";
 import { authorizeRunMutation } from "./security.ts";
+import {
+  createDeepLinkOpener,
+  readKnownTakosumiOrigins,
+  rememberTakosumiOrigins,
+  savedAccountOrigins,
+} from "./takosumi-origins.ts";
+import { takosumiOrigins } from "./url-policy.ts";
 import "./styles.css";
 
 /** How apps open: the router, its chooser, recent apps and bar actions. */
@@ -135,12 +142,27 @@ function startTakosumiMobile() {
     showChooser: setChooser,
     onRecentChanged: setRecent,
   });
+  const deepLinks = createDeepLinkOpener({
+    openUrl: (url, options) => launcher.openUrl(url, options),
+    platform,
+    currentOrigins: () => context()?.accountsOrigins,
+    knownOrigins: () =>
+      readKnownTakosumiOrigins({ store: baseBridge.storage, adapter: productAdapter }),
+    hasSavedAccounts: async () =>
+      (await savedAccountOrigins(baseBridge.storage, productAdapter)).length > 0,
+    onError: (error) =>
+      console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。")),
+  });
   const routing: OpenRouting = {
     router,
     platform,
     openWeb,
     openStore,
-    setContext,
+    setContext: (next) => {
+      setContext(next);
+      // A link that arrived before the session was restored opens now.
+      if (next) void deepLinks.sessionReady();
+    },
     context,
     chooser,
     closeChooser: () => setChooser(undefined),
@@ -166,18 +188,10 @@ function startTakosumiMobile() {
       console.warn(`Ignored app screen link: ${link.error}`);
       return;
     }
-    // A link names a page to show inside Takosumi. It neither resumes nor
-    // becomes the app's remembered last page (no scope): only pages the person
-    // reaches from the app itself are remembered.
-    const current = context();
-    void launcher
-      .openUrl(link.url, {
-        platform,
-        ...(current ? { accountsOrigins: current.accountsOrigins } : {}),
-      })
-      .catch((error) => {
-        console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。"));
-      });
+    // A link names a page to show inside Takosumi, judged with every known
+    // Takosumi origin. It neither resumes nor becomes the app's remembered
+    // last page: only pages the person reaches from the app itself are.
+    void deepLinks.open(link.url);
   });
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
@@ -273,11 +287,14 @@ function TakosumiControlHome(props: {
   // Choices, recent apps and last pages follow the current instance/account.
   createEffect(() => {
     const session = activeSession();
-    void openContextFromSession(session)
-      .then((context) => {
-        if (activeSession() === session) props.routing.setContext(context);
-      })
-      .catch(() => props.routing.setContext(undefined));
+    void (async () => {
+      const store = props.nativeBridge.storage;
+      // This instance's Accounts and instance origins join the known list.
+      await rememberTakosumiOrigins(store, takosumiOrigins(session));
+      const known = await readKnownTakosumiOrigins({ store, adapter: productAdapter });
+      const context = await openContextFromSession(session, known);
+      if (activeSession() === session) props.routing.setContext(context);
+    })().catch(() => props.routing.setContext(undefined));
   });
 
   const attentionRuns = createMemo(() =>

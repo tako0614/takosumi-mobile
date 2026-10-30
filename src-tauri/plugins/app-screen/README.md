@@ -142,6 +142,13 @@ bugs the plugin can close.
   browser view (an external IdP such as Google, or a Takosumi page there)
   lives in the browser's cookie jar, not in the app screen's profile, so the
   app screen itself may still be signed out afterwards.
+- **An upstream sign-in started in an app screen does not complete.** On the
+  Takosumi sign-in screen inside an app screen, the upstream providers' buttons
+  (GitHub, Google ...) hand the provider's page to the browser view. The
+  browser view has neither the app screen's `sessionStorage` (the PKCE
+  verifier and state the sign-in screen keeps) nor its state cookie, so that
+  flow ends in a sign-in error there. Sign in with email or a passkey inside
+  the app screen, or open the app in the browser view and sign in there.
 - **iOS cannot force Safari.** 「Safariで開く」 / 「ブラウザで開く」 on iOS opens
   the URL with the system, and an app that claims it as a universal link
   takes it.

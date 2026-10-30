@@ -17,6 +17,7 @@ import {
   type AppScreenOpenOptions,
   resolveAppScreenTarget,
 } from "./app-screens.ts";
+import { mergeTakosumiOrigins } from "./takosumi-origins.ts";
 import { isLaunchableAppScreenUrl, screenOrigin, takosumiOrigins } from "./url-policy.ts";
 
 /**
@@ -57,8 +58,9 @@ export interface OpenContext {
   /** The instance's origin; remembered choices are kept per instance. */
   readonly instanceOrigin: string;
   /**
-   * The Takosumi origins (Accounts and the instance itself): app screens show
-   * only their sign-in pages.
+   * The Takosumi origins (this instance's Accounts and the instance itself,
+   * then every other known instance's): app screens show only their sign-in
+   * pages.
    */
   readonly accountsOrigins: readonly string[];
   /**
@@ -71,12 +73,13 @@ export interface OpenContext {
 
 export async function openContextFromSession(
   session: MobileSession,
+  knownOrigins: readonly string[] = [],
 ): Promise<OpenContext | undefined> {
   const instanceOrigin = screenOrigin(session.hostUrl);
   if (!instanceOrigin) return undefined;
   return {
     instanceOrigin,
-    accountsOrigins: takosumiOrigins(session),
+    accountsOrigins: mergeTakosumiOrigins(takosumiOrigins(session), knownOrigins),
     scope: await openScope(instanceOrigin, session.accountId),
   };
 }

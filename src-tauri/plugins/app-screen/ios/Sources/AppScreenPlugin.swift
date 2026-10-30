@@ -161,8 +161,8 @@ final class AppScreenPlugin: Plugin {
             throw requestError("Only https URLs can be opened in an app screen.")
         }
         let accountsOrigins = args.accountsOrigins ?? []
-        guard accountsOrigins.count <= 4, accountsOrigins.allSatisfy({ AppScreenPolicy.isHttpsOrigin($0) }) else {
-            throw requestError("The Takosumi origins must be at most four https origins.")
+        guard accountsOrigins.count <= 32, accountsOrigins.allSatisfy({ AppScreenPolicy.isHttpsOrigin($0) }) else {
+            throw requestError("The Takosumi origins must be at most 32 https origins.")
         }
         if let scope = args.scope,
            scope.isEmpty || scope.count > scopeMaxLength ||

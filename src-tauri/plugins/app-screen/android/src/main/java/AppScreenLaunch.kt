@@ -125,7 +125,7 @@ internal data class ScreenRequest(
     companion object {
         const val SCOPE_MAX_LENGTH = 512
 
-        const val ACCOUNTS_ORIGINS_MAX = 4
+        const val ACCOUNTS_ORIGINS_MAX = 32
 
         /** Null when any is not an https origin or there are too many. */
         fun checkedAccountsOrigins(raw: List<String>?): Set<String>? {

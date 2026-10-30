@@ -163,7 +163,7 @@ enum AppScreenPolicy {
         _ origin: String?, _ path: String?, _ origins: AppScreenOrigins
     ) -> AppScreenNavigation {
         guard let origin = origin else { return .browserView }
-        if origins.accountsOrigins.contains(origin) {
+        if isTakosumiOrigin(origin, origins) {
             return accountsSignInPaths.contains(path ?? "") ? .inApp : .browserView
         }
         return origin == origins.appOrigin ? .inApp : .browserView
@@ -173,7 +173,18 @@ enum AppScreenPolicy {
         _ origin: String?, _ path: String?, _ origins: AppScreenOrigins
     ) -> Bool {
         guard let origin = origin else { return false }
-        return origins.accountsOrigins.contains(origin) && !accountsSignInPaths.contains(path ?? "")
+        return isTakosumiOrigin(origin, origins) && !accountsSignInPaths.contains(path ?? "")
+    }
+
+    /// A Takosumi origin, also with a trailing dot in the host (the same server).
+    static func isTakosumiOrigin(_ origin: String, _ origins: AppScreenOrigins) -> Bool {
+        let name = withoutTrailingDot(origin)
+        return origins.accountsOrigins.contains { withoutTrailingDot($0) == name }
+    }
+
+    /// `https://host.:443` → `https://host` for comparison.
+    static func withoutTrailingDot(_ origin: String) -> String {
+        origin.replacingOccurrences(of: #"\.+(?=(?::\d+)?$)"#, with: "", options: .regularExpression)
     }
 
     /// The path as written (percent-encoded, dot segments kept).
