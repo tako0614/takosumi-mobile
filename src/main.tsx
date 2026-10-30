@@ -31,7 +31,9 @@ import {
 import {
   createProductAppScreenOpener,
   createProductNativeBridge,
+  createProductWebOpener,
   isUnsupportedTauriDesktop,
+  productPlatform,
 } from "./native.ts";
 import {
   appDisplayName,
@@ -43,19 +45,38 @@ import {
 } from "./home-presentation.ts";
 import { AppLauncher } from "./app-launcher.tsx";
 import { fetchIconDataUrl, rasterizeIconPng } from "./app-icons.ts";
-import type { AppUnreadCounts } from "./app-screens.ts";
-import type { AppScreenOpener } from "./app-screen-native.ts";
+import type { AppScreenAction, AppScreenOpener } from "./app-screen-native.ts";
 import { withAppScreenDeepLinks } from "./deep-links.ts";
 import {
   createLauncherController,
   type LauncherController,
 } from "./launcher-controller.ts";
+import {
+  type ChooserRequest,
+  createOpenRouter,
+  type OpenContext,
+  openContextFromSession,
+  type OpenRouter,
+  type RecentApp,
+} from "./open-routing.ts";
 import { productAdapter } from "./product.ts";
 import { authorizeRunMutation } from "./security.ts";
 import "./styles.css";
 
-/** Filled by push delivery (TASK-0119 U4 step 4); empty until then. */
-const [unreadCounts] = createSignal<AppUnreadCounts>(new Map());
+/** How apps open: the router, its chooser, recent apps and bar actions. */
+interface OpenRouting {
+  readonly router: OpenRouter;
+  readonly platform: string;
+  readonly openWeb: (url: string) => Promise<void>;
+  readonly setContext: (context: OpenContext | undefined) => void;
+  readonly context: () => OpenContext | undefined;
+  readonly chooser: () => ChooserRequest | undefined;
+  readonly closeChooser: () => void;
+  readonly recent: () => readonly RecentApp[];
+  readonly setRecent: (recent: readonly RecentApp[]) => void;
+  readonly pendingAction: () => AppScreenAction | undefined;
+  readonly clearPendingAction: () => void;
+}
 
 const metrics = [
   {
@@ -91,19 +112,68 @@ if (isUnsupportedTauriDesktop()) {
 function startTakosumiMobile() {
   const baseBridge = createProductNativeBridge();
   const opener = createProductAppScreenOpener(baseBridge);
+  const platform = productPlatform();
+  const openWeb = createProductWebOpener(baseBridge);
   const launcher = createLauncherController({
     opener,
     fetchIcon: (url) => fetchIconDataUrl(url),
     rasterize: (source) => rasterizeIconPng(source),
   });
+  const [context, setContext] = createSignal<OpenContext>();
+  const [chooser, setChooser] = createSignal<ChooserRequest>();
+  const [recent, setRecent] = createSignal<readonly RecentApp[]>([]);
+  const [pendingAction, setPendingAction] = createSignal<AppScreenAction>();
+  const router = createOpenRouter({
+    opener,
+    openInApp: (target, options) => launcher.openTarget(target, options),
+    openWeb,
+    ...(baseBridge.storage ? { store: baseBridge.storage } : {}),
+    platform,
+    context,
+    showChooser: setChooser,
+    onRecentChanged: setRecent,
+  });
+  const routing: OpenRouting = {
+    router,
+    platform,
+    openWeb,
+    setContext,
+    context,
+    chooser,
+    closeChooser: () => setChooser(undefined),
+    recent,
+    setRecent,
+    pendingAction,
+    clearPendingAction: () => setPendingAction(undefined),
+  };
+  // An app screen's bar (開き方を変える, a missing or unverified native app)
+  // leaves an action for the shell; take it now and whenever one arrives.
+  const takeAction = () => {
+    void opener
+      .takePendingAction()
+      .then((action) => {
+        if (action) setPendingAction(action);
+      })
+      .catch(() => undefined);
+  };
+  void opener.onActionPending(takeAction).catch(() => undefined);
+  takeAction();
   const nativeBridge = withAppScreenDeepLinks(baseBridge, (link) => {
     if (!link.ok) {
       console.warn(`Ignored app screen link: ${link.error}`);
       return;
     }
-    void launcher.openUrl(link.url).catch((error) => {
-      console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。"));
-    });
+    // A link names a page to show inside Takosumi; it never resumes elsewhere.
+    const current = context();
+    void launcher
+      .openUrl(link.url, {
+        platform,
+        ...(current?.accountsOrigin ? { accountsOrigin: current.accountsOrigin } : {}),
+        ...(current ? { scope: current.scope } : {}),
+      })
+      .catch((error) => {
+        console.warn(mobileErrorMessage(error, "アプリの画面を開けませんでした。"));
+      });
   });
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
@@ -162,6 +232,7 @@ function startTakosumiMobile() {
         openHostRoute={openHostRoute}
         launcher={launcher}
         opener={opener}
+        routing={routing}
       />
     ),
   });
@@ -185,6 +256,7 @@ function TakosumiControlHome(props: {
   openHostRoute: (path: string) => Promise<void>;
   launcher: LauncherController;
   opener: AppScreenOpener;
+  routing: OpenRouting;
 }) {
   const [current, setCurrent] = createSignal(props.home);
   const launcherApps = createMemo(() => launcherAppsFromHome(current()));
@@ -194,6 +266,8 @@ function TakosumiControlHome(props: {
 
   createEffect(() => setCurrent(props.home));
   createEffect(() => setActiveSession(props.session));
+  // Choices, recent apps and last pages follow the current instance/account.
+  createEffect(() => props.routing.setContext(openContextFromSession(activeSession())));
 
   const attentionRuns = createMemo(() =>
     (current()?.runs ?? []).filter(isAttentionRun),
@@ -317,7 +391,22 @@ function TakosumiControlHome(props: {
         store={props.nativeBridge.storage}
         controller={props.launcher}
         opener={props.opener}
-        unreadCounts={unreadCounts}
+        router={props.routing.router}
+        platform={props.routing.platform}
+        context={props.routing.context()}
+        chooser={props.routing.chooser}
+        closeChooser={props.routing.closeChooser}
+        recent={props.routing.recent}
+        setRecent={props.routing.setRecent}
+        pendingAction={props.routing.pendingAction}
+        clearPendingAction={props.routing.clearPendingAction}
+        openWeb={props.routing.openWeb}
+        {...(props.nativeBridge.writeClipboardText
+          ? {
+              copyText: (text: string) =>
+                props.nativeBridge.writeClipboardText!({ text, label: "URL" }),
+            }
+          : {})}
       />
 
       <MobilePreviewSection

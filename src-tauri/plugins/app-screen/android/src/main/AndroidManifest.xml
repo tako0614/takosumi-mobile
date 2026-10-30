@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+      The browser view finds the person's Custom Tabs browser. Native apps are
+      never looked up: open_client pins the target package and treats
+      ActivityNotFoundException as not installed.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
     <application>
         <!--
           One app screen per installed app. Launched with FLAG_ACTIVITY_NEW_DOCUMENT

@@ -1,10 +1,57 @@
+import SafariServices
 import UIKit
 import WebKit
+
+/// The declared native app the bar offers ("{name}で開く"). A verified one has
+/// its links; an unverified one has none and sends the person to the chooser.
+struct AppScreenBannerClient {
+    let name: String
+    let verified: Bool
+    let universalLink: URL?
+    let open: URL?
+
+    /// Re-checks everything; an invalid client is dropped, not repaired.
+    static func checked(
+        name: String,
+        verified: Bool,
+        hasAndroidLink: Bool,
+        universalLink: String?,
+        open: String?
+    ) -> AppScreenBannerClient? {
+        guard AppScreenPolicy.isClientName(name), !hasAndroidLink else { return nil }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !verified {
+            guard universalLink == nil, open == nil else { return nil }
+            return AppScreenBannerClient(name: trimmed, verified: false, universalLink: nil, open: nil)
+        }
+        let link = universalLink.flatMap { AppScreenPolicy.isHttpsLink($0) ? URL(string: $0) : nil }
+        let scheme = open.flatMap { AppScreenPolicy.isCustomSchemeLink($0) ? URL(string: $0) : nil }
+        guard (universalLink == nil) == (link == nil), (open == nil) == (scheme == nil),
+              link != nil || scheme != nil else {
+            return nil
+        }
+        return AppScreenBannerClient(name: trimmed, verified: true, universalLink: link, open: scheme)
+    }
+}
 
 struct AppScreenRequest {
     let key: String
     let url: URL
     let title: String
+    /// The instance's Accounts origin, kept in the screen with the app's own.
+    var accountsOrigin: String?
+    /// (instance, account) the last page is remembered for.
+    var scope: String?
+    /// Reopen at the last remembered page instead of `url`.
+    var resume = false
+    var client: AppScreenBannerClient?
+
+    var appOrigin: String? { AppScreenPolicy.origin(of: url.absoluteString) }
+
+    /// The origins this screen shows in its main frame; others go to the browser view.
+    var allowedOrigins: Set<String> {
+        Set([appOrigin, accountsOrigin].compactMap { $0 })
+    }
 }
 
 final class AppScreenSession {
@@ -15,12 +62,139 @@ final class AppScreenSession {
     /// URL the screen was opened with; reopening with it keeps the page state.
     var launchURL: URL?
     var title: String = ""
+    var scope: String?
+    var client: AppScreenBannerClient?
 
     init(key: String, webView: WKWebView, popup: Bool) {
         self.key = key
         self.webView = webView
         self.popup = popup
         navigator = AppScreenNavigator(webView: webView)
+    }
+}
+
+/// Hands a screen to its declared native app (`open_client`).
+enum AppClientOpener {
+    static func open(universalLink: URL?, scheme: URL?, completion: @escaping (Bool) -> Void) {
+        func openScheme() {
+            guard let scheme = scheme else {
+                completion(false)
+                return
+            }
+            // `false` when no installed app handles the scheme.
+            UIApplication.shared.open(scheme, options: [:]) { completion($0) }
+        }
+        guard let link = universalLink else {
+            openScheme()
+            return
+        }
+        // Opens only an installed app that claims the link, never Safari.
+        UIApplication.shared.open(link, options: [.universalLinksOnly: true]) { opened in
+            if opened { completion(true) } else { openScheme() }
+        }
+    }
+}
+
+/// The browser view: `SFSafariViewController` over Takosumi Mobile, with the
+/// person's Safari sign-ins. External sign-ins (Google forbids OAuth in
+/// embedded webviews) go here; closing it comes back to the screen.
+enum BrowserView {
+    static let barColor = UIColor(red: 0x15 / 255, green: 0x15 / 255, blue: 0x17 / 255, alpha: 1)
+
+    static func present(_ url: URL, from presenter: UIViewController, barTint: UIColor? = nil) {
+        guard AppScreenPolicy.isLaunchable(url.absoluteString) else { return }
+        let safari = SFSafariViewController(url: url)
+        safari.preferredBarTintColor = barTint ?? barColor
+        safari.preferredControlTintColor = .white
+        safari.dismissButtonStyle = .close
+        var top = presenter
+        while let presented = top.presentedViewController, !presented.isBeingDismissed {
+            top = presented
+        }
+        top.present(safari, animated: true)
+    }
+
+    static func color(hex: String) -> UIColor? {
+        guard hex.count == 7, hex.hasPrefix("#"), let value = UInt32(hex.dropFirst(), radix: 16) else {
+            return nil
+        }
+        return UIColor(
+            red: CGFloat((value >> 16) & 0xff) / 255,
+            green: CGFloat((value >> 8) & 0xff) / 255,
+            blue: CGFloat(value & 0xff) / 255,
+            alpha: 1)
+    }
+}
+
+/// The last page of each app per (instance, account), so reopening an app
+/// starts where the person left it. Only pages `isRememberable` accepts are
+/// kept: the app's own origin, no credentials.
+enum AppScreenResume {
+    private static let defaultsKey = "com.takosumi.appscreen.resume.v1"
+    private static let maxRemembered = 64
+
+    static func record(_ url: URL, key: String, scope: String?, appOrigin: String?) {
+        guard let scope = scope, let appOrigin = appOrigin,
+              AppScreenPolicy.isRememberable(url.absoluteString, appOrigin: appOrigin) else {
+            return
+        }
+        var stored = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String: Any]] ?? [:]
+        let id = identifier(scope: scope, key: key)
+        if stored[id]?["url"] as? String == url.absoluteString { return }
+        stored[id] = ["url": url.absoluteString, "t": Date().timeIntervalSince1970]
+        if stored.count > maxRemembered {
+            let oldest = stored.sorted { ($0.value["t"] as? Double ?? 0) < ($1.value["t"] as? Double ?? 0) }
+            for (staleId, _) in oldest.prefix(stored.count - maxRemembered) { stored.removeValue(forKey: staleId) }
+        }
+        UserDefaults.standard.set(stored, forKey: defaultsKey)
+    }
+
+    static func recall(_ request: AppScreenRequest) -> URL? {
+        guard let scope = request.scope, let appOrigin = request.appOrigin else { return nil }
+        let stored = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String: Any]]
+        guard let raw = stored?[identifier(scope: scope, key: request.key)]?["url"] as? String,
+              AppScreenPolicy.isRememberable(raw, appOrigin: appOrigin) else {
+            return nil
+        }
+        return URL(string: raw)
+    }
+
+    private static func identifier(scope: String, key: String) -> String {
+        // Scope and key are bounded and printable; the pair needs no hashing.
+        "\(scope)\n\(key)"
+    }
+}
+
+/// What an app screen's bar asks the shell to do: show the chooser for an app.
+struct AppScreenPendingAction {
+    let key: String
+    let url: String
+    let reason: String
+
+    var json: [String: Any] { ["kind": "choose", "key": key, "url": url, "reason": reason] }
+}
+
+/// The bar's actions for the shell (開き方を変える, a native app that is not
+/// installed, an unverified one to confirm). The action waits here until the
+/// shell takes it (`take_pending_action`); the plugin's `actionPending` event
+/// tells the shell, which the app screen is dismissed to.
+enum AppScreenActions {
+    static let change = "change"
+    static let notInstalled = "not-installed"
+    static let unverified = "unverified"
+
+    static weak var plugin: AppScreenPlugin?
+    private static var pending: AppScreenPendingAction?
+
+    static func take() -> AppScreenPendingAction? {
+        defer { pending = nil }
+        return pending
+    }
+
+    static func request(_ action: AppScreenPendingAction) {
+        guard AppScreenPolicy.isLaunchable(action.url) else { return }
+        pending = action
+        plugin?.notifyActionPending()
     }
 }
 
@@ -50,6 +224,11 @@ final class DialogCompletion {
 /// bar updates) goes to the controller currently showing the session.
 final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     weak var screen: AppScreenViewController?
+    /// Origins the main frame may show (the app's and the instance's
+    /// Accounts); other https pages go to the browser view.
+    var allowedOrigins: Set<String>?
+    /// Called with each committed page, to remember where to reopen.
+    var onCommitted: ((URL) -> Void)?
     /// Last committed URL. The host label shows only this, never the URL of
     /// a navigation that has not committed yet (no spoofing by slow loads).
     private(set) var committedURL: URL?
@@ -96,6 +275,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     private func refreshCommitted(_ webView: WKWebView) {
         if !webView.isLoading {
             committedURL = webView.url
+            if let url = webView.url { onCommitted?(url) }
         }
         screen?.updateBar()
     }
@@ -110,11 +290,23 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let url = navigationAction.request.url
         // A nil target frame is a new window; it is judged as a main frame.
         let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
-        switch AppScreenPolicy.decide(url?.absoluteString ?? "", mainFrame: mainFrame) {
+        switch AppScreenPolicy.decide(
+            url?.absoluteString ?? "", mainFrame: mainFrame, allowedOrigins: allowedOrigins)
+        {
         case .inApp:
             decisionHandler(.allow)
         case .block:
             decisionHandler(.cancel)
+        case .browserView:
+            decisionHandler(.cancel)
+            guard let url = url else { return }
+            if (navigationAction.request.httpMethod ?? "GET").uppercased() == "GET" {
+                screen?.handOffToBrowserView(
+                    url, userGesture: navigationAction.navigationType == .linkActivated)
+            } else {
+                // A form POST cannot be handed over as a link.
+                screen?.offerBrowserViewForPage(blocked: url)
+            }
         case .externalConfirm(let insecureHttp):
             decisionHandler(.cancel)
             if mainFrame, let url = url {
@@ -148,7 +340,10 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if !webView.isLoading { committedURL = webView.url }
+        if !webView.isLoading {
+            committedURL = webView.url
+            if let url = webView.url { onCommitted?(url) }
+        }
         screen?.updateBar()
     }
 
@@ -168,7 +363,24 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        screen?.presentPopup(configuration: configuration)
+        // `window.open()` reaches here without a policy decision on the opener.
+        if let url = navigationAction.request.url, url.absoluteString != "about:blank",
+           !url.absoluteString.isEmpty
+        {
+            switch AppScreenPolicy.decide(url.absoluteString, mainFrame: true, allowedOrigins: allowedOrigins) {
+            case .inApp:
+                break
+            case .browserView:
+                screen?.handOffToBrowserView(url, userGesture: true)
+                return nil
+            case .externalConfirm(let insecureHttp):
+                screen?.confirmExternal(url, insecureHttp: insecureHttp, userGesture: true)
+                return nil
+            case .block:
+                return nil
+            }
+        }
+        return screen?.presentPopup(configuration: configuration, allowedOrigins: allowedOrigins)
     }
 
     func webViewDidClose(_ webView: WKWebView) {
@@ -259,15 +471,22 @@ final class DialogTextField {
     var text: String? { field?.text }
 }
 
-/// Keeps app screen webviews alive across switches (at most `maxAlive`, least
-/// recently used closed first) and presents them over the Tauri shell.
+/// Presents app screens over the Tauri shell. One app screen stays alive at a
+/// time (with the popups it opened); another app's page is reopened by URL,
+/// at its last remembered page. Keeping several live and switching between
+/// them waits for device testing (TASK-0119 step 3).
 ///
 /// Every screen uses the default website data store, so cookies and storage are
 /// one profile across apps: a Takosumi sign-in made in one app screen carries
 /// over to the others. Do not give screens their own data store.
+///
+/// The webviews are plain WKWebViews with a fresh configuration: no script
+/// message handler, no user script and no URL scheme handler, so a page can
+/// reach neither the Tauri IPC nor native plugins.
 final class AppScreenCoordinator {
     static let shared = AppScreenCoordinator()
-    static let maxAlive = 4
+    /// Live app screens, not counting popups.
+    static let maxAliveScreens = 1
 
     private let processPool = WKProcessPool()
     private var sessions: [String: AppScreenSession] = [:]
@@ -277,12 +496,27 @@ final class AppScreenCoordinator {
 
     func open(_ request: AppScreenRequest, from presenter: UIViewController) {
         let existing = sessions[request.key]
+        // A live page is kept when the app is reopened (resume) or opened with
+        // its own launch URL, for the same (instance, account).
+        let keep = existing != nil && existing?.webView.url != nil && existing?.scope == request.scope &&
+            (request.resume || existing?.launchURL == request.url)
         let session = existing ?? makeSession(key: request.key, popup: false, configuration: nil)
-        if existing == nil { session.launchURL = request.url }
+        if !keep { session.launchURL = request.url }
         session.title = request.title
+        session.scope = request.scope
+        session.client = request.client
+        session.navigator.allowedOrigins = request.allowedOrigins
+        let key = request.key
+        let scope = request.scope
+        let appOrigin = request.appOrigin
+        session.navigator.onCommitted = { url in
+            AppScreenResume.record(url, key: key, scope: scope, appOrigin: appOrigin)
+        }
         touch(session.key)
-        let keep = existing != nil && existing?.webView.url != nil && existing?.launchURL == request.url
-        if !keep { session.webView.load(URLRequest(url: request.url)) }
+        if !keep {
+            let start = (request.resume ? AppScreenResume.recall(request) : nil) ?? request.url
+            session.webView.load(URLRequest(url: start))
+        }
 
         if let screen = screen, screen.presentingViewController != nil, !screen.isBeingDismissed {
             screen.dismissPopups()
@@ -297,9 +531,13 @@ final class AppScreenCoordinator {
         evict(keeping: session.key)
     }
 
-    func makePopupSession(configuration: WKWebViewConfiguration) -> AppScreenSession {
+    func makePopupSession(
+        configuration: WKWebViewConfiguration,
+        allowedOrigins: Set<String>?
+    ) -> AppScreenSession {
         let session = makeSession(key: "popup:\(UUID().uuidString)", popup: true, configuration: configuration)
-        evict(keeping: session.key)
+        // A popup keeps its opener's origins.
+        session.navigator.allowedOrigins = allowedOrigins
         return session
     }
 
@@ -344,7 +582,6 @@ final class AppScreenCoordinator {
         configuration.dataDetectorTypes = []
         // Popups need a user gesture, as in a browser.
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        // TASK-0119 U4 step 4 adds the document-start Push API bridge here.
         return configuration
     }
 
@@ -353,13 +590,13 @@ final class AppScreenCoordinator {
         order.append(key)
     }
 
+    /// Close every other app screen that is not on screen (`maxAliveScreens`).
+    /// Popups are closed with the screen that presented them.
     private func evict(keeping key: String) {
-        while sessions.count > Self.maxAlive {
-            guard let victim = order.first(where: { $0 != key && !visibleKeys.contains($0) }) else {
-                return
-            }
-            remove(victim)
+        let victims = order.filter { candidate in
+            candidate != key && !visibleKeys.contains(candidate) && sessions[candidate]?.popup == false
         }
+        for victim in victims { remove(victim) }
     }
 
     private func topmost(from controller: UIViewController) -> UIViewController {
@@ -373,16 +610,19 @@ final class AppScreenCoordinator {
 
 /// One installed app in a WKWebView under a thin bar: the current host (always
 /// visible; there is no address field), back, reload, close and a menu with
-/// share, open in Safari and switch apps.
+/// share, the browser view, Safari, the app's declared native app,
+/// 開き方を変える and switch apps.
 final class AppScreenViewController: UIViewController {
-    private static let barColor = UIColor(red: 0x15 / 255, green: 0x15 / 255, blue: 0x17 / 255, alpha: 1)
+    private static let barColor = BrowserView.barColor
     private static let promptCooldown: TimeInterval = 5
+    private static let browserViewCooldown: TimeInterval = 3
 
     private let coordinator: AppScreenCoordinator
     private(set) var session: AppScreenSession
     private var attachedSession: AppScreenSession?
     private var pendingDialog: DialogCompletion?
     private var lastExternalDeclinedAt: Date?
+    private var lastBrowserViewAt: Date?
 
     private let bar = UIStackView()
     private let hostLabel = UILabel()
@@ -535,12 +775,27 @@ final class AppScreenViewController: UIViewController {
             UIAction(title: "共有", image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
                 self?.share()
             },
+            UIAction(title: "ブラウザの画面で開く", image: UIImage(systemName: "rectangle.portrait.on.rectangle.portrait")) { [weak self] _ in
+                guard let self = self, let url = self.currentLaunchableURL() ?? self.session.launchURL else { return }
+                self.presentBrowserView(url)
+            },
             UIAction(title: "Safariで開く", image: UIImage(systemName: "safari")) { [weak self] _ in
                 guard let url = self?.currentLaunchableURL() else { return }
                 self?.openExternally(url)
             },
         ]
+        if !session.popup, let client = session.client {
+            let title = client.verified ? "\(client.name)で開く" : "\(client.name)で開く…"
+            actions.append(
+                UIAction(title: title, image: UIImage(systemName: "app.badge")) { [weak self] _ in
+                    self?.openClient(client)
+                })
+        }
         if !session.popup {
+            actions.append(
+                UIAction(title: "開き方を変える", image: UIImage(systemName: "arrow.triangle.branch")) { [weak self] _ in
+                    self?.askShell(AppScreenActions.change)
+                })
             actions.append(
                 UIAction(title: "アプリを切り替える", image: UIImage(systemName: "square.grid.2x2")) { [weak self] _ in
                     self?.switchApps()
@@ -582,10 +837,70 @@ final class AppScreenViewController: UIViewController {
 
     private func currentLaunchableURL() -> URL? {
         guard let url = session.navigator.committedURL,
-              AppScreenPolicy.isLaunchable(url.absoluteString) else {
+              AppScreenPolicy.isInScreen(url.absoluteString, allowedOrigins: session.navigator.allowedOrigins) else {
             return nil
         }
         return url
+    }
+
+    /// 「{name}で開く」: a verified app opens directly; a missing one, or an
+    /// unverified one (confirmed with its real destination shown), goes to the
+    /// shell's chooser.
+    private func openClient(_ client: AppScreenBannerClient) {
+        guard client.verified else {
+            askShell(AppScreenActions.unverified)
+            return
+        }
+        AppClientOpener.open(universalLink: client.universalLink, scheme: client.open) { [weak self] opened in
+            if !opened { self?.askShell(AppScreenActions.notInstalled) }
+        }
+    }
+
+    /// Leave the chooser for this app to the shell and go back to it; the page
+    /// stays alive.
+    private func askShell(_ reason: String) {
+        guard let url = session.launchURL else { return }
+        AppScreenActions.request(AppScreenPendingAction(key: session.key, url: url.absoluteString, reason: reason))
+        switchApps()
+    }
+
+    /// A main-frame page outside this screen's origins. Opened in the browser
+    /// view at once; without a user gesture (a redirect, a script) at most once
+    /// every few seconds, so a page cannot keep presenting it.
+    func handOffToBrowserView(_ url: URL, userGesture: Bool) {
+        if !userGesture, let last = lastBrowserViewAt,
+           Date().timeIntervalSince(last) < Self.browserViewCooldown {
+            return
+        }
+        lastBrowserViewAt = Date()
+        presentBrowserView(url)
+    }
+
+    private func presentBrowserView(_ url: URL) {
+        guard viewIfLoaded?.window != nil, !isBeingDismissed else { return }
+        BrowserView.present(url, from: self)
+    }
+
+    /// A request to another origin that cannot be handed over as a link (a form
+    /// POST) was refused; offer to continue from this page in the browser view.
+    func offerBrowserViewForPage(blocked url: URL) {
+        guard canPresent() else { return }
+        if let declined = lastExternalDeclinedAt, Date().timeIntervalSince(declined) < Self.promptCooldown {
+            return
+        }
+        let host = AppScreenPolicy.displayHost(url)
+        let alert = UIAlertController(
+            title: "ブラウザの画面で続ける",
+            message: "\(host.isEmpty ? "ほかのサイト" : host) への送信は Takosumi の中ではできません。このページをブラウザの画面で開いて続けますか？",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel) { [weak self] _ in
+            self?.lastExternalDeclinedAt = Date()
+        })
+        alert.addAction(UIAlertAction(title: "ブラウザの画面で開く", style: .default) { [weak self] _ in
+            guard let self = self, let page = self.currentLaunchableURL() ?? self.session.launchURL else { return }
+            self.presentBrowserView(page)
+        })
+        present(alert, animated: true)
     }
 
     private func share() {
@@ -649,9 +964,9 @@ final class AppScreenViewController: UIViewController {
             !isBeingDismissed && !isBeingPresented && transitionCoordinator == nil
     }
 
-    func presentPopup(configuration: WKWebViewConfiguration) -> WKWebView? {
+    func presentPopup(configuration: WKWebViewConfiguration, allowedOrigins: Set<String>?) -> WKWebView? {
         guard canPresent() else { return nil }
-        let popup = coordinator.makePopupSession(configuration: configuration)
+        let popup = coordinator.makePopupSession(configuration: configuration, allowedOrigins: allowedOrigins)
         popup.title = session.title
         let controller = AppScreenViewController(coordinator: coordinator, session: popup)
         controller.modalPresentationStyle = .fullScreen

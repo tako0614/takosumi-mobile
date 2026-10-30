@@ -1,6 +1,9 @@
 use tauri::{command, AppHandle, Runtime};
 
-use crate::models::{CapabilitiesResponse, OpenRequest, PinShortcutResponse};
+use crate::models::{
+    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
+    OpenClientResponse, OpenRequest, PendingActionResponse, PinShortcutResponse,
+};
 use crate::{AppScreenExt, Result};
 
 #[command]
@@ -21,4 +24,29 @@ pub(crate) async fn pin_shortcut<R: Runtime>(
 ) -> Result<PinShortcutResponse> {
     payload.validate()?;
     app.app_screen().pin_shortcut(payload)
+}
+
+#[command]
+pub(crate) async fn open_client<R: Runtime>(
+    app: AppHandle<R>,
+    payload: OpenClientRequest,
+) -> Result<OpenClientResponse> {
+    payload.validate()?;
+    app.app_screen().open_client(payload)
+}
+
+#[command]
+pub(crate) async fn open_browser_view<R: Runtime>(
+    app: AppHandle<R>,
+    payload: BrowserViewRequest,
+) -> Result<BrowserViewResponse> {
+    payload.validate()?;
+    app.app_screen().open_browser_view(payload)
+}
+
+#[command]
+pub(crate) async fn take_pending_action<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<PendingActionResponse> {
+    app.app_screen().take_pending_action()
 }

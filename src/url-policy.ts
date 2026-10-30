@@ -1,3 +1,5 @@
+import resumeRules from "../src-tauri/plugins/app-screen/resume-url-cases.json";
+
 /**
  * Navigation rules for app screens (the native webviews that show installed
  * apps). The native plugins enforce the same table at navigation time:
@@ -7,17 +9,23 @@
  *
  * - The main frame shows https pages only. `about:blank` / `about:srcdoc`
  *   stay in the screen because `window.open()` popups start there.
+ * - A screen shows only its app's own origin and the instance's Accounts
+ *   origin in the main frame (`allowedOrigins`). Any other https page (an
+ *   external sign-in such as Google, which forbids embedded webviews) goes to
+ *   the browser view (Custom Tabs / `SFSafariViewController`) instead.
  * - `http:` and other schemes (`tel:`, `mailto:`, ...) leave the app only
  *   after the person confirms, and only from the main frame.
  * - Schemes that would run or read local content (`javascript:`, `data:`,
- *   `file:`, ...) and Takosumi Mobile's own `takosumi:` scheme are refused,
- *   so a page cannot drive the shell (for example a forged OIDC callback).
+ *   `file:`, ...), Takosumi Mobile's own `takosumi:` scheme and the hosts the
+ *   Tauri shell serves itself from (`tauri.localhost`, ...) are refused, so a
+ *   page cannot drive the shell (for example a forged OIDC callback).
  * - URLs with user info (`https://bank.example@evil.example`) are refused in
  *   the main frame.
  */
 
 export type AppScreenNavigationDecision =
   | { readonly kind: "in-app" }
+  | { readonly kind: "browser-view"; readonly reason: "other-origin" }
   | {
       readonly kind: "external-confirm";
       readonly reason: "insecure-http" | "other-scheme";
@@ -30,15 +38,32 @@ export type AppScreenNavigationDecision =
         | "user-info"
         | "local-content"
         | "shell-scheme"
+        | "shell-host"
         | "subframe-scheme";
     };
 
 export interface AppScreenNavigationContext {
   readonly mainFrame: boolean;
+  /**
+   * Origins the screen may show in its main frame: the app's own origin and
+   * the instance's Accounts origin. Other https pages go to the browser view.
+   * Without it only the scheme rules apply (launch URL checks).
+   */
+  readonly allowedOrigins?: readonly string[];
 }
 
 /** Takosumi Mobile's own deep-link scheme; pages must not navigate to it. */
 export const SHELL_SCHEME = "takosumi";
+
+/**
+ * Hosts the Tauri shell serves its own UI and IPC from. App screens share the
+ * device's web profile with the shell, so they never load these hosts.
+ */
+export const SHELL_HOSTS: ReadonlySet<string> = new Set([
+  "tauri.localhost",
+  "ipc.localhost",
+  "asset.localhost",
+]);
 
 const IN_SCREEN_ABOUT_URLS = new Set(["about:blank", "about:srcdoc"]);
 
@@ -89,9 +114,17 @@ export function decideAppScreenNavigation(
     if (url.username || url.password) {
       return { kind: "block", reason: "user-info" };
     }
-    return url.hostname
-      ? { kind: "in-app" }
-      : { kind: "block", reason: "invalid-url" };
+    if (!url.hostname) return { kind: "block", reason: "invalid-url" };
+    if (SHELL_HOSTS.has(url.hostname.toLowerCase().replace(/\.$/u, ""))) {
+      return { kind: "block", reason: "shell-host" };
+    }
+    if (
+      context.allowedOrigins !== undefined &&
+      !context.allowedOrigins.includes(url.origin)
+    ) {
+      return { kind: "browser-view", reason: "other-origin" };
+    }
+    return { kind: "in-app" };
   }
   if (scheme === "about" && IN_SCREEN_ABOUT_URLS.has(rawUrl.trim().toLowerCase())) {
     return { kind: "in-app" };
@@ -145,6 +178,87 @@ export function isLaunchableAppScreenUrl(rawUrl: string): boolean {
   );
 }
 
+/**
+ * The origin a screen compares navigations against (`https://host[:port]`,
+ * lowercase, default port dropped). `undefined` for opaque origins.
+ */
+export function screenOrigin(rawUrl: string): string | undefined {
+  const url = parseUrl(rawUrl);
+  if (!url || url.origin === "null") return undefined;
+  return url.origin;
+}
+
+/**
+ * The https origin of the instance's Accounts (the OIDC issuer, else the
+ * instance itself). Only an https origin can be shown in an app screen.
+ */
+export function accountsOrigin(input: {
+  readonly hostUrl?: string;
+  readonly oidcIssuer?: string;
+}): string | undefined {
+  for (const candidate of [input.oidcIssuer, input.hostUrl]) {
+    if (!candidate) continue;
+    const url = parseUrl(candidate);
+    if (url?.protocol === "https:" && !url.username && !url.password) {
+      return url.origin;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Origins an app screen keeps in its main frame: the app's own origin and the
+ * instance's Accounts origin (Takosumi sign-in stays in the screen).
+ */
+export function appScreenAllowedOrigins(input: {
+  readonly appUrl: string;
+  readonly accountsOrigin?: string;
+}): readonly string[] {
+  const origins: string[] = [];
+  for (const origin of [screenOrigin(input.appUrl), input.accountsOrigin]) {
+    if (origin && origin.startsWith("https://") && !origins.includes(origin)) {
+      origins.push(origin);
+    }
+  }
+  return origins;
+}
+
+/** Longest URL a screen remembers as the place to return to. */
+export const RESUME_URL_MAX_LENGTH = 4_096;
+
+/**
+ * Query parameter names (lowercase letters and digits only) that carry a
+ * credential. Takosumi's own list (`hasCredentialQueryParams` in
+ * `contract/interface-display.ts`) plus the OAuth / SAML callback values.
+ * Shared with the native plugins through `resume-url-cases.json`.
+ */
+export const CREDENTIAL_QUERY_NAMES: ReadonlySet<string> = new Set(
+  resumeRules.credentialQueryNames,
+);
+
+/**
+ * True when a screen may remember `rawUrl` as the place to reopen at: an
+ * https page of the app's own origin with no user info, no fragment (where
+ * implicit-flow tokens travel) and no credential-named query parameter.
+ * Takosumi's `safeLaunchUrl` rules, plus the OAuth callback values.
+ */
+export function isRememberableAppScreenUrl(
+  rawUrl: string,
+  appOrigin: string,
+): boolean {
+  if (rawUrl.length > RESUME_URL_MAX_LENGTH || rawUrl.includes("#")) return false;
+  const url = parseUrl(rawUrl);
+  if (!url || url.protocol !== "https:" || url.username || url.password) {
+    return false;
+  }
+  if (url.origin !== appOrigin || !isLaunchableAppScreenUrl(rawUrl)) return false;
+  for (const [name, value] of url.searchParams) {
+    const normalized = name.toLowerCase().replace(/[^a-z0-9]/gu, "");
+    if (value.trim() && CREDENTIAL_QUERY_NAMES.has(normalized)) return false;
+  }
+  return true;
+}
+
 export type NormalizedAppUrl =
   | { readonly ok: true; readonly url: string; readonly host: string }
   | { readonly ok: false; readonly error: string };
@@ -176,6 +290,9 @@ export function normalizeUserAppUrl(input: string): NormalizedAppUrl {
     return { ok: false, error: "URLの形が正しくありません。" };
   }
   url.hash = "";
+  if (!isLaunchableAppScreenUrl(url.toString())) {
+    return { ok: false, error: "このURLは追加できません。" };
+  }
   return { ok: true, url: url.toString(), host: url.host };
 }
 

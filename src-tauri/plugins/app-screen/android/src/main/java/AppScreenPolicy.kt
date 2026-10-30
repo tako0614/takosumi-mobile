@@ -5,8 +5,11 @@ import android.net.Uri
 /**
  * Mirror of `src/url-policy.ts`. The shared table is
  * `navigation-policy-cases.json`; keep the three implementations equal.
+ * BROWSER_VIEW: an https page outside the screen's allowed origins (its app
+ * and the instance's Accounts), such as an external sign-in, goes to the
+ * browser view instead of this WebView.
  */
-internal enum class NavigationKind { IN_APP, EXTERNAL_CONFIRM, BLOCK }
+internal enum class NavigationKind { IN_APP, BROWSER_VIEW, EXTERNAL_CONFIRM, BLOCK }
 
 internal data class NavigationDecision(
     val kind: NavigationKind,
@@ -23,7 +26,11 @@ internal object AppScreenPolicy {
     )
     private val subframeWebSchemes = setOf("about", "blob", "data", "http", "https", "javascript")
 
-    fun decide(rawUrl: String, mainFrame: Boolean): NavigationDecision {
+    fun decide(
+        rawUrl: String,
+        mainFrame: Boolean,
+        allowedOrigins: Set<String>? = null,
+    ): NavigationDecision {
         val trimmed = rawUrl.trim()
         val uri = try {
             Uri.parse(trimmed)
@@ -38,7 +45,11 @@ internal object AppScreenPolicy {
         }
         if (scheme == "https") {
             if (!uri.userInfo.isNullOrEmpty()) return block(scheme)
-            return if (uri.host.isNullOrEmpty()) block(scheme) else inApp(scheme)
+            if (uri.host.isNullOrEmpty() || AppScreenRules.isShellHost(uri.host)) return block(scheme)
+            if (allowedOrigins != null && !AppScreenRules.isAllowedOrigin(trimmed, allowedOrigins)) {
+                return NavigationDecision(NavigationKind.BROWSER_VIEW, scheme)
+            }
+            return inApp(scheme)
         }
         if (scheme == "about" && trimmed.lowercase() in inScreenAbout) return inApp(scheme)
         if (scheme == SHELL_SCHEME || scheme in localContentSchemes) return block(scheme)
@@ -72,6 +83,10 @@ internal object AppScreenPolicy {
         val data = rawUrl.substring(rawUrl.indexOf(':') + 1, hash)
         return Regex("^([a-zA-Z][a-zA-Z0-9+.-]*):").find(data)?.groupValues?.get(1)?.lowercase()
     }
+
+    /** True when a screen with [allowedOrigins] shows [rawUrl] itself. */
+    fun isInScreen(rawUrl: String, allowedOrigins: Set<String>?): Boolean =
+        isLaunchable(rawUrl) && decide(rawUrl, mainFrame = true, allowedOrigins).kind == NavigationKind.IN_APP
 
     /** https with a host and no user info: the only URLs a screen opens with. */
     fun isLaunchable(rawUrl: String): Boolean {

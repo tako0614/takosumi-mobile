@@ -48,9 +48,15 @@ import java.util.UUID
 /**
  * One installed app, shown in a native WebView under a thin bar: the current
  * host (always visible; there is no address field), back, reload, close and a
- * menu with share, open in the browser, add to the home screen and switch
- * apps. Each app runs in its own task (FLAG_ACTIVITY_NEW_DOCUMENT) named and
- * drawn after the app, so Recents lists apps separately.
+ * menu with share, the browser view, the browser, the app's declared native
+ * app, 開き方を変える, add to the home screen and switch apps. Each app runs
+ * in its own task (FLAG_ACTIVITY_NEW_DOCUMENT) named and drawn after the app,
+ * so Recents lists apps separately.
+ *
+ * The main frame shows only the app's own origin and the instance's Accounts
+ * origin. Any other https page, such as an external sign-in (Google forbids
+ * OAuth in embedded webviews), opens in the browser view over this screen;
+ * closing it comes back here.
  */
 class AppScreenActivity : AppCompatActivity() {
     private lateinit var request: ScreenRequest
@@ -60,6 +66,7 @@ class AppScreenActivity : AppCompatActivity() {
     private var evicted = false
     private var externalDialog: AlertDialog? = null
     private var lastExternalDeclinedAt = 0L
+    private var lastBrowserViewAt = 0L
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
 
     private lateinit var container: FrameLayout
@@ -94,8 +101,8 @@ class AppScreenActivity : AppCompatActivity() {
             },
         )
         val restored = savedInstanceState?.getString(STATE_URL)
-            ?.takeIf { AppScreenPolicy.isLaunchable(it) }
-        show(target = restored ?: request.url, keepIfLaunchedWith = request.url)
+            ?.takeIf { AppScreenPolicy.isInScreen(it, request.allowedOrigins) }
+        show(target = restored ?: startUrl(), keepLivePage = keepsLivePage(request))
         applyTaskDescription()
         container.post { reportOpened() }
     }
@@ -105,8 +112,9 @@ class AppScreenActivity : AppCompatActivity() {
         val parsed = AppScreenLaunch.parse(this, intent) ?: return
         if (parsed.key != request.key || parsed.popup) return
         setIntent(intent)
+        val keep = keepsLivePage(parsed)
         request = parsed
-        show(target = parsed.url, keepIfLaunchedWith = parsed.url)
+        show(target = startUrl(), keepLivePage = keep)
         applyTaskDescription()
         reportOpened()
     }
@@ -115,7 +123,7 @@ class AppScreenActivity : AppCompatActivity() {
         super.onStart()
         visible = true
         if (evicted) {
-            show(target = lastKnownUrl.ifEmpty { request.url }, keepIfLaunchedWith = null)
+            show(target = lastKnownUrl.ifEmpty { startUrl() }, keepLivePage = false)
         }
     }
 
@@ -161,12 +169,27 @@ class AppScreenActivity : AppCompatActivity() {
     /** Started (visible, even when not focused in split screen). */
     internal fun isVisibleScreen(): Boolean = visible
 
+    /** The page to open at: the app's last page when resuming, else its URL. */
+    private fun startUrl(): String =
+        (if (request.resume) AppScreenResume.recall(this, request) else null) ?: request.url
+
     /**
-     * Show this screen's webview. An existing page opened with
-     * [keepIfLaunchedWith] keeps its state (tapping the app again); anything
-     * else (a deep link, a reload after eviction) loads [target].
+     * A live page is kept when the app is reopened (resume) or opened again
+     * with its own launch URL, for the same (instance, account). A deep link to
+     * another page loads that page.
      */
-    private fun show(target: String, keepIfLaunchedWith: String?) {
+    private fun keepsLivePage(next: ScreenRequest): Boolean {
+        val existing = AppScreenRegistry.get(next.key) ?: return false
+        if (next.popup) return true
+        return existing.scope == next.scope && (next.resume || existing.launchUrl == next.url)
+    }
+
+    /**
+     * Show this screen's webview. With [keepLivePage] an existing page keeps
+     * its state (tapping the app again); anything else (a deep link, a reload
+     * after eviction) loads [target].
+     */
+    private fun show(target: String, keepLivePage: Boolean) {
         evicted = false
         val existing = AppScreenRegistry.get(request.key)
         if (request.popup && existing == null) {
@@ -177,20 +200,22 @@ class AppScreenActivity : AppCompatActivity() {
             ?: AppScreenRegistry.obtain(this, request.key, request.popup).also {
                 it.launchUrl = request.url
             }
+        if (!request.popup) {
+            current.allowedOrigins = request.allowedOrigins
+            current.scope = request.scope
+            if (!keepLivePage) current.launchUrl = request.url
+        }
         bind(current)
         current.title = request.title
         val keptUrl = existing?.webView?.url
-        val keep = existing != null &&
-            keptUrl != null &&
-            keepIfLaunchedWith != null &&
-            keepIfLaunchedWith == existing.launchUrl
+        val keep = existing != null && keptUrl != null && keepLivePage
         if (!request.popup && !keep) {
-            if (AppScreenPolicy.isLaunchable(target)) current.webView.loadUrl(target)
+            if (AppScreenPolicy.isInScreen(target, current.allowedOrigins)) current.webView.loadUrl(target)
             else current.webView.loadUrl(request.url)
-        } else if (keptUrl != null && !isAllowedCommittedUrl(keptUrl)) {
+        } else if (keptUrl != null && !isAllowedCommittedUrl(keptUrl, current.allowedOrigins)) {
             // A detached page ended up outside the policy (a blocked POST).
             current.webView.loadUrl(
-                current.lastUrl.takeIf { AppScreenPolicy.isLaunchable(it) }
+                current.lastUrl.takeIf { AppScreenPolicy.isInScreen(it, current.allowedOrigins) }
                     ?: if (request.popup) "about:blank" else request.url,
             )
         }
@@ -205,7 +230,7 @@ class AppScreenActivity : AppCompatActivity() {
         (webView.parent as? ViewGroup)?.removeView(webView)
         current.context.baseContext = this
         current.host = this
-        webView.webViewClient = ScreenClient()
+        webView.webViewClient = ScreenClient(current)
         webView.webChromeClient = ScreenChromeClient()
         webView.setDownloadListener { url, _, _, _, _ ->
             confirmExternal(url, download = true, userGesture = true)
@@ -223,7 +248,7 @@ class AppScreenActivity : AppCompatActivity() {
     private fun unbind(current: AppScreenRegistry.Entry) {
         val webView = current.webView
         container.removeView(webView)
-        webView.webViewClient = DetachedScreenClient
+        webView.webViewClient = current.detachedClient
         webView.webChromeClient = null
         webView.setDownloadListener(null)
         current.host = null
@@ -250,18 +275,26 @@ class AppScreenActivity : AppCompatActivity() {
         startActivity(launch)
     }
 
-    /** The app's own launch URL, not a deep-linked page inside it. */
+    /**
+     * The app itself, as a shortcut or the chooser opens it: its own launch
+     * URL (not a deep-linked page inside it), reopening at its last page.
+     */
     private fun appRequest(): ScreenRequest =
-        request.copy(url = entry?.launchUrl?.takeIf { AppScreenPolicy.isLaunchable(it) } ?: request.url)
+        request.copy(
+            url = entry?.launchUrl?.takeIf { AppScreenPolicy.isLaunchable(it) } ?: request.url,
+            resume = true,
+        )
 
     private fun reportOpened() {
         if (!request.popup) AppScreenShortcuts.reportOpened(this, appRequest())
     }
 
     private fun rememberUrl(url: String?) {
-        if (url != null && AppScreenPolicy.isLaunchable(url)) {
+        val current = entry ?: return
+        if (url != null && AppScreenPolicy.isInScreen(url, current.allowedOrigins)) {
             lastKnownUrl = url
-            entry?.lastUrl = url
+            current.lastUrl = url
+            if (!request.popup) AppScreenResume.record(this, request, url)
         }
     }
 
@@ -288,16 +321,25 @@ class AppScreenActivity : AppCompatActivity() {
     private fun showMenu(anchor: View) {
         val menu = PopupMenu(this, anchor)
         menu.menu.add(0, MENU_SHARE, 0, "共有")
-        menu.menu.add(0, MENU_BROWSER, 1, "ブラウザで開く")
-        if (!request.popup && AppScreenShortcuts.isPinSupported(this)) {
-            menu.menu.add(0, MENU_PIN, 2, "ホーム画面に追加")
+        menu.menu.add(0, MENU_BROWSER_VIEW, 1, "ブラウザの画面で開く")
+        menu.menu.add(0, MENU_BROWSER, 2, "ブラウザで開く")
+        val client = request.client.takeUnless { request.popup }
+        if (client != null) {
+            menu.menu.add(0, MENU_CLIENT, 3, if (client.verified) "${client.name}で開く" else "${client.name}で開く…")
         }
-        menu.menu.add(0, MENU_SWITCH, 3, "アプリを切り替える")
-        menu.menu.add(0, MENU_CLOSE, 4, "閉じる")
+        if (!request.popup) menu.menu.add(0, MENU_CHOOSE, 4, "開き方を変える")
+        if (!request.popup && AppScreenShortcuts.isPinSupported(this)) {
+            menu.menu.add(0, MENU_PIN, 5, "ホーム画面に追加")
+        }
+        menu.menu.add(0, MENU_SWITCH, 6, "アプリを切り替える")
+        menu.menu.add(0, MENU_CLOSE, 7, "閉じる")
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 MENU_SHARE -> share()
+                MENU_BROWSER_VIEW -> openBrowserView(currentUrl() ?: appRequest().url)
                 MENU_BROWSER -> currentUrl()?.let { openExternally(it) }
+                MENU_CLIENT -> client?.let { openClient(it) }
+                MENU_CHOOSE -> askShell(AppScreenActions.CHANGE)
                 MENU_PIN -> pinShortcut()
                 MENU_SWITCH -> switchApps()
                 MENU_CLOSE -> closeScreen()
@@ -307,8 +349,79 @@ class AppScreenActivity : AppCompatActivity() {
         menu.show()
     }
 
+    /**
+     * 「{name}で開く」: a verified app opens directly; a missing one, or an
+     * unverified one (which must be confirmed with its real destination
+     * shown), goes to the shell's chooser.
+     */
+    private fun openClient(client: BannerClient) {
+        val packageName = client.packageName
+        if (!client.verified || packageName == null) {
+            askShell(AppScreenActions.UNVERIFIED)
+            return
+        }
+        val result = AppClientLauncher.open(this, packageName, client.appLink, client.open)
+        if (result != AppClientLauncher.OPENED) askShell(AppScreenActions.NOT_INSTALLED)
+    }
+
+    /** Leave the chooser for this app to the shell and bring it forward. */
+    private fun askShell(reason: String) {
+        try {
+            AppScreenActions.request(this, PendingAction(request.key, appRequest().url, reason))
+        } catch (_: Exception) {
+            Toast.makeText(this, "Takosumiを開けませんでした", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * A main-frame page outside this screen's origins. Opened in the browser
+     * view at once; without a user gesture (a redirect, a script) at most once
+     * every few seconds, so a page cannot keep popping it up.
+     */
+    internal fun handOffToBrowserView(url: String, userGesture: Boolean) {
+        if (isFinishing) return
+        val now = SystemClock.elapsedRealtime()
+        if (!userGesture && now - lastBrowserViewAt < BROWSER_VIEW_COOLDOWN_MS) return
+        lastBrowserViewAt = now
+        openBrowserView(url)
+    }
+
+    private fun openBrowserView(url: String) {
+        if (!AppScreenPolicy.isLaunchable(url)) return
+        try {
+            BrowserView.open(this, url, BAR_COLOR)
+        } catch (_: Exception) {
+            Toast.makeText(this, "開けるブラウザがありません", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * A request to another origin that cannot be handed over as a link (a form
+     * POST). It was refused; offer to continue from this page in the browser
+     * view, where the person can repeat it.
+     */
+    internal fun offerBrowserViewForPage(blockedUrl: String) {
+        if (externalDialog?.isShowing == true || isFinishing) return
+        if (SystemClock.elapsedRealtime() - lastExternalDeclinedAt < PROMPT_COOLDOWN_MS) return
+        val page = currentUrl() ?: appRequest().url
+        val host = AppScreenPolicy.displayHost(blockedUrl).ifEmpty { "ほかのサイト" }
+        var opened = false
+        externalDialog = AlertDialog.Builder(this)
+            .setTitle("ブラウザの画面で続ける")
+            .setMessage("$host への送信は Takosumi の中ではできません。このページをブラウザの画面で開いて続けますか？")
+            .setNegativeButton("キャンセル", null)
+            .setPositiveButton("ブラウザの画面で開く") { _, _ ->
+                opened = true
+                openBrowserView(page)
+            }
+            .setOnDismissListener {
+                if (!opened) lastExternalDeclinedAt = SystemClock.elapsedRealtime()
+            }
+            .show()
+    }
+
     private fun currentUrl(): String? =
-        entry?.webView?.url?.takeIf { AppScreenPolicy.isLaunchable(it) }
+        entry?.webView?.url?.takeIf { AppScreenPolicy.isInScreen(it, entry?.allowedOrigins) }
 
     private fun share() {
         val url = currentUrl() ?: return
@@ -453,22 +566,39 @@ class AppScreenActivity : AppCompatActivity() {
             !current.webView.canGoBack()
     }
 
-    private inner class ScreenClient : WebViewClient() {
+    private inner class ScreenClient(private val bound: AppScreenRegistry.Entry) : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val url = request.url.toString()
-            val decision = AppScreenPolicy.decide(url, request.isForMainFrame)
+            val decision = AppScreenPolicy.decide(url, request.isForMainFrame, bound.allowedOrigins)
             val popupTarget = request.isForMainFrame && view === entry?.webView && isPopupTarget()
             if (decision.kind == NavigationKind.IN_APP) return false
             if (request.isForMainFrame && view === entry?.webView) {
                 if (popupTarget) {
-                    // A target=_blank / window.open to tel:, http: and the like:
-                    // ask on the opener and drop the empty popup.
-                    AppScreenRegistry.openerHost(this@AppScreenActivity.request.key)
-                        ?.takeIf { decision.kind == NavigationKind.EXTERNAL_CONFIRM }
-                        ?.confirmExternal(url, insecureHttp = decision.insecureHttp, userGesture = request.hasGesture())
+                    // A target=_blank / window.open to another origin, tel:,
+                    // http: and the like: hand it over from the opener and drop
+                    // the empty popup.
+                    val opener = AppScreenRegistry.openerHost(this@AppScreenActivity.request.key)
+                    when (decision.kind) {
+                        NavigationKind.EXTERNAL_CONFIRM -> opener?.confirmExternal(
+                            url,
+                            insecureHttp = decision.insecureHttp,
+                            userGesture = request.hasGesture(),
+                        )
+                        NavigationKind.BROWSER_VIEW ->
+                            (opener ?: this@AppScreenActivity).handOffToBrowserView(url, request.hasGesture())
+                        else -> Unit
+                    }
                     closeScreen()
-                } else if (decision.kind == NavigationKind.EXTERNAL_CONFIRM) {
-                    confirmExternal(url, insecureHttp = decision.insecureHttp, userGesture = request.hasGesture())
+                } else {
+                    when (decision.kind) {
+                        NavigationKind.EXTERNAL_CONFIRM -> confirmExternal(
+                            url,
+                            insecureHttp = decision.insecureHttp,
+                            userGesture = request.hasGesture(),
+                        )
+                        NavigationKind.BROWSER_VIEW -> handOffToBrowserView(url, request.hasGesture())
+                        else -> Unit
+                    }
                 }
             }
             return true
@@ -476,22 +606,30 @@ class AppScreenActivity : AppCompatActivity() {
 
         /**
          * POSTs and their redirects never reach shouldOverrideUrlLoading; refuse
-         * any main-frame request that is not https before it loads.
+         * any main-frame request that is not https, or not on this screen's
+         * origins, before it loads.
          */
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             if (!request.isForMainFrame) return null
-            val scheme = request.url.scheme?.lowercase()
-            return if (scheme == "https") null else blockedResponse()
+            val url = request.url.toString()
+            if (request.url.scheme?.lowercase() != "https") return blockedResponse()
+            val allowed = bound.allowedOrigins ?: return null
+            if (AppScreenRules.isAllowedOrigin(url, allowed)) return null
+            view.post { if (view === entry?.webView) offerBrowserViewForPage(url) }
+            return blockedResponse()
         }
 
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
-            if (url != null && !isAllowedCommittedUrl(url)) {
+            if (url != null && !isAllowedCommittedUrl(url, bound.allowedOrigins)) {
                 // Something reached the main frame without passing the policy.
                 view.stopLoading()
-                val decision = AppScreenPolicy.decide(url, mainFrame = true)
-                if (decision.kind == NavigationKind.EXTERNAL_CONFIRM) {
-                    confirmExternal(url, insecureHttp = decision.insecureHttp, userGesture = false)
+                val decision = AppScreenPolicy.decide(url, mainFrame = true, bound.allowedOrigins)
+                when (decision.kind) {
+                    NavigationKind.EXTERNAL_CONFIRM ->
+                        confirmExternal(url, insecureHttp = decision.insecureHttp, userGesture = false)
+                    NavigationKind.BROWSER_VIEW -> offerBrowserViewForPage(url)
+                    else -> Unit
                 }
                 if (view.canGoBack()) view.goBack()
                 else view.loadUrl(lastKnownUrl.ifEmpty { this@AppScreenActivity.request.url })
@@ -533,7 +671,7 @@ class AppScreenActivity : AppCompatActivity() {
             if (current.key == this@AppScreenActivity.request.key) {
                 when {
                     this@AppScreenActivity.request.popup -> finish()
-                    visible -> show(target = lastKnownUrl.ifEmpty { this@AppScreenActivity.request.url }, keepIfLaunchedWith = null)
+                    visible -> show(target = lastKnownUrl.ifEmpty { startUrl() }, keepLivePage = false)
                     else -> evicted = true
                 }
             }
@@ -553,7 +691,9 @@ class AppScreenActivity : AppCompatActivity() {
             val key = "popup:${UUID.randomUUID()}"
             val popup = AppScreenRegistry.obtain(this@AppScreenActivity, key, popup = true)
             popup.openerKey = request.key
-            popup.webView.webViewClient = PopupPrebindClient(key)
+            // A popup keeps its opener's origins.
+            popup.allowedOrigins = entry?.allowedOrigins
+            popup.webView.webViewClient = PopupPrebindClient(popup)
             transport.webView = popup.webView
             resultMsg.sendToTarget()
             startActivity(AppScreenLaunch.popupIntent(this@AppScreenActivity, key, request.title))
@@ -674,20 +814,24 @@ class AppScreenActivity : AppCompatActivity() {
         const val STATE_URL = "com.takosumi.appscreen.state.URL"
         const val SHELL_SCHEME = "takosumi"
         const val PROMPT_COOLDOWN_MS = 5_000L
+        const val BROWSER_VIEW_COOLDOWN_MS = 3_000L
         const val POPUP_TARGET_WINDOW_MS = 3_000L
         const val MENU_SHARE = 1
         const val MENU_BROWSER = 2
         const val MENU_PIN = 3
         const val MENU_SWITCH = 4
         const val MENU_CLOSE = 5
+        const val MENU_BROWSER_VIEW = 6
+        const val MENU_CLIENT = 7
+        const val MENU_CHOOSE = 8
         val BAR_COLOR = Color.parseColor("#151517")
         val FOREGROUND = Color.parseColor("#F5F5F6")
     }
 }
 
 /** Main-frame URLs a screen may show once committed. */
-internal fun isAllowedCommittedUrl(url: String): Boolean =
-    AppScreenPolicy.isLaunchable(url) || url == "about:blank" || url == "about:srcdoc"
+internal fun isAllowedCommittedUrl(url: String, allowedOrigins: Set<String>?): Boolean =
+    AppScreenPolicy.isInScreen(url, allowedOrigins) || url == "about:blank" || url == "about:srcdoc"
 
 internal fun blockedResponse(): WebResourceResponse =
     WebResourceResponse(
@@ -699,14 +843,21 @@ internal fun blockedResponse(): WebResourceResponse =
         ByteArrayInputStream(ByteArray(0)),
     )
 
-/** Client for webviews no activity shows: keeps the policy, asks nothing. */
-internal object DetachedScreenClient : WebViewClient() {
+/** Refuse a main-frame request that is not https or not on [allowedOrigins]. */
+internal fun refusedMainFrame(request: WebResourceRequest, allowedOrigins: Set<String>?): Boolean {
+    if (!request.isForMainFrame) return false
+    if (request.url.scheme?.lowercase() != "https") return true
+    return allowedOrigins != null && !AppScreenRules.isAllowedOrigin(request.url.toString(), allowedOrigins)
+}
+
+/** Client for a webview no activity shows: keeps the policy, asks nothing. */
+internal class DetachedScreenClient(private val entry: AppScreenRegistry.Entry) : WebViewClient() {
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-        AppScreenPolicy.decide(request.url.toString(), request.isForMainFrame).kind !=
+        AppScreenPolicy.decide(request.url.toString(), request.isForMainFrame, entry.allowedOrigins).kind !=
             NavigationKind.IN_APP
 
     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-        if (request.isForMainFrame && request.url.scheme?.lowercase() != "https") blockedResponse() else null
+        if (refusedMainFrame(request, entry.allowedOrigins)) blockedResponse() else null
 
     override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
         handler.cancel()
@@ -722,22 +873,25 @@ internal object DetachedScreenClient : WebViewClient() {
 
 /**
  * A popup's webview between `window.open` and its activity binding. An in-app
- * first page loads normally; anything else is offered on the opener and the
- * empty popup is dropped.
+ * first page loads normally; another origin goes to the browser view, other
+ * schemes are offered on the opener, and the empty popup is dropped.
  */
-internal class PopupPrebindClient(private val key: String) : WebViewClient() {
+internal class PopupPrebindClient(private val popup: AppScreenRegistry.Entry) : WebViewClient() {
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val url = request.url.toString()
-        val decision = AppScreenPolicy.decide(url, request.isForMainFrame)
-        if (request.isForMainFrame) AppScreenRegistry.get(key)?.popupTargetDecided = true
+        val decision = AppScreenPolicy.decide(url, request.isForMainFrame, popup.allowedOrigins)
+        if (request.isForMainFrame) popup.popupTargetDecided = true
         if (decision.kind == NavigationKind.IN_APP) return false
         if (request.isForMainFrame) {
-            if (decision.kind == NavigationKind.EXTERNAL_CONFIRM) {
-                AppScreenRegistry.openerHost(key)?.confirmExternal(
+            val opener = AppScreenRegistry.openerHost(popup.key)
+            when (decision.kind) {
+                NavigationKind.EXTERNAL_CONFIRM -> opener?.confirmExternal(
                     url,
                     insecureHttp = decision.insecureHttp,
                     userGesture = request.hasGesture(),
                 )
+                NavigationKind.BROWSER_VIEW -> opener?.handOffToBrowserView(url, request.hasGesture())
+                else -> Unit
             }
             val target = WeakReference(view)
             view.post {
@@ -751,7 +905,7 @@ internal class PopupPrebindClient(private val key: String) : WebViewClient() {
     }
 
     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-        if (request.isForMainFrame && request.url.scheme?.lowercase() != "https") blockedResponse() else null
+        if (refusedMainFrame(request, popup.allowedOrigins)) blockedResponse() else null
 
     override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
         handler.cancel()

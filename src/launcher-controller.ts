@@ -1,6 +1,7 @@
 import {
   type AppLauncherEntry,
   type AppScreenIcon,
+  type AppScreenOpenOptions,
   type AppScreenTarget,
   appScreenOpenRequest,
   resolveAppScreenTarget,
@@ -16,9 +17,17 @@ import { type NativeIconSource, nativeIconSource } from "./app-icons.ts";
 export interface LauncherController {
   readonly setEntries: (entries: readonly AppLauncherEntry[]) => void;
   readonly entries: () => readonly AppLauncherEntry[];
-  readonly openEntry: (entry: AppLauncherEntry) => Promise<void>;
-  readonly openUrl: (url: string) => Promise<void>;
-  readonly pinEntry: (entry: AppLauncherEntry) => Promise<boolean>;
+  /** Open in an app screen (中で見る); the open router decides when. */
+  readonly openTarget: (
+    target: AppScreenTarget,
+    options?: AppScreenOpenOptions,
+  ) => Promise<void>;
+  /** A deep-linked URL: the known app with that origin, else its own screen. */
+  readonly openUrl: (url: string, options?: AppScreenOpenOptions) => Promise<void>;
+  readonly pinEntry: (
+    entry: AppLauncherEntry,
+    options?: AppScreenOpenOptions,
+  ) => Promise<boolean>;
   /** Cached `data:` URL of an image icon, for `<img>` in the launcher. */
   readonly iconDataUrl: (icon: AppScreenIcon | undefined) => Promise<string | undefined>;
 }
@@ -73,9 +82,9 @@ export function createLauncherController(input: {
       new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), iconWaitMs)),
     ]);
 
-  const open = async (target: AppScreenTarget) => {
+  const open = async (target: AppScreenTarget, options?: AppScreenOpenOptions) => {
     const png = await withinBudget(iconPng(target));
-    await input.opener.open(appScreenOpenRequest(target, png));
+    await input.opener.open(appScreenOpenRequest(target, png, options));
   };
 
   return {
@@ -84,15 +93,15 @@ export function createLauncherController(input: {
     },
     entries: () => entries,
     iconDataUrl,
-    async openEntry(entry) {
-      await open(entry);
+    async openTarget(target, options) {
+      await open(target, options);
     },
-    async openUrl(url) {
-      await open(resolveAppScreenTarget(url, entries));
+    async openUrl(url, options) {
+      await open(resolveAppScreenTarget(url, entries), options);
     },
-    async pinEntry(entry) {
+    async pinEntry(entry, options) {
       const png = await withinBudget(iconPng(entry));
-      return await input.opener.pinShortcut(appScreenOpenRequest(entry, png));
+      return await input.opener.pinShortcut(appScreenOpenRequest(entry, png, options));
     },
   };
 }

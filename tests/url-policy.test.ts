@@ -1,25 +1,124 @@
 import { expect, test } from "bun:test";
 import policyCases from "../src-tauri/plugins/app-screen/navigation-policy-cases.json";
+import resumeCases from "../src-tauri/plugins/app-screen/resume-url-cases.json";
 import {
+  accountsOrigin,
+  appScreenAllowedOrigins,
+  CREDENTIAL_QUERY_NAMES,
   decideAppScreenNavigation,
   displayHost,
   intentTargetScheme,
   isLaunchableAppScreenUrl,
+  isRememberableAppScreenUrl,
   normalizeUserAppUrl,
+  RESUME_URL_MAX_LENGTH,
   sameOrigin,
+  screenOrigin,
 } from "../src/url-policy.ts";
 
 test("every shared navigation case matches the TypeScript policy", () => {
-  expect(policyCases.cases.length).toBeGreaterThan(20);
+  expect(policyCases.cases.length).toBeGreaterThan(40);
   for (const item of policyCases.cases) {
+    const allowedOrigins = (item as { allowedOrigins?: string[] }).allowedOrigins;
     const decision = decideAppScreenNavigation(item.url, {
       mainFrame: item.mainFrame,
+      ...(allowedOrigins ? { allowedOrigins } : {}),
     });
-    expect({ url: item.url, mainFrame: item.mainFrame, kind: decision.kind }).toEqual({
+    expect({ url: item.url, allowedOrigins, kind: decision.kind }).toEqual({
       url: item.url,
-      mainFrame: item.mainFrame,
+      allowedOrigins,
       kind: item.decision as typeof decision.kind,
     });
+  }
+});
+
+test("every shared resume case matches the TypeScript rule", () => {
+  expect(resumeCases.cases.length).toBeGreaterThan(15);
+  for (const item of resumeCases.cases) {
+    expect({ url: item.url, remember: isRememberableAppScreenUrl(item.url, item.appOrigin) })
+      .toEqual({ url: item.url, remember: item.remember });
+  }
+  const long = `https://app.example/${"a".repeat(RESUME_URL_MAX_LENGTH)}`;
+  expect(isRememberableAppScreenUrl(long, "https://app.example")).toBe(false);
+});
+
+test("pages of other origins go to the browser view; the app and Accounts stay", () => {
+  const allowedOrigins = appScreenAllowedOrigins({
+    appUrl: "https://yurucommu.example/home?tab=1",
+    accountsOrigin: "https://accounts.takosumi.example",
+  });
+  expect(allowedOrigins).toEqual([
+    "https://yurucommu.example",
+    "https://accounts.takosumi.example",
+  ]);
+  const decide = (url: string, mainFrame = true) =>
+    decideAppScreenNavigation(url, { mainFrame, allowedOrigins });
+  expect(decide("https://yurucommu.example/notifications")).toEqual({ kind: "in-app" });
+  expect(decide("https://accounts.takosumi.example/oauth/authorize?x=1")).toEqual({
+    kind: "in-app",
+  });
+  // Google forbids OAuth in embedded webviews: the browser view signs in.
+  expect(decide("https://accounts.google.com/o/oauth2/v2/auth")).toEqual({
+    kind: "browser-view",
+    reason: "other-origin",
+  });
+  expect(decide("https://yurucommu.example.evil.example/")).toEqual({
+    kind: "browser-view",
+    reason: "other-origin",
+  });
+  // Subframes (embedded widgets) keep their own rules.
+  expect(decide("https://accounts.google.com/gsi/iframe", false)).toEqual({ kind: "in-app" });
+  // The scheme rules come first.
+  expect(decide("http://yurucommu.example/").kind).toBe("external-confirm");
+  expect(decide("takosumi://oauth/callback?code=x").kind).toBe("block");
+});
+
+test("the Tauri shell's own hosts never load in an app screen", () => {
+  for (const url of [
+    "https://tauri.localhost/",
+    "https://ipc.localhost/plugin%3Aapp-screen%7Copen",
+    "https://asset.localhost/x",
+    "https://TAURI.localhost./",
+  ]) {
+    expect(decideAppScreenNavigation(url, { mainFrame: true })).toEqual({
+      kind: "block",
+      reason: "shell-host",
+    });
+    expect(isLaunchableAppScreenUrl(url)).toBe(false);
+  }
+  expect(normalizeUserAppUrl("tauri.localhost").ok).toBe(false);
+});
+
+test("the Accounts origin is the https issuer, else the instance itself", () => {
+  expect(
+    accountsOrigin({
+      hostUrl: "https://app.takosumi.example",
+      oidcIssuer: "https://accounts.takosumi.example/",
+    }),
+  ).toBe("https://accounts.takosumi.example");
+  expect(accountsOrigin({ hostUrl: "https://self.example:8443/" })).toBe(
+    "https://self.example:8443",
+  );
+  expect(accountsOrigin({ hostUrl: "http://localhost:8787" })).toBeUndefined();
+  expect(screenOrigin("https://APP.example:443/x")).toBe("https://app.example");
+  expect(screenOrigin("about:blank")).toBeUndefined();
+  expect(
+    appScreenAllowedOrigins({ appUrl: "https://a.example/", accountsOrigin: "https://a.example" }),
+  ).toEqual(["https://a.example"]);
+});
+
+test("resume never keeps a credential Takosumi itself would refuse", async () => {
+  // Every name Takosumi's hasCredentialQueryParams refuses is refused here too.
+  const contract = await Bun.file(
+    new URL("../../takosumi/contract/interface-display.ts", import.meta.url),
+  ).text();
+  const block = /const CREDENTIAL_QUERY_NAMES = new Set\(\[([\s\S]*?)\]\)/u.exec(contract)?.[1];
+  expect(block).toBeDefined();
+  const serverNames = [...block!.matchAll(/"([a-z0-9]+)"/gu)].map((match) => match[1]!);
+  expect(serverNames.length).toBeGreaterThan(20);
+  for (const name of serverNames) expect(CREDENTIAL_QUERY_NAMES.has(name)).toBe(true);
+  for (const name of ["code", "idtoken", "samlresponse"]) {
+    expect(CREDENTIAL_QUERY_NAMES.has(name)).toBe(true);
   }
 });
 
@@ -90,6 +189,7 @@ test("subframes never reach the OS", () => {
 });
 
 test("only https URLs are launchable", () => {
+  expect(isLaunchableAppScreenUrl("https://app.example/#/inbox")).toBe(true);
   expect(isLaunchableAppScreenUrl("https://app.example/path?x=1")).toBe(true);
   expect(isLaunchableAppScreenUrl("http://app.example/")).toBe(false);
   expect(isLaunchableAppScreenUrl("about:blank")).toBe(false);

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import {
   checkPermissions,
@@ -27,6 +27,7 @@ import {
 } from "@takosjp/mobile-kit";
 import {
   type AppScreenInvoke,
+  type AppScreenListen,
   type AppScreenOpener,
   createAppScreenOpener,
 } from "./app-screen-native.ts";
@@ -36,6 +37,11 @@ export function isUnsupportedTauriDesktop(): boolean {
   return detectTauriRuntime() && !isTauriMobilePlatform(platform());
 }
 
+/** `ios`, `android`, or `web` for the browser preview. */
+export function productPlatform(): string {
+  return detectTauriRuntime() && isTauriMobilePlatform(platform()) ? platform() : "web";
+}
+
 /**
  * App screens open in the product's native webview plugin on iOS/Android and
  * in the external browser in the web preview.
@@ -43,12 +49,29 @@ export function isUnsupportedTauriDesktop(): boolean {
 export function createProductAppScreenOpener(
   bridge: Pick<NativeBridge, "openExternalUrl">,
 ): AppScreenOpener {
-  const mobile = detectTauriRuntime() && isTauriMobilePlatform(platform());
+  const mobile = productPlatform() !== "web";
   return createAppScreenOpener({
-    ...(mobile ? { invoke: invoke as AppScreenInvoke } : {}),
-    platform: mobile ? platform() : "web",
+    ...(mobile
+      ? {
+          invoke: invoke as AppScreenInvoke,
+          listen: addPluginListener as unknown as AppScreenListen,
+        }
+      : {}),
+    platform: productPlatform(),
     openExternalUrl: (url) => bridge.openExternalUrl(url),
   });
+}
+
+/**
+ * The phone's own browser (Safari, Chrome ...), not the browser view: a web
+ * app the person adds to the home screen there can receive its Web Push.
+ * `NativeBridge.openExternalUrl` prefers the in-app browser on phones.
+ */
+export function createProductWebOpener(
+  bridge: Pick<NativeBridge, "openExternalUrl">,
+): (url: string) => Promise<void> {
+  if (productPlatform() === "web") return (url) => bridge.openExternalUrl(url);
+  return async (url) => await openUrl(url);
 }
 
 export function createProductNativeBridge(): NativeBridge {

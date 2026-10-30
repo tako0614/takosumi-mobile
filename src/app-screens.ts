@@ -1,5 +1,12 @@
 import type { WireDecoder } from "@takosjp/mobile-kit";
 import {
+  clientForPlatform,
+  clientLabel,
+  decodeScreenClients,
+  openClientRequest,
+  type ScreenClients,
+} from "./app-clients.ts";
+import {
   displayHost,
   isLaunchableAppScreenUrl,
   normalizeUserAppUrl,
@@ -32,6 +39,8 @@ export interface CapsuleAppScreen {
   readonly icon?: AppScreenIcon;
   readonly sortOrder?: number;
   readonly url: string;
+  /** The native phone apps the screen declares (re-checked). */
+  readonly clients?: ScreenClients;
 }
 
 export interface CapsuleAppScreens {
@@ -82,6 +91,7 @@ function decodeScreen(value: unknown): CapsuleAppScreen | undefined {
     typeof value.sortOrder === "number" && Number.isFinite(value.sortOrder)
       ? value.sortOrder
       : undefined;
+  const clients = decodeScreenClients(value.clients);
   return {
     interfaceId,
     name,
@@ -89,6 +99,7 @@ function decodeScreen(value: unknown): CapsuleAppScreen | undefined {
     ...(icon === undefined ? {} : { icon }),
     ...(sortOrder === undefined ? {} : { sortOrder }),
     url,
+    ...(clients === undefined ? {} : { clients }),
   };
 }
 
@@ -152,6 +163,8 @@ export interface AppLauncherEntry {
   readonly icon?: AppScreenIcon;
   /** Letter shown when there is no icon or it cannot be loaded. */
   readonly fallbackGlyph: string;
+  /** The screen's declared native phone apps (Takosumi screens only). */
+  readonly clients?: ScreenClients;
 }
 
 /** App states whose screens are worth asking for. */
@@ -213,6 +226,7 @@ export function buildLauncherEntries(input: {
         host: displayHost(screen.url),
         ...(icon === undefined ? {} : { icon }),
         fallbackGlyph: fallbackGlyph(label),
+        ...(screen.clients === undefined ? {} : { clients: screen.clients }),
       });
     }
   }
@@ -335,6 +349,7 @@ export interface AppScreenTarget {
   readonly url: string;
   readonly icon?: AppScreenIcon;
   readonly fallbackGlyph: string;
+  readonly clients?: ScreenClients;
 }
 
 /**
@@ -355,6 +370,7 @@ export function resolveAppScreenTarget(
       url,
       ...(match.icon === undefined ? {} : { icon: match.icon }),
       fallbackGlyph: match.fallbackGlyph,
+      ...(match.clients === undefined ? {} : { clients: match.clients }),
     };
   }
   const host = displayHost(url);
@@ -375,6 +391,21 @@ export function resolveAppScreenTarget(
  */
 export const APP_SCREEN_PROFILE = "shared" as const;
 
+/**
+ * The declared native app the screen's bar offers ("{name}で開く"). A
+ * verified client carries its links so the bar can open it directly; an
+ * unverified one carries only its label, and the bar sends the person to the
+ * chooser, which shows the real destination and asks first.
+ */
+export interface AppScreenBannerClient {
+  readonly name: string;
+  readonly verified: boolean;
+  readonly package?: string;
+  readonly appLink?: string;
+  readonly universalLink?: string;
+  readonly open?: string;
+}
+
 export interface AppScreenOpenRequest {
   readonly key: string;
   readonly url: string;
@@ -382,50 +413,64 @@ export interface AppScreenOpenRequest {
   /** Base64 PNG (no data: prefix) for the Android task and shortcuts. */
   readonly iconPng?: string;
   readonly profile: typeof APP_SCREEN_PROFILE;
+  /**
+   * The instance's Accounts origin. With the app's own origin it is all the
+   * screen shows in its main frame; other pages go to the browser view.
+   */
+  readonly accountsOrigin?: string;
+  /** (instance, account) the screen remembers its last page for. */
+  readonly scope?: string;
+  /** Reopen at the last remembered page of this app instead of `url`. */
+  readonly resume?: boolean;
+  readonly client?: AppScreenBannerClient;
 }
 
+export interface AppScreenOpenOptions {
+  readonly accountsOrigin?: string;
+  readonly scope?: string;
+  readonly resume?: boolean;
+  /** The phone Takosumi Mobile runs on, to pick the declared client. */
+  readonly platform?: string;
+}
+
+/** Longest `scope` the native side accepts. */
+export const APP_SCREEN_SCOPE_MAX_LENGTH = 512;
+
 export function appScreenOpenRequest(
-  target: Pick<AppScreenTarget, "key" | "label" | "url">,
+  target: Pick<AppScreenTarget, "key" | "label" | "url" | "clients">,
   iconPng?: string,
+  options: AppScreenOpenOptions = {},
 ): AppScreenOpenRequest {
   if (!isLaunchableAppScreenUrl(target.url)) {
     throw new Error("Only https URLs can be opened in an app screen.");
   }
+  const scope =
+    options.scope && options.scope.length <= APP_SCREEN_SCOPE_MAX_LENGTH
+      ? options.scope
+      : undefined;
+  const client = bannerClient(target.clients, options.platform);
   return {
     key: boundedKey(target.key),
     url: target.url,
     title: clampLabel(target.label) || displayHost(target.url),
     ...(iconPng ? { iconPng } : {}),
     profile: APP_SCREEN_PROFILE,
+    ...(options.accountsOrigin ? { accountsOrigin: options.accountsOrigin } : {}),
+    ...(scope ? { scope } : {}),
+    ...(options.resume ? { resume: true } : {}),
+    ...(client ? { client } : {}),
   };
 }
 
-// --- Unread counts (step 4) -------------------------------------------------
-
-/**
- * Unread counts per launcher entry. Push delivery (TASK-0119 U4 step 4) fills
- * this from each app's Declarative Web Push `app_badge`; until then it is
- * empty and the launcher shows no badges.
- */
-export type AppUnreadCounts = ReadonlyMap<string, number>;
-
-export function unreadBadgeLabel(
-  counts: AppUnreadCounts,
-  key: string,
-): string | undefined {
-  const count = counts.get(key);
-  if (count === undefined || !Number.isFinite(count) || count <= 0) {
-    return undefined;
-  }
-  return count > 99 ? "99+" : String(Math.floor(count));
-}
-
-export function totalUnread(counts: AppUnreadCounts): number {
-  let total = 0;
-  for (const count of counts.values()) {
-    if (Number.isFinite(count) && count > 0) total += Math.floor(count);
-  }
-  return total;
+function bannerClient(
+  clients: ScreenClients | undefined,
+  platform: string | undefined,
+): AppScreenBannerClient | undefined {
+  const client = clientForPlatform(clients, platform ?? "");
+  if (!client) return undefined;
+  if (!client.verified) return { name: clientLabel(client), verified: false };
+  const { platform: _platform, ...links } = openClientRequest(client);
+  return { name: clientLabel(client), verified: true, ...links };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

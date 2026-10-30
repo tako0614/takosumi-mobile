@@ -10,8 +10,6 @@ import {
   parseAppScreenDeepLink,
   resolveAppScreenTarget,
   stabilizeLauncherEntries,
-  totalUnread,
-  unreadBadgeLabel,
 } from "../src/app-screens.ts";
 
 function view(app: Record<string, unknown>) {
@@ -272,20 +270,4 @@ test("a home refresh keeps unchanged tiles and replaces changed ones", () => {
   expect(renamed[0]).toBe(first[0]!);
   expect(renamed[1]).not.toBe(first[1]!);
   expect(renamed[1]?.label).toBe("B2");
-});
-
-test("unread badges are a hook for push delivery and stay empty by default", () => {
-  const empty = new Map<string, number>();
-  expect(unreadBadgeLabel(empty, "app:cap_a:w")).toBeUndefined();
-  expect(totalUnread(empty)).toBe(0);
-  const counts = new Map([
-    ["a", 3],
-    ["b", 120],
-    ["c", 0],
-    ["d", Number.NaN],
-  ]);
-  expect(unreadBadgeLabel(counts, "a")).toBe("3");
-  expect(unreadBadgeLabel(counts, "b")).toBe("99+");
-  expect(unreadBadgeLabel(counts, "c")).toBeUndefined();
-  expect(totalUnread(counts)).toBe(123);
 });

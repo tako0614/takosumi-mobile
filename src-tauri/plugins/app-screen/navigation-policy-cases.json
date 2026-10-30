@@ -1,5 +1,5 @@
 {
-  "description": "Shared navigation rules for app screens. tests/url-policy.test.ts checks src/url-policy.ts against every case; AppScreenPolicy.kt and AppScreenPolicy.swift implement the same table. Decisions: in-app, external-confirm, block.",
+  "description": "Shared navigation rules for app screens. tests/url-policy.test.ts checks src/url-policy.ts against every case; AppScreenPolicy.kt and AppScreenPolicy.swift implement the same table. Decisions: in-app, browser-view, external-confirm, block. A case with allowedOrigins is judged for a screen that keeps only those origins (its app's origin and the instance's Accounts origin) in the main frame; other https pages go to the browser view.",
   "cases": [
     { "url": "https://yurucommu.example/home", "mainFrame": true, "decision": "in-app" },
     { "url": "https://app.takosumi.com/oauth/authorize?client_id=x", "mainFrame": true, "decision": "in-app" },
@@ -40,6 +40,24 @@
     { "url": "tel:+81312345678", "mainFrame": false, "decision": "block" },
     { "url": "intent://scan/#Intent;scheme=zxing;end", "mainFrame": false, "decision": "block" },
     { "url": "takosumi://app?url=https%3A%2F%2Fevil.example", "mainFrame": false, "decision": "block" },
-    { "url": "file:///etc/hosts", "mainFrame": false, "decision": "block" }
+    { "url": "file:///etc/hosts", "mainFrame": false, "decision": "block" },
+    { "url": "https://tauri.localhost/", "mainFrame": true, "decision": "block" },
+    { "url": "https://ipc.localhost/plugin%3Aapp-screen%7Copen", "mainFrame": true, "decision": "block" },
+    { "url": "https://asset.localhost/data/x", "mainFrame": true, "decision": "block" },
+    { "url": "https://TAURI.localhost./", "mainFrame": true, "decision": "block" },
+    { "url": "https://app.example/inbox", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "in-app" },
+    { "url": "https://APP.example:443/inbox", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "in-app" },
+    { "url": "https://accounts.takosumi.example/oauth/authorize?client_id=x", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "in-app" },
+    { "url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=x", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "browser-view" },
+    { "url": "https://app.example:8443/", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "browser-view" },
+    { "url": "https://sub.app.example/", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "browser-view" },
+    { "url": "https://app.example.evil.example/", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "browser-view" },
+    { "url": "https://tauri.localhost/", "mainFrame": true, "allowedOrigins": ["https://tauri.localhost"], "decision": "block" },
+    { "url": "https://u@app.example/", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "block" },
+    { "url": "http://app.example/", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "external-confirm" },
+    { "url": "tel:+81312345678", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "external-confirm" },
+    { "url": "about:blank", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "in-app" },
+    { "url": "takosumi://app?url=https%3A%2F%2Fapp.example", "mainFrame": true, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "block" },
+    { "url": "https://accounts.google.com/gsi/iframe", "mainFrame": false, "allowedOrigins": ["https://app.example", "https://accounts.takosumi.example"], "decision": "in-app" }
   ]
 }

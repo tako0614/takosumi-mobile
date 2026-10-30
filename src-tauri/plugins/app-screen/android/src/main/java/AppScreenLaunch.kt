@@ -19,19 +19,126 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
+/**
+ * The declared native app the bar offers ("{name}で開く"). A verified one has
+ * its links; an unverified one has none and sends the person to the chooser.
+ */
+internal data class BannerClient(
+    val name: String,
+    val verified: Boolean,
+    val packageName: String? = null,
+    val appLink: String? = null,
+    val open: String? = null,
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("name", name)
+        .put("verified", verified)
+        .apply {
+            packageName?.let { put("package", it) }
+            appLink?.let { put("appLink", it) }
+            open?.let { put("open", it) }
+        }
+
+    companion object {
+        /** Re-checks everything; an invalid client is dropped, not repaired. */
+        fun of(
+            name: String?,
+            verified: Boolean,
+            packageName: String?,
+            appLink: String?,
+            open: String?,
+        ): BannerClient? {
+            if (!AppScreenRules.isClientName(name)) return null
+            if (!verified) {
+                return if (packageName == null && appLink == null && open == null) {
+                    BannerClient(name!!.trim(), verified = false)
+                } else {
+                    null
+                }
+            }
+            if (!AppScreenRules.isAndroidPackage(packageName)) return null
+            if (appLink != null && !AppScreenRules.isHttpsLink(appLink)) return null
+            if (open != null && !AppScreenRules.isCustomSchemeLink(open)) return null
+            if (appLink == null && open == null) return null
+            return BannerClient(name!!.trim(), verified = true, packageName, appLink, open)
+        }
+
+        fun fromJson(raw: String?): BannerClient? = try {
+            raw?.let { JSONObject(it) }?.let { json ->
+                of(
+                    json.optString("name").ifEmpty { null },
+                    json.optBoolean("verified", false),
+                    json.optString("package").ifEmpty { null },
+                    json.optString("appLink").ifEmpty { null },
+                    json.optString("open").ifEmpty { null },
+                )
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
 /** One app screen to show: identity, first URL and the name for its task. */
 internal data class ScreenRequest(
     val key: String,
     val url: String,
     val title: String,
     val popup: Boolean = false,
-)
+    /** The instance's Accounts origin, kept in the screen with the app's own. */
+    val accountsOrigin: String? = null,
+    /** (instance, account) the last page is remembered for. */
+    val scope: String? = null,
+    /** Reopen at the last remembered page instead of [url]. */
+    val resume: Boolean = false,
+    val client: BannerClient? = null,
+) {
+    val appOrigin: String? get() = AppScreenRules.originOf(url)
+
+    /** The origins this screen shows in its main frame; others go to the browser view. */
+    val allowedOrigins: Set<String>
+        get() = setOfNotNull(appOrigin, accountsOrigin)
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("url", url)
+        .put("title", title)
+        .apply {
+            accountsOrigin?.let { put("accountsOrigin", it) }
+            scope?.let { put("scope", it) }
+            client?.let { put("client", it.toJson().toString()) }
+        }
+
+    companion object {
+        const val SCOPE_MAX_LENGTH = 512
+
+        fun checkedAccountsOrigin(raw: String?): String? =
+            raw?.takeIf { AppScreenRules.isHttpsOrigin(it) }
+
+        fun checkedScope(raw: String?): String? =
+            raw?.takeIf { it.isNotEmpty() && it.length <= SCOPE_MAX_LENGTH && it.none { c -> c.isISOControl() } }
+
+        /** A request stored by [toJson] (task restore, shortcuts). */
+        fun fromJson(key: String, json: JSONObject): ScreenRequest = ScreenRequest(
+            key = key,
+            url = json.optString("url"),
+            title = json.optString("title"),
+            accountsOrigin = checkedAccountsOrigin(json.optString("accountsOrigin").ifEmpty { null }),
+            scope = checkedScope(json.optString("scope").ifEmpty { null }),
+            resume = true,
+            client = BannerClient.fromJson(json.optString("client").ifEmpty { null }),
+        )
+    }
+}
 
 internal object AppScreenLaunch {
     const val EXTRA_KEY = "com.takosumi.appscreen.KEY"
     const val EXTRA_URL = "com.takosumi.appscreen.URL"
     const val EXTRA_TITLE = "com.takosumi.appscreen.TITLE"
     const val EXTRA_POPUP = "com.takosumi.appscreen.POPUP"
+    const val EXTRA_ACCOUNTS_ORIGIN = "com.takosumi.appscreen.ACCOUNTS_ORIGIN"
+    const val EXTRA_SCOPE = "com.takosumi.appscreen.SCOPE"
+    const val EXTRA_RESUME = "com.takosumi.appscreen.RESUME"
+    const val EXTRA_CLIENT = "com.takosumi.appscreen.CLIENT"
     private const val SCHEME = "takosumi"
     private const val HOST = "app"
     private const val KEY_MAX_LENGTH = 512
@@ -50,6 +157,10 @@ internal object AppScreenLaunch {
             putExtra(EXTRA_KEY, request.key)
             putExtra(EXTRA_URL, request.url)
             putExtra(EXTRA_TITLE, request.title)
+            putExtra(EXTRA_RESUME, request.resume)
+            request.accountsOrigin?.let { putExtra(EXTRA_ACCOUNTS_ORIGIN, it) }
+            request.scope?.let { putExtra(EXTRA_SCOPE, it) }
+            request.client?.let { putExtra(EXTRA_CLIENT, it.toJson().toString()) }
             addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
         }
 
@@ -95,7 +206,18 @@ internal object AppScreenLaunch {
         if (key.isBlank() || key.length > KEY_MAX_LENGTH) return null
         val title = (intent.getStringExtra(EXTRA_TITLE) ?: stored?.title ?: AppScreenPolicy.displayHost(url))
             .take(TITLE_MAX_LENGTH)
-        return ScreenRequest(key, url, title, popup)
+        if (popup) return ScreenRequest(key, url, title, popup = true)
+        if (stored != null) return stored.copy(key = key, title = title)
+        return ScreenRequest(
+            key = key,
+            url = url,
+            title = title,
+            accountsOrigin = ScreenRequest.checkedAccountsOrigin(intent.getStringExtra(EXTRA_ACCOUNTS_ORIGIN)),
+            scope = ScreenRequest.checkedScope(intent.getStringExtra(EXTRA_SCOPE)),
+            // A bare `takosumi://app?url=` names a page; it never resumes elsewhere.
+            resume = intent.getBooleanExtra(EXTRA_RESUME, false),
+            client = BannerClient.fromJson(intent.getStringExtra(EXTRA_CLIENT)),
+        )
     }
 
     /** Keep the screen's launch so its task can be restored without extras. */
@@ -105,11 +227,7 @@ internal object AppScreenLaunch {
             val preferences = context.getSharedPreferences(LAUNCH_PREFERENCES, Context.MODE_PRIVATE)
             val editor = preferences.edit().putString(
                 digest(request.key),
-                JSONObject()
-                    .put("url", request.url)
-                    .put("title", request.title)
-                    .put("t", System.currentTimeMillis())
-                    .toString(),
+                request.toJson().put("t", System.currentTimeMillis()).toString(),
             )
             val all = preferences.all
             if (all.size > MAX_REMEMBERED) {
@@ -130,7 +248,7 @@ internal object AppScreenLaunch {
         context.getSharedPreferences(LAUNCH_PREFERENCES, Context.MODE_PRIVATE)
             .getString(digest(key), null)
             ?.let { JSONObject(it) }
-            ?.let { ScreenRequest(key, it.optString("url"), it.optString("title")) }
+            ?.let { ScreenRequest.fromJson(key, it) }
             ?.takeIf { AppScreenPolicy.isLaunchable(it.url) }
     } catch (_: Exception) {
         null
@@ -233,10 +351,8 @@ internal object AppScreenShortcuts {
             val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             val id = shortcutId(request.key)
             val previous = preferences.getString(id, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
-            val usage = JSONObject()
+            val usage = request.toJson()
                 .put("key", request.key)
-                .put("url", request.url)
-                .put("title", request.title)
                 .put("count", (previous?.optInt("count") ?: 0) + 1)
                 .put("lastUsed", System.currentTimeMillis())
             val editor = preferences.edit().putString(id, usage.toString())
@@ -255,11 +371,7 @@ internal object AppScreenShortcuts {
                     .thenByDescending { it.optLong("lastUsed") },
             ).take(limit)
             val shortcuts = top.mapIndexedNotNull { rank, item ->
-                val screen = ScreenRequest(
-                    item.optString("key"),
-                    item.optString("url"),
-                    item.optString("title"),
-                )
+                val screen = ScreenRequest.fromJson(item.optString("key"), item)
                 if (screen.key.isEmpty() || !AppScreenPolicy.isLaunchable(screen.url)) null
                 else info(context, screen, rank)
             }

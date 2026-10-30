@@ -8,27 +8,53 @@ shell's own webview and sits under a thin native bar:
 - the current host, always visible (there is no address field, so a page
   cannot pretend to be another site);
 - back, reload and close;
-- a menu with share, open in the browser, switch apps and, on Android, add to
-  the home screen.
+- a menu with share, ブラウザの画面で開く (the browser view), open in the
+  browser, 「{name}で開く」 when the app declares a native app, 開き方を変える,
+  switch apps and, on Android, add to the home screen.
 
-Design: `takos-control/docs/platform/takosumi-mobile-browser.md` (TASK-0119
-U4, step 3). Push delivery (step 4) and the iOS widget and App Intents
-(step 5) are not part of this plugin yet; the webview factories mark where the
-document-start Push API bridge will be added.
+It also hands a screen to its declared native app (`open_client`) and opens
+pages in the browser view (`open_browser_view`): Custom Tabs on Android,
+`SFSafariViewController` on iOS.
+
+Design: `takos-control/docs/platform/takosumi-app-clients.md` §3 and §5
+(TASK-0119 step 3). App screens receive no Web Push; the iOS widget and App
+Intents come later.
 
 ## Commands
 
 | Command | Payload | Result |
 | --- | --- | --- |
 | `capabilities` | none | `{ pinShortcut }` (Android launchers that can pin) |
-| `open` | `{ key, url, title, iconPng?, profile: "shared" }` | opens or returns to the screen |
+| `open` | `{ key, url, title, iconPng?, profile: "shared", accountsOrigin?, scope?, resume?, client? }` | opens or returns to the screen |
 | `pin_shortcut` | same as `open` | `{ requested }`; always `false` on iOS |
+| `open_client` | `{ platform, package?, appLink?, universalLink?, open? }` | `{ result: "opened" \| "not_installed" }` |
+| `open_browser_view` | `{ url, toolbarColor? }` | `{ result: "browser-view" \| "browser" }` |
+| `take_pending_action` | none | `{ action? }`: `{ kind: "choose", key, url, reason }` left by a bar |
 
 `key` is the screen's stable identity (`app:<capsuleId>:<interfaceId>`,
 `custom:<id>` or `origin:<origin>`). `iconPng` is a base64 PNG the shell drew
 from the Interface `display.icon` (SVG and glyphs are rasterized in the shell;
-the native side only decodes PNG). Rust, Kotlin and Swift each re-check that
-the URL is https without user info and that `profile` is `shared`.
+the native side only decodes PNG). `accountsOrigin` is the instance's Accounts
+(OIDC issuer) origin, `scope` the (instance, account) the last page is kept
+for, `resume` reopens at that page, and `client` the declared native app the
+bar offers (a verified one with its links, an unverified one with its label
+only). Rust, Kotlin and Swift each re-check that the URL is https without user
+info and not one of the shell's own hosts, that `profile` is `shared`, and the
+origin, scope, package, links and schemes (the schemes Takosumi refuses for
+native apps, `contract/interface-clients.ts`, are refused here too).
+
+`open_client` pins the target: on Android `ACTION_VIEW` with `setPackage`,
+the App Link first with `FLAG_ACTIVITY_REQUIRE_NON_BROWSER`, then the custom
+scheme, and `ActivityNotFoundException` is `not_installed` (no `<queries>`,
+no `QUERY_ALL_PACKAGES`); on iOS `UIApplication.open` with
+`universalLinksOnly` first, then the custom scheme, and `false` from both is
+`not_installed` (no `canOpenURL`). The shell never opens an unverified client
+without the person's confirmation.
+
+An app screen's bar reaches the shell only through `take_pending_action`: the
+bar stores the action (開き方を変える, a native app that is not installed, an
+unverified one to confirm), fires the plugin event `actionPending`, and brings
+the shell forward; the shell then takes the action and shows its chooser.
 
 ## Navigation rules
 
@@ -38,6 +64,16 @@ the same rules:
 
 - the main frame shows https only; `about:blank` / `about:srcdoc` stay (popups
   start there);
+- the main frame shows only the app's own origin and the instance's Accounts
+  origin. Any other https page (an external sign-in such as Google, which
+  forbids OAuth in embedded webviews) opens in the browser view over the
+  screen instead, and closing it comes back. Without a user gesture (a
+  redirect, a script) this happens at most once every few seconds. A form
+  POST to another origin is refused, with an offer to continue from the page
+  in the browser view. A `target=_blank` / `window.open` to another origin
+  goes to the browser view too, and popups keep their opener's origins;
+- the Tauri shell's own hosts (`tauri.localhost`, `ipc.localhost`,
+  `asset.localhost`) are refused;
 - `http:` and other schemes (`tel:`, `mailto:`, `intent:` ...) go to the OS only
   after a confirmation that names the page's host, and only from the main frame;
 - `javascript:`, `data:`, `file:`, `content:` and Takosumi Mobile's own
@@ -49,6 +85,16 @@ the same rules:
 - `target=_blank` and `window.open` (with a user gesture) open a new in-app
   screen stacked on the opener; `window.close()` closes it.
 
+## Isolation
+
+App screens are not Tauri webviews. They are plain `android.webkit.WebView` /
+`WKWebView`s with their own configuration: no capability (the capabilities
+apply to the shell's `main` window only and none has `remote`), no Tauri IPC,
+no JavaScript interface, web message listener, script message handler, user
+script or URL scheme handler. A page in an app screen therefore cannot call
+plugin commands, files, the control plane or the instance's tokens.
+`tests/app-screen-isolation.test.ts` and `tests/capabilities.rs` keep it so.
+
 ## Profile and lifetime
 
 All app screens share one cookie and storage profile (Android's process-wide
@@ -57,10 +103,13 @@ signing in to Takosumi once on the web carries over to every app that uses
 Takosumi OIDC. Do not give screens their own data directory, profile or
 non-persistent store.
 
-Up to four screens stay alive when the person switches between apps; the least
-recently used one is closed first. On Android it reloads its last URL when its
-task returns; on iOS it reopens at the app's launch URL. A screen covered by its
-own popup is never closed for this.
+One app screen stays alive at a time (with its popups). Opening another app
+closes the previous one's webview; it reopens by URL. Each app's last page is
+remembered per (instance, account) on the device (`resume-url-cases.json`:
+the app's own origin only, no user info, fragment or credential-named query
+parameter), and reopening the app starts there. A deep link opens exactly the
+page it names. Keeping several pages alive and switching between them waits
+for device testing.
 
 The host label shows the committed page only: on iOS it does not change while a
 navigation is still loading, so a slow load of another site cannot borrow its
