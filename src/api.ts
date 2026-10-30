@@ -23,6 +23,16 @@ import {
 } from "./app-screens.ts";
 import { productAdapter } from "./product.ts";
 
+/**
+ * Takosumi API client for one instance's session. Paths are relative to the
+ * API root the instance advertised in `/.well-known/takosumi` (`apiBaseUrl`),
+ * which mobile-kit only accepts on the instance's own origin; `/api/v1` on the
+ * instance is the fallback for sessions saved before it was recorded.
+ */
+function takosumiApi(session: MobileSession) {
+  return createMobileApiClient({ session, apiBasePath: "/api/v1" });
+}
+
 const WORKSPACE_PAGE_SIZE = 100;
 const APP_SCREEN_CONCURRENCY = 6;
 export const MAX_LAUNCHER_APPS = 100;
@@ -102,7 +112,7 @@ async function listAppRuns(
   session: MobileSession,
   apps: readonly MobileApp[],
 ): Promise<readonly MobileRun[]> {
-  const api = createMobileApiClient({ session });
+  const api = takosumiApi(session);
   const perAppPageSize = Math.max(
     1,
     Math.min(RUN_PAGE_SIZE, Math.floor(MAX_RUNS / Math.max(1, apps.length))),
@@ -194,7 +204,7 @@ async function readAppRunPage(
   },
   limit: number,
 ): Promise<{ readonly runs: readonly MobileRun[]; readonly nextCursor?: string } | undefined> {
-  const path = `/api/v1/capsules/${encodeURIComponent(state.capsuleId)}/runs?limit=${limit}${state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : ""}`;
+  const path = `/capsules/${encodeURIComponent(state.capsuleId)}/runs?limit=${limit}${state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : ""}`;
   try {
     return await api.wire(path, PUBLIC_SESSION_RUNS_RESPONSE_DECODER);
   } catch (error) {
@@ -216,7 +226,7 @@ async function listLegacyRunsForApps(
         capsuleIdList.slice(offset, offset + 20).map(async (capsuleId) => {
           try {
             const detail = await api.wire(
-              `/api/v1/capsules/${encodeURIComponent(capsuleId)}`,
+              `/capsules/${encodeURIComponent(capsuleId)}`,
               APP_CAPSULE_DETAIL_DECODER,
             );
             if (detail.id !== capsuleId) {
@@ -248,7 +258,7 @@ async function listLegacyRunsForApps(
       runs.push(
         ...(await collectPages({
           api,
-          basePath: `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/runs?limit=${RUN_PAGE_SIZE}`,
+          basePath: `/workspaces/${encodeURIComponent(workspaceId)}/runs?limit=${RUN_PAGE_SIZE}`,
           decoder: PUBLIC_SESSION_RUNS_RESPONSE_DECODER,
           pageItems: (page) =>
             page.runs.filter(
@@ -285,7 +295,7 @@ export async function loadWorkspaceHome(
   workspaceId: string,
   knownWorkspaces?: readonly MobileWorkspace[],
 ): Promise<TakosumiMobileHome> {
-  const api = createMobileApiClient({ session });
+  const api = takosumiApi(session);
   const workspaces = knownWorkspaces ?? (await listWorkspaces(session));
   const workspace = workspaces.find(
     (candidate) => candidate.id === workspaceId,
@@ -295,7 +305,7 @@ export async function loadWorkspaceHome(
   const [capsules, runs] = await Promise.all([
     collectPages({
       api,
-      basePath: `/api/v1/workspaces/${encodedId}/capsules?includeDestroyed=false&limit=${CAPSULE_PAGE_SIZE}`,
+      basePath: `/workspaces/${encodedId}/capsules?includeDestroyed=false&limit=${CAPSULE_PAGE_SIZE}`,
       decoder: PUBLIC_SESSION_CAPSULES_RESPONSE_DECODER,
       pageItems: (page) => page.capsules,
       maximumItems: MAX_CAPSULES,
@@ -303,7 +313,7 @@ export async function loadWorkspaceHome(
     }),
     collectPages({
       api,
-      basePath: `/api/v1/workspaces/${encodedId}/runs?limit=${RUN_PAGE_SIZE}`,
+      basePath: `/workspaces/${encodedId}/runs?limit=${RUN_PAGE_SIZE}`,
       decoder: PUBLIC_SESSION_RUNS_RESPONSE_DECODER,
       pageItems: (page) => page.runs,
       maximumItems: MAX_RUNS,
@@ -315,8 +325,8 @@ export async function loadWorkspaceHome(
 
 async function listApps(session: MobileSession): Promise<readonly MobileApp[]> {
   return await collectPages({
-    api: createMobileApiClient({ session }),
-    basePath: `/api/v1/apps?limit=${APP_PAGE_SIZE}`,
+    api: takosumiApi(session),
+    basePath: `/apps?limit=${APP_PAGE_SIZE}`,
     decoder: MOBILE_APPS_RESPONSE_DECODER,
     pageItems: (page) => page.apps,
     maximumItems: MAX_APPS,
@@ -341,7 +351,7 @@ export async function loadAppScreens(
   session: MobileSession,
   apps: readonly LauncherApp[],
 ): Promise<AppScreensLoad> {
-  const api = createMobileApiClient({ session });
+  const api = takosumiApi(session);
   const candidates = apps
     .filter((app) => appMayHaveScreens(app.state))
     .slice(0, MAX_LAUNCHER_APPS);
@@ -353,7 +363,7 @@ export async function loadAppScreens(
       const app = candidates[next++]!;
       try {
         const view = await api.wire(
-          `/api/v1/capsules/${encodeURIComponent(app.capsuleId)}/app`,
+          `/capsules/${encodeURIComponent(app.capsuleId)}/app`,
           CAPSULE_APP_SCREENS_DECODER,
         );
         if (view.capsuleId !== app.capsuleId) {
@@ -466,8 +476,8 @@ async function listWorkspaces(
   session: MobileSession,
 ): Promise<readonly MobileWorkspace[]> {
   return await collectPages({
-    api: createMobileApiClient({ session }),
-    basePath: `/api/v1/workspaces?limit=${WORKSPACE_PAGE_SIZE}`,
+    api: takosumiApi(session),
+    basePath: `/workspaces?limit=${WORKSPACE_PAGE_SIZE}`,
     decoder: PUBLIC_SESSION_WORKSPACES_RESPONSE_DECODER,
     pageItems: (page) => page.workspaces,
     maximumItems: MAX_WORKSPACES,
@@ -586,8 +596,8 @@ async function mutateRun(
     session: input.session,
   });
   requireMutationScope(session, requiredScope);
-  const response = await createMobileApiClient({ session }).wire(
-    `/api/v1/runs/${encodeURIComponent(input.run.id)}/${action}`,
+  const response = await takosumiApi(session).wire(
+    `/runs/${encodeURIComponent(input.run.id)}/${action}`,
     PUBLIC_SESSION_RUN_RESPONSE_DECODER,
     {
       method: "POST",

@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import type {
-  MobileSecureStore,
-  MobileSession,
-  NativeBridge,
+import {
+  persistMobileSession,
+  type MobileSecureStore,
+  type MobileSession,
+  type NativeBridge,
 } from "@takosjp/mobile-kit";
+import { productAdapter } from "../src/product.ts";
 import { legacyWorkspaceOptions } from "../src/home-presentation.ts";
 import {
   approveRun,
@@ -26,8 +28,7 @@ const session: MobileSession = {
   product: "takosumi",
   accessToken: "takat_fixture_mobile_access",
   tokenType: "Bearer",
-  scope:
-    "workspaces:read capsules:read runs:read runs:approve runs:cancel offline_access",
+  scope: "openid profile offline_access capsules:read capsules:write",
   createdAt: "2026-07-20T00:00:00.000Z",
 };
 
@@ -617,6 +618,8 @@ test("approval and cancellation authorize, refresh, then use narrow Run routes",
     expiresAt: "2026-07-20T00:00:00.000Z",
   };
   const bridge = memoryBridge();
+  // The app refreshes the saved session of the current instance.
+  await persistMobileSession({ adapter: productAdapter, nativeBridge: bridge, session: expired });
   const approve = await approveRun({
     session: expired,
     nativeBridge: bridge,
@@ -805,3 +808,28 @@ function memoryBridge(): NativeBridge {
     openExternalUrl: async () => undefined,
   };
 }
+
+test("API calls follow the instance's advertised API root and stay on that instance", async () => {
+  const requested: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    requested.push(url.toString());
+    expect(new Headers(init?.headers).get("authorization")).toBe(
+      "Bearer takat_fixture_mobile_access",
+    );
+    if (url.pathname === "/control/v1/apps") {
+      return Response.json({ apps: [] });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }) as typeof fetch;
+
+  await loadHome({ ...session, apiBaseUrl: "https://operator.example/control/v1" });
+  expect(requested).toEqual(["https://operator.example/control/v1/apps?limit=100"]);
+
+  requested.length = 0;
+  // A root on another origin is never used for this instance's token.
+  await expect(
+    loadHome({ ...session, apiBaseUrl: "https://collector.example/api/v1" }),
+  ).rejects.toThrow();
+  expect(requested.every((url) => url.startsWith("https://operator.example/"))).toBe(true);
+});

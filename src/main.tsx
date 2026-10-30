@@ -140,6 +140,17 @@ function startTakosumiMobile() {
       homeTitle: mobileHomeTitle,
       metricsLabel: "現在の状態",
       shortcutsLabel: "メニュー",
+      accountsLabel: "接続しているTakosumi",
+      savedAccountsLabel: "保存したTakosumi",
+      addAccountLabel: "別のTakosumiを追加",
+      discoveredWhileSignedInHeading: "別のTakosumiが見つかりました",
+      signInToAddLabel: "サインインして追加",
+      // Every Takosumi accepts the built-in `takosumi-mobile` client unless its
+      // operator turned it off (TAKOSUMI_MOBILE_OIDC_BUILTIN_CLIENT=false).
+      signInUnavailableMessage:
+        "このTakosumiはTakosumi Mobileのサインインを有効にしていません。運用者に確認してください。",
+      signInUnavailableHelpUrl: "https://takosumi.com/docs/reference/api",
+      signInUnavailableHelpLabel: "運用者向けの手順",
     },
     metrics,
     hostActions: actions,
