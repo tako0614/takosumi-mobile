@@ -387,6 +387,31 @@ export function createPushManager(deps: PushManagerDeps) {
     }));
   }
 
+  /**
+   * Whether the relay still knows this device (`PUT /v1/devices/{id}` with
+   * the current token): `forgotten` on 401 or without a device for this
+   * relay, `unknown` when the relay or the token cannot be reached.
+   */
+  async function probeDevice(): Promise<"alive" | "forgotten" | "unknown"> {
+    const { relay } = requireReady();
+    let token: PushToken;
+    try {
+      token = await currentToken();
+    } catch {
+      return "unknown";
+    }
+    const device = await loadDevice();
+    if (!device || device.relayOrigin !== relay.origin || device.platform !== token.provider) return "forgotten";
+    try {
+      const updated = await relay.updateDevice(device, token);
+      await saveDevice(updated);
+      await updateState((state) => ({ ...state, deviceTouchedAt: now().toISOString() }));
+      return "alive";
+    } catch (error) {
+      return error instanceof RelayError && error.deviceUnknown ? "forgotten" : "unknown";
+    }
+  }
+
   async function instanceKeyFor(session: MobileSession): Promise<{ key: string } | { problem: PushProblem }> {
     let config;
     try {
@@ -457,10 +482,11 @@ export function createPushManager(deps: PushManagerDeps) {
      * On launch and whenever this instance becomes current. A pusher gone
      * from the instance while this device's relay subscription stands means
      * the person removed this device in the account settings: turn off, never
-     * quietly register again. Otherwise resubscribe when the instance's key
-     * changed (its secret was rotated), the relay subscription is gone (the
-     * relay forgot the device; the instance then dropped the pusher on 404)
-     * or the native keys are gone.
+     * quietly register again — unless the relay no longer knows this device
+     * (asked with `PUT /v1/devices/{id}`), which is why the instance dropped
+     * the pusher. Resubscribe then, and when the instance's key changed (its
+     * secret was rotated), the relay subscription is known to be gone, or the
+     * native keys are gone.
      */
     check(session: MobileSession): Promise<PushCheckResult> {
       return serial(async (): Promise<PushCheckResult> => {
@@ -480,14 +506,24 @@ export function createPushManager(deps: PushManagerDeps) {
         if (!config.webPushPublicKey) {
           return { kind: "unavailable", problem: unavailableProblem(config.unavailableReason) };
         }
-        if (!current.stale && !config.pushers.some((pusher) => pusher.id === current.pusherId)) {
-          await removeSubscription(current, undefined);
-          return { kind: "removed" };
+        let stale = current.stale === true;
+        if (!stale && !config.pushers.some((pusher) => pusher.id === current.pusherId)) {
+          // Before concluding that the person removed this device, ask the
+          // relay whether it still knows it: a relay that forgot the device
+          // (purged after 180 idle days) answered the instance 404, and the
+          // instance dropped the pusher. That is a subscription to renew.
+          const device = await probeDevice();
+          if (device === "unknown") return { kind: "unknown" };
+          if (device === "alive") {
+            await removeSubscription(current, undefined);
+            return { kind: "removed" };
+          }
+          stale = true;
         }
         const nativeKeys = await native.listSubscriptions().catch(() => undefined);
         const keysMissing = nativeKeys !== undefined && !nativeKeys.some((item) => item.subscriptionId === current.subscriptionId);
         if (
-          current.stale ||
+          stale ||
           keysMissing ||
           config.webPushPublicKey !== current.instanceKey ||
           current.relayOrigin !== relay.origin

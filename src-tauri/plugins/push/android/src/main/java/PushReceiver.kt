@@ -7,8 +7,8 @@ internal sealed class ReceivedMessage {
     /** A Takosumi notification this device decrypted with a subscription's key. */
     class Shown(val record: SubscriptionRecord, val notification: DeclarativeNotification) : ReceivedMessage()
 
-    /** A known subscription whose message could not be read. */
-    class Unreadable(val record: SubscriptionRecord) : ReceivedMessage()
+    /** A message for a known `s` that could not be read. */
+    object Unreadable : ReceivedMessage()
 
     /** No `s`, or no subscription with this `s` on this device: dropped. */
     object Unknown : ReceivedMessage()
@@ -24,9 +24,11 @@ internal sealed class ReceivedMessage {
  *
  * The envelope (`s`) is not authenticated: only a message that decrypts with
  * the subscription's key and `auth` proves it came from that instance. So
- * only such a message records a tap that switches account and opens a page;
- * an unreadable one shows generic text whose tap just opens the app, and one
- * for an unknown subscription is dropped (it would only crowd out real taps).
+ * only such a message records a tap that switches account and opens a page
+ * and goes on that instance's channel; an unreadable one shows generic text
+ * on the general channel (the envelope does not choose an instance's
+ * channel) whose tap just opens the app, and one for an unknown subscription
+ * is dropped (it would only crowd out real taps).
  */
 internal class PushReceiver(private val context: Context) {
     private val store = PushStore(context)
@@ -46,8 +48,7 @@ internal class PushReceiver(private val context: Context) {
                 notifier.show(message.record, message.notification, ticket)
                 PushRuntime.publishReceived(message.record)
             }
-            is ReceivedMessage.Unreadable -> notifier.showGeneric(message.record)
-            ReceivedMessage.StoreUnavailable -> notifier.showGeneric(null)
+            ReceivedMessage.Unreadable, ReceivedMessage.StoreUnavailable -> notifier.showGeneric()
             ReceivedMessage.Unknown -> Unit
         }
     }
@@ -61,7 +62,7 @@ internal class PushReceiver(private val context: Context) {
             return ReceivedMessage.StoreUnavailable
         } ?: return ReceivedMessage.Unknown
         return try {
-            val body = PushStore.fromBase64Url(data["b"] ?: return ReceivedMessage.Unreadable(record))
+            val body = PushStore.fromBase64Url(data["b"] ?: return ReceivedMessage.Unreadable)
             val plaintext = WebPushCrypto.decrypt(
                 body = body,
                 uaPrivate = WebPushCrypto.privateFromPkcs8(store.privateKey(record)),
@@ -69,12 +70,12 @@ internal class PushReceiver(private val context: Context) {
                 authSecret = record.authSecret,
             )
             val notification = DeclarativePush.parse(plaintext, record.origins)
-                ?: return ReceivedMessage.Unreadable(record)
+                ?: return ReceivedMessage.Unreadable
             ReceivedMessage.Shown(record, notification)
         } catch (error: Exception) {
             // Bad base64, a key the Keystore lost, or a message that does not
             // decrypt: generic text, nothing from the message.
-            ReceivedMessage.Unreadable(record)
+            ReceivedMessage.Unreadable
         }
     }
 }

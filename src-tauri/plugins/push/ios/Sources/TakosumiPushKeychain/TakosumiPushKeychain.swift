@@ -2,22 +2,8 @@ import CryptoKit
 import Foundation
 import Security
 
-/// One Takosumi instance subscription: the relay's subscription id (`s`), the
-/// instance and account it belongs to, the origins its notifications may open,
-/// and the RFC 8291 key material.
-public struct TakosumiPushSubscription: Codable {
-    public let subscriptionId: String
-    public let instance: String
-    public let account: String
-    public let label: String
-    public let origins: [String]
-    /// Uncompressed P-256 point (`p256dh`), 65 bytes.
-    public let publicKey: Data
-    /// The 16-byte `auth` secret.
-    public let authSecret: Data
-    /// `P256.KeyAgreement.PrivateKey.rawRepresentation`.
-    public let privateKey: Data
-}
+// TakosumiPushSubscription is declared in TakosumiWebPush.swift, which also
+// builds on Linux for the shared-fixture tests (ios/WebPushTests).
 
 public enum TakosumiPushKeychainError: Error {
     case exists

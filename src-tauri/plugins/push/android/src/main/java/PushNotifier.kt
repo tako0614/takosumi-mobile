@@ -56,19 +56,14 @@ internal class PushNotifier(private val context: Context) {
     }
 
     /**
-     * A message this device could not read: generic text, never the
-     * instance's words, and a tap that only opens the app (the unread
-     * envelope proves nothing about which instance or account it is for).
+     * A message this device could not read: generic text on the general
+     * channel, never the instance's words or channel, and a tap that only
+     * opens the app (the unread envelope proves nothing about which instance
+     * or account it is for).
      */
-    fun showGeneric(record: SubscriptionRecord?) {
-        val channel = if (record != null) {
-            ensureChannel(record)
-            channelId(record)
-        } else {
-            ensureGeneralChannel()
-            GENERAL_CHANNEL
-        }
-        post(channel, "$channel:${randomTag()}", "Takosumi", genericBody(), null)
+    fun showGeneric() {
+        ensureGeneralChannel()
+        post(GENERAL_CHANNEL, "$GENERAL_CHANNEL:${randomTag()}", "Takosumi", genericBody(), null)
     }
 
     private fun post(channel: String, tag: String, title: String, body: String?, ticket: TapTicket?) {

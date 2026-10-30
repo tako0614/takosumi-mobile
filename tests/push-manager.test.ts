@@ -36,10 +36,14 @@ function setup(
   const native = options.native ?? createFakeNative();
   const store = memoryStore();
   const secureStore = memorySecureStore();
+  const relayDown = { value: false };
   const deps: PushManagerDeps = {
     native: native.native,
     relayOrigin: options.relayOrigin === null ? undefined : (options.relayOrigin ?? RELAY_ORIGIN),
-    fetch: world.fetch,
+    fetch: async (input, init) => {
+      if (relayDown.value && input.startsWith(RELAY_ORIGIN)) throw new TypeError("network down");
+      return await world.fetch(input, init);
+    },
     store,
     secureStore: options.secure === false ? undefined : secureStore,
     freshSession: async (session) => session,
@@ -47,7 +51,7 @@ function setup(
     now: () => new Date(world.relay.clock.now * 1000),
   };
   const manager = createPushManager(deps);
-  return { instances, instance: instances[0]!, world, native, store, secureStore, manager };
+  return { instances, instance: instances[0]!, world, native, store, secureStore, manager, relayDown };
 }
 
 /** A bridge whose saved-account list files `rows` (slot id → account). */
@@ -296,6 +300,38 @@ test("a stale subscription whose pusher the instance dropped (relay 404) subscri
   expect((await manager.record(a.session()))!.stale).toBe(true);
   expect(await manager.check(a.session())).toEqual({ kind: "resubscribed" });
   expect(a.pushers).toHaveLength(1);
+});
+
+test("a pusher the instance dropped because the relay forgot the device is renewed, not reported as removed", async () => {
+  const { instance, world, native, manager } = setup();
+  const session = instance.session();
+  const before = await manager.enable(session);
+  const old = { ...instance.pushers[0]! };
+  // The relay purged the device; the instance's next send gets 404 and drops the pusher.
+  world.relay.sqlite.query("DELETE FROM subscriptions").run();
+  world.relay.sqlite.query("DELETE FROM devices").run();
+  expect((await instance.send(world, old, { title: "x", navigate: "https://takosumi.example/" })).status).toBe(404);
+  expect(instance.pushers).toHaveLength(0);
+  // The PUT probe answers 401: register again and subscribe again.
+  expect(await manager.check(session)).toEqual({ kind: "resubscribed" });
+  const after = (await manager.record(session))!;
+  expect(after.subscriptionId).not.toBe(before.subscriptionId);
+  expect(instance.pushers.map((pusher) => pusher.id)).toEqual([after.pusherId]);
+  expect([...native.keys.keys()]).toEqual([after.subscriptionId]);
+  expect((await instance.send(world, instance.pushers[0]!, { title: "ok", navigate: "https://takosumi.example/" })).status).toBe(201);
+});
+
+test("a missing pusher with the relay out of reach changes nothing", async () => {
+  const { instance, native, manager, relayDown } = setup();
+  const session = instance.session();
+  await manager.enable(session);
+  instance.pushers.splice(0, 1);
+  relayDown.value = true;
+  expect(await manager.check(session)).toEqual({ kind: "unknown" });
+  expect(await manager.isEnabled(session)).toBe(true);
+  expect(native.keys.size).toBe(1);
+  relayDown.value = false;
+  expect(await manager.check(session)).toEqual({ kind: "removed" });
 });
 
 test("reads wait for a change in progress", async () => {

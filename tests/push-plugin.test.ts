@@ -96,10 +96,15 @@ test("only a message that decrypts may switch accounts or open a page", async ()
   expect(swift).toContain("removeDeliveredNotifications");
   const shared = await read("plugins/push/ios/Sources/TakosumiPushKeychain/TakosumiWebPush.swift");
   expect(shared).toContain("Content-Encoding: aes128gcm");
+  // Builds with CryptoKit on Apple platforms and swift-crypto on Linux (CI),
+  // without CoreFoundation-only calls.
+  expect(shared).toMatch(/#if canImport\(CryptoKit\)\s+import CryptoKit\s+#else[\s\S]*?import Crypto\s+#endif/u);
+  expect(shared).not.toMatch(/\bCF[A-Z][A-Za-z]+\(/u);
   // Android: an unknown `s` shows nothing; an unreadable message opens only the app.
   const receiver = await read("plugins/push/android/src/main/java/PushReceiver.kt");
   expect(receiver).toMatch(/ReceivedMessage\.Unknown -> Unit/u);
-  expect(receiver).toMatch(/is ReceivedMessage\.Unreadable -> notifier\.showGeneric\(message\.record\)/u);
+  // Generic text goes on the general channel: the envelope picks no instance's channel.
+  expect(receiver).toMatch(/ReceivedMessage\.Unreadable, ReceivedMessage\.StoreUnavailable -> notifier\.showGeneric\(\)/u);
   expect(receiver.match(/rememberTap\(/gu)).toHaveLength(1);
   const notifier = await read("plugins/push/android/src/main/java/PushNotifier.kt");
   // One PendingIntent per notification: no request codes from hashes.
@@ -111,6 +116,15 @@ test("CI runs the native tests that bun run check does not", async () => {
   const workflow = await Bun.file(new URL("../.github/workflows/ci.yml", import.meta.url)).text();
   expect(workflow).toContain("src-tauri/plugins/push/jvm-tests");
   expect(workflow).toMatch(/cargo test --manifest-path "src-tauri\/plugins\/\$plugin\/Cargo\.toml"/u);
+  // Gradle must have run the suites (NO-SOURCE would pass silently).
+  expect(workflow).toContain("TEST-com.takosumi.push.$suite.xml");
+  expect(workflow).toMatch(/test "\$total" -ge 1/u);
+  // The Swift decryption against the shared table, on Linux.
+  expect(workflow).toContain("swift test --package-path src-tauri/plugins/push/ios/WebPushTests");
+  const { readlink } = await import("node:fs/promises");
+  expect(
+    await readlink(new URL("plugins/push/ios/WebPushTests/Sources/TakosumiWebPushCore/TakosumiWebPush.swift", root)),
+  ).toBe("../../../Sources/TakosumiPushKeychain/TakosumiWebPush.swift");
   const harness = await read("plugins/push/jvm-tests/build.gradle");
   for (const file of ["WebPushCrypto.kt", "DeclarativePush.kt", "WebPushCryptoTest.kt", "WebPushCasesTest.kt"]) {
     expect(harness).toContain(`"${file}"`);
