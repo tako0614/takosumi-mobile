@@ -50,6 +50,26 @@ function setup(
   return { instances, instance: instances[0]!, world, native, store, secureStore, manager };
 }
 
+/** A bridge whose saved-account list files `rows` (slot id → account). */
+async function hookBridge(rows: readonly { id: string; hostUrl: string; accountId?: string }[]) {
+  const secure = memorySecureStore();
+  const storage = memoryStore();
+  await storage.set(
+    "takosumi.mobile.takosumi.accounts",
+    JSON.stringify({ version: 1, accounts: rows.map((row) => ({ ...row, product: "takosumi", lastUsedAt: "2027-01-01T00:00:00.000Z" })) }),
+  );
+  return {
+    secure,
+    bridge: {
+      capabilities: {} as never,
+      secureStore: secure,
+      storage,
+      getLaunchPayload: async () => undefined,
+      openExternalUrl: async () => undefined,
+    },
+  };
+}
+
 function relaySubscriptions(world: PushWorld): number {
   return (world.relay.sqlite.query("SELECT COUNT(*) AS n FROM subscriptions").get() as { n: number }).n;
 }
@@ -248,6 +268,49 @@ test("a pusher removed on the instance (account settings) turns this device off"
   expect(native.keys.size).toBe(0);
 });
 
+test("a removed pusher is not quietly registered again, even when the key also changed", async () => {
+  const { instance, world, native, manager } = setup();
+  const session = instance.session();
+  await manager.enable(session);
+  instance.pushers.splice(0, 1);
+  await instance.rotateKey();
+  native.keys.clear();
+  expect(await manager.check(session)).toEqual({ kind: "removed" });
+  expect(instance.pushers).toHaveLength(0);
+  expect(await manager.isEnabled(session)).toBe(false);
+  expect(relaySubscriptions(world)).toBe(0);
+});
+
+test("a stale subscription whose pusher the instance dropped (relay 404) subscribes again", async () => {
+  const a = createFakeInstance({ origin: "https://a.example" });
+  const b = createFakeInstance({ origin: "https://b.example" });
+  const { world, manager } = setup({ instances: [a, b] });
+  await manager.enable(a.session());
+  const old = { ...a.pushers[0]! };
+  world.relay.sqlite.query("DELETE FROM subscriptions").run();
+  world.relay.sqlite.query("DELETE FROM devices").run();
+  // The instance sends, gets 404, and drops the pusher.
+  expect((await a.send(world, old, { title: "x", navigate: "https://a.example/" })).status).toBe(404);
+  expect(a.pushers).toHaveLength(0);
+  await manager.enable(b.session());
+  expect((await manager.record(a.session()))!.stale).toBe(true);
+  expect(await manager.check(a.session())).toEqual({ kind: "resubscribed" });
+  expect(a.pushers).toHaveLength(1);
+});
+
+test("reads wait for a change in progress", async () => {
+  const { instance, manager } = setup();
+  const session = instance.session();
+  const enabling = manager.enable(session);
+  // Queued behind the enable: never the half-written state.
+  expect(await manager.isEnabled(session)).toBe(true);
+  expect(await manager.shouldPrompt(session)).toBe(false);
+  await enabling;
+  const disabling = manager.disable(session);
+  expect(await manager.isEnabled(session)).toBe(false);
+  await disabling;
+});
+
 test("lost native keys are replaced on the next check", async () => {
   const { instance, native, manager } = setup();
   const session = instance.session();
@@ -302,12 +365,14 @@ test("signing out removes the instance's pusher, relay subscription and keys bef
   await manager.enable(session);
 
   const slotKey = "takosumi.mobile.takosumi.session.AbCdEfGhIjKlMnOp";
-  const secure = memorySecureStore();
+  const { secure, bridge: base } = await hookBridge([
+    { id: "AbCdEfGhIjKlMnOp", hostUrl: "https://takosumi.example", accountId: "acct_1" },
+  ]);
   await secure.set(slotKey, JSON.stringify(session));
   await secure.set("unrelated", "x");
   const seen: MobileSession[] = [];
   const bridge = withAccountRemovalHook(
-    { capabilities: {} as never, secureStore: secure, getLaunchPayload: async () => undefined, openExternalUrl: async () => undefined },
+    base,
     productAdapter,
     async (removed) => {
       seen.push(removed);
@@ -326,12 +391,44 @@ test("signing out removes the instance's pusher, relay subscription and keys bef
   expect(native.keys.size).toBe(0);
 });
 
+test("a slot dropped because its stored session is another account's keeps that account's notifications", async () => {
+  const a = createFakeInstance({ origin: "https://a.example" });
+  const { world, native, manager } = setup({ instances: [a] });
+  const alice = a.session("alice");
+  await manager.enable(alice);
+  // Bob's row, but the slot holds Alice's session (mobile-kit discards it).
+  const slotKey = "takosumi.mobile.takosumi.session.BobSlot0123456789";
+  const { secure, bridge: base } = await hookBridge([
+    { id: "BobSlot0123456789", hostUrl: "https://a.example", accountId: "bob" },
+    { id: "AliceSlot01234567", hostUrl: "https://a.example", accountId: "alice" },
+  ]);
+  await secure.set(slotKey, JSON.stringify(alice));
+  let called = 0;
+  const bridge = withAccountRemovalHook(base, productAdapter, async (removed) => {
+    called += 1;
+    await manager.accountRemoving(removed);
+  });
+  await bridge.secureStore!.delete(slotKey);
+  expect(called).toBe(0);
+  expect(await secure.get(slotKey)).toBeUndefined();
+  expect(await manager.isEnabled(alice)).toBe(true);
+  expect(a.pushers).toHaveLength(1);
+  expect(relaySubscriptions(world)).toBe(1);
+  expect(native.keys.size).toBe(1);
+  // A slot with no row at all is not an account either.
+  await secure.set("takosumi.mobile.takosumi.session.NoRow0123456789A", JSON.stringify(alice));
+  await bridge.secureStore!.delete("takosumi.mobile.takosumi.session.NoRow0123456789A");
+  expect(called).toBe(0);
+});
+
 test("a sign-out never waits long for the cleanup", async () => {
-  const secure = memorySecureStore();
   const slotKey = "takosumi.mobile.takosumi.session.AbCdEfGhIjKlMnOp";
+  const { secure, bridge: base } = await hookBridge([
+    { id: "AbCdEfGhIjKlMnOp", hostUrl: "https://t.example", accountId: "acct_1" },
+  ]);
   await secure.set(slotKey, JSON.stringify(createFakeInstance({ origin: "https://t.example" }).session()));
   const bridge = withAccountRemovalHook(
-    { capabilities: {} as never, secureStore: secure, getLaunchPayload: async () => undefined, openExternalUrl: async () => undefined },
+    base,
     productAdapter,
     () => new Promise<void>(() => undefined),
     20,

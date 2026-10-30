@@ -77,9 +77,48 @@ test("private keys never reach JavaScript and taps carry only a token", async ()
     expect({ file, logs: /\bLog\.[dviwe]\(|println\(|printStackTrace/u.test(source) }).toEqual({ file, logs: false });
   }
   const notifier = await read("plugins/push/android/src/main/java/PushNotifier.kt");
-  expect(notifier).toContain("putExtra(EXTRA_TAP_TOKEN, tapToken)");
+  expect(notifier).toContain("putExtra(EXTRA_TAP_TOKEN, ticket.token)");
   expect(notifier.match(/putExtra\(/gu)).toHaveLength(1);
   expect(notifier).toContain("PendingIntent.FLAG_IMMUTABLE");
+});
+
+test("only a message that decrypts may switch accounts or open a page", async () => {
+  // iOS: the APNs envelope (`s`, `b`, anything else) is set by the relay.
+  const swift = await read("plugins/push/ios/Sources/TakosumiPush/PushPlugin.swift");
+  const tapped = swift.slice(swift.indexOf("fileprivate func tapped"), swift.indexOf("fileprivate func received"));
+  expect(tapped).toContain("authenticated(userInfo)");
+  expect(swift).toContain("TakosumiWebPush.decrypt(body, subscription: subscription)");
+  expect(swift).not.toContain("takosumi_navigate");
+  // SecTask's entitlement API is macOS-only; iOS reads the build or profile.
+  expect(swift).not.toMatch(/SecTask[A-Za-z]*\(/u);
+  expect(swift).toContain("embedded");
+  // Its notifications go with a subscription.
+  expect(swift).toContain("removeDeliveredNotifications");
+  const shared = await read("plugins/push/ios/Sources/TakosumiPushKeychain/TakosumiWebPush.swift");
+  expect(shared).toContain("Content-Encoding: aes128gcm");
+  // Android: an unknown `s` shows nothing; an unreadable message opens only the app.
+  const receiver = await read("plugins/push/android/src/main/java/PushReceiver.kt");
+  expect(receiver).toMatch(/ReceivedMessage\.Unknown -> Unit/u);
+  expect(receiver).toMatch(/is ReceivedMessage\.Unreadable -> notifier\.showGeneric\(message\.record\)/u);
+  expect(receiver.match(/rememberTap\(/gu)).toHaveLength(1);
+  const notifier = await read("plugins/push/android/src/main/java/PushNotifier.kt");
+  // One PendingIntent per notification: no request codes from hashes.
+  expect(notifier).not.toContain("hashCode()");
+  expect(notifier).toContain("ticket?.requestCode");
+});
+
+test("CI runs the native tests that bun run check does not", async () => {
+  const workflow = await Bun.file(new URL("../.github/workflows/ci.yml", import.meta.url)).text();
+  expect(workflow).toContain("src-tauri/plugins/push/jvm-tests");
+  expect(workflow).toMatch(/cargo test --manifest-path "src-tauri\/plugins\/\$plugin\/Cargo\.toml"/u);
+  const harness = await read("plugins/push/jvm-tests/build.gradle");
+  for (const file of ["WebPushCrypto.kt", "DeclarativePush.kt", "WebPushCryptoTest.kt", "WebPushCasesTest.kt"]) {
+    expect(harness).toContain(`"${file}"`);
+  }
+  // The pure files stay free of Android imports so the harness can build them.
+  for (const file of ["WebPushCrypto.kt", "DeclarativePush.kt"]) {
+    expect(await read(`plugins/push/android/src/main/java/${file}`)).not.toMatch(/^import android/mu);
+  }
 });
 
 test("the messaging service is not exported and FCM stays off until notifications are turned on", async () => {

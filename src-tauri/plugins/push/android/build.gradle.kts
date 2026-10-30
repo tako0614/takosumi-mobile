@@ -40,6 +40,7 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.15.0"))
     implementation("com.google.firebase:firebase-messaging")
     testImplementation("junit:junit:4.13.2")
-    // org.json (DeclarativePush) needs Android's own classes on the JVM.
-    testImplementation("org.robolectric:robolectric:4.14.1")
+    // The real org.json for DeclarativePush on the JVM (android.jar only has
+    // stubs). The same tests run without Android in ../jvm-tests (CI).
+    testImplementation("org.json:json:20240303")
 }

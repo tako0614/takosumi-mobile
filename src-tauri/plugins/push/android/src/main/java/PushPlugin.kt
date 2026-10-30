@@ -252,19 +252,30 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("subscriptionId is invalid")
             return
         }
-        val record = store.find(args.subscriptionId)
-        store.delete(args.subscriptionId)
-        // The channel goes with its last subscription for that instance/account.
-        if (record != null && store.list().none { PushNotifier.channelId(it) == PushNotifier.channelId(record) }) {
-            notifier.deleteChannel(record)
+        try {
+            val record = store.find(args.subscriptionId)
+            store.delete(args.subscriptionId)
+            // The channel, and the notifications on it, go with the last
+            // subscription for that instance/account.
+            if (record != null && store.list().none { PushNotifier.channelId(it) == PushNotifier.channelId(record) }) {
+                notifier.deleteChannel(record)
+            }
+            invoke.resolve()
+        } catch (error: Exception) {
+            invoke.reject("Could not delete subscription keys.")
         }
-        invoke.resolve()
     }
 
     @Command
     fun listSubscriptions(invoke: Invoke) {
+        val records = try {
+            store.list()
+        } catch (error: Exception) {
+            invoke.reject("Could not read subscriptions.")
+            return
+        }
         val list = JSArray()
-        for (record in store.list()) {
+        for (record in records) {
             list.put(
                 JSObject().apply {
                     put("subscriptionId", record.subscriptionId)
@@ -279,7 +290,11 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun takePendingTap(invoke: Invoke) {
-        val tap = store.takePendingTap(System.currentTimeMillis())
+        val tap = try {
+            store.takePendingTap(System.currentTimeMillis())
+        } catch (error: Exception) {
+            null
+        }
         invoke.resolve(JSObject().apply { if (tap != null) put("tap", tapPayload(tap)) })
     }
 
@@ -297,7 +312,11 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         // Recreating the activity or reopening it from Recents re-delivers the
         // same intent; the token is spent either way.
         intent.removeExtra(EXTRA_TAP_TOKEN)
-        val tap = store.acceptTap(token, System.currentTimeMillis()) ?: return
+        val tap = try {
+            store.acceptTap(token, System.currentTimeMillis())
+        } catch (error: Exception) {
+            null
+        } ?: return
         trigger(EVENT_NOTIFICATION_TAPPED, tapPayload(tap))
     }
 

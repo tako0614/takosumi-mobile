@@ -8,17 +8,18 @@ import WebKit
 
 // Takosumi Mobile's own notifications on iOS (TASK-0119 step 7, code only:
 // building and checking it needs macOS and Xcode). The relay's APNs alert
-// carries placeholder text and `mutable-content: 1`; decrypting it and
-// replacing the text is the Notification Service Extension's job (step 8),
-// which reads the same Keychain items (TakosumiPushKeychain). Until then a
-// tap switches to the subscription's instance and account and opens its home;
-// the page opens too once the extension leaves `takosumi_navigate` in the
-// notification's userInfo.
+// carries placeholder text and `mutable-content: 1`; replacing the text is the
+// Notification Service Extension's job (step 8), which reads the same Keychain
+// items and decrypts with the same code (TakosumiPushKeychain). The envelope
+// (`s`, `b`) is set by the relay and is not authenticated, so a tap decrypts
+// `b` with the subscription's key and takes the instance, the account and the
+// page only from a message that decrypts; anything else just opens the app.
 
 private let notificationTappedEvent = "notification-tapped"
 private let notificationReceivedEvent = "notification-received"
 private let tokenRefreshEvent = "token-refresh"
 private let tokenRequestTimeoutSeconds: TimeInterval = 20
+private let pendingTapLifetime: TimeInterval = 5 * 60
 private let maxLabelLength = 128
 private let maxAccountLength = 512
 
@@ -119,6 +120,7 @@ public final class PushPlugin: Plugin {
 
     private let lock = NSLock()
     private var pendingTap: JSObject?
+    private var pendingTapAt = Date.distantPast
     private var currentToken: String?
     private var tokenInvokes: [Invoke] = []
 
@@ -161,9 +163,7 @@ public final class PushPlugin: Plugin {
     @objc public func getToken(_ invoke: Invoke) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return invoke.reject("APNs bridge is unavailable.") }
-            guard let environment = apnsEnvironment() else {
-                return invoke.reject("push_unavailable: the aps-environment entitlement is missing")
-            }
+            let environment = apnsEnvironment()
             self.lock.lock()
             if let token = self.currentToken {
                 self.lock.unlock()
@@ -216,8 +216,17 @@ public final class PushPlugin: Plugin {
 
     @objc public func deleteSubscriptionKeys(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(SubscriptionArgs.self)
-        guard isSubscriptionId(args.subscriptionId) else { return invoke.reject("subscriptionId is invalid") }
-        TakosumiPushKeychain.delete(args.subscriptionId)
+        let subscriptionId = args.subscriptionId
+        guard isSubscriptionId(subscriptionId) else { return invoke.reject("subscriptionId is invalid") }
+        TakosumiPushKeychain.delete(subscriptionId)
+        // Its notifications go too (Android deletes the instance's channel).
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let identifiers = delivered
+                .filter { ($0.request.content.userInfo["s"] as? String) == subscriptionId }
+                .map { $0.request.identifier }
+            if !identifiers.isEmpty { center.removeDeliveredNotifications(withIdentifiers: identifiers) }
+        }
         invoke.resolve()
     }
 
@@ -235,37 +244,48 @@ public final class PushPlugin: Plugin {
 
     @objc public func takePendingTap(_ invoke: Invoke) {
         lock.lock()
-        let tap = pendingTap
+        // A tap the shell did not take within a few minutes is not used.
+        let tap = Date().timeIntervalSince(pendingTapAt) <= pendingTapLifetime ? pendingTap : nil
         pendingTap = nil
         lock.unlock()
         if let tap = tap { invoke.resolve(["tap": tap]) } else { invoke.resolve([:]) }
     }
 
-    fileprivate func tapped(_ userInfo: [AnyHashable: Any]) {
+    /// The subscription and message of a push, only when `b` decrypts with
+    /// that subscription's key and `auth` and is a Takosumi notification.
+    private func authenticated(
+        _ userInfo: [AnyHashable: Any]
+    ) -> (TakosumiPushSubscription, TakosumiNotification)? {
         guard let subscriptionId = userInfo["s"] as? String,
-              let subscription = TakosumiPushKeychain.find(subscriptionId)
-        else { return }
+              isSubscriptionId(subscriptionId),
+              let encoded = userInfo["b"] as? String,
+              let body = TakosumiPushOrigin.base64UrlDecode(encoded),
+              let subscription = TakosumiPushKeychain.find(subscriptionId),
+              let plaintext = try? TakosumiWebPush.decrypt(body, subscription: subscription),
+              let notification = TakosumiWebPush.parse(plaintext, origins: subscription.origins)
+        else { return nil }
+        return (subscription, notification)
+    }
+
+    fileprivate func tapped(_ userInfo: [AnyHashable: Any]) {
+        guard let message = authenticated(userInfo) else { return }
+        let (subscription, notification) = message
         var tap: JSObject = [
             "id": UUID().uuidString,
             "subscriptionId": subscription.subscriptionId,
             "instance": subscription.instance,
             "account": subscription.account,
         ]
-        if let navigate = userInfo["takosumi_navigate"] as? String,
-           let origin = webOrigin(navigate),
-           subscription.origins.contains(origin) {
-            tap["navigate"] = navigate
-        }
+        if let navigate = notification.navigate { tap["navigate"] = navigate }
         lock.lock()
         pendingTap = tap
+        pendingTapAt = Date()
         lock.unlock()
         trigger(notificationTappedEvent, data: tap)
     }
 
     fileprivate func received(_ userInfo: [AnyHashable: Any]) {
-        guard let subscriptionId = userInfo["s"] as? String,
-              let subscription = TakosumiPushKeychain.find(subscriptionId)
-        else { return }
+        guard let subscription = authenticated(userInfo)?.0 else { return }
         trigger(notificationReceivedEvent, data: [
             "subscriptionId": subscription.subscriptionId,
             "instance": subscription.instance,
@@ -274,7 +294,8 @@ public final class PushPlugin: Plugin {
     }
 
     fileprivate func didRegister(_ data: Data) {
-        guard !data.isEmpty, let environment = apnsEnvironment() else { return didFailToRegister() }
+        guard !data.isEmpty else { return didFailToRegister() }
+        let environment = apnsEnvironment()
         let token = data.map { String(format: "%02x", $0) }.joined()
         lock.lock()
         let changed = currentToken != nil && currentToken != token
@@ -292,7 +313,9 @@ public final class PushPlugin: Plugin {
         let invokes = tokenInvokes
         tokenInvokes.removeAll()
         lock.unlock()
-        for invoke in invokes { invoke.reject("APNs device token is unavailable.") }
+        // Without the Push Notifications capability (aps-environment) iOS
+        // refuses the registration: this build cannot receive pushes.
+        for invoke in invokes { invoke.reject("push_unavailable: APNs registration failed") }
     }
 
     private func timeOut(_ invoke: Invoke) {
@@ -308,16 +331,31 @@ private func tokenPayload(_ token: String, _ environment: String) -> JSObject {
     ["token": token, "provider": "apns", "environment": environment]
 }
 
-/// The relay calls the APNs sandbox `development`.
-private func apnsEnvironment() -> String? {
-    guard let task = SecTaskCreateFromSelf(nil),
-          let value = SecTaskCopyValueForEntitlement(task, "aps-environment" as CFString, nil) as? String
-    else { return nil }
-    switch value {
-    case "development": return "development"
-    case "production": return "production"
-    default: return nil
+/// The APNs environment this build's tokens belong to, as the relay names it
+/// (`development` is the sandbox): Info.plist `TakosumiApnsEnvironment` when
+/// the build configuration sets it; else the `aps-environment` entitlement in
+/// the embedded provisioning profile (development and ad-hoc builds); else
+/// production, since App Store and TestFlight builds carry no profile and
+/// always get production tokens. (The SecTask entitlement API is macOS-only.)
+private func apnsEnvironment() -> String {
+    if let configured = Bundle.main.object(forInfoDictionaryKey: "TakosumiApnsEnvironment") as? String,
+       configured == "development" || configured == "production" {
+        return configured
     }
+    return provisionedApnsEnvironment() ?? "production"
+}
+
+private func provisionedApnsEnvironment() -> String? {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let data = try? Data(contentsOf: url),
+          let start = data.range(of: Data("<?xml".utf8)),
+          let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+          let plist = (try? PropertyListSerialization.propertyList(
+              from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil)) as? [String: Any],
+          let entitlements = plist["Entitlements"] as? [String: Any],
+          let value = entitlements["aps-environment"] as? String
+    else { return nil }
+    return value == "development" || value == "production" ? value : nil
 }
 
 private func isSubscriptionId(_ value: String) -> Bool {
@@ -325,24 +363,8 @@ private func isSubscriptionId(_ value: String) -> Bool {
 }
 
 private func isOrigin(_ value: String) -> Bool {
-    guard value.count <= 256, value == value.lowercased(), let origin = webOrigin(value) else { return false }
+    guard value.count <= 256, value == value.lowercased(), let origin = TakosumiPushOrigin.of(value) else { return false }
     return origin == value
-}
-
-/// `scheme://host[:port]` of an https URL (or http on loopback).
-private func webOrigin(_ value: String) -> String? {
-    guard let components = URLComponents(string: value),
-          let scheme = components.scheme?.lowercased(),
-          let host = components.host?.lowercased(), !host.isEmpty,
-          components.user == nil, components.password == nil
-    else { return nil }
-    let loopback = ["localhost", "127.0.0.1", "::1"].contains(host)
-    guard scheme == "https" || (scheme == "http" && loopback) else { return nil }
-    let authority = host.contains(":") ? "[\(host)]" : host
-    if let port = components.port, port != (scheme == "https" ? 443 : 80) {
-        return "\(scheme)://\(authority):\(port)"
-    }
-    return "\(scheme)://\(authority)"
 }
 
 private func base64Url(_ data: Data) -> String {

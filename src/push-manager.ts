@@ -401,19 +401,23 @@ export function createPushManager(deps: PushManagerDeps) {
     return { key: config.webPushPublicKey };
   }
 
-  async function record(session: MobileSession): Promise<PushInstanceRecord | undefined> {
+  async function findRecord(session: MobileSession): Promise<PushInstanceRecord | undefined> {
     const identity = mobileAccountIdentity(session);
     return (await loadState()).instances.find((item) => item.identity === identity);
   }
 
+  // Every read and write of the state goes through `serial`, so a read never
+  // sees the middle of a change (turning on, a check, a sign-out).
   return {
     /** Why notifications cannot work in this app at all, if they cannot. */
     availability,
 
-    record,
+    record(session: MobileSession): Promise<PushInstanceRecord | undefined> {
+      return serial(() => findRecord(session));
+    },
 
-    async isEnabled(session: MobileSession): Promise<boolean> {
-      return (await record(session)) !== undefined;
+    isEnabled(session: MobileSession): Promise<boolean> {
+      return serial(async () => (await findRecord(session)) !== undefined);
     },
 
     /** Turns notifications on for this session's instance and account. */
@@ -427,7 +431,7 @@ export function createPushManager(deps: PushManagerDeps) {
         const instance = await instanceKeyFor(fresh);
         if ("problem" in instance) throw new PushError(instance.problem);
         const token = await currentToken();
-        const previous = await record(fresh);
+        const previous = await findRecord(fresh);
         const next = await subscribe(fresh, instance.key, token);
         if (previous) await removeSubscription(previous, fresh);
         await updateState((state) => ({
@@ -442,7 +446,7 @@ export function createPushManager(deps: PushManagerDeps) {
     /** Turns notifications off for this session's instance and account. */
     disable(session: MobileSession): Promise<void> {
       return serial(async () => {
-        const current = await record(session);
+        const current = await findRecord(session);
         if (!current) return;
         const fresh = await deps.freshSession(session).catch(() => session);
         await removeSubscription(current, fresh);
@@ -450,14 +454,17 @@ export function createPushManager(deps: PushManagerDeps) {
     },
 
     /**
-     * On launch and whenever this instance becomes current: resubscribe when
-     * the instance's key changed (its secret was rotated), the relay
-     * subscription or the native keys are gone; turn off when the instance no
-     * longer has the pusher (removed in its account settings).
+     * On launch and whenever this instance becomes current. A pusher gone
+     * from the instance while this device's relay subscription stands means
+     * the person removed this device in the account settings: turn off, never
+     * quietly register again. Otherwise resubscribe when the instance's key
+     * changed (its secret was rotated), the relay subscription is gone (the
+     * relay forgot the device; the instance then dropped the pusher on 404)
+     * or the native keys are gone.
      */
     check(session: MobileSession): Promise<PushCheckResult> {
       return serial(async (): Promise<PushCheckResult> => {
-        const current = await record(session);
+        const current = await findRecord(session);
         if (!current) return { kind: "off" };
         const problem = availability();
         if (problem) return { kind: "unavailable", problem };
@@ -472,6 +479,10 @@ export function createPushManager(deps: PushManagerDeps) {
         }
         if (!config.webPushPublicKey) {
           return { kind: "unavailable", problem: unavailableProblem(config.unavailableReason) };
+        }
+        if (!current.stale && !config.pushers.some((pusher) => pusher.id === current.pusherId)) {
+          await removeSubscription(current, undefined);
+          return { kind: "removed" };
         }
         const nativeKeys = await native.listSubscriptions().catch(() => undefined);
         const keysMissing = nativeKeys !== undefined && !nativeKeys.some((item) => item.subscriptionId === current.subscriptionId);
@@ -492,10 +503,6 @@ export function createPushManager(deps: PushManagerDeps) {
           } catch (error) {
             return { kind: "unavailable", problem: error instanceof PushError ? error.problem : "instance_failed" };
           }
-        }
-        if (!config.pushers.some((pusher) => pusher.id === current.pusherId)) {
-          await removeSubscription(current, undefined);
-          return { kind: "removed" };
         }
         // Keep the relay's copy of the token current (and the device alive).
         try {
@@ -561,22 +568,26 @@ export function createPushManager(deps: PushManagerDeps) {
     accountRemoving(session: MobileSession): Promise<void> {
       return serial(async () => {
         if (availability()) return;
-        const current = await record(session);
+        const current = await findRecord(session);
         if (current) await removeSubscription(current, session);
       });
     },
 
     /** Ask once after sign-in, unless notifications are on or cannot work. */
-    async shouldPrompt(session: MobileSession): Promise<boolean> {
-      if (availability()) return false;
-      const state = await loadState();
-      const identity = mobileAccountIdentity(session);
-      return !state.prompted.includes(identity) && !state.instances.some((item) => item.identity === identity);
+    shouldPrompt(session: MobileSession): Promise<boolean> {
+      return serial(async () => {
+        if (availability()) return false;
+        const state = await loadState();
+        const identity = mobileAccountIdentity(session);
+        return !state.prompted.includes(identity) && !state.instances.some((item) => item.identity === identity);
+      });
     },
 
-    async markPrompted(session: MobileSession): Promise<void> {
-      const identity = mobileAccountIdentity(session);
-      await updateState((state) => ({ ...state, prompted: rememberPrompt(state.prompted, identity) }));
+    markPrompted(session: MobileSession): Promise<void> {
+      return serial(async () => {
+        const identity = mobileAccountIdentity(session);
+        await updateState((state) => ({ ...state, prompted: rememberPrompt(state.prompted, identity) }));
+      });
     },
   };
 }
