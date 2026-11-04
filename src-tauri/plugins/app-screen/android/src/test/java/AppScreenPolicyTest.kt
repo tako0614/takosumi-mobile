@@ -32,6 +32,55 @@ class AppScreenPolicyTest {
     }
 
     @Test
+    fun profilesUseCanonicalNamesAndRestoreWithoutFallingBackToShared() {
+        val file = listOf(java.io.File("../profile-cases.json"), java.io.File("profile-cases.json"))
+            .first { it.isFile }
+        val cases = org.json.JSONObject(file.readText()).getJSONArray("cases")
+        for (index in 0 until cases.length()) {
+            val item = cases.getJSONObject(index)
+            val profile = item.getString("profile")
+            assertEquals(profile, item.getBoolean("valid"), AppScreenProfiles.isValid(profile))
+        }
+        val profile = "11111111-1111-4111-8111-111111111111"
+        val home = ScreenRequest("web-home:$profile:https://sumi.example", "https://sumi.example/", "Work", webHome = true, profile = profile)
+        val restored = ScreenRequest.fromJson(home.key, home.toJson())
+        assertEquals(profile, restored.profile)
+        assertEquals(home.key, restored.key)
+        assertEquals(null, ScreenRequest.checkedProfile(profile, webHome = false))
+        assertEquals(null, ScreenRequest.checkedProfile("invalid", webHome = true))
+        assertEquals("shared", ScreenRequest.checkedProfile(null, webHome = false))
+        val legacyKey = "web-home:https://sumi.example"
+        val legacy = home.copy(key = legacyKey, profile = "shared").toJson().apply { remove("profile") }
+        assertEquals("shared", ScreenRequest.fromJson(legacyKey, legacy).profile)
+        for (broken in listOf(
+            home.toJson().apply { remove("profile") },
+            home.toJson().put("profile", "invalid"),
+            home.toJson().put("profile", "22222222-2222-4222-8222-222222222222"),
+            home.toJson().apply { remove("webHome") },
+        )) {
+            try {
+                ScreenRequest.fromJson(home.key, broken)
+                org.junit.Assert.fail("Malformed isolated identity restored")
+            } catch (_: IllegalArgumentException) { }
+        }
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val validIntent = AppScreenLaunch.documentIntent(context, home)
+        assertEquals(profile, AppScreenLaunch.parse(context, validIntent)?.profile)
+        val missing = AppScreenLaunch.documentIntent(context, home).apply { removeExtra(AppScreenLaunch.EXTRA_PROFILE) }
+        assertEquals(null, AppScreenLaunch.parse(context, missing))
+        val mismatch = AppScreenLaunch.documentIntent(context, home).apply {
+            putExtra(AppScreenLaunch.EXTRA_PROFILE, "22222222-2222-4222-8222-222222222222")
+        }
+        assertEquals(null, AppScreenLaunch.parse(context, mismatch))
+        AppScreenLaunch.remember(context, home)
+        val conflictingIdentity = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+            data = AppScreenLaunch.documentUri(home.key)
+            putExtra(AppScreenLaunch.EXTRA_KEY, "web-home:22222222-2222-4222-8222-222222222222:https://sumi.example")
+        }
+        assertEquals(null, AppScreenLaunch.parse(context, conflictingIdentity))
+    }
+
+    @Test
     fun webHomeKeepsWebNavigationAndSurvivesTaskRestoration() {
         val home = ScreenRequest("web-home:https://sumi.example", "https://sumi.example/", "Sumi", webHome = true)
         assertEquals(null, home.origins)

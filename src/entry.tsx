@@ -21,6 +21,9 @@ if (!webClientSelected(location.search, storage)) {
       await invoke("plugin:app-screen|open", { payload: webHomeRequest(connection) });
     } else {
       // Browser preview uses an ordinary Web page, with no native capabilities.
+      if (connection.profile !== "shared") {
+        throw new Error("このブラウザでは、分離されたログイン領域を開けません。端末のTakosumi Appで開いてください。");
+      }
       location.assign(`${connection.origin}/`);
     }
   }} />, document.getElementById("root")!);

@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// The only browsing profile app screens use: one cookie and storage jar shared
-/// by every app screen, so a Takosumi OIDC sign-in on the web carries over to
-/// every app that signs in with Takosumi.
+/// Legacy app screens keep their existing browsing profile. Web homes can
+/// explicitly select an isolated UUID profile instead.
 pub const SHARED_PROFILE: &str = "shared";
 
 const KEY_MAX_LENGTH: usize = 512;
@@ -140,9 +139,9 @@ pub struct OpenRequest {
 impl OpenRequest {
     /// Re-checks the shell's request before any native view is created.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.profile != SHARED_PROFILE {
+        if self.profile != SHARED_PROFILE && (!self.web_home || !is_isolated_profile(&self.profile)) {
             return Err(crate::Error::InvalidRequest(
-                "App screens share one browsing profile.",
+                "Only Web homes may select an isolated browsing profile.",
             ));
         }
         if self.key.trim().is_empty() || self.key.len() > KEY_MAX_LENGTH {
@@ -165,6 +164,17 @@ impl OpenRequest {
         }
         if self.web_home && (self.client.is_some() || !is_web_home_url(&self.url)) {
             return Err(crate::Error::InvalidRequest("A Web home must be an https site root without a native client."));
+        }
+        if self.web_home {
+            let origin = tauri::Url::parse(&self.url).unwrap().origin().ascii_serialization();
+            let expected = if self.profile == SHARED_PROFILE {
+                format!("web-home:{origin}")
+            } else {
+                format!("web-home:{}:{origin}", self.profile)
+            };
+            if self.key != expected {
+                return Err(crate::Error::InvalidRequest("The Web home profile does not match its screen identity."));
+            }
         }
         if self.accounts_origins.len() > ACCOUNTS_ORIGINS_MAX
             || self
@@ -384,6 +394,15 @@ pub fn is_launchable_url(raw: &str) -> bool {
     }
 }
 
+pub fn is_isolated_profile(raw: &str) -> bool {
+    raw.len() == 36 && raw.bytes().enumerate().all(|(index, value)| match index {
+        8 | 13 | 18 | 23 => value == b'-',
+        14 => value == b'4',
+        19 => matches!(value, b'8' | b'9' | b'a' | b'b'),
+        _ => value.is_ascii_digit() || matches!(value, b'a'..=b'f'),
+    })
+}
+
 pub fn is_web_home_url(raw: &str) -> bool {
     is_launchable_url(raw) && tauri::Url::parse(raw).is_ok_and(|url| {
         url.path() == "/" && url.query().is_none() && url.fragment().is_none()
@@ -510,9 +529,26 @@ mod tests {
     }
 
     #[test]
+    fn profiles_validate_the_shared_table_and_never_reassign_legacy_screens() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../profile-cases.json")).unwrap();
+        for item in cases["cases"].as_array().unwrap() {
+            let profile = item["profile"].as_str().unwrap();
+            let valid = item["valid"].as_bool().unwrap();
+            let mut home = request("https://sumi.example/", profile);
+            home.web_home = true;
+            home.key = if profile == SHARED_PROFILE { "web-home:https://sumi.example".into() }
+                else { format!("web-home:{profile}:https://sumi.example") };
+            assert_eq!(home.validate().is_ok(), valid, "{profile:?}");
+            home.web_home = false;
+            assert_eq!(home.validate().is_ok(), profile == SHARED_PROFILE);
+        }
+    }
+
+    #[test]
     fn web_home_requires_a_site_root_and_keeps_the_legacy_default() {
         let mut home = request("https://sumi.example/", "shared");
         home.web_home = true;
+        home.key = "web-home:https://sumi.example".into();
         assert!(home.validate().is_ok());
         for url in ["https://sumi.example/?token=secret", "https://sumi.example/#token", "https://sumi.example/sign-in", "https://ipc.localhost/"] {
             home.url = url.into();

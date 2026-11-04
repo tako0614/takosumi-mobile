@@ -91,6 +91,11 @@ jobs:
           swift --version
           swift test --package-path src-tauri/plugins/push/ios/WebPushTests 2>&1 | tee "$RUNNER_TEMP/swift-test.log"
           grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/swift-test.log"
+      - name: Swift tests (app-screen policy)
+        shell: bash
+        run: |
+          swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests 2>&1 | tee "$RUNNER_TEMP/app-screen-swift-test.log"
+          grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/app-screen-swift-test.log"
       - name: System libraries for Tauri on Linux
         run: |
           sudo apt-get update
@@ -114,3 +119,60 @@ jobs:
             cp src-tauri/Cargo.lock "src-tauri/plugins/$plugin/Cargo.lock"
             cargo test --manifest-path "src-tauri/plugins/$plugin/Cargo.toml"
           done
+      - name: Android app-screen JVM and instrumentation compile
+        shell: bash
+        run: |
+          export TAURI_ANDROID_SOURCE="$(cargo metadata --format-version 1 --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml | python3 -c 'import json,sys,pathlib; data=json.load(sys.stdin); print(next(pathlib.Path(p["manifest_path"]).parent / "mobile/android" for p in data["packages"] if p["name"]=="tauri"))')"
+          echo "TAURI_ANDROID_SOURCE=$TAURI_ANDROID_SOURCE" >> "$GITHUB_ENV"
+          gradle --project-dir native-tests/android :app-screen:testDebugUnitTest :app-screen:assembleDebugAndroidTest
+      - name: Actual WebView profile isolation on Android emulator
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          sdkmanager "system-images;android-35;google_apis;x86_64"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/sumi-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-35;google_apis;x86_64" --force
+          "$ANDROID_HOME/emulator/emulator" -version
+          "$ANDROID_HOME/emulator/emulator" -list-avds
+          df -h "$ANDROID_HOME" "$RUNNER_TEMP"
+          "$ANDROID_HOME/emulator/emulator" -avd sumi-profiles -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot -wipe-data > "$RUNNER_TEMP/sumi-emulator.log" 2>&1 &
+          emulator_pid=$!
+          cleanup() {
+            result=$?
+            if [[ "$result" != "0" ]]; then
+              cat "$RUNNER_TEMP/sumi-emulator.log"
+              adb devices -l || true
+            fi
+            kill "$emulator_pid" 2>/dev/null || true
+            return "$result"
+          }
+          trap cleanup EXIT
+          timeout 180 adb wait-for-device
+          booted=0
+          for attempt in {1..90}; do
+            if [[ "$(adb shell getprop sys.boot_completed | tr -d '\r')" == "1" ]]; then booted=1; break; fi
+            sleep 2
+          done
+          if [[ "$booted" != "1" ]]; then cat "$RUNNER_TEMP/sumi-emulator.log"; exit 1; fi
+          adb shell input keyevent 82
+          adb shell getprop ro.build.version.sdk
+          adb shell dumpsys webviewupdate
+          gradle --project-dir native-tests/android :app-screen:connectedDebugAndroidTest
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as E
+          reports = list(pathlib.Path('src-tauri/plugins/app-screen/android/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
+          assert reports, 'No actual Android instrumentation reports'
+          tests = failures = skipped = 0
+          for report in reports:
+              root = E.parse(report).getroot()
+              tests += int(root.get('tests', 0))
+              failures += int(root.get('failures', 0)) + int(root.get('errors', 0))
+              skipped += int(root.get('skipped', 0))
+          print(f'Actual WebView tests: {tests}, failures/errors: {failures}, skipped: {skipped}')
+          assert tests >= 2 and failures == 0 and skipped == 0
+          PY

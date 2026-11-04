@@ -46,6 +46,7 @@ struct AppScreenRequest {
     /// Reopen at the last remembered page instead of `url`.
     var resume = false
     var webHome = false
+    var profile = "shared"
     var client: AppScreenBannerClient?
 
     var appOrigin: String? { AppScreenPolicy.origin(of: url.absoluteString) }
@@ -63,6 +64,7 @@ final class AppScreenSession {
     let navigator: AppScreenNavigator
     /// URL the screen was opened with; reopening with it keeps the page state.
     var launchURL: URL?
+    var profile = "shared"
     var webHome = false
     var title: String = ""
     var scope: String?
@@ -530,9 +532,10 @@ final class DialogTextField {
 /// at its last remembered page. Keeping several live and switching between
 /// them waits for device testing (TASK-0119 step 3).
 ///
-/// Every screen uses the default website data store, so cookies and storage are
-/// one profile across apps: a Takosumi sign-in made in one app screen carries
-/// over to the others. Do not give screens their own data store.
+/// Legacy app screens retain the default website data store. Web homes may
+/// select a UUID data store on iOS 17+, including a separate process pool.
+/// Popups inherit the opener's data store. There is no default-store fallback
+/// when isolation is unavailable.
 ///
 /// The webviews are plain WKWebViews with a fresh configuration: no script
 /// message handler, no user script and no URL scheme handler, so a page can
@@ -543,12 +546,14 @@ final class AppScreenCoordinator {
     static let maxAliveScreens = 1
 
     private let processPool = WKProcessPool()
+    private var isolatedPools: [String: WKProcessPool] = [:]
+    private var isolatedStores: [String: WKWebsiteDataStore] = [:]
     private var sessions: [String: AppScreenSession] = [:]
     private var order: [String] = []
     private var visibleKeys: Set<String> = []
     private weak var screen: AppScreenViewController?
 
-    func open(_ request: AppScreenRequest, from presenter: UIViewController) {
+    func open(_ request: AppScreenRequest, from presenter: UIViewController) throws {
         // A Takosumi page outside sign-in (the dashboard, account pages) never
         // runs in an app screen.
         guard AppScreenPolicy.isInScreen(request.url.absoluteString, origins: request.origins) else {
@@ -556,11 +561,17 @@ final class AppScreenCoordinator {
             return
         }
         let existing = sessions[request.key]
+        guard AppScreenPolicy.isWebProfile(request.profile), existing == nil || existing?.profile == request.profile else {
+            throw NSError(domain: "com.takosumi.appscreen", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "A live screen cannot change its browsing profile."])
+        }
+        let configuration = try makeConfiguration(profile: request.profile)
         // A live page is kept when the app is reopened (resume) or opened with
         // its own launch URL, for the same (instance, account).
         let keep = existing != nil && existing?.webView.url != nil && existing?.scope == request.scope &&
             (request.resume || existing?.launchURL == request.url)
-        let session = existing ?? makeSession(key: request.key, popup: false, configuration: nil)
+        let session = existing ?? makeSession(key: request.key, popup: false, configuration: configuration)
+        session.profile = request.profile
         if !keep { session.launchURL = request.url }
         session.webHome = request.webHome
         session.title = request.title
@@ -597,10 +608,12 @@ final class AppScreenCoordinator {
 
     func makePopupSession(
         configuration: WKWebViewConfiguration,
-        origins: AppScreenOrigins?
+        origins: AppScreenOrigins?,
+        profile: String
     ) -> AppScreenSession {
         let session = makeSession(key: "popup:\(UUID().uuidString)", popup: true, configuration: configuration)
-        // A popup keeps its opener's origins.
+        // A popup keeps its opener's origins and already-selected data store.
+        session.profile = profile
         session.navigator.origins = origins
         return session
     }
@@ -626,9 +639,9 @@ final class AppScreenCoordinator {
     private func makeSession(
         key: String,
         popup: Bool,
-        configuration: WKWebViewConfiguration?
+        configuration: WKWebViewConfiguration
     ) -> AppScreenSession {
-        let webView = WKWebView(frame: .zero, configuration: configuration ?? makeConfiguration())
+        let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
         let session = AppScreenSession(key: key, webView: webView, popup: popup)
         sessions[key] = session
@@ -636,11 +649,23 @@ final class AppScreenCoordinator {
         return session
     }
 
-    private func makeConfiguration() -> WKWebViewConfiguration {
+    private func makeConfiguration(profile: String) throws -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = WKWebsiteDataStore.default()
-        // iOS 14 still keeps session cookies per process pool; share one.
-        configuration.processPool = processPool
+        if profile == "shared" {
+            configuration.websiteDataStore = WKWebsiteDataStore.default()
+            configuration.processPool = processPool
+        } else {
+            guard #available(iOS 17.0, *), AppScreenPolicy.isWebProfile(profile), let identifier = UUID(uuidString: profile) else {
+                throw NSError(domain: "com.takosumi.appscreen", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "分離されたログイン領域にはiOS 17以降が必要です。"])
+            }
+            let store = isolatedStores[profile] ?? WKWebsiteDataStore(forIdentifier: identifier)
+            let pool = isolatedPools[profile] ?? WKProcessPool()
+            isolatedStores[profile] = store
+            isolatedPools[profile] = pool
+            configuration.websiteDataStore = store
+            configuration.processPool = pool
+        }
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = .all
         configuration.dataDetectorTypes = []
@@ -1049,7 +1074,9 @@ final class AppScreenViewController: UIViewController {
 
     func presentPopup(configuration: WKWebViewConfiguration, origins: AppScreenOrigins?) -> WKWebView? {
         guard canPresent() else { return nil }
-        let popup = coordinator.makePopupSession(configuration: configuration, origins: origins)
+        configuration.websiteDataStore = session.webView.configuration.websiteDataStore
+        configuration.processPool = session.webView.configuration.processPool
+        let popup = coordinator.makePopupSession(configuration: configuration, origins: origins, profile: session.profile)
         popup.title = session.title
         let controller = AppScreenViewController(coordinator: coordinator, session: popup)
         controller.modalPresentationStyle = .fullScreen

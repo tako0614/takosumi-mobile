@@ -33,14 +33,27 @@ The overlay makes a cold shell launch return to the Web connection picker.
 An explicit `?web-client=1` choice is also remembered in a separate shell
 preference. `?web-client=0` returns to the old client in a default build. Native
 sessions and credentials are neither imported nor deleted by this choice.
-Only connection names and https site roots are stored by the Web shell;
+Only connection names, https site roots and opaque profile IDs are stored by the Web shell;
 callback URLs, credentials, paths, queries and fragments are refused as
 connection inputs. Removing a connection removes that preference, not site data
 or the site's session. Sign-out remains a Web operation.
 
-Current limits: app screens use the existing single shared browsing profile,
-with normal Web origin/domain cookie and storage rules. Two isolated profiles,
-site-data deletion, per-app cold restoration, desktop embedded rendering,
+New Web connections each use an isolated persistent profile; adding the same
+site again creates a separate login, with a distinct label even if no name was
+entered. Android requires a WebView engine supporting AndroidX `MULTI_PROFILE`;
+iOS requires 17 or later. Unsupported isolation reports an error without opening
+the shared jar. Popups use the opener's profile. Within a profile, normal Web
+origin/domain cookie and storage rules apply. The old v1 connection preference
+is retained, and its entries continue using the existing shared profile; no
+cookie or native credential is copied. Subsequent preference edits use a v2 key.
+
+The ordinary browser preview cannot allocate these native profiles, so opening
+a newly isolated connection there reports that limitation. Native test builds
+use the config overlay above. Android actual-WebView profile tests are described
+in [native-tests/README.md](native-tests/README.md); Swift policy tests compile
+in CI and are distinct from iOS WebView qualification.
+
+Current limits: site-data deletion, per-app cold restoration, desktop embedded rendering,
 notification/deep-link routing and distribution/update are unfinished. Web
 authentication (including third-party IdPs), popups and file operations still
 need Android/iOS device qualification; some IdPs refuse embedded browsers. No

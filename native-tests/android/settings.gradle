@@ -1,0 +1,12 @@
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+
+rootProject.name = 'takosumi-app-screen-tests'
+def tauriAndroid = System.getenv('TAURI_ANDROID_SOURCE')
+if (!tauriAndroid || !new File(tauriAndroid, 'build.gradle.kts').isFile()) {
+    throw new GradleException('TAURI_ANDROID_SOURCE must name the pinned tauri crate mobile/android source directory.')
+}
+include ':app-screen', ':tauri-android'
+project(':app-screen').projectDir = new File(settingsDir, '../../src-tauri/plugins/app-screen/android')
+project(':tauri-android').projectDir = new File(tauriAndroid)

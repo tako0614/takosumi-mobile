@@ -162,19 +162,29 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun screenRequestOrReject(invoke: Invoke): ScreenRequest? {
         val args = invoke.parseArgs(OpenScreenArgs::class.java)
-        if (args.profile != SHARED_PROFILE) {
-            invoke.reject("App screens share one browsing profile.")
+        if (!AppScreenProfiles.isValid(args.profile) || (!args.webHome && args.profile != SHARED_PROFILE)) {
+            invoke.reject("Only Web homes may select an isolated browsing profile.")
+            return null
+        }
+        if (!AppScreenProfiles.isSupported(args.profile)) {
+            invoke.reject("この端末のWeb表示は、分離されたログイン領域に対応していません。")
             return null
         }
         if (args.key.isBlank() || args.key.length > KEY_MAX_LENGTH) {
             invoke.reject("App screen key is invalid.")
             return null
         }
+        val liveProfile = AppScreenRegistry.get(args.key)?.profile
+        if (liveProfile != null && liveProfile != args.profile) {
+            invoke.reject("A live screen cannot change its browsing profile.")
+            return null
+        }
         if (!AppScreenPolicy.isLaunchable(args.url)) {
             invoke.reject("Only https URLs can be opened in an app screen.")
             return null
         }
-        if (args.webHome && (!ScreenRequest.isWebHomeUrl(args.url) || args.client != null)) {
+        if (args.webHome && (!ScreenRequest.isWebHomeUrl(args.url) || args.client != null ||
+                args.key != ScreenRequest.webHomeKey(args.url, args.profile))) {
             invoke.reject("A Web home must be an https site root without a native client.")
             return null
         }
@@ -211,6 +221,7 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             scope = scope,
             resume = args.resume,
             webHome = args.webHome,
+            profile = args.profile,
             client = client,
         )
     }

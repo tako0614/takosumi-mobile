@@ -1,0 +1,64 @@
+{
+  "cases": [
+    {
+      "profile": "shared",
+      "valid": true
+    },
+    {
+      "profile": "11111111-1111-4111-8111-111111111111",
+      "valid": true
+    },
+    {
+      "profile": "abcdefab-cdef-4abc-9def-abcdefabcdef",
+      "valid": true
+    },
+    {
+      "profile": "12345678-90ab-4cde-a012-34567890abcd",
+      "valid": true
+    },
+    {
+      "profile": "12345678-90ab-4cde-b012-34567890abcd",
+      "valid": true
+    },
+    {
+      "profile": "",
+      "valid": false
+    },
+    {
+      "profile": "default",
+      "valid": false
+    },
+    {
+      "profile": "Shared",
+      "valid": false
+    },
+    {
+      "profile": "SHARED",
+      "valid": false
+    },
+    {
+      "profile": "shared\n",
+      "valid": false
+    },
+    {
+      "profile": "11111111-1111-1111-8111-111111111111",
+      "valid": false
+    },
+    {
+      "profile": "11111111-1111-4111-7111-111111111111",
+      "valid": false
+    },
+    {
+      "profile": "ABCDEFAB-CDEF-4ABC-9DEF-ABCDEFABCDEF",
+      "valid": false
+    },
+    {
+      "profile": "../11111111-1111-4111-8111-111111111111",
+      "valid": false
+    },
+    {
+      "profile": "11111111-1111-4111-8111-111111111111\n",
+      "valid": false
+    }
+  ]
+}
