@@ -91,6 +91,12 @@ five-second close bound. This detects the view/manager message-signal cycle
 without relying on process exit. Context disposal and helper-process shutdown
 remain separate checks. DOM probes start only after the native target URI has
 settled; cookie/storage assertions still run once after the document nonce matches.
+SPA readback asserts the saved successful route once before constructing its
+view, then lets the production factory's initial navigation finish. It trusts
+the disposable certificate on that context without reloading or loading the
+expected route from the fixture. A native readiness timeout prints the actual
+URI/loading state as well as the expected document; the five-second bound is
+unchanged. This distinguishes saved-route failure from startup loading failure.
 
 ## Full Linux App Web-home flow
 
