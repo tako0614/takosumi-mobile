@@ -3,6 +3,7 @@
 //! HTML assigned an https base URI. Never loads a real service or user profile.
 
 use super::*;
+use gtk::glib::prelude::ObjectExt;
 use javascriptcore::ValueExt;
 use std::{path::Path, time::Duration};
 use webkit2gtk::{WebContextExt, WebViewExt};
@@ -190,8 +191,12 @@ fn spa_probe(app: AppHandle, readback: bool) {
 
 fn close_spa(app: AppHandle) {
     let screen_label = label(WORK);
-    let window =
-        SCREENS.with(|screens| screens.borrow().get(&screen_label).unwrap().window.clone());
+    let (window, context) = SCREENS.with(|screens| {
+        let screens = screens.borrow();
+        let screen = screens.get(&screen_label).unwrap();
+        let context = screen.view.webview().context().unwrap().downgrade();
+        (screen.window.clone(), context)
+    });
     if let Err(error) = window.close() {
         eprintln!("FAIL: native close: {error}");
         app.exit(1);
@@ -201,11 +206,11 @@ fn close_spa(app: AppHandle) {
         app,
         screen_label,
         std::time::Instant::now() + Duration::from_secs(5),
+        context,
     );
 }
 
 fn fail_after_spa(app: AppHandle, target: String) {
-    use gtk::glib::prelude::ObjectExt;
     let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
     let native = view.clone();
     after_document_load(&view, target, "bootstrap".into(), app.clone(), move || {
@@ -264,17 +269,29 @@ fn fail_after_spa(app: AppHandle, target: String) {
     });
 }
 
-fn after_spa_close(app: AppHandle, label: String, deadline: std::time::Instant) {
-    if !SCREENS.with(|screens| screens.borrow().contains_key(&label)) {
-        println!("PASS: primary native window closed before process exit");
+fn after_spa_close(
+    app: AppHandle,
+    label: String,
+    deadline: std::time::Instant,
+    context: gtk::glib::WeakRef<webkit2gtk::WebContext>,
+) {
+    let closed = !SCREENS.with(|screens| screens.borrow().contains_key(&label));
+    if closed {
+        // Only WORK is opened in this case. Drop its production cache after
+        // ordinary Close while the UI loop is alive; no helper can hide a
+        // view/manager cycle behind process exit.
+        CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    }
+    if closed && context.upgrade().is_none() {
+        println!("PASS: primary window and native context released before process exit");
         EXIT_STATUS.store(0, Ordering::SeqCst);
         app.exit(0);
     } else if std::time::Instant::now() >= deadline {
-        eprintln!("FAIL: primary native window did not close");
+        eprintln!("FAIL: primary window or native context retained after ordinary Close");
         app.exit(1);
     } else {
         gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
-            after_spa_close(app, label, deadline)
+            after_spa_close(app, label, deadline, context)
         });
     }
 }
@@ -456,6 +473,20 @@ fn after_document_load(
 }
 
 fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
+    // The caller registers readiness before starting its target navigation.
+    // Do not launch an async evaluation into the document it is about to
+    // replace. Check the native document first, including across process swaps.
+    if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
+        if std::time::Instant::now() >= pending.deadline {
+            eprintln!("FAIL: expected fixture document not ready: native target did not settle");
+            pending.app.exit(1);
+        } else {
+            gtk::glib::timeout_add_local_once(Duration::from_millis(25), move || {
+                poll_document(view, pending)
+            });
+        }
+        return;
+    }
     let probe = "({uri: location.href, nonce: document.querySelector('meta[name=sumi-fixture]')?.content, ready: document.readyState})";
     let native = view.clone();
     view.evaluate_javascript(probe, None, None, None::<&gtk::gio::Cancellable>, move |result| {

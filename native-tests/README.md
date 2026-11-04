@@ -75,6 +75,12 @@ Close; the next process must still restore the earlier successful SPA route.
 These cases use production profile metadata, not a fixture-side saved URL.
 GLib criticals fail the runner, including during teardown. Deferred URL snapshots
 use weak view references so queued work does not keep a closed view alive.
+The SPA close case also releases the raw profile cache while the UI loop is
+alive and requires the native context's weak reference to clear within the same
+five-second close bound. This detects the view/manager message-signal cycle
+without relying on process exit. Context disposal and helper-process shutdown
+remain separate checks. DOM probes start only after the native target URI has
+settled; cookie/storage assertions still run once after the document nonce matches.
 
 ## Full Linux App Web-home flow
 

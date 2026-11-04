@@ -81,6 +81,10 @@ Unknown failure identities keep the saved metadata rather than qualify a new
 page. OS runtime qualification is still required for these native callbacks.
 
 Wry's default content messaging is removed on GTK/WK before navigation.
+GTK also disconnects the raw manager's native message signal: unregistering the
+JS channel alone leaves a Wry callback that retains the view and its context.
+The trusted shell's IPC stays active until actual GTK widget destruction;
+document reloads and cancelled close requests keep their normal connection.
 On Windows the WebMessage transport is disabled before navigation; Wry's inert
 `window.ipc` JS stub may remain, with no application/Tauri handler behind it.
 No remote page is granted a capability, custom protocol, OS opener or host object.

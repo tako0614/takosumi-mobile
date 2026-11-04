@@ -116,9 +116,10 @@ async fn ready(view: &WebView, condition: &str) -> Result<()> {
             return Ok(());
         }
         if start.elapsed() > Duration::from_secs(8) {
+            let snapshot = eval(view, "({ready: document.readyState, title: document.title, body: document.body?.textContent?.slice(0, 1200), scripts: [...document.scripts].map(script => script.src)})").await;
             return Err(format!(
-                "DOM not ready: {condition}; uri={:?}; last={result:?}",
-                view.uri()
+                "DOM not ready: {condition}; uri={:?}; last={result:?}; document={snapshot:?}",
+                view.uri(),
             ));
         }
         pause().await;

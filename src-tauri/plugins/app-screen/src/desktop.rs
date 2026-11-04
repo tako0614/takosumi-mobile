@@ -52,10 +52,14 @@ thread_local! {
 pub fn init() -> TauriPlugin<tauri::Wry> {
     Builder::new("app-screen")
         .invoke_handler(tauri::generate_handler![capabilities, open])
-        .on_event(|_, event| {
+        .on_event(|_app, event| {
+            #[cfg(target_os = "linux")]
+            if matches!(event, tauri::RunEvent::Ready) {
+                install_shell_message_cleanup(_app);
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 // Raw views do not belong to Tauri's managed-view registry.
-                // Release them explicitly while the UI runtime still exists.
+                // Clear remaining owned resources as a terminal fallback.
                 SCREENS.with(|screens| screens.borrow_mut().clear());
                 CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
             }
@@ -460,6 +464,7 @@ fn disable_messaging(view: &WebView) -> Result<()> {
             ))?;
         manager.remove_all_scripts();
         manager.unregister_script_message_handler("ipc");
+        disconnect_gtk_messages(&manager)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -486,6 +491,63 @@ fn disable_messaging(view: &WebView) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn disconnect_gtk_messages(manager: &webkit2gtk::UserContentManager) -> Result<()> {
+    use gtk::glib::{
+        gobject_ffi,
+        prelude::{ObjectExt, ObjectType},
+        subclass::SignalId,
+        translate::IntoGlib,
+    };
+    let signal = SignalId::lookup("script-message-received", manager.type_()).ok_or(
+        Error::InvalidRequest("The Web message signal is unavailable."),
+    )?;
+    // Unregistering a JS channel leaves Wry's native signal closure alive.
+    // It captures the view even with no IPC handler, forming a manager/view
+    // cycle that retains this profile's context after ordinary Close.
+    // SAFETY: the caller owns a live manager on its UI thread. Raw managers
+    // have no IPC; the trusted shell calls this only on native destruction.
+    unsafe {
+        gobject_ffi::g_signal_handlers_disconnect_matched(
+            manager.as_ptr().cast(),
+            gobject_ffi::G_SIGNAL_MATCH_ID,
+            signal.into_glib(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_shell_message_cleanup(app: &AppHandle) {
+    use gtk::prelude::*;
+    use webkit2gtk::{UserContentManagerExt, WebViewExt};
+    let Some(main) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Err(error) = main.with_webview(|platform| {
+        let native = platform.inner();
+        if let Some(manager) = native.user_content_manager() {
+            let manager = manager.downgrade();
+            native.connect_destroy(move |_| {
+                // Actual destruction, never a close request that can be vetoed.
+                // A weak capture does not add a manager/view ownership cycle.
+                if let Some(manager) = manager.upgrade() {
+                    manager.unregister_script_message_handler("ipc");
+                    if let Err(error) = disconnect_gtk_messages(&manager) {
+                        eprintln!("Takosumi closed-view messaging cleanup failed: {error}");
+                    }
+                }
+            });
+        }
+    }) {
+        eprintln!("Takosumi shell cleanup could not be installed: {error}");
+    }
 }
 
 struct NativeHandlers {
