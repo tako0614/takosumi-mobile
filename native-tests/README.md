@@ -3,6 +3,44 @@
 These tests exercise the product's plain WebViews. They do not sign in to any
 real service, use provider/DB/SSO credentials, or qualify distribution.
 
+## Whole App iOS Simulator SDK build
+
+On a disposable macOS checkout with Xcode, CocoaPods, Rust and Bun:
+
+```bash
+bun install --frozen-lockfile
+bash native-tests/ios/build-simulator.sh
+```
+
+The script refuses an existing generated Apple project, uses the shared kit's
+normal iOS generation/push wiring and builds the normal App with all iOS
+plugins for the host's Simulator architecture. A separate bundle identifier
+and `--no-sign` avoid installed App identity and Apple signing credentials.
+Signing environment inputs are refused before generation/build because the
+pinned CLI can import them before handling `--no-sign`.
+The disposable generated target is restricted to the Simulator SDK/platform,
+then regenerated with XcodeGen before the normal Tauri build, to address Xcode
+26 selecting the device archive destination for an Intel Simulator build.
+An unexpected template, existing platform override or wrong fixture identity
+fails before build. The normal product's generated projects are not reused.
+The normal kit Apple push writer runs again after regeneration; the development
+entitlement must survive before compilation. This is wiring evidence, not push delivery.
+It requires one nonempty Simulator `.app` with the exact fixture identifier
+and Simulator platform, rejects a device IPA, and prints the executable digest.
+CI runs this after the macOS desktop compile, serialized with the other desktop
+SDK checks. The desktop matrix waits for the native job to finish but still
+runs if that independent job fails; a native failure keeps the workflow red.
+Quality failure or workflow cancellation prevents the matrix from running.
+The SDK lane uses the standard `macos-26-intel` runner after hosted arm64
+capacity prevented job acquisition. It compiles the host's x86_64 Simulator
+target; Apple Silicon/iOS device runtime remains separate qualification.
+This is an SDK compile check: it does not install or launch the App,
+test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
+Simulator/device runtime checks remain separate from the portable Swift policy tests.
+Compiler caches are saved after non-cancelled SDK failures as well as success,
+so a source repair can reuse completed compilation. Failed checks stay failed;
+cached compiler files are not accepted App artifacts or runtime evidence.
+
 ## Desktop GTK runtime fixture
 
 On Linux with the Tauri GTK/WebKit SDK, Xvfb, xdotool, Python and OpenSSL, build

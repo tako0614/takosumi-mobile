@@ -56,9 +56,11 @@ private func installApnsDelegateCallbacks() {
         }
         PushPlugin.instance?.didRegister(token as Data)
     }
-    _ = class_replaceMethod(
-        delegateClass, registerSelector, imp_implementationWithBlock(register as Any),
-        registerMethod.flatMap { method_getTypeEncoding($0) } ?? "v@:@@")
+    "v@:@@".withCString { fallbackEncoding in
+        _ = class_replaceMethod(
+            delegateClass, registerSelector, imp_implementationWithBlock(register as Any),
+            registerMethod.flatMap { method_getTypeEncoding($0) } ?? fallbackEncoding)
+    }
 
     let failSelector = sel_registerName("application:didFailToRegisterForRemoteNotificationsWithError:")
     let failMethod = class_getInstanceMethod(delegateClass, failSelector)
@@ -69,9 +71,11 @@ private func installApnsDelegateCallbacks() {
         }
         PushPlugin.instance?.didFailToRegister()
     }
-    _ = class_replaceMethod(
-        delegateClass, failSelector, imp_implementationWithBlock(fail as Any),
-        failMethod.flatMap { method_getTypeEncoding($0) } ?? "v@:@@")
+    "v@:@@".withCString { fallbackEncoding in
+        _ = class_replaceMethod(
+            delegateClass, failSelector, imp_implementationWithBlock(fail as Any),
+            failMethod.flatMap { method_getTypeEncoding($0) } ?? fallbackEncoding)
+    }
     installedDelegateClass = delegateClass
 }
 
