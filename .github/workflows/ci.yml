@@ -14,7 +14,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  MOBILE_KIT_SOURCE_REF: e93a2e76970fa55069c787392577b021c541db59
+  MOBILE_KIT_SOURCE_REF: 2e1aeff1f88c4370889acb68b99081c32f5a6740
   TAKOSUMI_SOURCE_REF: d6347b169dc04f5036218cfb59a7e91b7d489176
 
 jobs:
@@ -221,7 +221,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: desktop-cache
         with:
           path: |
             ~/.cargo/registry/index
@@ -268,3 +269,15 @@ jobs:
           python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-web-home"
           python3 native-tests/desktop/web_home.py --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-quick-close"
           python3 native-tests/desktop/web_home.py --legacy-entry --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-legacy-return"
+      # Preserve compiler work after a diagnosed SDK failure. A cancelled job
+      # may still have writers, and a cache is never an acceptance receipt.
+      - name: Preserve desktop compiler cache
+        if: ${{ !cancelled() && steps.desktop-cache.outputs.cache-hit != 'true' && steps.desktop-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            takosumi-mobile/src-tauri/target
+          key: ${{ steps.desktop-cache.outputs.cache-primary-key }}

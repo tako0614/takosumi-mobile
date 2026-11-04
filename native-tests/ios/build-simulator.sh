@@ -36,6 +36,39 @@ rustup target add "$rust_target"
 simulator_config='{"identifier":"com.takosumi.fixture.simulator"}'
 bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform ios \
   --apple-environment development -- --ci --skip-targets-install --config "$simulator_config"
+
+# Xcode 26 can resolve the generic archive destination to iphoneos even when
+# cargo-mobile2 requests the Simulator SDK/architecture. Restrict this fresh
+# fixture project's supported platform before the normal Tauri build; retain
+# its Rust build hook, plugins, push wiring and no-sign handling.
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+spec = Path("src-tauri/gen/apple/project.yml")
+text = spec.read_text()
+identifiers = re.findall(r"(?m)^[ \t]*PRODUCT_BUNDLE_IDENTIFIER[ \t]*:[ \t]*(.+)$", text)
+assert identifiers == ["com.takosumi.fixture.simulator"], "Not the fixture project"
+marker = "    settings:\n      base:\n"
+assert text.count(marker) == 1, "Unexpected generated target settings"
+assert not re.search(r"(?m)^[ \t]*['\"]?(?:SDKROOT|SUPPORTED_PLATFORMS)(?:\[[^\r\n]*\])?['\"]?[ \t]*:", text), "Unexpected platform overrides"
+text = text.replace(marker, marker + "        SDKROOT: iphonesimulator\n        SUPPORTED_PLATFORMS: iphonesimulator\n", 1)
+spec.write_text(text)
+PY
+xcodegen generate --spec src-tauri/gen/apple/project.yml --project src-tauri/gen/apple
+# XcodeGen rewrites entitlements from its spec. Reapply the same product writer
+# used by init so regeneration cannot silently remove normal plugin wiring.
+bun ../mobile-kit/scripts/apply-tauri-mobile-push-native.mjs --platform ios \
+  --apple-environment development --strict
+python3 - <<'PY'
+from pathlib import Path
+import plistlib
+
+entitlements = list(Path("src-tauri/gen/apple").rglob("*.entitlements"))
+assert len(entitlements) == 1, "Expected the generated App entitlements"
+with entitlements[0].open("rb") as source:
+    assert plistlib.load(source).get("aps-environment") == "development", "Missing normal push wiring"
+PY
 bunx tauri ios build --ci --debug --no-sign --target "$simulator_target" \
   --config "$simulator_config" -- --locked
 
