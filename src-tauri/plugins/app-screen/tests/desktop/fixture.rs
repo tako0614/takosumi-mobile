@@ -60,6 +60,14 @@ pub fn run() {
                 &[WORK, PERSONAL, "shared"]
             };
             for &profile in profiles {
+                if spa && readback {
+                    let payload = request(profile);
+                    let expected = format!("{}document/work?view=edit", payload.url);
+                    let stored = ResumeStore::new(directory.join(profile), payload.key).recall()?;
+                    assert_eq!(stored.as_deref(), Some(expected.as_str()),
+                        "SPA readback must start with the saved successful route, before constructing a view");
+                    println!("PASS: saved SPA route matches before native view construction");
+                }
                 open_on_ui_thread(app.handle(), request(profile), directory.clone())?;
                 let view = SCREENS.with(|screens| {
                     screens
@@ -75,9 +83,11 @@ pub fn run() {
                 view.context()
                     .unwrap()
                     .allow_tls_certificate_for_host(&certificate, "127.0.0.1");
-                if spa && readback {
-                    view.reload();
-                } else {
+                // SPA readback must finish the factory's saved-route load.
+                // Reloading here can interrupt it before its URI settles.
+                // Trust is set in the same setup turn after construction;
+                // do not force the expected route or start a second request.
+                if !(spa && readback) {
                     view.load_uri(&request(profile).url);
                 }
             }
@@ -674,7 +684,7 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
     // replace. Check the native document first, including across process swaps.
     if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
         if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: native target did not settle");
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}", pending.uri, pending.nonce, view.uri(), view.is_loading());
             pending.app.exit(1);
         } else {
             gtk::glib::timeout_add_local_once(Duration::from_millis(25), move || {
