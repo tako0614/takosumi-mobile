@@ -6,6 +6,7 @@ import {
 export function WebHome(props: {
   readonly open: (connection: WebConnection) => Promise<void>;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
+  readonly allowLegacyMobile?: boolean;
 }) {
   const [connections, setConnections] = createSignal<readonly WebConnection[]>([]);
   const [url, setUrl] = createSignal("");
@@ -65,7 +66,7 @@ export function WebHome(props: {
   return (
     <main class="web-home">
       <header class="web-heading">
-        <span class="web-mark" aria-hidden="true">墨</span>
+        <img class="web-mark" src="/brand/takosumi.png" width="44" height="44" alt="" />
         <h1>Takosumi</h1>
         <p>いつものアプリへ。</p>
       </header>
@@ -108,6 +109,16 @@ export function WebHome(props: {
         </form>
       </section>
       <Show when={error()}><p class="web-error" role="alert">{error()}</p></Show>
+      <Show when={props.allowLegacyMobile}>
+        <details class="web-legacy">
+          <summary>以前のモバイル版を使っていた方</summary>
+          <p class="web-note">この端末に保存した以前のログインは、旧モバイル画面で利用できます。</p>
+          <a href="?web-client=0" onClick={(event) => {
+            event.preventDefault();
+            location.replace("?web-client=0");
+          }}>保存済みログインを開く</a>
+        </details>
+      </Show>
     </main>
   );
 }

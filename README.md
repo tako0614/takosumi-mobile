@@ -1,13 +1,12 @@
 # Takosumi Mobile
 
-The mobile-first Takosumi client, with a shared Tauri Web-client candidate for
-Android, iOS, Windows, macOS and Linux. The default native client for iOS/Android
-connects to any Takosumi instance — Takosumi Hosted or an operator or
-self-hosted deployment — through `/.well-known/takosumi` discovery and
-public-client OIDC PKCE, and keeps several instances and accounts signed in at
-once.
+The Tauri Takosumi client for Android, iOS, Windows, macOS and Linux. A fresh
+launch opens the shared connection picker. Choose a Takosumi instance — Hosted,
+operator-managed or self-hosted — and use its Web sign-in, home and apps.
+The previous iOS/Android client and its saved credentials remain available
+through an explicit choice.
 
-## Web client migration (source/local candidate)
+## Shared Web home
 
 The Web client retains connection selection while opening Takosumi's own Web
 sign-in, app home and management screens. Apps linked by the Web home open in
@@ -16,27 +15,31 @@ offers **アプリホームへ** and **接続先を切り替える**; a popup cl
 opener, and the current site's host stays visible. Pages receive no
 Tauri IPC, native credential or management-API adapter.
 
-This is an opt-in candidate, not a replacement for the default native client
-yet. Browser preview: `bun run dev`, then open
-`http://localhost:1450/?web-client=1`. The preview navigates in the ordinary
-browser; it does not prove native engine behavior.
+Browser preview: `bun run dev`, then open `http://localhost:1450/`. The preview
+uses the ordinary browser; it does not prove native engine behavior.
 
-For a native test build, pass the non-default config overlay:
+Native development and debug builds open the same Web home by default:
 
 ```bash
-bunx tauri android dev --config src-tauri/tauri.web-client.conf.json
-bunx tauri android build --debug --config src-tauri/tauri.web-client.conf.json
+bunx tauri android dev
+bunx tauri android build --debug
 # On a macOS host with the iOS SDK:
-bunx tauri ios dev --config src-tauri/tauri.web-client.conf.json
+bunx tauri ios dev
 # Desktop (the same UI, connection records and native request):
-bunx tauri dev --config src-tauri/tauri.web-client.conf.json
-bunx tauri build --debug --no-bundle --config src-tauri/tauri.web-client.conf.json
+bunx tauri dev
+bunx tauri build --debug --no-bundle
 ```
 
-The overlay makes a cold shell launch return to the Web connection picker.
-An explicit `?web-client=1` choice is also remembered in a separate shell
-preference. `?web-client=0` returns to the old client in a default build. Native
-sessions and credentials are neither imported nor deleted by this choice.
+On Android/iOS, **以前のモバイル版を使っていた方 → 保存済みログインを開く**
+opens the preserved mobile client. Its **新しいTakosumiホームへ** link returns
+to the shared Web home, including before signing in. This explicit choice is
+remembered separately when preferences are available. Switching reloads the
+local document and replaces its history entry, so Back does not undo the choice.
+Existing native sessions
+and credentials are neither imported nor deleted; they retain their previous
+unlock and authorization guards. The Web path never initializes that client.
+For diagnostics, `?web-client=0` / `?web-client=1` still select either entry.
+The existing `tauri.web-client.conf.json` overlay can force Web mode for tests.
 Only connection names, https site roots and opaque profile IDs are stored by the Web shell;
 callback URLs, credentials, paths, queries and fragments are refused as
 connection inputs. Removing a connection removes that preference, not site data
@@ -52,8 +55,7 @@ is retained, and its entries continue using the existing shared profile; no
 cookie or native credential is copied. Subsequent preference edits use a v2 key.
 
 The ordinary browser preview cannot allocate these native profiles, so opening
-a newly isolated connection there reports that limitation. Native test builds
-use the config overlay above. Android actual-WebView profile tests are described
+a newly isolated connection there reports that limitation. Android actual-WebView profile tests are described
 in [native-tests/README.md](native-tests/README.md); Swift policy tests compile
 in CI and are distinct from iOS WebView qualification.
 
@@ -79,11 +81,11 @@ notification/deep-link routing and distribution/update are unfinished. Web
 authentication (including third-party IdPs), popups and file operations still
 need Android/iOS device qualification; some IdPs refuse embedded browsers. No
 external browser cookies or tokens are copied to bypass that restriction. A
-desktop native runtime still needs OS-by-OS qualification. The default legacy
-desktop entry stays closed; the Web overlay selects the shared UI without
-loading legacy credentials. This candidate does not claim the full App goal complete.
+desktop native runtime still needs OS-by-OS qualification. The preserved mobile
+entry refuses desktop authentication and offers a return link to Web home.
+This source does not claim the full App goal complete.
 
-## Default native client
+## Preserved mobile client
 
 ### What you can do
 

@@ -1,21 +1,40 @@
 import { describe, expect, test } from "bun:test";
 import { CONNECTIONS_KEY, LEGACY_CONNECTIONS_KEY, connectionKey, connectionOrigin, decodeConnections,
-  isWebProfile, loadWebConnections, newWebConnection, webConnection, webHomeRequest, webClientSelected } from "../src/web-connections.ts";
+  isWebProfile, loadWebConnections, newWebConnection, newWebProfile, webConnection, webHomeRequest, webClientSelected } from "../src/web-connections.ts";
 import profileCases from "../src-tauri/plugins/app-screen/profile-cases.json";
 
 const firstProfile = "11111111-1111-4111-8111-111111111111";
 const secondProfile = "22222222-2222-4222-8222-222222222222";
 
 describe("Web connection preferences", () => {
-  test("keeps an explicit Web choice when the native screen cold-starts the shell, with legacy opt-out", () => {
+  test("defaults to Web home and preserves an explicit legacy-mobile choice across cold starts", () => {
     const saved = new Map<string, string>();
     const storage = { getItem: (key: string) => saved.get(key) ?? null,
       setItem: (key: string, value: string) => { saved.set(key, value); } };
-    expect(webClientSelected("", storage)).toBe(false);
+    expect(webClientSelected("", storage)).toBe(true);
     expect(webClientSelected("?web-client=1", storage)).toBe(true);
     expect(webClientSelected("", storage)).toBe(true);
     expect(webClientSelected("?web-client=0", storage)).toBe(false);
     expect(webClientSelected("", storage)).toBe(false);
+  });
+
+  test("starts on Web home without storage, while an explicit legacy choice still takes effect", () => {
+    const blocked = { getItem: () => { throw new Error("blocked"); },
+      setItem: () => { throw new Error("blocked"); } };
+    for (const storage of [undefined, blocked]) {
+      expect(webClientSelected("", storage)).toBe(true);
+      expect(webClientSelected("?web-client=0", storage)).toBe(false);
+      expect(webClientSelected("?web-client=1", storage)).toBe(true);
+    }
+  });
+
+  test("allocates v4 profiles using secure random values without requiring randomUUID", () => {
+    const random = { getRandomValues: crypto.getRandomValues.bind(crypto) };
+    const first = newWebProfile(random);
+    const second = newWebProfile(random);
+    expect(isWebProfile(first)).toBe(true);
+    expect(isWebProfile(second)).toBe(true);
+    expect(first).not.toBe(second);
   });
 
   test("uses the site's Web root without constructing an API or OIDC credential", () => {

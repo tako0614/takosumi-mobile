@@ -65,7 +65,14 @@ Failure/timeout or a lingering engine process exits nonzero.
 immediate native Close, and new-process readback. CI runs it separately with a
 fresh data directory, alongside the full two-profile flow.
 
-This covers the opt-in Web path and ordinary window closure. An early diagnostic
+The main cases use the normal App URL without `web-client=1`, proving the default
+entry. A separate `--legacy-entry --quick-close` case explicitly selects the
+preserved client, checks its desktop refusal and visible local return link,
+then opens Web home. Its second App process uses the normal URL, so the return
+choice must survive restart without another override. It does not read native credentials
+or qualify the old client on mobile devices.
+
+This covers the default Web path and ordinary window closure. An early diagnostic
 using immediate App.exit lost a draft on restart; a delayed control and a later
 run with stronger write acknowledgement both passed. The original separate
 Xvfb/D-Bus session per App also lost storage during ordinary-close readback in

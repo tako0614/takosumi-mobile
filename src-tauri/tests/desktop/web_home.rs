@@ -19,8 +19,10 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     // Do not borrow an installed App's preferences or native data directory.
     context.config_mut().identifier = "com.takosumi.fixture.webhome".into();
     context.config_mut().build.dev_url = None;
-    context.config_mut().app.windows[0].url =
-        tauri::WebviewUrl::App("index.html?web-client=1".into());
+    if legacy_entry() && !readback() {
+        context.config_mut().app.windows[0].url =
+            tauri::WebviewUrl::App("index.html?web-client=0".into());
+    }
     let app = builder.build(context).expect("Full fixture App builds");
     let watchdog = app.handle().clone();
     glib::timeout_add_local_once(Duration::from_secs(60), move || {
@@ -59,6 +61,10 @@ fn readback() -> bool {
 
 fn quick_close() -> bool {
     std::env::args().any(|arg| arg == "--quick-close")
+}
+
+fn legacy_entry() -> bool {
+    std::env::args().any(|arg| arg == "--legacy-entry")
 }
 
 fn required_env(name: &str) -> String {
@@ -281,7 +287,57 @@ async fn flow(app: &AppHandle) -> Result<()> {
     }
     let main = app.get_window("main").ok_or("main window missing")?;
     let shell = view(&main)?;
+    let mut legacy_history = None;
+    if legacy_entry() && !readback() {
+        // Linux deliberately refuses the preserved legacy mobile client.
+        // The local return link must still work without entering its auth UI.
+        ready(&shell, "document.querySelector('.unsupported-platform') && !document.querySelector('#legacy-navigation').hidden").await?;
+        legacy_history = Some(eval(&shell, "history.length").await?);
+        assert_js(&shell, "(() => {const a=document.querySelector('#legacy-navigation a'), r=a.getBoundingClientRect(), s=getComputedStyle(a); return s.visibility==='visible' && s.display!=='none' && r.width>0 && r.height>=44 && a.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));})()", "legacy return link is visible and hit-testable").await?;
+        main.set_focus().map_err(|e| e.to_string())?;
+        focused(&main).await?;
+        shell.grab_focus();
+        assert_js(&shell, "(() => {const a=document.querySelector('#legacy-navigation a'); a.focus(); return document.activeElement===a;})()", "legacy return link accepts focus").await?;
+        let status = std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", "Return"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("native key activation of legacy return failed".into());
+        }
+    }
     ready(&shell, "document.querySelector('.web-home')").await?;
+    if legacy_entry() {
+        assert_js(
+            &shell,
+            "localStorage.getItem('takosumi.web-client.selected.v1') === '1'",
+            "explicit Web choice is stored after return and survives restart",
+        )
+        .await?;
+    }
+    if let Some(before) = legacy_history {
+        let after = eval(&shell, "history.length").await?;
+        if before != after {
+            return Err(format!("client switch added history: {before} -> {after}"));
+        }
+        println!(
+            "PASS: client switch replaces the entry instead of leaving legacy in Back history"
+        );
+    }
+    if !legacy_entry() || readback() {
+        assert_js(
+            &shell,
+            "!new URL(location.href).searchParams.has('web-client')",
+            "normal App starts on Web home without a mode override",
+        )
+        .await?;
+    }
+    assert_js(
+        &shell,
+        "document.querySelector('#legacy-navigation').hidden",
+        "legacy return navigation is hidden on Web home",
+    )
+    .await?;
     assert_js(
         &shell,
         "typeof window.__TAURI_INTERNALS__ === 'object' && !document.querySelector('[role=alert]')",

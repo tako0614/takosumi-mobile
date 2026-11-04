@@ -95,13 +95,25 @@ def descendants(pid):
     return found
 
 
-def run_apps(binary, data, quick_close):
+def process_description(pid):
+    details = {"pid": pid, "identity": process_identity(pid)}
+    try:
+        details["name"] = Path(f"/proc/{pid}/comm").read_text().strip()
+        details["executable"] = Path(os.readlink(f"/proc/{pid}/exe")).name
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
+    return details
+
+
+def run_apps(binary, data, quick_close, legacy_entry):
     """Both Apps restart inside one disposable desktop session, as in use."""
     previous_pid = None
     for readback in (False, True):
         flags = ["--readback"] if readback else []
         if quick_close:
             flags.append("--quick-close")
+        if legacy_entry:
+            flags.append("--legacy-entry")
         log = data / ("readback.log" if readback else "first.log")
         tracked = {}
         with log.open("w") as output:
@@ -150,7 +162,7 @@ def run_apps(binary, data, quick_close):
             if not alive:
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"Old App engine children still alive: {alive}")
+                raise RuntimeError(f"Old App engine children still alive: {[process_description(pid) for pid in alive]}")
             time.sleep(0.025)
         print(f"PASS: App {child.pid} and {len(tracked)} observed engine children exited, readback={readback}", flush=True)
 
@@ -182,6 +194,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--quick-close", action="store_true")
+    parser.add_argument("--legacy-entry", action="store_true")
     parser.add_argument("--session-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
@@ -189,7 +202,7 @@ def main():
     if args.session_worker:
         if not data.is_dir() or not os.environ.get("DISPLAY"):
             parser.error("session worker requires the isolated outer runner")
-        run_apps(binary, data, args.quick_close)
+        run_apps(binary, data, args.quick_close, args.legacy_entry)
         return
     if data.exists():
         parser.error("--data must be a new disposable directory")
@@ -225,6 +238,8 @@ def main():
             threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             flags = ["--quick-close"] if args.quick_close else []
+            if args.legacy_entry:
+                flags.append("--legacy-entry")
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "python3", str(Path(__file__).resolve()),
                 "--session-worker", "--binary", str(binary), "--data", str(data), *flags,
