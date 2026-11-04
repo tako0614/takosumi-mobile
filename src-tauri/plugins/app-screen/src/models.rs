@@ -120,6 +120,9 @@ pub struct OpenRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_png: Option<String>,
     pub profile: String,
+    /// Web-home mode opens Takosumi and app sites with standard Web navigation.
+    #[serde(default)]
+    pub web_home: bool,
     /// The Takosumi origins (the instance's Accounts and the instance itself).
     /// The screen shows only their sign-in pages; the rest goes to the
     /// browser view.
@@ -159,6 +162,9 @@ impl OpenRequest {
             return Err(crate::Error::InvalidRequest(
                 "Only https URLs can be opened in an app screen.",
             ));
+        }
+        if self.web_home && (self.client.is_some() || !is_web_home_url(&self.url)) {
+            return Err(crate::Error::InvalidRequest("A Web home must be an https site root without a native client."));
         }
         if self.accounts_origins.len() > ACCOUNTS_ORIGINS_MAX
             || self
@@ -378,6 +384,12 @@ pub fn is_launchable_url(raw: &str) -> bool {
     }
 }
 
+pub fn is_web_home_url(raw: &str) -> bool {
+    is_launchable_url(raw) && tauri::Url::parse(raw).is_ok_and(|url| {
+        url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+    })
+}
+
 fn is_shell_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     SHELL_HOSTS.contains(&host.as_str()) || host.ends_with(".localhost")
@@ -489,11 +501,26 @@ mod tests {
             title: "App".into(),
             icon_png: None,
             profile: profile.into(),
+            web_home: false,
             accounts_origins: Vec::new(),
             scope: None,
             resume: false,
             client: None,
         }
+    }
+
+    #[test]
+    fn web_home_requires_a_site_root_and_keeps_the_legacy_default() {
+        let mut home = request("https://sumi.example/", "shared");
+        home.web_home = true;
+        assert!(home.validate().is_ok());
+        for url in ["https://sumi.example/?token=secret", "https://sumi.example/#token", "https://sumi.example/sign-in", "https://ipc.localhost/"] {
+            home.url = url.into();
+            assert!(home.validate().is_err(), "{url}");
+        }
+        let legacy: OpenRequest = serde_json::from_str(r#"{"key":"old","url":"https://app.example/","title":"Old","profile":"shared"}"#).unwrap();
+        assert!(!legacy.web_home);
+        assert!(legacy.validate().is_ok());
     }
 
     fn verified_client() -> BannerClient {

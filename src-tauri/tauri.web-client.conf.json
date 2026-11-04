@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Takosumi",
+        "url": "index.html?web-client=1",
+        "width": 390,
+        "height": 844,
+        "resizable": true
+      }
+    ]
+  }
+}

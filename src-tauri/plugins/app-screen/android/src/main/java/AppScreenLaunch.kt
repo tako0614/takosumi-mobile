@@ -86,6 +86,7 @@ internal data class ScreenRequest(
     val url: String,
     val title: String,
     val popup: Boolean = false,
+    val webHome: Boolean = false,
     /**
      * The Takosumi origins (the instance's Accounts and the instance itself):
      * the screen shows only their sign-in pages.
@@ -100,8 +101,8 @@ internal data class ScreenRequest(
     val appOrigin: String? get() = AppScreenRules.originOf(url)
 
     /** What this screen shows; everything else goes to the browser view. */
-    val origins: ScreenOrigins
-        get() = ScreenOrigins(appOrigin, accountsOrigins)
+    val origins: ScreenOrigins?
+        get() = if (webHome) null else ScreenOrigins(appOrigin, accountsOrigins)
 
     /**
      * What is kept beyond this launch (task restore, shortcuts): the declared
@@ -115,6 +116,7 @@ internal data class ScreenRequest(
         JSONObject()
             .put("url", kept.url)
             .put("title", kept.title)
+            .put("webHome", kept.webHome)
             .apply {
                 if (kept.accountsOrigins.isNotEmpty()) put("accountsOrigins", JSONArray(kept.accountsOrigins.toList()))
                 kept.scope?.let { put("scope", it) }
@@ -123,6 +125,10 @@ internal data class ScreenRequest(
     }
 
     companion object {
+        fun isWebHomeUrl(raw: String): Boolean =
+            AppScreenPolicy.isLaunchable(raw) &&
+                raw == "${AppScreenRules.originOf(raw)}/"
+
         const val SCOPE_MAX_LENGTH = 512
 
         const val ACCOUNTS_ORIGINS_MAX = 32
@@ -141,6 +147,7 @@ internal data class ScreenRequest(
         fun fromJson(key: String, json: JSONObject): ScreenRequest = ScreenRequest(
             key = key,
             url = json.optString("url"),
+            webHome = json.optBoolean("webHome", false) && isWebHomeUrl(json.optString("url")),
             title = json.optString("title"),
             accountsOrigins = checkedAccountsOrigins(
                 json.optJSONArray("accountsOrigins")?.let { array -> List(array.length()) { array.optString(it) } },
@@ -156,6 +163,7 @@ internal object AppScreenLaunch {
     const val EXTRA_KEY = "com.takosumi.appscreen.KEY"
     const val EXTRA_URL = "com.takosumi.appscreen.URL"
     const val EXTRA_TITLE = "com.takosumi.appscreen.TITLE"
+    const val EXTRA_WEB_HOME = "com.takosumi.appscreen.WEB_HOME"
     const val EXTRA_POPUP = "com.takosumi.appscreen.POPUP"
     const val EXTRA_ACCOUNTS_ORIGINS = "com.takosumi.appscreen.ACCOUNTS_ORIGINS"
     const val EXTRA_SCOPE = "com.takosumi.appscreen.SCOPE"
@@ -180,6 +188,7 @@ internal object AppScreenLaunch {
             putExtra(EXTRA_URL, request.url)
             putExtra(EXTRA_TITLE, request.title)
             putExtra(EXTRA_RESUME, request.resume)
+            putExtra(EXTRA_WEB_HOME, request.webHome)
             if (request.accountsOrigins.isNotEmpty()) {
                 putExtra(EXTRA_ACCOUNTS_ORIGINS, request.accountsOrigins.toTypedArray())
             }
@@ -242,6 +251,7 @@ internal object AppScreenLaunch {
             scope = ScreenRequest.checkedScope(intent.getStringExtra(EXTRA_SCOPE)),
             // A bare `takosumi://app?url=` names a page; it never resumes elsewhere.
             resume = intent.getBooleanExtra(EXTRA_RESUME, false),
+            webHome = intent.getBooleanExtra(EXTRA_WEB_HOME, false) && ScreenRequest.isWebHomeUrl(url),
             client = BannerClient.fromJson(intent.getStringExtra(EXTRA_CLIENT)),
         )
     }

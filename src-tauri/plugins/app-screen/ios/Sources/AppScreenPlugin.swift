@@ -23,6 +23,7 @@ private class OpenScreenArgs: Decodable {
     let title: String
     let iconPng: String?
     let profile: String
+    let webHome: Bool?
     let accountsOrigins: [String]?
     let scope: String?
     let resume: Bool?
@@ -160,6 +161,9 @@ final class AppScreenPlugin: Plugin {
         guard AppScreenPolicy.isLaunchable(args.url), let url = URL(string: args.url) else {
             throw requestError("Only https URLs can be opened in an app screen.")
         }
+        if args.webHome == true && (!AppScreenPolicy.isWebHomeURL(args.url) || args.client != nil) {
+            throw requestError("A Web home must be an https site root without a native client.")
+        }
         let accountsOrigins = args.accountsOrigins ?? []
         guard accountsOrigins.count <= 32, accountsOrigins.allSatisfy({ AppScreenPolicy.isHttpsOrigin($0) }) else {
             throw requestError("The Takosumi origins must be at most 32 https origins.")
@@ -191,6 +195,7 @@ final class AppScreenPlugin: Plugin {
             accountsOrigins: accountsOrigins,
             scope: args.scope,
             resume: args.resume ?? false,
+            webHome: args.webHome ?? false,
             client: client)
     }
 

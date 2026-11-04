@@ -31,6 +31,7 @@ class OpenScreenArgs {
     var title: String = ""
     var iconPng: String? = null
     var profile: String = ""
+    var webHome: Boolean = false
     var accountsOrigins: Array<String>? = null
     var scope: String? = null
     var resume: Boolean = false
@@ -173,6 +174,10 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Only https URLs can be opened in an app screen.")
             return null
         }
+        if (args.webHome && (!ScreenRequest.isWebHomeUrl(args.url) || args.client != null)) {
+            invoke.reject("A Web home must be an https site root without a native client.")
+            return null
+        }
         val accountsOrigins = ScreenRequest.checkedAccountsOrigins(args.accountsOrigins?.toList()) ?: run {
             invoke.reject("The Takosumi origins must be at most 32 https origins.")
             return null
@@ -205,6 +210,7 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
             accountsOrigins = accountsOrigins,
             scope = scope,
             resume = args.resume,
+            webHome = args.webHome,
             client = client,
         )
     }

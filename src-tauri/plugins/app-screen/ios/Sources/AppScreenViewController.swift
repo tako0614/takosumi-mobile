@@ -45,13 +45,14 @@ struct AppScreenRequest {
     var scope: String?
     /// Reopen at the last remembered page instead of `url`.
     var resume = false
+    var webHome = false
     var client: AppScreenBannerClient?
 
     var appOrigin: String? { AppScreenPolicy.origin(of: url.absoluteString) }
 
     /// What this screen shows; everything else goes to the browser view.
-    var origins: AppScreenOrigins {
-        AppScreenOrigins(appOrigin: appOrigin, accountsOrigins: Set(accountsOrigins))
+    var origins: AppScreenOrigins? {
+        webHome ? nil : AppScreenOrigins(appOrigin: appOrigin, accountsOrigins: Set(accountsOrigins))
     }
 }
 
@@ -62,6 +63,7 @@ final class AppScreenSession {
     let navigator: AppScreenNavigator
     /// URL the screen was opened with; reopening with it keeps the page state.
     var launchURL: URL?
+    var webHome = false
     var title: String = ""
     var scope: String?
     var client: AppScreenBannerClient?
@@ -560,6 +562,7 @@ final class AppScreenCoordinator {
             (request.resume || existing?.launchURL == request.url)
         let session = existing ?? makeSession(key: request.key, popup: false, configuration: nil)
         if !keep { session.launchURL = request.url }
+        session.webHome = request.webHome
         session.title = request.title
         session.scope = request.scope
         session.client = request.client
@@ -856,7 +859,7 @@ final class AppScreenViewController: UIViewController {
                     self?.openClient(client)
                 })
         }
-        if !session.popup {
+        if !session.popup && !session.webHome {
             actions.append(
                 UIAction(title: "開き方を変える", image: UIImage(systemName: "arrow.triangle.branch")) { [weak self] _ in
                     self?.askShell(AppScreenActions.change)
@@ -865,6 +868,15 @@ final class AppScreenViewController: UIViewController {
                 UIAction(title: "アプリを切り替える", image: UIImage(systemName: "square.grid.2x2")) { [weak self] _ in
                     self?.switchApps()
                 })
+        }
+        if !session.popup && session.webHome {
+            actions.insert(UIAction(title: "アプリホームへ", image: UIImage(systemName: "square.grid.2x2")) { [weak self] _ in
+                guard let self = self, let url = self.session.launchURL else { return }
+                self.session.webView.load(URLRequest(url: url))
+            }, at: 0)
+            actions.append(UIAction(title: "接続先を切り替える", image: UIImage(systemName: "arrow.triangle.swap")) { [weak self] _ in
+                self?.switchApps()
+            })
         }
         actions.append(
             UIAction(title: "閉じる", image: UIImage(systemName: "xmark"), attributes: .destructive) { [weak self] _ in
