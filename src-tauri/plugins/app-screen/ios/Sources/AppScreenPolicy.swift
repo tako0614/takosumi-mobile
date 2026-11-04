@@ -232,6 +232,11 @@ enum AppScreenPolicy {
     }
 
     /// True when a screen with `origins` shows `rawUrl` itself.
+    static func isWebHomeURL(_ raw: String) -> Bool {
+        guard isLaunchable(raw), let origin = origin(of: raw) else { return false }
+        return raw == origin + "/"
+    }
+
     static func isInScreen(_ rawUrl: String, origins: AppScreenOrigins?) -> Bool {
         isLaunchable(rawUrl) && decide(rawUrl, mainFrame: true, origins: origins) == .inApp
     }

@@ -6,7 +6,50 @@ self-hosted deployment — through `/.well-known/takosumi` discovery and
 public-client OIDC PKCE, and keeps several instances and accounts signed in at
 once.
 
-## What you can do
+## Web client migration (source/local candidate)
+
+The Web client retains connection selection while opening Takosumi's own Web
+sign-in, app home and management screens. Apps linked by the Web home navigate
+in the same plain native WebView. Its native menu offers **アプリホームへ** and
+**接続先を切り替える**; the current site's host stays visible. Pages receive no
+Tauri IPC, native credential or management-API adapter.
+
+This is an opt-in candidate, not a replacement for the default native client
+yet. Browser preview: `bun run dev`, then open
+`http://localhost:1450/?web-client=1`. The preview navigates in the ordinary
+browser; it does not prove native engine behavior.
+
+For an Android/iOS test build, pass the non-default config overlay:
+
+```bash
+bunx tauri android dev --config src-tauri/tauri.web-client.conf.json
+bunx tauri android build --debug --config src-tauri/tauri.web-client.conf.json
+# On a macOS host with the iOS SDK:
+bunx tauri ios dev --config src-tauri/tauri.web-client.conf.json
+```
+
+The overlay makes a cold shell launch return to the Web connection picker.
+An explicit `?web-client=1` choice is also remembered in a separate shell
+preference. `?web-client=0` returns to the old client in a default build. Native
+sessions and credentials are neither imported nor deleted by this choice.
+Only connection names and https site roots are stored by the Web shell;
+callback URLs, credentials, paths, queries and fragments are refused as
+connection inputs. Removing a connection removes that preference, not site data
+or the site's session. Sign-out remains a Web operation.
+
+Current limits: app screens use the existing single shared browsing profile,
+with normal Web origin/domain cookie and storage rules. Two isolated profiles,
+site-data deletion, per-app cold restoration, desktop embedded rendering,
+notification/deep-link routing and distribution/update are unfinished. Web
+authentication (including third-party IdPs), popups and file operations still
+need Android/iOS device qualification; some IdPs refuse embedded browsers. No
+external browser cookies or tokens are copied to bypass that restriction. A
+desktop Tauri build reports embedded rendering unavailable without loading
+legacy credentials. This candidate does not claim the full App goal complete.
+
+## Default native client
+
+### What you can do
 
 The home lists your installed apps as icons, and each opens like an app:
 

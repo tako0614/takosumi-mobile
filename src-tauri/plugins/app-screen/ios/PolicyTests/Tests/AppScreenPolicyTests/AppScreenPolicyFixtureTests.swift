@@ -6,6 +6,16 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testWebHomeKeepsWebNavigationButNotShellAccess() {
+        XCTAssertTrue(AppScreenPolicy.isWebHomeURL("https://sumi.example/"))
+        XCTAssertTrue(AppScreenPolicy.isInScreen("https://sumi.example/apps", origins: nil))
+        XCTAssertTrue(AppScreenPolicy.isInScreen("https://app.example/inbox", origins: nil))
+        XCTAssertFalse(AppScreenPolicy.isInScreen("https://ipc.localhost/", origins: nil))
+        for url in ["https://sumi.example/?token=secret", "https://sumi.example/#secret", "https://sumi.example/apps", "https://ipc.localhost/"] {
+            XCTAssertFalse(AppScreenPolicy.isWebHomeURL(url), url)
+        }
+    }
+
     private func fixture(_ name: String) throws -> [String: Any] {
         // Tests/AppScreenPolicyTests/<file> → the plugin root.
         var directory = URL(fileURLWithPath: #filePath)

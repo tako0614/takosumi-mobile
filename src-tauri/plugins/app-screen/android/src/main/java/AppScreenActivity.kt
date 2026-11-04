@@ -348,21 +348,23 @@ class AppScreenActivity : AppCompatActivity() {
 
     private fun showMenu(anchor: View) {
         val menu = PopupMenu(this, anchor)
-        menu.menu.add(0, MENU_SHARE, 0, "共有")
+        if (!request.popup && request.webHome) menu.menu.add(0, MENU_HOME, 0, "アプリホームへ")
+        menu.menu.add(0, MENU_SHARE, 1, "共有")
         menu.menu.add(0, MENU_BROWSER_VIEW, 1, "ブラウザの画面で開く")
         menu.menu.add(0, MENU_BROWSER, 2, "ブラウザで開く")
         val client = request.client.takeUnless { request.popup }
         if (client != null) {
             menu.menu.add(0, MENU_CLIENT, 3, if (client.verified) "${client.name}で開く" else "${client.name}で開く…")
         }
-        if (!request.popup) menu.menu.add(0, MENU_CHOOSE, 4, "開き方を変える")
+        if (!request.popup && !request.webHome) menu.menu.add(0, MENU_CHOOSE, 4, "開き方を変える")
         if (!request.popup && AppScreenShortcuts.isPinSupported(this)) {
             menu.menu.add(0, MENU_PIN, 5, "ホーム画面に追加")
         }
-        menu.menu.add(0, MENU_SWITCH, 6, "アプリを切り替える")
+        menu.menu.add(0, MENU_SWITCH, 6, if (request.webHome) "接続先を切り替える" else "アプリを切り替える")
         menu.menu.add(0, MENU_CLOSE, 7, "閉じる")
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
+                MENU_HOME -> entry?.webView?.loadUrl(request.url)
                 MENU_SHARE -> share()
                 MENU_BROWSER_VIEW -> openBrowserView(AppScreenRules.shareable(currentUrl() ?: appRequest().url))
                 MENU_BROWSER -> currentUrl()?.let { openInBrowser(AppScreenRules.shareable(it)) }
@@ -889,6 +891,7 @@ class AppScreenActivity : AppCompatActivity() {
         const val MENU_BROWSER_VIEW = 6
         const val MENU_CLIENT = 7
         const val MENU_CHOOSE = 8
+        const val MENU_HOME = 9
         val BAR_COLOR = Color.parseColor("#151517")
         val FOREGROUND = Color.parseColor("#F5F5F6")
     }

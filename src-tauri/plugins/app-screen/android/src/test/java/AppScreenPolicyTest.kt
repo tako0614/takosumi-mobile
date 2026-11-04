@@ -32,6 +32,23 @@ class AppScreenPolicyTest {
     }
 
     @Test
+    fun webHomeKeepsWebNavigationAndSurvivesTaskRestoration() {
+        val home = ScreenRequest("web-home:https://sumi.example", "https://sumi.example/", "Sumi", webHome = true)
+        assertEquals(null, home.origins)
+        assertTrue(AppScreenPolicy.isInScreen("https://sumi.example/apps", home.origins))
+        assertTrue(AppScreenPolicy.isInScreen("https://app.example/inbox", home.origins))
+        assertEquals(false, AppScreenPolicy.isInScreen("https://ipc.localhost/", home.origins))
+        val restored = ScreenRequest.fromJson(home.key, home.toJson())
+        assertTrue(restored.webHome)
+        assertEquals(null, restored.origins)
+        val legacy = ScreenRequest("old", "https://app.example/", "App", accountsOrigins = setOf("https://sumi.example"))
+        assertEquals(false, AppScreenPolicy.isInScreen("https://sumi.example/apps", legacy.origins))
+        for (url in listOf("https://sumi.example/?token=secret", "https://sumi.example/#secret", "https://sumi.example/apps", "https://ipc.localhost/")) {
+            assertEquals(url, false, ScreenRequest.isWebHomeUrl(url))
+        }
+    }
+
+    @Test
     fun everySharedCaseMatchesTheAndroidPolicy() {
         val cases = fixture().getJSONArray("cases")
         assertTrue(cases.length() > 80)
