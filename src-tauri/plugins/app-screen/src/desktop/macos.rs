@@ -15,7 +15,7 @@ use wry::{WebView, WebViewExtMacOS};
 
 use super::{Error, Result, Window};
 
-struct DelegateState {
+pub(super) struct DelegateState {
     original: Retained<ProtocolObject<dyn WKUIDelegate>>,
     window: Window,
 }
