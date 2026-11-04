@@ -24,6 +24,9 @@ CI runs this after the macOS desktop compile, serialized with the other desktop
 SDK checks. The desktop matrix waits for the native job to finish but still
 runs if that independent job fails; a native failure keeps the workflow red.
 Quality failure or workflow cancellation prevents the matrix from running.
+The SDK lane uses the standard `macos-26-intel` runner after hosted arm64
+capacity prevented job acquisition. It compiles the host's x86_64 Simulator
+target; Apple Silicon/iOS device runtime remains separate qualification.
 This is an SDK compile check: it does not install or launch the App,
 test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
 Simulator/device runtime checks remain separate from the portable Swift policy tests.
