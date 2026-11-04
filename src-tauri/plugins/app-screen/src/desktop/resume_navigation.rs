@@ -78,6 +78,27 @@ impl State {
             }
         }
     }
+    #[cfg(any(target_os = "linux", test))]
+    fn snapshot(&self, uri: Option<&str>) {
+        // A failed provisional load may settle its active URI back to an old
+        // root. Only a qualified history event can update the surviving page;
+        // a close-time property sample must retain the last successful route.
+        if !self.failed.get() {
+            self.observe(uri);
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn observe_history(&self, uri: Option<&str>) {
+        if !self.alive.get() || self.pending.get() || !self.success.get() {
+            return;
+        }
+        // A stable same-document history change can legitimately revisit a
+        // URL that a preceding provisional load could not reach. It does not
+        // make that failed load (or a raw property notification) successful.
+        if let Some(uri) = uri.filter(|uri| rememberable(uri)) {
+            (self.save)(uri);
+        }
+    }
 }
 
 pub(super) struct Observer {
@@ -113,17 +134,50 @@ mod platform {
         translate::ToGlibPtr,
         SignalHandlerId,
     };
-    use webkit2gtk::{WebView as NativeView, WebViewExt};
+    use webkit2gtk::{
+        BackForwardList, BackForwardListExt, BackForwardListItemExt, WebView as NativeView,
+        WebViewExt,
+    };
     use wry::WebViewExtUnix;
 
     pub(super) struct Observer {
         view: NativeView,
         state: Rc<State>,
         signals: Vec<SignalHandlerId>,
+        history: BackForwardList,
+        history_signal: Option<SignalHandlerId>,
+    }
+
+    fn document_uri(view: &NativeView) -> Option<glib::GString> {
+        match view
+            .back_forward_list()
+            .and_then(|list| list.current_item())
+        {
+            Some(item) => item.uri().filter(|uri| view.uri().as_ref() == Some(uri)),
+            // Do not fall back when an existing item has no/unsafe URI.
+            None => view.uri(),
+        }
+    }
+    fn observe_history(view: &NativeView, state: &State) {
+        if !state.alive.get() || view.is_loading() {
+            return;
+        }
+        let uri = view
+            .back_forward_list()
+            .and_then(|list| list.current_item())
+            .and_then(|item| item.uri());
+        if let Some(uri) = uri.filter(|uri| view.uri().as_ref() == Some(uri)) {
+            state.observe_history(Some(uri.as_str()));
+        }
     }
     impl Observer {
         pub(super) fn new(view: &WebView, state: Rc<State>, _label: String) -> Result<Self> {
             let view = view.webview();
+            let history = view
+                .back_forward_list()
+                .ok_or(crate::Error::InvalidRequest(
+                    "Native Web history is unavailable.",
+                ))?;
             let load = state.clone();
             let changed = view.connect_load_changed(move |view, event| match event {
                 webkit2gtk::LoadEvent::Started => load.begin(load.current.get().wrapping_add(1)),
@@ -131,7 +185,7 @@ mod platform {
                 webkit2gtk::LoadEvent::Finished => load.finish(
                     load.current.get(),
                     !load.failed.get(),
-                    view.uri().as_deref(),
+                    document_uri(view).as_deref(),
                 ),
                 _ => (),
             });
@@ -140,29 +194,35 @@ mod platform {
                 failure.finish(failure.current.get(), false, Some(uri));
                 false // Preserve WebKit/Wry's normal error handling.
             });
+            let uri = {
+                let state = state.clone();
+                view.connect_uri_notify(move |view| observe_history(view, &state))
+            };
             let source = state.clone();
-            let uri = view.connect_uri_notify(move |view| {
-                let view = view.downgrade();
-                let source = source.clone();
-                // URI changes can precede Started. Observe after the native
-                // turn, when a provisional load is marked pending/loading.
-                glib::idle_add_local_once(move || {
-                    if source.alive.get() {
-                        if let Some(view) = view.upgrade().filter(|view| !view.is_loading()) {
-                            source.observe(view.uri().as_deref());
-                        }
-                    }
-                });
+            let weak_view = view.downgrade();
+            // pushState can notify history before URI; replaceState can notify
+            // only URI. Both capture agreement synchronously, without an idle
+            // that a following provisional navigation could overtake.
+            let history_signal = history.connect_local("changed", false, move |_| {
+                if !source.alive.get() {
+                    return None;
+                }
+                if let Some(view) = weak_view.upgrade() {
+                    observe_history(&view, &source);
+                }
+                None
             });
             Ok(Self {
                 view,
                 state,
                 signals: vec![changed, failed, uri],
+                history,
+                history_signal: Some(history_signal),
             })
         }
         pub(super) fn snapshot(&self) {
             if !self.view.is_loading() {
-                self.state.observe(self.view.uri().as_deref());
+                self.state.snapshot(document_uri(&self.view).as_deref());
             }
         }
     }
@@ -180,6 +240,18 @@ mod platform {
                 };
                 if connected {
                     self.view.disconnect(signal);
+                }
+            }
+            if let Some(signal) = self.history_signal.take() {
+                // The list is a separate GObject with its own signal IDs.
+                let connected = unsafe {
+                    glib::gobject_ffi::g_signal_handler_is_connected(
+                        self.history.as_object_ref().to_glib_none().0,
+                        signal.as_raw(),
+                    ) != 0
+                };
+                if connected {
+                    self.history.disconnect(signal);
                 }
             }
         }
@@ -389,6 +461,32 @@ mod tests {
         );
     }
     #[test]
+    fn failed_load_snapshot_cannot_undo_a_successful_spa_but_new_history_can_update() {
+        let (state, saved) = recording();
+        state.begin(1);
+        state.commit(1, false);
+        state.finish(1, true, Some("https://app.example/"));
+        state.observe(Some("https://app.example/document/1?view=edit"));
+        state.begin(2);
+        state.finish(2, false, Some("https://app.example/document/2"));
+        state.snapshot(Some("https://app.example/"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/1?view=edit"
+        );
+        // A qualified same-document history event is still accepted after a
+        // provisional failure, including a deliberate return to the root.
+        state.observe_history(Some("https://app.example/"));
+        assert_eq!(saved.borrow().last().unwrap(), "https://app.example/");
+        state.observe(Some("https://app.example/document/2"));
+        assert_eq!(saved.borrow().last().unwrap(), "https://app.example/");
+        state.observe_history(Some("https://app.example/document/2"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/2"
+        );
+    }
+    #[test]
     fn stale_completion_and_cancelled_targets_do_not_replace_the_working_page() {
         let (state, saved) = recording();
         state.begin(1);
@@ -421,6 +519,10 @@ mod tests {
             Some("https://accounts.example/callback?code=fixture-secret"),
         );
         state.observe(Some("https://app.example/#access_token=fixture-secret"));
+        state.observe_history(Some(
+            "https://accounts.example/callback?code=fixture-secret",
+        ));
+        state.observe_history(Some("https://app.example/#access_token=fixture-secret"));
         assert_eq!(*saved.borrow(), ["https://app.example/document/1"]);
     }
     #[test]
