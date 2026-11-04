@@ -10,7 +10,7 @@ publish = false
 links = "tauri-plugin-app-screen"
 
 [features]
-desktop = ["tauri/wry", "tauri/unstable", "dep:wry", "dep:gtk", "dep:objc2", "dep:webkit2gtk", "dep:objc2-web-kit", "dep:objc2-foundation", "dep:block2", "dep:webview2-com", "dep:serde_json"]
+desktop = ["tauri/wry", "tauri/unstable", "dep:wry", "dep:gtk", "dep:objc2", "dep:webkit2gtk", "dep:objc2-web-kit", "dep:objc2-foundation", "dep:block2", "dep:webview2-com", "dep:windows-core", "dep:serde_json"]
 desktop-fixture = ["desktop", "tauri/test", "dep:webkit2gtk", "dep:serde_json", "dep:javascriptcore-rs"]
 
 [dependencies]
@@ -29,12 +29,13 @@ javascriptcore-rs = { version = "1.1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKUIDelegate", "WKNavigationDelegate", "WKNavigation", "WKWebView", "block2", "WKSecurityOrigin", "WKFrameInfo"], optional = true }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKUIDelegate", "WKNavigationDelegate", "WKNavigation", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "block2", "WKSecurityOrigin", "WKFrameInfo"], optional = true }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSDictionary", "NSURL", "NSError", "NSURLError", "NSKeyValueObserving", "NSOperation", "block2"], optional = true }
 block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = { version = "0.38", optional = true }
+windows-core = { version = "0.61", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

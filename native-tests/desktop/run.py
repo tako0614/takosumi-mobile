@@ -51,9 +51,12 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--spa-resume", action="store_true")
+    parser.add_argument("--profile-reset", action="store_true")
     parser.add_argument("--failed-navigation", action="store_true")
     parser.add_argument("--cancelled-navigation", action="store_true")
     args = parser.parse_args()
+    if args.profile_reset and (args.spa_resume or args.failed_navigation or args.cancelled_navigation):
+        parser.error("profile reset requires its fresh single-process fixture")
     if (args.failed_navigation or args.cancelled_navigation) and not args.spa_resume:
         parser.error("navigation failure controls require --spa-resume")
     if args.failed_navigation and args.cancelled_navigation:
@@ -86,6 +89,10 @@ def main():
             directory.mkdir(mode=0o700)
             env[variable] = str(directory)
         try:
+            if args.profile_reset:
+                run_desktop_session(["xvfb-run", "-a", "dbus-run-session", "--", str(binary),
+                                     "--profile-reset"], env, timeout=50)
+                return
             if args.spa_resume:
                 data.mkdir(mode=0o700)
                 for method, extra in (("push", []), ("replace", ["--spa-replace"])):

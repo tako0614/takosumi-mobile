@@ -133,6 +133,16 @@ mod store {
     }
 
     impl ResumeStore {
+        /// Only the known convenience preference in this isolated profile.
+        /// Native engine data must have completed clearing before this runs.
+        pub(crate) fn clear_profile(directory: &std::path::Path) -> io::Result<()> {
+            match std::fs::remove_file(directory.join("takosumi-last-pages.v1.json")) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+
         pub(crate) fn new(directory: PathBuf, key: String) -> Self {
             Self {
                 path: directory.join("takosumi-last-pages.v1.json"),
@@ -289,6 +299,36 @@ mod store {
             assert!(!std::fs::read_to_string(work.path)
                 .unwrap()
                 .contains("fixture-secret"));
+        }
+
+        #[test]
+        fn profile_reset_removes_only_its_resume_preference() {
+            let work = Directory::new();
+            let personal = Directory::new();
+            let store = ResumeStore::new(work.0.clone(), "connection".into());
+            let other = ResumeStore::new(personal.0.clone(), "connection".into());
+            store
+                .record("https://office.example/document/work")
+                .unwrap();
+            other
+                .record("https://office.example/document/personal")
+                .unwrap();
+            let engine = work.0.join("engine-data");
+            std::fs::write(&engine, "native engine owns this").unwrap();
+            ResumeStore::clear_profile(&work.0).unwrap();
+            assert_eq!(store.recall().unwrap(), None);
+            assert_eq!(
+                other.recall().unwrap().as_deref(),
+                Some("https://office.example/document/personal")
+            );
+            assert_eq!(
+                std::fs::read_to_string(engine).unwrap(),
+                "native engine owns this"
+            );
+            ResumeStore::clear_profile(&work.0).unwrap();
+            std::fs::create_dir(&store.path).unwrap();
+            assert!(ResumeStore::clear_profile(&work.0).is_err());
+            std::fs::remove_dir(&store.path).unwrap();
         }
 
         #[test]

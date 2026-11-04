@@ -2,12 +2,15 @@
 """Linux process controls; every subreaper lives in its own disposable worker."""
 
 import os
+import contextlib
+import io
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 import web_home
@@ -96,6 +99,36 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
 
 
 class ProcessLifecycleTests(unittest.TestCase):
+    def test_timeout_diagnostics_and_cleanup_stay_in_the_owned_session(self):
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        output = io.StringIO()
+        observed = []
+        starts = {}
+        describe = web_home.shutdown_description
+
+        def observe(pid):
+            observed.append(pid)
+            details = describe(pid)
+            starts[pid] = details["identity"][0]
+            return details
+
+        try:
+            with mock.patch.object(web_home, "shutdown_description", side_effect=observe), contextlib.redirect_stderr(output):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    web_home.run_desktop_session([sys.executable, "-c", "import time; time.sleep(30) # SYNTHETIC_PRIVATE_ARG"],
+                                                 dict(os.environ), timeout=0.3)
+            self.assertTrue(observed)
+            self.assertNotIn(other.pid, observed)
+            self.assertIsNone(other.poll(), "Timeout cleanup signalled another session")
+            for pid in observed:
+                identity = web_home.process_identity(pid)
+                self.assertTrue(identity is None or identity[0] != starts[pid], "The timed-out target survived cleanup")
+            self.assertIn("Owned desktop session timeout:", output.getvalue())
+            self.assertNotIn("SYNTHETIC_PRIVATE_ARG", output.getvalue())
+        finally:
+            other.terminate()
+            other.wait(timeout=5)
+
     def run_control(self, mode):
         with tempfile.TemporaryDirectory(prefix="sumi-process-test-") as temporary:
             result = subprocess.run([sys.executable, __file__, "--worker", temporary, mode],

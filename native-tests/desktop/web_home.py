@@ -11,6 +11,7 @@ import resource
 import signal
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -245,6 +246,13 @@ def run_desktop_session(command, env, timeout=170, *, stdout=None, stderr=None):
         result = process.wait(timeout=timeout)
         if result:
             raise subprocess.CalledProcessError(result, command)
+    except subprocess.TimeoutExpired:
+        # Observe only this newly owned session, before its bounded cleanup.
+        # No argv, URLs, credentials or cross-session process search. These
+        # waits distinguish a live engine/storage stall from a runner timeout.
+        for pid in sorted({process.pid} | descendants(process.pid))[:12]:
+            print(f"Owned desktop session timeout: {shutdown_description(pid)}", file=sys.stderr, flush=True)
+        raise
     finally:
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:

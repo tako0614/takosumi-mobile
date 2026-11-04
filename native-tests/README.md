@@ -190,7 +190,8 @@ shared Web home. Removing a connection remains a preference edit. A clear
 request is bound to a canonical isolated UUID and its exact connection key;
 the legacy shared profile is refused. Engines advertise the action through a
 separate capability and the shell requires an explicit completed receipt.
-Desktop implementation is still pending and advertises no clear capability.
+The desktop native-completion candidate is implemented but still advertises no
+clear capability or bundled-shell grant pending its runtime qualification.
 
 Android uses the selected profile's `WebStorage` and the
 `WebStorageCompat.deleteBrowsingData` completion callback, gated by both
@@ -232,3 +233,29 @@ capability. Swift/native SDK checks remain separate. CI requires the two reset
 cases by class and test name, with zero
 failures/errors/skips. Portable TypeScript checks do not qualify native data
 deletion or UI behavior.
+
+Desktop uses an invisible blank raw view with the same cached profile context
+as normal screens. Navigation/popups and messaging are disabled. GTK validates
+the data/cache directory before `WebsiteDataManager.clear`; macOS validates the
+UUID store before WebKit removal; Windows waits for `ClearBrowsingDataAll`'s
+HRESULT callback. All native objects stay on the UI thread. The helper and
+profile latch remain until native completion, background removal of the known
+resume preference, and native helper teardown. Other profile files are not
+selected. Opens (including popups) and duplicate clears are refused meanwhile.
+Session-end teardown invalidates operations, drains outside the mutable borrow,
+and blocks new work; native construction rechecks the operation after any OS
+event pumping. Late callbacks cannot remove a newer operation's preference.
+
+The Linux plugin passes 17 unit/policy tests plus 2 capability tests and the
+fixture compiles. `run.py --profile-reset` adds live/shared/pending refusal,
+pre-clear reads of both target sites, one native clear, then one set of data
+observations for target emptiness and Personal/shared preservation. CI includes
+this new case. Locally its initial run and a failure-diagnostic control timed
+out before clearing, after observations 0/1. The diagnostic control observed
+two WebKit NetworkProcess persistent threads in `jbd2_log_wait_commit`; that
+does not establish the sole cause or qualify data deletion. Its timeout and
+data assertions remain unchanged. The bounded timeout snapshot reads only the
+owned session's process names/identities/waits, with no argv or page payload;
+a subprocess control verifies another session is untouched and unobserved.
+macOS/Windows compilation, native clear/error/teardown runtime, full WebHome
+confirmation/IPC and restart durability remain unqualified for this candidate.

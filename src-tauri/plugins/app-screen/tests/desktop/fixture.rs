@@ -10,6 +10,7 @@ use webkit2gtk::{WebContextExt, WebViewExt};
 use wry::WebViewExtUnix;
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+static RESET_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const WORK: &str = "11111111-1111-4111-8111-111111111111";
 const PERSONAL: &str = "22222222-2222-4222-8222-222222222222";
@@ -24,6 +25,10 @@ pub fn run() {
     );
     let readback = std::env::args().any(|value| value == "--readback");
     let spa = std::env::args().any(|value| value == "--spa-resume");
+    assert!(
+        !std::env::args().any(|value| value == "--profile-reset") || (!spa && !readback),
+        "Profile reset uses a fresh, single-process fixture"
+    );
     assert!(
         !std::env::args().any(|value| value == "--missing-document") || readback,
         "Missing-document control requires readback mode"
@@ -333,7 +338,15 @@ fn label(profile: &str) -> String {
 }
 
 fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
-    let operations = if readback {
+    let reset = std::env::args().any(|value| value == "--profile-reset");
+    let mut operations = if RESET_DONE.load(Ordering::SeqCst) {
+        vec![
+            (WORK, "sumi", "", ""),
+            (PERSONAL, "sumi", "personal", ""),
+            (WORK, "other", "", ""),
+            ("shared", "sumi", "legacy", ""),
+        ]
+    } else if readback {
         vec![
             (WORK, "sumi", "work", ""),
             (PERSONAL, "sumi", "personal", ""),
@@ -350,7 +363,22 @@ fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
             (PERSONAL, "sumi", "personal", ""),
         ]
     };
+    if reset && !RESET_DONE.load(Ordering::SeqCst) {
+        // The write snapshot alone cannot establish that OTHER-site data
+        // existed before deletion. Read it once before starting the clear.
+        operations.push((WORK, "other", "other", ""));
+    }
     if index == operations.len() {
+        if reset {
+            if RESET_DONE.load(Ordering::SeqCst) {
+                println!("PASS: completed native profile reset removes both sites and preserves personal/shared profiles");
+                EXIT_STATUS.store(0, Ordering::SeqCst);
+                app.exit(0);
+            } else {
+                reset_profile_probe(app, directory);
+            }
+            return;
+        }
         match lifecycle(&app, &directory) {
             Ok(()) => {
                 println!("Cookie/storage observations passed: {index}, readback={readback}");
@@ -414,6 +442,174 @@ fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
         load_after_stale_document(&native_view, target_html, target_uri);
     } else {
         native_view.load_html(&target_html, Some(&target_uri));
+    }
+}
+
+fn reset_profile_probe(app: AppHandle, directory: PathBuf) {
+    let (send, _) = std::sync::mpsc::sync_channel(1);
+    let live = profile_reset::begin(
+        &app,
+        crate::ClearProfileRequest {
+            profile: WORK.into(),
+            key: request(WORK).key,
+        },
+        directory.clone(),
+        send,
+    );
+    if !matches!(live, Err(Error::InvalidRequest(message)) if message.contains("すべて閉じて"))
+    {
+        eprintln!("FAIL: profile clear did not reject a live native screen");
+        app.exit(1);
+        return;
+    }
+    let (send, _) = std::sync::mpsc::sync_channel(1);
+    if profile_reset::begin(
+        &app,
+        crate::ClearProfileRequest {
+            profile: "shared".into(),
+            key: request("shared").key,
+        },
+        directory.clone(),
+        send,
+    )
+    .is_ok()
+    {
+        eprintln!("FAIL: profile clear accepted the legacy shared store");
+        app.exit(1);
+        return;
+    }
+    let window = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().window.clone());
+    if let Err(error) = window.close() {
+        eprintln!("FAIL: profile fixture close: {error}");
+        app.exit(1);
+        return;
+    }
+    reset_after_close(
+        app,
+        directory,
+        std::time::Instant::now() + Duration::from_secs(5),
+    );
+}
+
+fn reset_after_close(app: AppHandle, directory: PathBuf, deadline: std::time::Instant) {
+    if SCREENS.with(|screens| {
+        screens
+            .borrow()
+            .values()
+            .any(|screen| screen.profile == WORK)
+    }) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("FAIL: profile screen did not close before reset");
+            app.exit(1);
+        } else {
+            gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
+                reset_after_close(app, directory, deadline)
+            });
+        }
+        return;
+    }
+    let pending = (|| -> Result<_> {
+        let home = request(WORK);
+        let preference = ResumeStore::new(directory.join(WORK), home.key.clone());
+        let prior = format!("{}document/work", home.url);
+        preference.record(&prior).map_err(failure)?;
+        if preference.recall().map_err(failure)?.as_deref() != Some(prior.as_str()) {
+            return Err(Error::InvalidRequest(
+                "The pre-clear page preference was not recorded.",
+            ));
+        }
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        profile_reset::begin(
+            &app,
+            crate::ClearProfileRequest {
+                profile: WORK.into(),
+                key: home.key,
+            },
+            directory.clone(),
+            send,
+        )?;
+        if !matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ) {
+            return Err(Error::InvalidRequest(
+                "Clear acknowledged before native completion.",
+            ));
+        }
+        if open_on_ui_thread(&app, request(WORK), directory.clone()).is_ok() {
+            return Err(Error::InvalidRequest("A clearing profile reopened."));
+        }
+        let (send, _) = std::sync::mpsc::sync_channel(1);
+        if profile_reset::begin(
+            &app,
+            crate::ClearProfileRequest {
+                profile: WORK.into(),
+                key: request(WORK).key,
+            },
+            directory.clone(),
+            send,
+        )
+        .is_ok()
+        {
+            return Err(Error::InvalidRequest(
+                "A duplicate profile clear was accepted.",
+            ));
+        }
+        Ok(receive)
+    })();
+    match pending {
+        Ok(receive) => reset_wait(
+            app,
+            directory,
+            receive,
+            std::time::Instant::now() + Duration::from_secs(10),
+        ),
+        Err(error) => {
+            eprintln!("FAIL: profile reset setup: {error}");
+            app.exit(1);
+        }
+    }
+}
+
+fn reset_wait(
+    app: AppHandle,
+    directory: PathBuf,
+    receive: std::sync::mpsc::Receiver<Result<crate::ClearProfileResponse>>,
+    deadline: std::time::Instant,
+) {
+    match receive.try_recv() {
+        Ok(Ok(receipt)) if receipt.cleared => {
+            let preference = ResumeStore::new(directory.join(WORK), request(WORK).key).recall();
+            if !matches!(preference, Ok(None)) {
+                eprintln!("FAIL: completed clear left a prior-page preference");
+                app.exit(1);
+                return;
+            }
+            if let Err(error) = open_on_ui_thread(&app, request(WORK), directory.clone()) {
+                eprintln!("FAIL: cleared profile could not reopen: {error}");
+                app.exit(1);
+                return;
+            }
+            RESET_DONE.store(true, Ordering::SeqCst);
+            let view =
+                SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
+            after_document_load(
+                &view,
+                request(WORK).url,
+                "bootstrap".into(),
+                app.clone(),
+                move || step(app, directory, false, 0),
+            );
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+            gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
+                reset_wait(app, directory, receive, deadline)
+            });
+        }
+        result => {
+            eprintln!("FAIL: native profile clear did not complete: {result:?}");
+            app.exit(1);
+        }
     }
 }
 
