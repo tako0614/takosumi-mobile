@@ -1,7 +1,8 @@
 # Takosumi Mobile
 
-The mobile-first Takosumi client for iOS and Android. Like a Mastodon client,
-it connects to any Takosumi instance — Takosumi Hosted or an operator or
+The mobile-first Takosumi client, with a shared Tauri Web-client candidate for
+Android, iOS, Windows, macOS and Linux. The default native client for iOS/Android
+connects to any Takosumi instance — Takosumi Hosted or an operator or
 self-hosted deployment — through `/.well-known/takosumi` discovery and
 public-client OIDC PKCE, and keeps several instances and accounts signed in at
 once.
@@ -20,13 +21,16 @@ yet. Browser preview: `bun run dev`, then open
 `http://localhost:1450/?web-client=1`. The preview navigates in the ordinary
 browser; it does not prove native engine behavior.
 
-For an Android/iOS test build, pass the non-default config overlay:
+For a native test build, pass the non-default config overlay:
 
 ```bash
 bunx tauri android dev --config src-tauri/tauri.web-client.conf.json
 bunx tauri android build --debug --config src-tauri/tauri.web-client.conf.json
 # On a macOS host with the iOS SDK:
 bunx tauri ios dev --config src-tauri/tauri.web-client.conf.json
+# Desktop (the same UI, connection records and native request):
+bunx tauri dev --config src-tauri/tauri.web-client.conf.json
+bunx tauri build --debug --no-bundle --config src-tauri/tauri.web-client.conf.json
 ```
 
 The overlay makes a cold shell launch return to the Web connection picker.
@@ -53,13 +57,31 @@ use the config overlay above. Android actual-WebView profile tests are described
 in [native-tests/README.md](native-tests/README.md); Swift policy tests compile
 in CI and are distinct from iOS WebView qualification.
 
-Current limits: site-data deletion, per-app cold restoration, desktop embedded rendering,
+Desktop uses Tauri 2 with a raw Wry content adapter: Chromium-based WebView2 on
+Windows, WebKit on macOS and Linux. macOS requires 14 or later for persistent
+profile stores. Linux uses GTK containers for both X11 and Wayland. Remote views
+are never registered as Tauri webviews. Their window menu provides Back, Reload,
+App home, Connection picker and Close; the current https origin is visible in
+the native title bar. Windows/Linux keep profile directories separate from the
+trusted shell; macOS uses dedicated UUID data stores. Popups inherit their
+opener's native environment/store. The shell and mobile/desktop adapters share
+`WebHome`, connection persistence, profile identity and validated `OpenRequest`.
+CEF across every desktop OS would require a separate Tauri 3 alpha migration;
+this candidate keeps the existing Tauri 2 mobile plugins.
+
+Wry's default content messaging is removed on GTK/WK before navigation.
+On Windows the WebMessage transport is disabled before navigation; Wry's inert
+`window.ipc` JS stub may remain, with no application/Tauri handler behind it.
+No remote page is granted a capability, custom protocol, OS opener or host object.
+
+Current limits: site-data deletion, per-app cold restoration,
 notification/deep-link routing and distribution/update are unfinished. Web
 authentication (including third-party IdPs), popups and file operations still
 need Android/iOS device qualification; some IdPs refuse embedded browsers. No
 external browser cookies or tokens are copied to bypass that restriction. A
-desktop Tauri build reports embedded rendering unavailable without loading
-legacy credentials. This candidate does not claim the full App goal complete.
+desktop native runtime still needs OS-by-OS qualification. The default legacy
+desktop entry stays closed; the Web overlay selects the shared UI without
+loading legacy credentials. This candidate does not claim the full App goal complete.
 
 ## Default native client
 

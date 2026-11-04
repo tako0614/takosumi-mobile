@@ -6,6 +6,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("{0}")]
     InvalidRequest(&'static str),
+    #[cfg(all(desktop, feature = "desktop"))]
+    #[error("{0}")]
+    Desktop(String),
     #[cfg(mobile)]
     #[error(transparent)]
     PluginInvoke(#[from] tauri::plugin::mobile::PluginInvokeError),

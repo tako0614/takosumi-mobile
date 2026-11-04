@@ -2,17 +2,37 @@
 name = "tauri-plugin-app-screen"
 version = "0.1.0-takosumi.1"
 authors = ["Takos"]
-description = "Takosumi-owned native app screens (WKWebView / Android WebView) for installed apps"
+description = "Takosumi-owned raw mobile and desktop Web views for installed apps"
 edition = "2021"
 rust-version = "1.89"
 license = "AGPL-3.0-only"
 publish = false
 links = "tauri-plugin-app-screen"
 
+[features]
+desktop = ["tauri/wry", "tauri/unstable", "dep:wry", "dep:gtk", "dep:objc2", "dep:webkit2gtk", "dep:objc2-web-kit", "dep:block2", "dep:webview2-com"]
+desktop-fixture = ["desktop", "tauri/test", "dep:webkit2gtk", "dep:serde_json"]
+
 [dependencies]
 serde = "1.0"
 tauri = { version = "2.11.5", default-features = false }
 thiserror = "2"
+serde_json = { version = "1", optional = true }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+wry = { version = "=0.55.1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+webkit2gtk = { version = "2.0", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKUIDelegate", "WKWebView", "block2", "WKSecurityOrigin", "WKFrameInfo"], optional = true }
+block2 = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = { version = "0.38", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
@@ -20,3 +40,7 @@ tauri-utils = "2"
 
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[[example]]
+name = "desktop-profile-probe"
+required-features = ["desktop-fixture"]

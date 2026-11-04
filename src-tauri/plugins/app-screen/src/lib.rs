@@ -1,4 +1,4 @@
-//! Native app screens for Takosumi Mobile: each installed app opens in its own
+//! Product-owned app screens: each installed app opens in its own
 //! WKWebView / Android WebView, separate from the Tauri shell's webview, with a
 //! thin native top bar that always shows the current host. The plugin also
 //! hands a screen to its declared native app (`open_client`) and opens pages
@@ -6,6 +6,9 @@
 //!
 //! App screens are not Tauri webviews: they get no capability, no IPC and no
 //! JavaScript bridge. Only the shell's `main` window may call these commands.
+//! The desktop feature reuses the Web-home model with raw Wry content windows.
+//! Wry messaging is removed on GTK/WK and its transport disabled on WebView2;
+//! Windows may retain an inert JS stub without an application handler.
 
 #[cfg(mobile)]
 use tauri::{
@@ -17,6 +20,13 @@ pub use models::*;
 
 mod error;
 mod models;
+
+#[cfg(all(desktop, feature = "desktop"))]
+mod desktop;
+#[cfg(all(desktop, feature = "desktop"))]
+pub use desktop::init;
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+pub use desktop::fixture::run as run_desktop_profile_fixture;
 
 #[cfg(mobile)]
 mod commands;

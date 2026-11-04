@@ -1,6 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/plugins/*/target/
+# Standalone native fixtures copy the app's canonical lockfile.
+src-tauri/plugins/*/Cargo.lock
 src-tauri/gen/
 src-tauri/.tauri/
 *.log

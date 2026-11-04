@@ -6,6 +6,8 @@
     "main"
   ],
   "permissions": [
+    "app-screen:allow-open",
+    "app-screen:allow-capabilities",
     "core:default",
     "core:event:default",
     "core:path:default",
