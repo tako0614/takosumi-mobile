@@ -90,6 +90,12 @@ class AppScreenActivity : AppCompatActivity() {
             return
         }
         request = parsed
+        val liveProfile = AppScreenRegistry.get(parsed.key)?.profile
+        if (!AppScreenProfiles.isSupported(parsed.profile) || (liveProfile != null && liveProfile != parsed.profile)) {
+            Toast.makeText(this, "この端末のWeb表示は、分離されたログイン領域に対応していません。", Toast.LENGTH_LONG).show()
+            finishAndRemoveTask()
+            return
+        }
         if (!parsed.popup && !AppScreenPolicy.isInScreen(parsed.url, parsed.origins)) {
             // A Takosumi page outside sign-in (a stale shortcut to the
             // dashboard) never runs in an app screen.
@@ -121,7 +127,7 @@ class AppScreenActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val parsed = AppScreenLaunch.parse(this, intent) ?: return
-        if (parsed.key != request.key || parsed.popup) return
+        if (parsed.key != request.key || parsed.popup || parsed.profile != request.profile) return
         setIntent(intent)
         val keep = keepsLivePage(parsed)
         request = parsed
@@ -218,7 +224,7 @@ class AppScreenActivity : AppCompatActivity() {
             return
         }
         val current = existing
-            ?: AppScreenRegistry.obtain(this, request.key, request.popup).also {
+            ?: AppScreenRegistry.obtain(this, request.key, request.popup, request.profile).also {
                 it.launchUrl = request.url
             }
         if (!request.popup) {
@@ -754,11 +760,9 @@ class AppScreenActivity : AppCompatActivity() {
         ): Boolean {
             if (!isUserGesture) return false
             val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+            val current = entry?.takeIf { it.webView === view } ?: return false
             val key = "popup:${UUID.randomUUID()}"
-            val popup = AppScreenRegistry.obtain(this@AppScreenActivity, key, popup = true)
-            popup.openerKey = request.key
-            // A popup keeps its opener's origins.
-            popup.origins = entry?.origins
+            val popup = AppScreenRegistry.obtainPopup(this@AppScreenActivity, key, current)
             popup.webView.webViewClient = PopupPrebindClient(popup)
             transport.webView = popup.webView
             resultMsg.sendToTarget()

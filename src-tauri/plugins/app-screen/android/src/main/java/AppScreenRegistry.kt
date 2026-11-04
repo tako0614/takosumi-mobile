@@ -7,6 +7,7 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebView
+import androidx.webkit.WebViewCompat
 
 /**
  * Process-wide app screen webviews. One app screen stays alive at a time
@@ -15,9 +16,10 @@ import android.webkit.WebView
  * back. Keeping several live webviews and switching between them waits for
  * device testing (TASK-0119 step 3).
  *
- * Every webview uses the process's single WebView profile (one cookie jar and
- * storage area), so a Takosumi sign-in made in one app screen carries over to
- * the others. Do not give screens their own data directory or profile.
+ * Legacy app screens use the existing shared WebView profile. Web homes
+ * explicitly select a persistent AndroidX profile before WebView settings or
+ * navigation. Popups inherit their opener's profile; unsupported isolation is
+ * an error, never a fallback to the process's default cookie jar.
  *
  * The webviews are plain `android.webkit.WebView`s, not Tauri webviews: no
  * JavaScript interface, no web message listener and no Tauri IPC, so a page
@@ -35,6 +37,7 @@ internal object AppScreenRegistry {
         val webView: WebView,
         val context: MutableContextWrapper,
         val popup: Boolean,
+        val profile: String,
     ) {
         /** URL the screen was opened with; reopening with it keeps the state. */
         var launchUrl: String = ""
@@ -67,10 +70,13 @@ internal object AppScreenRegistry {
 
     fun get(key: String): Entry? = entries[key]?.takeUnless { it.destroyed }
 
-    fun obtain(context: Context, key: String, popup: Boolean = false): Entry {
-        get(key)?.let { return it }
+    fun obtain(context: Context, key: String, popup: Boolean = false, profile: String = AppScreenProfiles.SHARED): Entry {
+        get(key)?.let {
+            check(it.profile == profile) { "A live screen cannot change its browsing profile." }
+            return it
+        }
         val wrapper = MutableContextWrapper(context.applicationContext)
-        val entry = Entry(key, createWebView(wrapper), wrapper, popup)
+        val entry = Entry(key, createWebView(wrapper, profile), wrapper, popup, profile)
         // A webview without a client hands navigations to other apps; keep the
         // policy from the first navigation (a popup loads before its activity).
         entry.webView.webViewClient = entry.detachedClient
@@ -82,6 +88,14 @@ internal object AppScreenRegistry {
     fun remove(key: String) {
         val entry = entries.remove(key) ?: return
         destroy(entry, crashed = false)
+    }
+
+    fun obtainPopup(context: Context, key: String, opener: Entry): Entry {
+        check(get(opener.key) === opener) { "The popup's opener is no longer live." }
+        return obtain(context, key, popup = true, profile = opener.profile).apply {
+            openerKey = opener.key
+            origins = opener.origins
+        }
     }
 
     /** A webview whose renderer died may only be destroyed, never used. */
@@ -149,8 +163,14 @@ internal object AppScreenRegistry {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(context: MutableContextWrapper): WebView {
+    private fun createWebView(context: MutableContextWrapper, profile: String): WebView {
         val webView = WebView(context)
+        try {
+            AppScreenProfiles.select(webView, profile)
+        } catch (error: Exception) {
+            webView.destroy()
+            throw error
+        }
         with(webView.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -167,7 +187,8 @@ internal object AppScreenRegistry {
             displayZoomControls = false
             safeBrowsingEnabled = true
         }
-        val cookies = CookieManager.getInstance()
+        val cookies = if (profile == AppScreenProfiles.SHARED) CookieManager.getInstance()
+            else WebViewCompat.getProfile(webView).cookieManager
         cookies.setAcceptCookie(true)
         cookies.setAcceptThirdPartyCookies(webView, false)
         return webView

@@ -6,6 +6,15 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testCanonicalProfileNames() throws {
+        let cases = try XCTUnwrap(fixture("profile-cases.json")["cases"] as? [[String: Any]])
+        for item in cases {
+            let profile = try XCTUnwrap(item["profile"] as? String)
+            let valid = try XCTUnwrap(item["valid"] as? Bool)
+            XCTAssertEqual(AppScreenPolicy.isWebProfile(profile), valid, profile)
+        }
+    }
+
     func testWebHomeKeepsWebNavigationButNotShellAccess() {
         XCTAssertTrue(AppScreenPolicy.isWebHomeURL("https://sumi.example/"))
         XCTAssertTrue(AppScreenPolicy.isInScreen("https://sumi.example/apps", origins: nil))

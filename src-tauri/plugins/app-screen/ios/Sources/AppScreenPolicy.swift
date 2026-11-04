@@ -232,6 +232,17 @@ enum AppScreenPolicy {
     }
 
     /// True when a screen with `origins` shows `rawUrl` itself.
+    static func isWebProfile(_ profile: String) -> Bool {
+        profile == "shared" || profile.range(
+            of: "\\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\z",
+            options: .regularExpression) != nil
+    }
+
+    static func webHomeKey(_ url: String, profile: String) -> String? {
+        guard isWebHomeURL(url), let origin = origin(of: url) else { return nil }
+        return profile == "shared" ? "web-home:\(origin)" : "web-home:\(profile):\(origin)"
+    }
+
     static func isWebHomeURL(_ raw: String) -> Bool {
         guard isLaunchable(raw), let origin = origin(of: raw) else { return false }
         return raw == origin + "/"

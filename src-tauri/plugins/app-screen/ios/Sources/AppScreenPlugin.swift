@@ -60,8 +60,12 @@ final class AppScreenPlugin: Plugin {
                 invoke.reject("The app screen could not be opened.")
                 return
             }
-            AppScreenCoordinator.shared.open(request, from: presenter)
-            invoke.resolve()
+            do {
+                try AppScreenCoordinator.shared.open(request, from: presenter)
+                invoke.resolve()
+            } catch {
+                invoke.reject(error.localizedDescription)
+            }
         }
     }
 
@@ -151,8 +155,13 @@ final class AppScreenPlugin: Plugin {
 
     private func screenRequest(_ invoke: Invoke) throws -> AppScreenRequest {
         let args = try invoke.parseArgs(OpenScreenArgs.self)
-        guard args.profile == sharedProfile else {
-            throw requestError("App screens share one browsing profile.")
+        guard AppScreenPolicy.isWebProfile(args.profile), args.webHome == true || args.profile == sharedProfile else {
+            throw requestError("Only Web homes may select an isolated browsing profile.")
+        }
+        if args.profile != sharedProfile {
+            guard #available(iOS 17.0, *) else {
+                throw requestError("分離されたログイン領域にはiOS 17以降が必要です。")
+            }
         }
         let key = args.key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty, args.key.count <= keyMaxLength else {
@@ -161,7 +170,8 @@ final class AppScreenPlugin: Plugin {
         guard AppScreenPolicy.isLaunchable(args.url), let url = URL(string: args.url) else {
             throw requestError("Only https URLs can be opened in an app screen.")
         }
-        if args.webHome == true && (!AppScreenPolicy.isWebHomeURL(args.url) || args.client != nil) {
+        if args.webHome == true && (!AppScreenPolicy.isWebHomeURL(args.url) || args.client != nil ||
+            args.key != AppScreenPolicy.webHomeKey(args.url, profile: args.profile)) {
             throw requestError("A Web home must be an https site root without a native client.")
         }
         let accountsOrigins = args.accountsOrigins ?? []
@@ -196,6 +206,7 @@ final class AppScreenPlugin: Plugin {
             scope: args.scope,
             resume: args.resume ?? false,
             webHome: args.webHome ?? false,
+            profile: args.profile,
             client: client)
     }
 

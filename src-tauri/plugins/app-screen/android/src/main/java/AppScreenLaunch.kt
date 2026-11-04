@@ -87,6 +87,7 @@ internal data class ScreenRequest(
     val title: String,
     val popup: Boolean = false,
     val webHome: Boolean = false,
+    val profile: String = AppScreenProfiles.SHARED,
     /**
      * The Takosumi origins (the instance's Accounts and the instance itself):
      * the screen shows only their sign-in pages.
@@ -99,6 +100,10 @@ internal data class ScreenRequest(
     val client: BannerClient? = null,
 ) {
     val appOrigin: String? get() = AppScreenRules.originOf(url)
+
+    fun hasConsistentProfile(): Boolean =
+        if (webHome) isWebHomeUrl(url) && key == webHomeKey(url, profile)
+        else profile == AppScreenProfiles.SHARED && !key.startsWith("web-home:")
 
     /** What this screen shows; everything else goes to the browser view. */
     val origins: ScreenOrigins?
@@ -117,6 +122,7 @@ internal data class ScreenRequest(
             .put("url", kept.url)
             .put("title", kept.title)
             .put("webHome", kept.webHome)
+            .put("profile", kept.profile)
             .apply {
                 if (kept.accountsOrigins.isNotEmpty()) put("accountsOrigins", JSONArray(kept.accountsOrigins.toList()))
                 kept.scope?.let { put("scope", it) }
@@ -125,6 +131,10 @@ internal data class ScreenRequest(
     }
 
     companion object {
+        fun webHomeKey(url: String, profile: String): String =
+            if (profile == AppScreenProfiles.SHARED) "web-home:${AppScreenRules.originOf(url)}"
+            else "web-home:$profile:${AppScreenRules.originOf(url)}"
+
         fun isWebHomeUrl(raw: String): Boolean =
             AppScreenPolicy.isLaunchable(raw) &&
                 raw == "${AppScreenRules.originOf(raw)}/"
@@ -143,11 +153,20 @@ internal data class ScreenRequest(
         fun checkedScope(raw: String?): String? =
             raw?.takeIf { it.isNotEmpty() && it.length <= SCOPE_MAX_LENGTH && it.none { c -> c.isISOControl() } }
 
+        fun checkedProfile(raw: String?, webHome: Boolean): String? {
+            val profile = raw ?: AppScreenProfiles.SHARED
+            return profile.takeIf { AppScreenProfiles.isValid(it) && (webHome || it == AppScreenProfiles.SHARED) }
+        }
+
         /** A request stored by [toJson] (task restore, shortcuts). */
         fun fromJson(key: String, json: JSONObject): ScreenRequest = ScreenRequest(
             key = key,
             url = json.optString("url"),
             webHome = json.optBoolean("webHome", false) && isWebHomeUrl(json.optString("url")),
+            profile = requireNotNull(checkedProfile(
+                if (json.has("profile")) json.getString("profile") else null,
+                json.optBoolean("webHome", false) && isWebHomeUrl(json.optString("url")),
+            )),
             title = json.optString("title"),
             accountsOrigins = checkedAccountsOrigins(
                 json.optJSONArray("accountsOrigins")?.let { array -> List(array.length()) { array.optString(it) } },
@@ -155,7 +174,7 @@ internal data class ScreenRequest(
             scope = checkedScope(json.optString("scope").ifEmpty { null }),
             resume = true,
             client = BannerClient.fromJson(json.optString("client").ifEmpty { null }),
-        )
+        ).also { require(it.hasConsistentProfile()) { "The restored profile does not match its screen identity." } }
     }
 }
 
@@ -163,6 +182,7 @@ internal object AppScreenLaunch {
     const val EXTRA_KEY = "com.takosumi.appscreen.KEY"
     const val EXTRA_URL = "com.takosumi.appscreen.URL"
     const val EXTRA_TITLE = "com.takosumi.appscreen.TITLE"
+    const val EXTRA_PROFILE = "com.takosumi.appscreen.PROFILE"
     const val EXTRA_WEB_HOME = "com.takosumi.appscreen.WEB_HOME"
     const val EXTRA_POPUP = "com.takosumi.appscreen.POPUP"
     const val EXTRA_ACCOUNTS_ORIGINS = "com.takosumi.appscreen.ACCOUNTS_ORIGINS"
@@ -189,6 +209,7 @@ internal object AppScreenLaunch {
             putExtra(EXTRA_TITLE, request.title)
             putExtra(EXTRA_RESUME, request.resume)
             putExtra(EXTRA_WEB_HOME, request.webHome)
+            putExtra(EXTRA_PROFILE, request.profile)
             if (request.accountsOrigins.isNotEmpty()) {
                 putExtra(EXTRA_ACCOUNTS_ORIGINS, request.accountsOrigins.toTypedArray())
             }
@@ -239,8 +260,11 @@ internal object AppScreenLaunch {
         if (key.isBlank() || key.length > KEY_MAX_LENGTH) return null
         val title = (intent.getStringExtra(EXTRA_TITLE) ?: stored?.title ?: AppScreenPolicy.displayHost(url))
             .take(TITLE_MAX_LENGTH)
-        if (popup) return ScreenRequest(key, url, title, popup = true)
-        if (stored != null) return stored.copy(key = key, title = title)
+        if (popup) return ScreenRequest(key, url, title, popup = true,
+            profile = AppScreenRegistry.get(key)?.profile ?: return null)
+        val webHome = intent.getBooleanExtra(EXTRA_WEB_HOME, false) && ScreenRequest.isWebHomeUrl(url)
+        val profile = ScreenRequest.checkedProfile(intent.getStringExtra(EXTRA_PROFILE), webHome) ?: return null
+        if (stored != null) return stored.copy(key = key, title = title).takeIf { it.hasConsistentProfile() }
         return ScreenRequest(
             key = key,
             url = url,
@@ -251,9 +275,10 @@ internal object AppScreenLaunch {
             scope = ScreenRequest.checkedScope(intent.getStringExtra(EXTRA_SCOPE)),
             // A bare `takosumi://app?url=` names a page; it never resumes elsewhere.
             resume = intent.getBooleanExtra(EXTRA_RESUME, false),
-            webHome = intent.getBooleanExtra(EXTRA_WEB_HOME, false) && ScreenRequest.isWebHomeUrl(url),
+            webHome = webHome,
+            profile = profile,
             client = BannerClient.fromJson(intent.getStringExtra(EXTRA_CLIENT)),
-        )
+        ).takeIf { it.hasConsistentProfile() }
     }
 
     /** Keep the screen's launch so its task can be restored without extras. */

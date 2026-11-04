@@ -1,6 +1,6 @@
 import { createSignal, For, Show } from "solid-js";
 import {
-  CONNECTIONS_KEY, decodeConnections, webConnection, type WebConnection,
+  CONNECTIONS_KEY, connectionKey, loadWebConnections, newWebConnection, type WebConnection,
 } from "./web-connections.ts";
 
 export function WebHome(props: {
@@ -14,7 +14,7 @@ export function WebHome(props: {
   const [opening, setOpening] = createSignal<string>();
   const [lastOpened, setLastOpened] = createSignal<string>();
   try {
-    setConnections(decodeConnections(props.storage?.getItem(CONNECTIONS_KEY) ?? null));
+    setConnections(loadWebConnections(props.storage));
   } catch {
     setError("接続先の保存内容を読み込めませんでした。");
   }
@@ -34,10 +34,10 @@ export function WebHome(props: {
   async function open(connection: WebConnection) {
     if (opening()) return;
     setError("");
-    setOpening(connection.origin);
+    setOpening(connectionKey(connection));
     try {
       await props.open(connection);
-      setLastOpened(connection.origin);
+      setLastOpened(connectionKey(connection));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "接続先を開けませんでした。");
     } finally {
@@ -49,8 +49,8 @@ export function WebHome(props: {
     event.preventDefault();
     setError("");
     try {
-      const connection = webConnection(url(), name());
-      const next = connections().filter((item) => item.origin !== connection.origin);
+      const connection = newWebConnection(connections(), url(), name());
+      const next = connections();
       if (next.length >= 32) throw new Error("接続先は32件まで保存できます。");
       if (save([...next, connection])) {
         setUrl("");
@@ -80,12 +80,12 @@ export function WebHome(props: {
                   onClick={() => void open(connection)}>
                   <strong>{connection.name}</strong>
                   <span>{connection.origin}</span>
-                  <small>{opening() === connection.origin ? "開いています…" :
-                    lastOpened() === connection.origin ? "前の画面へ戻る →" : "開く →"}</small>
+                  <small>{opening() === connectionKey(connection) ? "開いています…" :
+                    lastOpened() === connectionKey(connection) ? "前の画面へ戻る →" : "開く →"}</small>
                 </button>
                 <button class="web-remove" type="button" disabled={Boolean(opening())}
                   aria-label={`${connection.name}を接続先から外す`}
-                  onClick={() => { setError(""); save(connections().filter((item) => item.origin !== connection.origin)); }}>
+                  onClick={() => { setError(""); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
                   接続先から外す
                 </button>
               </li>
@@ -95,6 +95,7 @@ export function WebHome(props: {
         </Show>
         <form onSubmit={add}>
           <h3>{connections().length ? "接続先を追加" : "Takosumiにつなぐ"}</h3>
+          <p class="web-note">同じ接続先を、別のログインで追加することもできます。</p>
           <label for="connection-url">接続先URL</label>
           <input id="connection-url" type="url" required autocomplete="url"
             placeholder="https://app.takosumi.com" value={url()} disabled={Boolean(opening())}
