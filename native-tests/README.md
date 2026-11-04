@@ -3,6 +3,28 @@
 These tests exercise the product's plain WebViews. They do not sign in to any
 real service, use provider/DB/SSO credentials, or qualify distribution.
 
+## Whole App iOS Simulator SDK build
+
+On a disposable macOS checkout with Xcode, CocoaPods, Rust and Bun:
+
+```bash
+bun install --frozen-lockfile
+bash native-tests/ios/build-simulator.sh
+```
+
+The script refuses an existing generated Apple project, uses the shared kit's
+normal iOS generation/push wiring and builds the normal App with all iOS
+plugins for the host's Simulator architecture. A separate bundle identifier
+and `--no-sign` avoid installed App identity and Apple signing credentials.
+Signing environment inputs are refused before generation/build because the
+pinned CLI can import them before handling `--no-sign`.
+It requires one nonempty Simulator `.app` with the exact fixture identifier
+and Simulator platform, rejects a device IPA, and prints the executable digest.
+CI runs this after the macOS desktop compile, serialized with the other desktop
+SDK checks. This is an SDK compile check: it does not install or launch the App,
+test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
+Simulator/device runtime checks remain separate from the portable Swift policy tests.
+
 ## Desktop GTK runtime fixture
 
 On Linux with the Tauri GTK/WebKit SDK, Xvfb, xdotool, Python and OpenSSL, build
