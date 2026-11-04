@@ -131,6 +131,8 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod 666 /dev/kvm
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           sdkmanager "system-images;android-35;google_apis;x86_64"
           echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-35;google_apis;x86_64" --force
           "$ANDROID_HOME/emulator/emulator" -avd sumi-profiles -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot -wipe-data > "$RUNNER_TEMP/sumi-emulator.log" 2>&1 &
