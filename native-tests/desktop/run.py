@@ -14,10 +14,11 @@ import threading
 class Pages(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         page = self.path.removeprefix("/")
-        if page not in ("first", "second"):
+        if page not in ("", "first", "second"):
             self.send_error(404)
             return
-        body = f"<!doctype html><title>Fixture</title><p>{page}</p>".encode()
+        body = ("<!doctype html><meta name='sumi-fixture' content='bootstrap'>"
+                f"<title>Fixture</title><p>{page}</p>").encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

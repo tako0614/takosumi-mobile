@@ -24,7 +24,10 @@ timeout. It uses the production raw-view
 factory and synthetic HTML with https base URIs, checks cookies/localStorage
 across two profiles/two sites and a separate legacy jar, absence of Tauri and
 Wry messaging on GTK, same-screen reuse, retarget refusal and picker return.
-Storage reads wait for an exact document URL and DOM nonce; an earlier page's
+All profiles first finish a real local HTTPS bootstrap document through the
+production view factory. Synthetic loads begin only after those initial loads
+finish; they do not cancel a pending factory request. Storage reads wait for an
+exact native/DOM URL, DOM nonce, complete document and idle native load; an earlier page's
 load event cannot start them. The regression deliberately finishes a previous
 document first. A separate missing-document process must time out with no
 storage observation. Each cookie/storage assertion runs once after readiness;
