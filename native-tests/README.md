@@ -324,6 +324,14 @@ open, then closes Work and waits for the completed receipt. Reopening must land
 at its root logged out, with no editor draft at the second site. A live Personal
 profile must retain its draft and its HttpOnly session on a fresh home request;
 connection settings must be unchanged. These new assertions run once after DOM
-readiness, alongside the existing cold-restoration flow. They remain unrun until
-the changed App is rebuilt. macOS/Windows compilation, native clear/error/teardown
-runtime and restart durability remain unqualified for this candidate.
+readiness, alongside the existing cold-restoration flow.
+Two local warm-mode attempts on WebKitGTK 2.52.3 remain overall red. The normal
+candidate passed live refusal but remained pending at the eight-second UI check.
+A separate diagnostic build observed native completion, metadata removal, helper
+teardown and reply, then passed the real shared-UI clear and preservation assertions.
+Its observed NetworkProcess shutdown exceeded the unchanged five-second bound;
+journal/bio waits and a test-desktop cleanup failure were recorded. That is
+component evidence, not a normal-candidate or whole-run pass, and does not prove
+the first delay's unique cause. Temporary observation code was removed.
+macOS/Windows compilation, native clear/error/teardown runtime across platforms
+and restart durability remain unqualified for this candidate.
