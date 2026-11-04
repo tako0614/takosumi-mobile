@@ -228,6 +228,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11
+      - name: Shared Web-home confirmation in isolated Chromium
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        working-directory: takosumi-mobile
+        run: |
+          node --version
+          export CHROME_BIN="$(command -v google-chrome)"
+          "$CHROME_BIN" --version
+          PYTHONDONTWRITEBYTECODE=1 python3 native-tests/browser/test_guard.py
+          bunx tsc --noEmit -p native-tests/browser/tsconfig.json
+          PYTHONDONTWRITEBYTECODE=1 node --experimental-strip-types native-tests/browser/run.ts "$RUNNER_TEMP/takosumi-webhome-ui"
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: desktop-cache
         with:

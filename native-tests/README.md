@@ -195,6 +195,37 @@ or iOS data-store isolation. WKWebView/device qualification remains necessary.
 
 ## Profile data reset candidate
 
+The shared WebHome confirmation has a separate actual-browser component test.
+From the product root on Linux, with modern Node (22.12+), Python with pidfd
+support, the existing dependencies and an installed Chrome:
+
+```bash
+bunx tsc --noEmit -p native-tests/browser/tsconfig.json
+PYTHONDONTWRITEBYTECODE=1 python3 native-tests/browser/test_guard.py
+node --experimental-strip-types native-tests/browser/run.ts /absolute/new/artifact-directory
+```
+
+It starts its own loopback-only Vite listener and fresh headless Chrome profile,
+and closes both. `CHROME_BIN` may select the test Chrome executable. It never
+uses an existing browser or login profile. The synthetic https connection labels
+are never opened. The browser's HTTP(S) proxy is configured for a loopback
+endpoint with loopback bypass. Chrome runs below a dedicated session/subreaper. Detached helper
+identities are tracked with pidfds and reaped before deleting the new profile;
+if cleanup cannot be confirmed within the bound, the private profile is retained
+and the command fails. The synthetic guard controls include a detached orphan
+and cancellation, late forks, observation failure, PID generation replacement,
+stale discovery from another ancestry and failed ancestry reads. They preserve
+a separate session. The final pass receipt is
+written only after browser and Vite cleanup succeed.
+The actual shared component and clear-request adapter render three synthetic
+connections. It checks cancel/confirmation locks, pending state, false receipts,
+native refusal, completed status and preservation of settings, then confirms
+that removing a setting does not invoke another deletion. Desktop and mobile
+width screenshots also reject horizontal overflow. Native results are simulated:
+this proves the UI/request path, not engine deletion or a mobile/desktop runtime.
+The receipt includes browser/Node versions and before/after source hashes. PNGs
+live in the new artifact directory. CI runs this on Linux.
+
 The unpublished reset work adds a separate, explicitly confirmed action to the
 shared Web home. Removing a connection remains a preference edit. A clear
 request is bound to a canonical isolated UUID and its exact connection key;
