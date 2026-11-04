@@ -86,6 +86,14 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
                 assert not (root / "readback.log").exists()
             else:
                 raise AssertionError("Abnormal NetworkProcess accepted as successful shutdown")
+        elif mode == "missing-reset":
+            try:
+                web_home.run_apps(fake, root, False, False, profile_reset=True)
+            except RuntimeError as error:
+                assert "Profile reset case did not report" in str(error), error
+                assert not (root / "readback.log").exists()
+            else:
+                raise AssertionError("An old App that ignored reset mode was accepted")
         else:
             web_home.run_apps(fake, root, False, False)
             assert (root / "readback.log").exists()
@@ -99,6 +107,9 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
 
 
 class ProcessLifecycleTests(unittest.TestCase):
+    def test_reset_mode_rejects_a_generic_success_without_reset_assertions(self):
+        self.run_control("missing-reset")
+
     def test_timeout_diagnostics_and_cleanup_stay_in_the_owned_session(self):
         other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
         output = io.StringIO()

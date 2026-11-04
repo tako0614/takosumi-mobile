@@ -86,6 +86,10 @@ fn legacy_entry() -> bool {
     std::env::args().any(|arg| arg == "--legacy-entry")
 }
 
+fn profile_reset() -> bool {
+    std::env::args().any(|arg| arg == "--profile-reset")
+}
+
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} required by isolated fixture runner"))
 }
@@ -452,6 +456,9 @@ async fn clear_work_profile(
 }
 
 async fn flow(app: &AppHandle) -> Result<()> {
+    if profile_reset() && (quick_close() || legacy_entry() || readback()) {
+        return Err("Profile reset uses its own fresh, single-process flow".into());
+    }
     let origin = required_env("TAKOSUMI_FIXTURE_HTTPS");
     let app_origin = required_env("TAKOSUMI_FIXTURE_APP_HTTPS");
     if !origin.starts_with("https://127.0.0.1:") || !app_origin.starts_with("https://127.0.0.2:") {
@@ -709,6 +716,16 @@ async fn flow(app: &AppHandle) -> Result<()> {
     if readback() {
         // Release fixture-only WebView references before closing Work. The
         // production registry remains the authority for live-profile refusal.
+        drop(content);
+        drop(other);
+        clear_work_profile(app, &shell, &main, &work, &personal, &origin, &app_origin).await?;
+        return Ok(());
+    }
+    if profile_reset() {
+        // Exercise the real clear UI independently of App restart. The normal
+        // readback flow still exercises the same operation after a restart.
+        menu(&personal, "アプリホームへ").await?;
+        assert_home(&other, &origin, "personal").await?;
         drop(content);
         drop(other);
         clear_work_profile(app, &shell, &main, &work, &personal, &origin, &app_origin).await?;

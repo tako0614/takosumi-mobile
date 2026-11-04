@@ -169,15 +169,17 @@ def shutdown_description(pid):
     return details
 
 
-def run_apps(binary, data, quick_close, legacy_entry):
-    """Both Apps restart inside one disposable desktop session, as in use."""
+def run_apps(binary, data, quick_close, legacy_entry, profile_reset=False):
+    """Run isolated App flows, optionally restarting in the same desktop session."""
     previous_pid = None
-    for readback in (False, True):
+    for readback in ((False,) if profile_reset else (False, True)):
         flags = ["--readback"] if readback else []
         if quick_close:
             flags.append("--quick-close")
         if legacy_entry:
             flags.append("--legacy-entry")
+        if profile_reset:
+            flags.append("--profile-reset")
         log = data / ("readback.log" if readback else "first.log")
         tracked = {}
         descriptions = {}
@@ -205,6 +207,8 @@ def run_apps(binary, data, quick_close, legacy_entry):
         print(text, end="", flush=True)
         if child.returncode or "PASS: full App Web-home flow," not in text:
             raise RuntimeError(f"Full App fixture failed, status={child.returncode}")
+        if profile_reset and "PASS: completed profile reset through shared UI and real native IPC preserves other profiles" not in text:
+            raise RuntimeError("Profile reset case did not report the required completed native UI assertions")
         assert tracked, "Expected to observe native engine child processes"
         # Keep Xvfb/D-Bus alive until the previous generation actually exits.
         # This waits for process lifecycle only, never storage values or success.
@@ -274,15 +278,18 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--quick-close", action="store_true")
     parser.add_argument("--legacy-entry", action="store_true")
+    parser.add_argument("--profile-reset", action="store_true")
     parser.add_argument("--session-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.profile_reset and (args.quick_close or args.legacy_entry):
+        parser.error("profile reset requires its own fresh, single-process fixture")
     binary = args.binary.resolve(strict=True)
     data = args.data.absolute()
     if args.session_worker:
         if not data.is_dir() or not os.environ.get("DISPLAY"):
             parser.error("session worker requires the isolated outer runner")
         enable_child_subreaper()
-        run_apps(binary, data, args.quick_close, args.legacy_entry)
+        run_apps(binary, data, args.quick_close, args.legacy_entry, args.profile_reset)
         return
     if data.exists():
         parser.error("--data must be a new disposable directory")
@@ -322,6 +329,8 @@ def main():
             flags = ["--quick-close"] if args.quick_close else []
             if args.legacy_entry:
                 flags.append("--legacy-entry")
+            if args.profile_reset:
+                flags.append("--profile-reset")
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "python3", str(Path(__file__).resolve()),
                 "--session-worker", "--binary", str(binary), "--data", str(data), *flags,

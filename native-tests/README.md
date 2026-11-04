@@ -157,6 +157,18 @@ within a persistent desktop session, not desktop logout or storage fsync.
 Immediate process termination, crashes, OS-by-OS cold restoration, real IdP,
 other OS runtimes, files, notifications and distribution remain separate checks.
 
+`--profile-reset` uses a fresh single App process to exercise the same shared-UI
+clear path after the two profiles' mock login and editor writes. It checks the
+native live-view refusal, completed receipt, cleared Work and preserved Personal
+without depending on an earlier App shutdown/readback. The normal full flow
+retains the clear assertions after cold restoration too. The runner requires
+the dedicated native-reset success marker, so an older binary that ignores the
+new mode cannot qualify it. `--quick-close`/`--legacy-entry` cannot be combined
+with this mode. CI runs reset and ordinary restoration as independent steps
+after one App build: a runtime failure keeps the job red while allowing the
+other case to return its own evidence. A failed/cancelled build never supplies
+an App acceptance result.
+
 ## Android
 
 `resume-navigation-cases.json` exercises native success, provisional failure,
