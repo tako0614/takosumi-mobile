@@ -36,6 +36,34 @@ settled writes after orderly teardown, not last-write durability or crash recove
 This qualifies the GTK adapter's synthetic behavior; it is not Windows/macOS,
 real IdP, file operations or distribution evidence.
 
+## Full Linux App Web-home flow
+
+This explicitly enabled fixture builds the entire App with its normal plugins
+and setup, bundled production WebHome, real form submission and native IPC:
+
+```bash
+bun run build
+cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-web-home-fixture
+python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data /absolute/new/disposable-directory
+```
+
+The feature is absent from normal/release builds. The runner uses a distinct
+App identifier, private XDG data/config/cache/runtime directories and disposable
+loopback HTTPS sites/certificate. No installed App data, real service or global
+certificate settings are used. It drives connection input, mock Web login
+(POST and HttpOnly cookie), home, a cross-site editor, native Home/Back/picker,
+resume into the same focused native window, two isolated profiles, and native
+Close. A new App process must restore both saved connections, both mock sessions
+and each profile's editor storage. DOM readiness may be polled; data assertions
+run once. The actual views expose no native IPC. Failure/timeout exits nonzero.
+
+This covers the opt-in Web path and ordinary window closure. An early diagnostic
+using immediate App.exit lost a draft on restart; a delayed control and a later
+run with stronger write acknowledgement both passed. No unique cause or product
+durability fix was established. Immediate process termination, pending writes,
+crashes, cold last-page restoration, real IdP, other OS runtimes, files,
+notifications and distribution remain separate checks.
+
 ## Android
 
 The Android fixture builds the actual `app-screen` plugin and its pinned Tauri
