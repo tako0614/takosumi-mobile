@@ -57,6 +57,10 @@ fn readback() -> bool {
     std::env::args().any(|arg| arg == "--readback")
 }
 
+fn quick_close() -> bool {
+    std::env::args().any(|arg| arg == "--quick-close")
+}
+
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} required by isolated fixture runner"))
 }
@@ -100,6 +104,15 @@ async fn assert_js(view: &WebView, condition: &str, name: &str) -> Result<()> {
     let actual = eval(view, condition).await?;
     if actual != Value::Bool(true) {
         return Err(format!("{name}: {actual}"));
+    }
+    println!("PASS: {name}");
+    Ok(())
+}
+
+async fn assert_draft(view: &WebView, expected: &str, name: &str) -> Result<()> {
+    let snapshot = eval(view, "({uri:location.href, origin:location.origin, draft:localStorage.getItem('draft'), input:document.querySelector('textarea')?.value})").await?;
+    if snapshot["draft"] != expected || snapshot["input"] != expected {
+        return Err(format!("{name}: expected={expected:?}, actual={snapshot}"));
     }
     println!("PASS: {name}");
     Ok(())
@@ -214,6 +227,25 @@ async fn focused(window: &Window) -> Result<()> {
     Ok(())
 }
 
+async fn close_profiles(app: &AppHandle, windows: &[Window]) -> Result<()> {
+    for window in windows {
+        menu(window, "閉じる").await?;
+    }
+    let start = Instant::now();
+    while app
+        .windows()
+        .keys()
+        .any(|label| label.starts_with("web-screen-"))
+    {
+        if start.elapsed() > Duration::from_secs(3) {
+            return Err("native Close left a raw window alive".into());
+        }
+        pause().await;
+    }
+    println!("PASS: native Close removed profile windows before App shutdown");
+    Ok(())
+}
+
 async fn click_connection(shell: &WebView, name: &str) -> Result<()> {
     action(shell, &format!(
         "[...document.querySelectorAll('.web-connection')].find(b => b.querySelector('strong').textContent === {}).click();",
@@ -260,7 +292,11 @@ async fn flow(app: &AppHandle) -> Result<()> {
     if readback() {
         assert_js(
             &shell,
-            "document.querySelectorAll('.web-connection').length === 2",
+            if quick_close() {
+                "document.querySelectorAll('.web-connection').length === 1"
+            } else {
+                "document.querySelectorAll('.web-connection').length === 2"
+            },
             "saved connections survive App restart",
         )
         .await?;
@@ -300,12 +336,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
     ready(&content, "document.querySelector('[data-page=editor]')").await?;
     no_ipc(&content).await?;
     if readback() {
-        assert_js(
-            &content,
-            "document.querySelector('textarea').value === 'work draft'",
-            "app storage survives App restart",
-        )
-        .await?;
+        assert_draft(&content, "work draft", "app storage survives App restart").await?;
     } else {
         action(&content, "const input=document.querySelector('textarea'); input.value='work draft'; input.dispatchEvent(new Event('input')); ").await?;
         ready(&content, "document.querySelector('[data-saved=yes]')").await?;
@@ -315,6 +346,12 @@ async fn flow(app: &AppHandle) -> Result<()> {
             "editor write acknowledged in expected document",
         )
         .await?;
+    }
+    if quick_close() {
+        // Minimal reproduction: native Close immediately after acknowledged
+        // storage write, without Home/Back/other-profile work settling it.
+        close_profiles(app, &[work]).await?;
+        return Ok(());
     }
     menu(&work, "接続先を切り替える").await?;
     focused(&main).await?;
@@ -402,9 +439,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
     ready(&other, "document.querySelector('[data-page=editor]')").await?;
     no_ipc(&other).await?;
     if readback() {
-        assert_js(
+        assert_draft(
             &other,
-            "document.querySelector('textarea').value === 'personal draft'",
+            "personal draft",
             "second profile session and app storage survive restart",
         )
         .await?;
@@ -427,19 +464,6 @@ async fn flow(app: &AppHandle) -> Result<()> {
     }
     // Exercise ordinary native Close before exiting the App. This is not an
     // immediate-process-exit or crash-durability test; those remain separate.
-    menu(&personal, "閉じる").await?;
-    menu(&work, "閉じる").await?;
-    let start = Instant::now();
-    while app
-        .windows()
-        .keys()
-        .any(|label| label.starts_with("web-screen-"))
-    {
-        if start.elapsed() > Duration::from_secs(3) {
-            return Err("native Close left a raw window alive".into());
-        }
-        pause().await;
-    }
-    println!("PASS: native Close removed both profile windows before App shutdown");
+    close_profiles(app, &[personal, work]).await?;
     Ok(())
 }

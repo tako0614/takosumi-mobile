@@ -54,15 +54,26 @@ certificate settings are used. It drives connection input, mock Web login
 (POST and HttpOnly cookie), home, a cross-site editor, native Home/Back/picker,
 resume into the same focused native window, two isolated profiles, and native
 Close. A new App process must restore both saved connections, both mock sessions
-and each profile's editor storage. DOM readiness may be polled; data assertions
-run once. The actual views expose no native IPC. Failure/timeout exits nonzero.
+and each profile's editor storage. The two App processes share one disposable
+Xvfb/D-Bus desktop session. The runner observes App descendants and requires the
+first App and its observed engine children to exit before starting a new App
+PID; it does not destroy the desktop session during App teardown. DOM readiness
+may be polled; data assertions run once. The actual views expose no native IPC.
+Failure/timeout or a lingering engine process exits nonzero.
+
+`--quick-close` minimizes the flow to one connection's acknowledged editor write,
+immediate native Close, and new-process readback. CI runs it separately with a
+fresh data directory, alongside the full two-profile flow.
 
 This covers the opt-in Web path and ordinary window closure. An early diagnostic
 using immediate App.exit lost a draft on restart; a delayed control and a later
-run with stronger write acknowledgement both passed. No unique cause or product
-durability fix was established. Immediate process termination, pending writes,
-crashes, cold last-page restoration, real IdP, other OS runtimes, files,
-notifications and distribution remain separate checks.
+run with stronger write acknowledgement both passed. The original separate
+Xvfb/D-Bus session per App also lost storage during ordinary-close readback in
+CI and a local minimized control. No unique cause or production durability fix
+is established by these failures. The current runner checks an App restart
+within a persistent desktop session, not desktop logout or storage fsync.
+Immediate process termination, crashes, cold last-page restoration, real IdP,
+other OS runtimes, files, notifications and distribution remain separate checks.
 
 ## Android
 
