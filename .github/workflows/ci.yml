@@ -168,13 +168,20 @@ jobs:
           reports = list(pathlib.Path('src-tauri/plugins/app-screen/android/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
           assert reports, 'No actual Android instrumentation reports'
           tests = failures = skipped = 0
+          actual_cases = set()
           for report in reports:
               root = E.parse(report).getroot()
               tests += int(root.get('tests', 0))
               failures += int(root.get('failures', 0)) + int(root.get('errors', 0))
               skipped += int(root.get('skipped', 0))
+              actual_cases.update((case.get('classname'), case.get('name')) for case in root.iter('testcase'))
           print(f'Actual WebView tests: {tests}, failures/errors: {failures}, skipped: {skipped}')
-          assert tests >= 2 and failures == 0 and skipped == 0
+          required = {
+              ('com.takosumi.appscreen.ProfileIsolationTest', 'clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles'),
+              ('com.takosumi.appscreen.ProfileResetActivityTest', 'completedResetDropsAnEvictedActivityUrlAndPreResetSavedState'),
+          }
+          assert required <= actual_cases, f'Missing actual profile reset controls: {required - actual_cases}'
+          assert tests >= 4 and failures == 0 and skipped == 0
           PY
 
   desktop:

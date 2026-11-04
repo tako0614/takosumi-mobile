@@ -213,6 +213,22 @@ selected. Completion does not claim fsync, crash or downgrade durability.
 The shared `clear-profile-cases.json` is consumed by Rust/Kotlin/Swift policy
 tests. The Android instrumentation case checks live-view refusal, pending-open
 refusal, two-site cookie/storage removal and preservation of a second profile
-and the shared store. These new native tests and SDK checks have not run yet;
-the Activity eviction/recreation path still needs an actual lifecycle control.
-Portable TypeScript checks do not qualify native data deletion or UI behavior.
+and the shared store. `ProfileResetActivityTest` exercises an actual stopped
+Activity whose WebView is evicted, completes a profile reset, then resumes the
+same Activity. It also recreates an Activity with a deliberately pre-reset
+saved URL after dropping the live view; assertions require both controls to
+have run. A lifecycle probe is armed before each resume/recreation, attaches on
+the same UI turn after the new view is made, freezes its first native page-start
+callback and restores the production client before forwarding it. A later root
+load cannot replace an observed wrong URL. The document-load wrapper is also
+removed after its awaited completion; neither wrapper qualifies general error
+handling.
+The latter saved-state input is synthetic; this is not an OS process-kill test.
+
+The Android JVM suite passes (17 tests), and the instrumentation APK compiles
+locally. Rust passes 9 policy/unit tests and 2 capability tests. The new engine
+and Activity tests have not run on an emulator/device; there is no local KVM
+capability. Swift/native SDK checks remain separate. CI requires the two reset
+cases by class and test name, with zero
+failures/errors/skips. Portable TypeScript checks do not qualify native data
+deletion or UI behavior.
