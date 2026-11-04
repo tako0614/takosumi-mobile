@@ -37,6 +37,9 @@ target; Apple Silicon/iOS device runtime remains separate qualification.
 This is an SDK compile check: it does not install or launch the App,
 test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
 Simulator/device runtime checks remain separate from the portable Swift policy tests.
+Compiler caches are saved after non-cancelled SDK failures as well as success,
+so a source repair can reuse completed compilation. Failed checks stay failed;
+cached compiler files are not accepted App artifacts or runtime evidence.
 
 ## Desktop GTK runtime fixture
 
