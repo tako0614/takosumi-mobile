@@ -3,6 +3,7 @@
 //! HTML assigned an https base URI. Never loads a real service or user profile.
 
 use super::*;
+use javascriptcore::ValueExt;
 use std::{path::Path, time::Duration};
 use webkit2gtk::WebViewExt;
 use wry::WebViewExtUnix;
@@ -21,6 +22,10 @@ pub fn run() {
         "Fixture directory must be absolute"
     );
     let readback = std::env::args().any(|value| value == "--readback");
+    assert!(
+        !std::env::args().any(|value| value == "--missing-document") || readback,
+        "Missing-document control requires readback mode"
+    );
     if !readback {
         assert!(
             !directory.exists(),
@@ -121,16 +126,37 @@ fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
     }
     let (profile, site, expected, write) = operations[index];
     let screen_label = label(profile);
-    let origin = format!("https://{site}.invalid/");
+    let origin = format!("https://{site}.invalid");
+    let nonce = format!("{}-{index}", if readback { "read" } else { "write" });
+    let target_uri = format!("{origin}/__fixture/{nonce}");
+    let target_html = format!("<!doctype html><meta name='sumi-fixture' content='{nonce}'><title>Synthetic {nonce}</title><p>Takosumi engine fixture</p>");
     let native_view =
         SCREENS.with(|screens| screens.borrow().get(&screen_label).unwrap().view.webview());
-    after_next_load(&native_view, move || {
-        let script = format!("(() => {{ const before = {{cookie: document.cookie, storage: localStorage.getItem('identity') || '', tauri: typeof window.__TAURI_INTERNALS__, ipc: typeof window.ipc}}; {} return before; }})()",
+    // The production factory starts the site's root load. The synthetic
+    // observation replaces it; never let that initial/error load satisfy it.
+    native_view.stop_loading();
+    let expected_uri = target_uri.clone();
+    let diagnostic_view = native_view.clone();
+    after_document_load(
+        &native_view,
+        target_uri.clone(),
+        nonce.clone(),
+        app.clone(),
+        move || {
+            let script = format!("(() => {{ try {{ if (location.href !== '{expected_uri}' || location.origin !== '{origin}' || document.querySelector('meta[name=sumi-fixture]')?.content !== '{nonce}') return {{wrongDocument: true, uri: location.href, origin: location.origin, nonce: document.querySelector('meta[name=sumi-fixture]')?.content}}; const before = {{nonce: '{nonce}', uri: location.href, origin: location.origin, cookie: document.cookie, storage: localStorage.getItem('identity') || '', tauri: typeof window.__TAURI_INTERNALS__, ipc: typeof window.ipc}}; {} return before; }} catch (error) {{ return {{failure: String(error), uri: location.href, title: document.title}}; }} }})()",
             if write.is_empty() { String::new() } else {format!("document.cookie = 'identity={write}; Path=/; Max-Age=3600; Secure; SameSite=Lax'; localStorage.setItem('identity', '{write}');")});
-        let next_app = app.clone();
-        let result = SCREENS.with(|screens| screens.borrow().get(&screen_label).unwrap().view.evaluate_script_with_callback(&script, move |result| {
+            let next_app = app.clone();
+            diagnostic_view.evaluate_javascript(&script, None, None, None::<&gtk::gio::Cancellable>, move |native_result| {
+            let result = match native_result {
+                Ok(value) => match value.to_json(0) {
+                    Some(json) => json.to_string(),
+                    None => { eprintln!("FAIL: native evaluation returned no JSON at observation {index}"); next_app.exit(1); return; }
+                },
+                Err(error) => { eprintln!("FAIL: native evaluation failed at observation {index}, target={expected_uri}: {error:?}"); next_app.exit(1); return; }
+            };
             let valid = serde_json::from_str::<serde_json::Value>(&result).ok().is_some_and(|value| {
-                value["cookie"] == if expected.is_empty() { String::new() } else { format!("identity={expected}") }
+                value["uri"] == expected_uri && value["origin"] == origin && value["nonce"] == nonce
+                    && value["cookie"] == if expected.is_empty() { String::new() } else { format!("identity={expected}") }
                     && value["storage"] == expected && value["tauri"] == "undefined" && value["ipc"] == "undefined"
             });
             println!("observation {index}: profile={profile}, site={site}, expected={expected:?}, result={result}, valid={valid}");
@@ -140,39 +166,95 @@ fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
             // Callback may be dispatched by an engine thread. Schedule all
             // view/GTK access on Tauri's UI thread again.
             let _ = next_app.run_on_main_thread(move || step(handle, data, readback, index + 1));
-        }));
-        if let Err(error) = result {
-            eprintln!("FAIL: {error}");
-            app.exit(1);
+        });
+        },
+    );
+    if index == 0 {
+        // Controlled old-document completion before the requested document.
+        // The readiness helper must not observe the previous document.
+        load_after_stale_document(&native_view, target_html, target_uri);
+    } else {
+        native_view.load_html(&target_html, Some(&target_uri));
+    }
+}
+
+fn load_after_stale_document(view: &webkit2gtk::WebView, html: String, uri: String) {
+    use gtk::glib::prelude::ObjectExt;
+    let id = Rc::new(RefCell::new(None));
+    let callback_id = id.clone();
+    let stale_uri = format!("{uri}?previous=1");
+    let expected_stale = stale_uri.clone();
+    let target = Rc::new(RefCell::new(Some((html, uri))));
+    let handler = view.connect_load_changed(move |view, event| {
+        if matches!(event, webkit2gtk::LoadEvent::Finished)
+            && view.uri().as_deref() == Some(expected_stale.as_str())
+        {
+            if let Some(id) = callback_id.borrow_mut().take() {
+                view.disconnect(id);
+            }
+            let Some((html, uri)) = target.borrow_mut().take() else {
+                return;
+            };
+            let view = view.clone();
+            if !std::env::args().any(|value| value == "--missing-document") {
+                gtk::glib::idle_add_local_once(move || view.load_html(&html, Some(&uri)));
+            }
         }
     });
-    native_view.load_html(
-        "<!doctype html><title>Synthetic profile fixture</title><p>Takosumi engine fixture</p>",
-        Some(&origin),
+    *id.borrow_mut() = Some(handler);
+    view.load_html(
+        "<!doctype html><title>Previous document</title>",
+        Some(&stale_uri),
     );
 }
 
-fn after_next_load(view: &webkit2gtk::WebView, next: impl FnOnce() + 'static) {
-    use gtk::glib::prelude::ObjectExt;
-    let next = Rc::new(RefCell::new(Some(next)));
-    let handler_id = Rc::new(RefCell::new(None));
-    let callback_id = handler_id.clone();
-    let committed = std::cell::Cell::new(false);
-    let handler = view.connect_load_changed(move |view, event| {
-        if matches!(event, webkit2gtk::LoadEvent::Committed) {
-            committed.set(true);
-        }
-        if committed.get() && matches!(event, webkit2gtk::LoadEvent::Finished) {
-            let id = callback_id.borrow_mut().take();
-            if let Some(id) = id {
-                view.disconnect(id);
-            }
-            if let Some(next) = next.borrow_mut().take() {
-                gtk::glib::idle_add_local_once(next);
-            }
+struct PendingDocument {
+    uri: String,
+    nonce: String,
+    app: AppHandle,
+    deadline: std::time::Instant,
+    callback: RefCell<Option<Box<dyn FnOnce()>>>,
+}
+
+fn after_document_load(
+    view: &webkit2gtk::WebView,
+    uri: String,
+    nonce: String,
+    app: AppHandle,
+    next: impl FnOnce() + 'static,
+) {
+    let pending = Rc::new(PendingDocument {
+        uri,
+        nonce,
+        app,
+        deadline: std::time::Instant::now() + Duration::from_secs(5),
+        callback: RefCell::new(Some(Box::new(next))),
+    });
+    poll_document(view.clone(), pending);
+}
+
+fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
+    let probe = "({uri: location.href, nonce: document.querySelector('meta[name=sumi-fixture]')?.content, ready: document.readyState})";
+    let native = view.clone();
+    view.evaluate_javascript(probe, None, None, None::<&gtk::gio::Cancellable>, move |result| {
+        let diagnostic = match result {
+            Ok(value) => value.to_json(0).map(|value| value.to_string()).unwrap_or_else(|| "No JSON result".into()),
+            Err(error) => format!("Native WebKit error: {error:?}"),
+        };
+        let ready = serde_json::from_str::<serde_json::Value>(&diagnostic).ok().is_some_and(|value|
+            value["uri"] == pending.uri && value["nonce"] == pending.nonce && value["ready"] == "complete");
+        if ready {
+            let callback = pending.callback.borrow_mut().take();
+            if let Some(next) = callback { next(); }
+        } else if std::time::Instant::now() >= pending.deadline {
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, last={diagnostic}", pending.uri, pending.nonce);
+            pending.app.exit(1);
+        } else {
+            // Readiness only. Cookies/storage are read and asserted exactly
+            // once after identity matches; failed data is never retried.
+            gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || poll_document(native, pending));
         }
     });
-    *handler_id.borrow_mut() = Some(handler);
 }
 
 fn title_and_back_probe(app: AppHandle) {

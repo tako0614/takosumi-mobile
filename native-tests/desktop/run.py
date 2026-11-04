@@ -58,6 +58,16 @@ def main():
             for flags in ([], ["--readback"]):
                 subprocess.run(["xvfb-run", "-a", "dbus-run-session", "--", str(binary), *flags],
                                env=env, check=True)
+            rejected = subprocess.run([
+                "xvfb-run", "-a", "dbus-run-session", "--", str(binary),
+                "--readback", "--missing-document",
+            ], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=50)
+            (data / "missing-document.log").write_text(rejected.stdout)
+            if (rejected.returncode != 1 or "expected fixture document not ready" not in rejected.stdout
+                    or "observation " in rejected.stdout):
+                raise RuntimeError(f"Wrong document was not rejected before storage access:\n{rejected.stdout}")
+            print("PASS: missing document rejects before any storage observation", flush=True)
         finally:
             server.shutdown()
             server.server_close()

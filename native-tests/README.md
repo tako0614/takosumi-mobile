@@ -24,6 +24,11 @@ timeout. It uses the production raw-view
 factory and synthetic HTML with https base URIs, checks cookies/localStorage
 across two profiles/two sites and a separate legacy jar, absence of Tauri and
 Wry messaging on GTK, same-screen reuse, retarget refusal and picker return.
+Storage reads wait for an exact document URL and DOM nonce; an earlier page's
+load event cannot start them. The regression deliberately finishes a previous
+document first. A separate missing-document process must time out with no
+storage observation. Each cookie/storage assertion runs once after readiness;
+incorrect data is never retried. Native evaluation errors retain WebKit's error.
 It also checks committed-origin display, pending/cancelled and iframe navigation,
 native Back despite a page override, and native-keyboard-triggered popup creation,
 profile/opener inheritance and script-close cleanup. Process readback concerns
