@@ -36,6 +36,18 @@ class AppScreenRulesTest {
     }
 
     @Test
+    fun webHomeResumeCasesMatchTheSharedTable() {
+        val lines = fixture("web-home-resume-cases.json").lines().filter { it.contains("\"remember\"") }
+        assertTrue(lines.size >= 20)
+        for (line in lines) {
+            val url = field(line, "url")!!
+            assertEquals(url, line.contains("\"remember\": true"),
+                AppScreenRules.isRememberable(url, "https://sumi.example", webHome = true))
+        }
+        assertFalse(AppScreenRules.isRememberable("https://office.example/document/1", "https://sumi.example"))
+    }
+
+    @Test
     fun credentialNamesMatchTheSharedTable() {
         val text = fixture("resume-url-cases.json")
         val block = text.substringAfter("\"credentialQueryNames\": [").substringBefore("]")

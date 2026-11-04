@@ -226,7 +226,8 @@ def main():
             servers.append(server)
         servers[1].app_origin = f"https://127.0.0.2:{servers[0].server_port}"
         env = dict(os.environ, TAKOSUMI_FIXTURE_CERT=str(cert),
-                   TAKOSUMI_FIXTURE_HTTPS=f"https://127.0.0.1:{servers[1].server_port}")
+                   TAKOSUMI_FIXTURE_HTTPS=f"https://127.0.0.1:{servers[1].server_port}",
+                   TAKOSUMI_FIXTURE_APP_HTTPS=servers[1].app_origin)
         # Scope all native plugin/shell/engine state, including cache and portal
         # helpers, to this runner. Never use an installed App's data or keyring.
         for variable, name in (("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),

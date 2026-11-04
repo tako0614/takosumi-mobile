@@ -86,6 +86,16 @@ final class AppScreenPolicyFixtureTests: XCTestCase {
         }
     }
 
+    func testWebHomeResumeCases() throws {
+        let rules = try fixture("web-home-resume-cases.json")
+        for item in try XCTUnwrap(rules["cases"] as? [[String: Any]]) {
+            let url = try XCTUnwrap(item["url"] as? String)
+            let remember = try XCTUnwrap(item["remember"] as? Bool)
+            XCTAssertEqual(AppScreenPolicy.isRememberable(url, appOrigin: "https://sumi.example", webHome: true), remember, url)
+        }
+        XCTAssertFalse(AppScreenPolicy.isRememberable("https://office.example/document/1", appOrigin: "https://sumi.example"))
+    }
+
     func testOriginsAndLinks() {
         XCTAssertEqual(AppScreenPolicy.origin(of: "https://APP.example:443/x?y"), "https://app.example")
         XCTAssertEqual(AppScreenPolicy.origin(of: "https://[::1]:8443/x"), "https://[::1]:8443")

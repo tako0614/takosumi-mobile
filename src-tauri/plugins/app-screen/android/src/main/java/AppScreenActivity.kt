@@ -193,7 +193,7 @@ class AppScreenActivity : AppCompatActivity() {
      */
     private fun restorable(url: String): String? =
         url.takeIf { candidate ->
-            !request.popup && request.appOrigin?.let { AppScreenRules.isRememberable(candidate, it) } == true
+            !request.popup && request.appOrigin?.let { AppScreenRules.isRememberable(candidate, it, request.webHome) } == true
         }
 
     /** The page to open at: the app's last page when resuming, else its URL. */

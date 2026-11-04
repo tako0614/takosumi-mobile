@@ -306,11 +306,16 @@ enum AppScreenPolicy {
 
     /// A page the screen may reopen at: https on the app's own origin, no user
     /// info, no fragment, no credential-named query parameter with a value.
-    static func isRememberable(_ rawUrl: String, appOrigin: String) -> Bool {
+    /// Web homes may cross app origins in the same profile, excluding the
+    /// known temporary authorization/sign-in paths.
+    static func isRememberable(_ rawUrl: String, appOrigin: String, webHome: Bool = false) -> Bool {
         if rawUrl.count > resumeURLMaxLength || rawUrl.contains("#") { return false }
         if !rawUrl.lowercased().hasPrefix("https://") { return false }
         if rawUrl.contains(where: { $0.isWhitespace }) { return false }
-        guard let origin = origin(of: rawUrl), origin == appOrigin,
+        if webHome {
+            guard let path = encodedPath(rawUrl), !accountsSignInPaths.contains(path) else { return false }
+        }
+        guard let origin = origin(of: rawUrl), webHome || origin == appOrigin,
               let host = URL(string: rawUrl)?.host, !isShellHost(host) else {
             return false
         }

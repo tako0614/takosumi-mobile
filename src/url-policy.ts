@@ -320,17 +320,21 @@ export const CREDENTIAL_QUERY_NAMES: ReadonlySet<string> = new Set(
  * https page of the app's own origin with no user info, no fragment (where
  * implicit-flow tokens travel) and no credential-named query parameter.
  * Takosumi's `safeLaunchUrl` rules, plus the OAuth callback values.
+ * Web-home mode may reopen another app origin in the same profile, but skips
+ * the known temporary sign-in/authorization paths.
  */
 export function isRememberableAppScreenUrl(
   rawUrl: string,
   appOrigin: string,
+  webHome = false,
 ): boolean {
   if (rawUrl.length > RESUME_URL_MAX_LENGTH || rawUrl.includes("#")) return false;
   const url = parseUrl(rawUrl);
   if (!url || url.protocol !== "https:" || url.username || url.password) {
     return false;
   }
-  if (url.origin !== appOrigin || !isLaunchableAppScreenUrl(rawUrl)) return false;
+  if ((!webHome && url.origin !== appOrigin) || !isLaunchableAppScreenUrl(rawUrl)) return false;
+  if (webHome && ACCOUNTS_SIGN_IN_PATHS.has(url.pathname)) return false;
   if (/\s/u.test(rawUrl)) return false;
   const query = rawUrl.includes("?") ? rawUrl.slice(rawUrl.indexOf("?") + 1) : "";
   for (const pair of query.split("&")) {

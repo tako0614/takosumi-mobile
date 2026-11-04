@@ -138,9 +138,9 @@ enum AppScreenResume {
     private static let defaultsKey = "com.takosumi.appscreen.resume.v1"
     private static let maxRemembered = 64
 
-    static func record(_ url: URL, key: String, scope: String?, appOrigin: String?) {
+    static func record(_ url: URL, key: String, scope: String?, appOrigin: String?, webHome: Bool = false) {
         guard let scope = scope, let appOrigin = appOrigin,
-              AppScreenPolicy.isRememberable(url.absoluteString, appOrigin: appOrigin) else {
+              AppScreenPolicy.isRememberable(url.absoluteString, appOrigin: appOrigin, webHome: webHome) else {
             return
         }
         var stored = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String: Any]] ?? [:]
@@ -158,7 +158,7 @@ enum AppScreenResume {
         guard let scope = request.scope, let appOrigin = request.appOrigin else { return nil }
         let stored = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String: Any]]
         guard let raw = stored?[identifier(scope: scope, key: request.key)]?["url"] as? String,
-              AppScreenPolicy.isRememberable(raw, appOrigin: appOrigin) else {
+              AppScreenPolicy.isRememberable(raw, appOrigin: appOrigin, webHome: request.webHome) else {
             return nil
         }
         return URL(string: raw)
@@ -582,10 +582,11 @@ final class AppScreenCoordinator {
         let key = request.key
         let scope = request.scope
         let appOrigin = request.appOrigin
+        let webHome = request.webHome
         // Only an app opened as itself (tile, recent) keeps its last page; a
         // deep-linked page never becomes it.
         session.navigator.onCommitted = request.resume ? { url in
-            AppScreenResume.record(url, key: key, scope: scope, appOrigin: appOrigin)
+            AppScreenResume.record(url, key: key, scope: scope, appOrigin: appOrigin, webHome: webHome)
         } : nil
         touch(session.key)
         if !keep {

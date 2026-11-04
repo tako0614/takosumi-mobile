@@ -10,7 +10,7 @@ publish = false
 links = "tauri-plugin-app-screen"
 
 [features]
-desktop = ["tauri/wry", "tauri/unstable", "dep:wry", "dep:gtk", "dep:objc2", "dep:webkit2gtk", "dep:objc2-web-kit", "dep:block2", "dep:webview2-com"]
+desktop = ["tauri/wry", "tauri/unstable", "dep:wry", "dep:gtk", "dep:objc2", "dep:webkit2gtk", "dep:objc2-web-kit", "dep:block2", "dep:webview2-com", "dep:serde_json"]
 desktop-fixture = ["desktop", "tauri/test", "dep:webkit2gtk", "dep:serde_json", "dep:javascriptcore-rs"]
 
 [dependencies]

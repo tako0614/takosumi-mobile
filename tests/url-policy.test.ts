@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import policyCases from "../src-tauri/plugins/app-screen/navigation-policy-cases.json";
 import resumeCases from "../src-tauri/plugins/app-screen/resume-url-cases.json";
+import webResumeCases from "../src-tauri/plugins/app-screen/web-home-resume-cases.json";
 import {
   ACCOUNTS_SIGN_IN_PATHS,
   appScreenOrigins,
@@ -55,6 +56,14 @@ test("every shared resume and share case matches the TypeScript rules", () => {
       shared: item.shared,
     });
   }
+});
+
+test("Web-home resume may cross app origins without accepting credential URLs", () => {
+  for (const item of webResumeCases.cases) {
+    expect({ url: item.url, remember: isRememberableAppScreenUrl(item.url, "https://sumi.example", true) })
+      .toEqual({ url: item.url, remember: item.remember });
+  }
+  expect(isRememberableAppScreenUrl("https://office.example/document/1", "https://sumi.example")).toBe(false);
 });
 
 const screen = appScreenOrigins({

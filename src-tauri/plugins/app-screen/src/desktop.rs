@@ -17,6 +17,7 @@ use tauri::{
 };
 use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
+use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
 
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
@@ -135,15 +136,19 @@ fn open_on_ui_thread(app: &AppHandle, payload: OpenRequest, directory: PathBuf) 
         contexts
             .borrow_mut()
             .entry(context_path.clone())
-            .or_insert_with(|| Rc::new(RefCell::new(WebContext::new(Some(context_path)))))
+            .or_insert_with(|| Rc::new(RefCell::new(WebContext::new(Some(context_path.clone())))))
             .clone()
     });
+    let resume = payload
+        .resume
+        .then(|| ResumeStore::new(context_path, payload.key.clone()));
     create_screen(
         app,
         payload.key,
         payload.profile,
         payload.url,
         context,
+        resume,
         None,
     )?;
     Ok(())
@@ -155,9 +160,20 @@ fn create_screen(
     profile: String,
     home: String,
     context: Rc<RefCell<WebContext>>,
+    resume: Option<ResumeStore>,
     popup: Option<NewWindowFeatures>,
 ) -> Result<NewWindowResponse> {
     let is_popup = popup.is_some();
+    let start = resume
+        .as_ref()
+        .and_then(|store| match store.recall() {
+            Ok(url) => url,
+            Err(error) => {
+                eprintln!("Takosumi last page could not be read: {error}");
+                None
+            }
+        })
+        .unwrap_or_else(|| home.clone());
     if SCREENS.with(|screens| screens.borrow().len()) >= MAX_WINDOWS {
         return Err(Error::InvalidRequest(
             "Close a Takosumi window before opening another.",
@@ -204,6 +220,11 @@ fn create_screen(
                 // are provisional and can also represent iframe navigation.
                 // Finished may follow a failed navigation, so do not use it.
                 if matches!(event, wry::PageLoadEvent::Started) {
+                    if let Some(store) = &resume {
+                        if let Err(error) = store.record(&url) {
+                            eprintln!("Takosumi last page could not be saved: {error}");
+                        }
+                    }
                     let title = if is_launchable_url(&url) {
                         site_title(&url)
                     } else {
@@ -225,6 +246,7 @@ fn create_screen(
                     popup_profile.clone(),
                     popup_home.clone(),
                     popup_context.clone(),
+                    None,
                     Some(features),
                 ) {
                     Ok(response) => response,
@@ -277,7 +299,7 @@ fn create_screen(
         disable_messaging(&view)?;
         let native_handlers = native_close_handler(&view, &window)?;
         if !is_popup {
-            view.load_url(&home).map_err(failure)?;
+            view.load_url(&start).map_err(failure)?;
         }
         #[cfg(target_os = "linux")]
         let response = {
