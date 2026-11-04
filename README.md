@@ -9,9 +9,10 @@ once.
 ## Web client migration (source/local candidate)
 
 The Web client retains connection selection while opening Takosumi's own Web
-sign-in, app home and management screens. Apps linked by the Web home navigate
-in the same plain native WebView. Its native menu offers **アプリホームへ** and
-**接続先を切り替える**; the current site's host stays visible. Pages receive no
+sign-in, app home and management screens. Apps linked by the Web home open in
+plain native WebViews within the same browsing profile. The main screen's menu
+offers **アプリホームへ** and **接続先を切り替える**; a popup closes back to its
+opener, and the current site's host stays visible. Pages receive no
 Tauri IPC, native credential or management-API adapter.
 
 This is an opt-in candidate, not a replacement for the default native client
