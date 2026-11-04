@@ -36,6 +36,45 @@ settled writes after orderly teardown, not last-write durability or crash recove
 This qualifies the GTK adapter's synthetic behavior; it is not Windows/macOS,
 real IdP, file operations or distribution evidence.
 
+## Full Linux App Web-home flow
+
+This explicitly enabled fixture builds the entire App with its normal plugins
+and setup, bundled production WebHome, real form submission and native IPC:
+
+```bash
+bun run build
+cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-web-home-fixture
+python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data /absolute/new/disposable-directory
+```
+
+The feature is absent from normal/release builds. The runner uses a distinct
+App identifier, private XDG data/config/cache/runtime directories and disposable
+loopback HTTPS sites/certificate. No installed App data, real service or global
+certificate settings are used. It drives connection input, mock Web login
+(POST and HttpOnly cookie), home, a cross-site editor, native Home/Back/picker,
+resume into the same focused native window, two isolated profiles, and native
+Close. A new App process must restore both saved connections, both mock sessions
+and each profile's editor storage. The two App processes share one disposable
+Xvfb/D-Bus desktop session. The runner observes App descendants and requires the
+first App and its observed engine children to exit before starting a new App
+PID; it does not destroy the desktop session during App teardown. DOM readiness
+may be polled; data assertions run once. The actual views expose no native IPC.
+Failure/timeout or a lingering engine process exits nonzero.
+
+`--quick-close` minimizes the flow to one connection's acknowledged editor write,
+immediate native Close, and new-process readback. CI runs it separately with a
+fresh data directory, alongside the full two-profile flow.
+
+This covers the opt-in Web path and ordinary window closure. An early diagnostic
+using immediate App.exit lost a draft on restart; a delayed control and a later
+run with stronger write acknowledgement both passed. The original separate
+Xvfb/D-Bus session per App also lost storage during ordinary-close readback in
+CI and a local minimized control. No unique cause or production durability fix
+is established by these failures. The current runner checks an App restart
+within a persistent desktop session, not desktop logout or storage fsync.
+Immediate process termination, crashes, cold last-page restoration, real IdP,
+other OS runtimes, files, notifications and distribution remain separate checks.
+
 ## Android
 
 The Android fixture builds the actual `app-screen` plugin and its pinned Tauri

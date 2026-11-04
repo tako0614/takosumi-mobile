@@ -1,8 +1,15 @@
 use tauri::Manager;
 
+#[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
+#[path = "../tests/desktop/web_home.rs"]
+mod web_home_fixture;
+
+#[cfg(all(feature = "native-web-home-fixture", not(target_os = "linux")))]
+compile_error!("The native Web-home fixture requires Linux; it does not qualify other OSes.");
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
@@ -28,8 +35,14 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_app_screen::init())?;
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_takosumi_push::init())?;
+            #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
+            web_home_fixture::start(app.handle().clone());
             Ok(())
-        })
+        });
+    #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
+    web_home_fixture::run(builder, tauri::generate_context!());
+    #[cfg(not(feature = "native-web-home-fixture"))]
+    builder
         .run(tauri::generate_context!())
         .expect("error while running Takosumi mobile");
 }

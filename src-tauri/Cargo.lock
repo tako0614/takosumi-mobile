@@ -4742,6 +4742,8 @@ dependencies = [
 name = "takosumi-mobile"
 version = "0.1.0"
 dependencies = [
+ "gtk",
+ "javascriptcore-rs",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -4758,6 +4760,7 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-plugin-stronghold",
  "tauri-plugin-takosumi-push",
+ "webkit2gtk",
 ]
 
 [[package]]

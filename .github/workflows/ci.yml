@@ -241,3 +241,13 @@ jobs:
           cp src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
           cargo build --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-fixture --example desktop-profile-probe
           python3 native-tests/desktop/run.py --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA"
+      - name: Actual bundled App connection, mock login and home flow
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: "2"
+        working-directory: takosumi-mobile
+        run: |
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-web-home-fixture
+          python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-web-home"
+          python3 native-tests/desktop/web_home.py --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-quick-close"
