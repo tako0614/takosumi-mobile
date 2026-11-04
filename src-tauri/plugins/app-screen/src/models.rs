@@ -501,6 +501,45 @@ fn is_hex_color(raw: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct CapabilitiesResponse {
     pub pin_shortcut: bool,
+    #[serde(default)]
+    pub clear_profile: bool,
+}
+
+/// Explicitly clear one isolated Web connection, never the legacy shared jar.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClearProfileRequest {
+    pub profile: String,
+    pub key: String,
+}
+
+impl ClearProfileRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !is_isolated_profile(&self.profile) || self.key.len() > KEY_MAX_LENGTH {
+            return Err(crate::Error::InvalidRequest(
+                "Only an isolated Web connection can be cleared.",
+            ));
+        }
+        let prefix = format!("web-home:{}:", self.profile);
+        let origin = self
+            .key
+            .strip_prefix(&prefix)
+            .ok_or(crate::Error::InvalidRequest(
+                "The Web connection does not match its browsing profile.",
+            ))?;
+        if !is_https_origin(origin) {
+            return Err(crate::Error::InvalidRequest(
+                "The Web connection identity is invalid.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearProfileResponse {
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -512,6 +551,23 @@ pub struct PinShortcutResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_profile_targets_never_include_shared_or_another_connection() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../clear-profile-cases.json")).unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let request = ClearProfileRequest {
+                profile: case["profile"].as_str().unwrap().into(),
+                key: case["key"].as_str().unwrap().into(),
+            };
+            assert_eq!(
+                request.validate().is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{case}"
+            );
+        }
+    }
 
     fn request(url: &str, profile: &str) -> OpenRequest {
         OpenRequest {

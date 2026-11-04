@@ -168,6 +168,14 @@ enum AppScreenResume {
         // Scope and key are bounded and printable; the pair needs no hashing.
         "\(scope)\n\(key)"
     }
+
+    static func clearWebHome(key: String) throws {
+        guard let value = UserDefaults.standard.object(forKey: defaultsKey) else { return }
+        guard let stored = value as? [String: [String: Any]] else {
+            throw NSError(domain: "AppScreen", code: 1, userInfo: [NSLocalizedDescriptionKey: "前の画面の記録を消去できませんでした。"])
+        }
+        UserDefaults.standard.set(AppScreenPolicy.clearingResumeMetadata(stored, key: key), forKey: defaultsKey)
+    }
 }
 
 /// What an app screen's bar asks the shell to do: show the chooser for an app.
@@ -579,10 +587,40 @@ final class AppScreenCoordinator {
     private let processPool = WKProcessPool()
     private var isolatedPools: [String: WKProcessPool] = [:]
     private var isolatedStores: [String: WKWebsiteDataStore] = [:]
+    private var clearingProfiles: Set<String> = []
     private var sessions: [String: AppScreenSession] = [:]
     private var order: [String] = []
     private var visibleKeys: Set<String> = []
     private weak var screen: AppScreenViewController?
+
+    func clearProfile(_ profile: String, key: String, completion: @escaping (Error?) -> Void) {
+        func error(_ message: String) -> NSError {
+            NSError(domain: "com.takosumi.appscreen", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        guard #available(iOS 17.0, *), AppScreenPolicy.canClearProfile(profile, key: key),
+              let identifier = UUID(uuidString: profile) else {
+            completion(error("この接続先の保存データは消去できません。")); return
+        }
+        guard !sessions.values.contains(where: { $0.profile == profile }) else {
+            completion(error("この接続先の画面をすべて閉じてから消去してください。")); return
+        }
+        guard clearingProfiles.insert(profile).inserted else {
+            completion(error("この接続先の保存データを消去しています。")); return
+        }
+        let store = isolatedStores[profile] ?? WKWebsiteDataStore(forIdentifier: identifier)
+        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
+            do {
+                try AppScreenResume.clearWebHome(key: key)
+                self.isolatedStores.removeValue(forKey: profile)
+                self.isolatedPools.removeValue(forKey: profile)
+                self.clearingProfiles.remove(profile)
+                completion(nil)
+            } catch {
+                self.clearingProfiles.remove(profile)
+                completion(error)
+            }
+        }
+    }
 
     func open(_ request: AppScreenRequest, from presenter: UIViewController) throws {
         // A Takosumi page outside sign-in (the dashboard, account pages) never
@@ -682,6 +720,10 @@ final class AppScreenCoordinator {
     }
 
     private func makeConfiguration(profile: String) throws -> WKWebViewConfiguration {
+        guard !clearingProfiles.contains(profile) else {
+            throw NSError(domain: "com.takosumi.appscreen", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "この接続先の保存データを消去しています。"])
+        }
         let configuration = WKWebViewConfiguration()
         if profile == "shared" {
             configuration.websiteDataStore = WKWebsiteDataStore.default()

@@ -25,10 +25,10 @@ mod resume;
 
 #[cfg(all(desktop, feature = "desktop"))]
 mod desktop;
-#[cfg(all(desktop, feature = "desktop"))]
-pub use desktop::init;
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 pub use desktop::fixture::run as run_desktop_profile_fixture;
+#[cfg(all(desktop, feature = "desktop"))]
+pub use desktop::init;
 
 #[cfg(mobile)]
 mod commands;
@@ -56,6 +56,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("app-screen")
         .invoke_handler(tauri::generate_handler![
             commands::capabilities,
+            commands::clear_profile,
             commands::open,
             commands::pin_shortcut,
             commands::open_client,

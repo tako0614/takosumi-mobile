@@ -65,6 +65,7 @@ class AppScreenActivity : AppCompatActivity() {
     private var lastKnownUrl: String = ""
     private var visible = false
     private var evicted = false
+    private var profileGeneration = 0L
     private var externalDialog: AlertDialog? = null
     private var lastExternalDeclinedAt = 0L
     private var lastBrowserViewAt = 0L
@@ -91,6 +92,8 @@ class AppScreenActivity : AppCompatActivity() {
             return
         }
         request = parsed
+        if (refuseWhileClearing()) return
+        profileGeneration = AppScreenProfileData.generation(this, parsed.profile)
         val liveProfile = AppScreenRegistry.get(parsed.key)?.profile
         if (!AppScreenProfiles.isSupported(parsed.profile) || (liveProfile != null && liveProfile != parsed.profile)) {
             Toast.makeText(this, "この端末のWeb表示は、分離されたログイン領域に対応していません。", Toast.LENGTH_LONG).show()
@@ -119,7 +122,9 @@ class AppScreenActivity : AppCompatActivity() {
                 override fun handleOnBackPressed() = goBackOrLeave()
             },
         )
-        val restored = savedInstanceState?.getString(STATE_URL)?.let { restorable(it) }
+        val restored = savedInstanceState?.takeIf {
+            !request.webHome || (profileGeneration >= 0L && it.getLong(STATE_GENERATION, 0L) == profileGeneration)
+        }?.getString(STATE_URL)?.let { restorable(it) }
         show(target = restored ?: startUrl(), keepLivePage = keepsLivePage(request))
         applyTaskDescription()
         container.post { reportOpened() }
@@ -139,8 +144,9 @@ class AppScreenActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (!::request.isInitialized || refuseWhileClearing()) return
         visible = true
-        if (evicted) {
+        if (evicted || (request.webHome && AppScreenProfileData.generation(this, request.profile) != profileGeneration)) {
             show(target = restorable(lastKnownUrl) ?: startUrl(), keepLivePage = false)
         }
     }
@@ -152,7 +158,11 @@ class AppScreenActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        restorable(lastKnownUrl)?.let { outState.putString(STATE_URL, it) }
+        if (!::request.isInitialized) return
+        outState.putLong(STATE_GENERATION, profileGeneration)
+        if (!request.webHome || (profileGeneration >= 0L && AppScreenProfileData.generation(this, request.profile) == profileGeneration)) {
+            restorable(lastKnownUrl)?.let { outState.putString(STATE_URL, it) }
+        }
     }
 
     override fun onDestroy() {
@@ -218,6 +228,14 @@ class AppScreenActivity : AppCompatActivity() {
      * after eviction) loads [target].
      */
     private fun show(target: String, keepLivePage: Boolean) {
+        if (refuseWhileClearing()) return
+        val generation = AppScreenProfileData.generation(this, request.profile)
+        val reset = request.webHome && generation != profileGeneration
+        if (reset) {
+            profileGeneration = generation
+            lastKnownUrl = ""
+        }
+        val nextTarget = if (reset) startUrl() else target
         evicted = false
         val existing = AppScreenRegistry.get(request.key)
         if (request.popup && existing == null) {
@@ -236,9 +254,9 @@ class AppScreenActivity : AppCompatActivity() {
         bind(current)
         current.title = request.title
         val keptUrl = existing?.webView?.url
-        val keep = existing != null && keptUrl != null && keepLivePage
+        val keep = existing != null && keptUrl != null && keepLivePage && !reset
         if (!request.popup && !keep) {
-            if (AppScreenPolicy.isInScreen(target, current.origins)) current.webView.loadUrl(target)
+            if (AppScreenPolicy.isInScreen(nextTarget, current.origins)) current.webView.loadUrl(nextTarget)
             else current.webView.loadUrl(request.url)
         } else if (keptUrl != null && !isAllowedCommittedUrl(keptUrl, current.origins)) {
             // A detached page ended up outside the policy (a blocked POST).
@@ -298,6 +316,13 @@ class AppScreenActivity : AppCompatActivity() {
         }
     }
 
+    private fun refuseWhileClearing(): Boolean {
+        if (!AppScreenProfileData.isClearing(request.profile)) return false
+        Toast.makeText(this, "この接続先の保存データを消去しています。完了してから開いてください。", Toast.LENGTH_LONG).show()
+        finishAndRemoveTask()
+        return true
+    }
+
     private fun closeScreen() {
         if (request.popup) finish() else finishAndRemoveTask()
     }
@@ -329,7 +354,7 @@ class AppScreenActivity : AppCompatActivity() {
             current.lastUrl = url
             // Only an app opened as itself (tile, recent, shortcut) keeps its
             // last page; a deep-linked page never becomes it.
-            if (!request.popup && request.resume) AppScreenResume.record(this, request, url)
+            if (!request.popup && request.resume) AppScreenResume.record(this, request, url, profileGeneration)
         }
     }
 
@@ -916,6 +941,7 @@ class AppScreenActivity : AppCompatActivity() {
 
     private companion object {
         const val STATE_URL = "com.takosumi.appscreen.state.URL"
+        const val STATE_GENERATION = "com.takosumi.appscreen.state.GENERATION"
         const val SHELL_SCHEME = "takosumi"
         const val PROMPT_COOLDOWN_MS = 5_000L
         const val BROWSER_VIEW_COOLDOWN_MS = 3_000L

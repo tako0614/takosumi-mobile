@@ -71,6 +71,7 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
 fn capabilities() -> CapabilitiesResponse {
     CapabilitiesResponse {
         pin_shortcut: false,
+        clear_profile: false,
     }
 }
 

@@ -127,16 +127,23 @@ internal object AppScreenResume {
     private const val PREFERENCES = "com.takosumi.appscreen.resume.v1"
     private const val MAX_REMEMBERED = 64
 
-    fun record(context: Context, request: ScreenRequest, url: String) {
+    fun record(context: Context, request: ScreenRequest, url: String, expectedGeneration: Long? = null) {
         val scope = request.scope ?: return
         val appOrigin = request.appOrigin ?: return
         if (request.popup || !AppScreenRules.isRememberable(url, appOrigin, request.webHome)) return
         try {
+            val generation = if (request.webHome) AppScreenProfileData.generation(context, request.profile) else 0L
+            if (request.webHome && (generation < 0L || AppScreenProfileData.isClearing(request.profile) ||
+                (expectedGeneration != null && generation != expectedGeneration))) return
             val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             val id = id(scope, request.key)
-            if (preferences.getString(id, null)?.let { JSONObject(it).optString("url") } == url) return
+            val previous = preferences.getString(id, null)?.let { JSONObject(it) }
+            if (previous?.optString("url") == url && (!request.webHome ||
+                (previous.optString("profile") == request.profile && previous.optLong("generation", -1L) == generation))) return
+            val data = JSONObject().put("url", url).put("t", System.currentTimeMillis())
+            if (request.webHome) data.put("profile", request.profile).put("key", request.key).put("generation", generation)
             val editor = preferences.edit()
-                .putString(id, JSONObject().put("url", url).put("t", System.currentTimeMillis()).toString())
+                .putString(id, data.toString())
             val all = preferences.all
             if (all.size >= MAX_REMEMBERED) {
                 all.mapNotNull { (storedId, value) ->
@@ -159,7 +166,14 @@ internal object AppScreenResume {
         return try {
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
                 .getString(id(scope, request.key), null)
-                ?.let { JSONObject(it).optString("url") }
+                ?.let {
+                    val data = JSONObject(it)
+                    if (request.webHome && (AppScreenProfileData.generation(context, request.profile).let { generation ->
+                        generation < 0L || data.optLong("generation", 0L) != generation
+                    } || (data.has("profile") && data.optString("profile") != request.profile) ||
+                        (data.has("key") && data.optString("key") != request.key))) null
+                    else data.optString("url")
+                }
                 ?.takeIf { AppScreenRules.isRememberable(it, appOrigin, request.webHome) }
         } catch (_: Exception) {
             null
@@ -167,6 +181,19 @@ internal object AppScreenResume {
     }
 
     private fun id(scope: String, key: String) = AppScreenLaunch.digest("$scope\n$key")
+
+    /** Web homes use their validated connection key as both key and scope. */
+    fun clearWebHome(context: Context, profile: String, key: String): Boolean {
+        val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+        val editor = preferences.edit().remove(id(key, key))
+        // Indexed records can be physically removed without touching another
+        // profile. Old opaque hashes are invalidated by the profile generation.
+        for ((storedId, value) in preferences.all) {
+            val data = (value as? String)?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (data?.optString("profile") == profile) editor.remove(storedId)
+        }
+        return editor.commit()
+    }
 }
 
 /** What an app screen's bar asks the shell to do: show the chooser for an app. */

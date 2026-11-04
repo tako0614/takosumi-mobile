@@ -281,6 +281,17 @@ internal object AppScreenLaunch {
         ).takeIf { it.hasConsistentProfile() }
     }
 
+    /** Forget only the launch belonging to the explicitly cleared Web home. */
+    fun clearWebHome(context: Context, profile: String, key: String): Boolean {
+        val preferences = context.getSharedPreferences(LAUNCH_PREFERENCES, Context.MODE_PRIVATE)
+        val editor = preferences.edit().remove(digest(key))
+        for ((storedId, value) in preferences.all) {
+            val data = (value as? String)?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (data?.optString("profile") == profile && data.optBoolean("webHome")) editor.remove(storedId)
+        }
+        return editor.commit()
+    }
+
     /** Keep the screen's launch so its task can be restored without extras. */
     fun remember(context: Context, request: ScreenRequest) {
         if (request.popup || !AppScreenPolicy.isLaunchable(request.url)) return

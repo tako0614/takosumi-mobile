@@ -5,8 +5,9 @@ use tauri::{
 };
 
 use crate::models::{
-    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
-    OpenClientResponse, OpenRequest, OpenWebRequest, PendingActionResponse, PinShortcutResponse,
+    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, ClearProfileRequest,
+    ClearProfileResponse, OpenClientRequest, OpenClientResponse, OpenRequest, OpenWebRequest,
+    PendingActionResponse, PinShortcutResponse,
 };
 
 #[cfg(target_os = "ios")]
@@ -26,6 +27,15 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct AppScreen<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> AppScreen<R> {
+    pub fn clear_profile(
+        &self,
+        payload: ClearProfileRequest,
+    ) -> crate::Result<ClearProfileResponse> {
+        self.0
+            .run_mobile_plugin("clearProfile", payload)
+            .map_err(Into::into)
+    }
+
     pub fn capabilities(&self) -> crate::Result<CapabilitiesResponse> {
         self.0
             .run_mobile_plugin("capabilities", ())

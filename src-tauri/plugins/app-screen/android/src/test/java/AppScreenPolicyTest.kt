@@ -23,6 +23,66 @@ class AppScreenPolicyTest {
         return JSONObject(file.readText())
     }
 
+    @Test
+    fun clearTargetsNeverSelectSharedOrAnotherConnection() {
+        val cases = JSONObject(listOf(File("../clear-profile-cases.json"), File("clear-profile-cases.json"))
+            .first { it.isFile }.readText()).getJSONArray("cases")
+        for (index in 0 until cases.length()) {
+            val item = cases.getJSONObject(index)
+            assertEquals(item.toString(), item.getBoolean("valid"),
+                AppScreenProfiles.canClear(item.getString("profile"), item.getString("key")))
+        }
+    }
+
+    @Test
+    fun clearingWebHomeMetadataPreservesOtherProfilesAndLegacyPreferences() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val profile = "11111111-1111-4111-8111-111111111111"
+        val otherProfile = "22222222-2222-4222-8222-222222222222"
+        val work = ScreenRequest("web-home:$profile:https://sumi.example", "https://sumi.example/", "Work", profile = profile, webHome = true).let { it.copy(scope = it.key, resume = true) }
+        val personal = work.copy(key = "web-home:$otherProfile:https://sumi.example", profile = otherProfile).let { it.copy(scope = it.key) }
+        val legacy = work.copy(key = "legacy-app", profile = "shared", webHome = false, scope = "legacy-scope")
+        val alternate = work.copy(scope = "accepted-alternate-scope")
+        for (request in listOf(work, personal, legacy, alternate)) {
+            AppScreenResume.record(context, request, "https://sumi.example/editor")
+            AppScreenLaunch.remember(context, request)
+        }
+        assertTrue(AppScreenProfileData.advanceGeneration(context, profile))
+        assertTrue(AppScreenResume.clearWebHome(context, profile, work.key))
+        assertTrue(AppScreenLaunch.clearWebHome(context, profile, work.key))
+        assertEquals(null, AppScreenResume.recall(context, work))
+        assertEquals(null, AppScreenResume.recall(context, alternate))
+        assertEquals("https://sumi.example/editor", AppScreenResume.recall(context, personal))
+        assertEquals("https://sumi.example/editor", AppScreenResume.recall(context, legacy))
+    }
+
+    @Test
+    fun oldOpaqueResumeScopesCannotReturnAfterTheProfileGenerationChanges() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val profile = "33333333-3333-4333-8333-333333333333"
+        val key = "web-home:$profile:https://sumi.example"
+        val request = ScreenRequest(key, "https://sumi.example/", "Work", profile = profile,
+            webHome = true, scope = "old-alternate-scope", resume = true)
+        val preferences = context.getSharedPreferences("com.takosumi.appscreen.resume.v1", android.content.Context.MODE_PRIVATE)
+        val id = AppScreenLaunch.digest("${request.scope}\n$key")
+        val old = JSONObject().put("url", "https://sumi.example/private-draft").put("t", 1).toString()
+        assertTrue(preferences.edit().putString(id, old).commit())
+        assertEquals("https://sumi.example/private-draft", AppScreenResume.recall(context, request))
+        val before = AppScreenProfileData.generation(context, profile)
+        assertTrue(AppScreenProfileData.advanceGeneration(context, profile))
+        assertTrue(AppScreenResume.clearWebHome(context, profile, key))
+        assertEquals(before + 1L, AppScreenProfileData.generation(context, profile))
+        assertEquals(null, AppScreenResume.recall(context, request))
+        // Opaque v1 hashes cannot safely be assigned to a profile for physical
+        // removal. A tombstone disables their restoration without deleting
+        // unrelated accounts' preferences or claiming forensic erasure.
+        assertEquals(old, preferences.getString(id, null))
+        AppScreenResume.record(context, request, "https://sumi.example/stale-callback", before)
+        assertEquals(null, AppScreenResume.recall(context, request))
+        AppScreenResume.record(context, request, "https://sumi.example/new-page", before + 1L)
+        assertEquals("https://sumi.example/new-page", AppScreenResume.recall(context, request))
+    }
+
     private fun expected(decision: String): NavigationKind = when (decision) {
         "in-app" -> NavigationKind.IN_APP
         "browser-view" -> NavigationKind.BROWSER_VIEW

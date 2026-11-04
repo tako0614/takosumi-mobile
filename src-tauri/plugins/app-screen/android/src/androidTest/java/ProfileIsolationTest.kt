@@ -118,6 +118,54 @@ class ProfileIsolationTest {
     }
 
     @Test
+    fun clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles() {
+        assertTrue("This engine must qualify profile-data deletion without a skip.", main { AppScreenProfileData.isSupported() })
+        val first = UUID.randomUUID().toString()
+        val second = UUID.randomUUID().toString()
+        val key = "web-home:$first:$site"
+        read(open("shared"), "legacy-clear-control")
+        read(open(second), "personal-clear-control")
+        val work = open(first)
+        read(work, "work-clear-control")
+        load(work, otherSite)
+        read(work, "other-clear-control")
+        val request = ScreenRequest(key, "$site/", "Work", profile = first, webHome = true, scope = key, resume = true)
+        main {
+            AppScreenResume.record(instrumentation.targetContext, request, "$otherSite/editor")
+            AppScreenLaunch.remember(instrumentation.targetContext, request)
+            var refused: String? = null
+            AppScreenProfileData.clear(instrumentation.targetContext, first, key) { refused = it }
+            assertTrue(requireNotNull(refused).contains("すべて閉じて"))
+            assertFalse(AppScreenProfileData.isClearing(first))
+        }
+        account(work, "other-clear-control", otherSite)
+        main { keys.forEach { AppScreenRegistry.remove(it) } }
+        val finished = CountDownLatch(1)
+        var failure: String? = null
+        main {
+            AppScreenProfileData.clear(instrumentation.targetContext, first, key) {
+                failure = it
+                finished.countDown()
+            }
+            assertTrue(AppScreenProfileData.isClearing(first))
+            try {
+                AppScreenRegistry.obtain(instrumentation.targetContext, "test:pending:$first", profile = first)
+                fail("A clearing profile was reopened")
+            } catch (_: IllegalStateException) { }
+        }
+        assertTrue("Native profile deletion did not complete", finished.await(20, TimeUnit.SECONDS))
+        assertNull(failure)
+        assertFalse(main { AppScreenProfileData.isClearing(first) })
+        assertNull(main { AppScreenResume.recall(instrumentation.targetContext, request) })
+        val cleared = open(first)
+        account(cleared, null)
+        load(cleared, otherSite)
+        account(cleared, null, otherSite)
+        account(open(second), "personal-clear-control")
+        account(open("shared"), "legacy-clear-control")
+    }
+
+    @Test
     fun liveScreenCannotBeRetargetedToAnotherProfilesCookieJar() {
         assertTrue(main { WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE) })
         val first = UUID.randomUUID().toString()

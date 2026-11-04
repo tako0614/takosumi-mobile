@@ -182,3 +182,37 @@ swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests
 
 That suite verifies navigation and canonical profile names, not UIKit rendering
 or iOS data-store isolation. WKWebView/device qualification remains necessary.
+
+## Profile data reset candidate
+
+The unpublished reset work adds a separate, explicitly confirmed action to the
+shared Web home. Removing a connection remains a preference edit. A clear
+request is bound to a canonical isolated UUID and its exact connection key;
+the legacy shared profile is refused. Engines advertise the action through a
+separate capability and the shell requires an explicit completed receipt.
+Desktop implementation is still pending and advertises no clear capability.
+
+Android uses the selected profile's `WebStorage` and the
+`WebStorageCompat.deleteBrowsingData` completion callback, gated by both
+`MULTI_PROFILE` and `DELETE_BROWSING_DATA`. It does not clear process-default
+storage or use `ProfileStore.deleteProfile` as a completion receipt. Live views
+block deletion. A latch blocks opening the profile during deletion. Committed
+profile generations also invalidate stale Activity/saved-instance URLs and
+late callbacks after an inactive view was evicted. New resume metadata is
+indexed by profile; old opaque v1 hashes cannot be safely assigned for physical
+removal, so old-generation restoration is disabled without deleting another
+profile's preferences. This resets restoration, not forensic disk erasure.
+
+iOS removes all website data in the selected UUID store and waits for WebKit's
+completion callback. Any live same-profile session blocks the operation and
+configuration creation is refused while clearing. Resume metadata is removed
+for every scope with the exact cleared key. Other profiles, legacy native
+credentials, connection settings and files saved outside site storage are not
+selected. Completion does not claim fsync, crash or downgrade durability.
+
+The shared `clear-profile-cases.json` is consumed by Rust/Kotlin/Swift policy
+tests. The Android instrumentation case checks live-view refusal, pending-open
+refusal, two-site cookie/storage removal and preservation of a second profile
+and the shared store. These new native tests and SDK checks have not run yet;
+the Activity eviction/recreation path still needs an actual lifecycle control.
+Portable TypeScript checks do not qualify native data deletion or UI behavior.
