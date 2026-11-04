@@ -82,6 +82,14 @@ Add `--spa-resume` with a fresh data directory to test `pushState` and
 a new process without clicking an app link. `--failed-navigation` and
 `--cancelled-navigation` each add a real native failure/cancellation before
 Close; the next process must still restore the earlier successful SPA route.
+`--pending-navigation` requires the exact next URI to remain loading at native
+CloseRequested with no intervening failure/completion, then requires the same
+saved SPA route on readback. The GTK adapter observes URI and native history
+notifications synchronously, accepting a stable route only when both agree.
+This covers replaceState when no history-list signal arrives. Active/requested
+URI settlement and unqualified Close snapshots after a failure cannot overwrite
+the last successful route. Later qualified history changes remain eligible,
+including the URL of an earlier failed load, with the same credential filters.
 These cases use production profile metadata, not a fixture-side saved URL.
 GLib criticals fail the runner, including during teardown. Deferred URL snapshots
 use weak view references so queued work does not keep a closed view alive.

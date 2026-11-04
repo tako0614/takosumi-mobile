@@ -54,13 +54,14 @@ def main():
     parser.add_argument("--profile-reset", action="store_true")
     parser.add_argument("--failed-navigation", action="store_true")
     parser.add_argument("--cancelled-navigation", action="store_true")
+    parser.add_argument("--pending-navigation", action="store_true")
     args = parser.parse_args()
-    if args.profile_reset and (args.spa_resume or args.failed_navigation or args.cancelled_navigation):
+    if args.profile_reset and (args.spa_resume or args.failed_navigation or args.cancelled_navigation or args.pending_navigation):
         parser.error("profile reset requires its fresh single-process fixture")
-    if (args.failed_navigation or args.cancelled_navigation) and not args.spa_resume:
+    if (args.failed_navigation or args.cancelled_navigation or args.pending_navigation) and not args.spa_resume:
         parser.error("navigation failure controls require --spa-resume")
-    if args.failed_navigation and args.cancelled_navigation:
-        parser.error("select one navigation failure control")
+    if sum((args.failed_navigation, args.cancelled_navigation, args.pending_navigation)) > 1:
+        parser.error("select one navigation failure/pending control")
     binary = args.binary.resolve(strict=True)
     data = args.data.absolute()
     if data.exists():
@@ -98,6 +99,8 @@ def main():
                 for method, extra in (("push", []), ("replace", ["--spa-replace"])):
                     controls = (["--failed-navigation"] if args.failed_navigation else []) + (
                         ["--cancelled-navigation"] if args.cancelled_navigation else [])
+                    if args.pending_navigation:
+                        controls.append("--pending-navigation")
                     scoped = dict(env, TAKOSUMI_FIXTURE_DATA=str(data / method))
                     for flags in ([], ["--readback"]):
                         run_desktop_session(["xvfb-run", "-a", "dbus-run-session", "--", str(binary),

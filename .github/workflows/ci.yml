@@ -276,6 +276,7 @@ jobs:
           python3 native-tests/desktop/run.py --spa-resume --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-spa"
           python3 native-tests/desktop/run.py --spa-resume --failed-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-failure"
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled"
+          python3 native-tests/desktop/run.py --spa-resume --pending-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-pending"
       - name: Build bundled App and verify the fixture observer
         id: linux-app-fixture-build
         if: ${{ !cancelled() && runner.os == 'Linux' }}

@@ -11,6 +11,8 @@ use wry::WebViewExtUnix;
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 static RESET_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_CLOSE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_CLOSE_VALID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const WORK: &str = "11111111-1111-4111-8111-111111111111";
 const PERSONAL: &str = "22222222-2222-4222-8222-222222222222";
@@ -192,6 +194,7 @@ fn spa_probe(app: AppHandle, readback: bool) {
                     let _ = app.run_on_main_thread(move || {
                         if std::env::args().any(|arg| {
                             arg == "--failed-navigation" || arg == "--cancelled-navigation"
+                                || arg == "--pending-navigation"
                         }) {
                             fail_after_spa(handle, target);
                         } else {
@@ -229,6 +232,69 @@ fn fail_after_spa(app: AppHandle, target: String) {
     let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
     let native = view.clone();
     after_document_load(&view, target, "bootstrap".into(), app.clone(), move || {
+        if std::env::args().any(|arg| arg == "--pending-navigation") {
+            let pending_uri = format!("{}slow", request(WORK).url);
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finished_armed = armed.clone();
+            let finished_terminal = terminal.clone();
+            native.connect_load_changed(move |_, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Finished)
+                    && finished_armed.load(Ordering::SeqCst)
+                {
+                    finished_terminal.store(true, Ordering::SeqCst);
+                }
+            });
+            let failed_armed = armed.clone();
+            let failed_terminal = terminal.clone();
+            let failed_uri = pending_uri.clone();
+            native.connect_load_failed(move |_, _, uri, _| {
+                if failed_armed.load(Ordering::SeqCst) && uri == failed_uri {
+                    failed_terminal.store(true, Ordering::SeqCst);
+                }
+                false
+            });
+            let close_label = label(WORK);
+            let close_uri = pending_uri.clone();
+            let window = SCREENS.with(|screens| screens.borrow().get(&close_label).unwrap().window.clone());
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                    && !PENDING_CLOSE_SEEN.swap(true, Ordering::SeqCst)
+                {
+                    let valid = !terminal.load(Ordering::SeqCst) && SCREENS.with(|screens| {
+                        screens.borrow().get(&close_label).is_some_and(|screen| {
+                            let view = screen.view.webview();
+                            view.is_loading() && view.uri().as_deref() == Some(close_uri.as_str())
+                        })
+                    });
+                    PENDING_CLOSE_VALID.store(valid, Ordering::SeqCst);
+                    if valid {
+                        println!("PASS: controlled native load is still pending at CloseRequested");
+                    } else {
+                        eprintln!("FAIL: pending control settled before native CloseRequested");
+                    }
+                }
+            });
+            let expected = pending_uri.clone();
+            let id = Rc::new(RefCell::new(None));
+            let callback_id = id.clone();
+            let handle = app.clone();
+            let handler = native.connect_load_changed(move |view, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Started)
+                    && view.uri().as_deref() == Some(expected.as_str())
+                {
+                    if let Some(id) = callback_id.borrow_mut().take() {
+                        view.disconnect(id);
+                    }
+                    armed.store(true, Ordering::SeqCst);
+                    let app = handle.clone();
+                    gtk::glib::idle_add_local_once(move || close_spa(app));
+                }
+            });
+            *id.borrow_mut() = Some(handler);
+            native.load_uri(&pending_uri);
+            return;
+        }
         let cancel = std::env::args().any(|arg| arg == "--cancelled-navigation");
         let failed_uri = format!(
             "{}{}",
@@ -298,6 +364,13 @@ fn after_spa_close(
         CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     }
     if closed && context.upgrade().is_none() {
+        if std::env::args().any(|arg| arg == "--pending-navigation")
+            && !(PENDING_CLOSE_SEEN.load(Ordering::SeqCst) && PENDING_CLOSE_VALID.load(Ordering::SeqCst))
+        {
+            eprintln!("FAIL: pending control did not prove its native Close boundary");
+            app.exit(1);
+            return;
+        }
         println!("PASS: primary window and native context released before process exit");
         EXIT_STATUS.store(0, Ordering::SeqCst);
         app.exit(0);
