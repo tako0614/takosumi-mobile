@@ -321,6 +321,136 @@ async fn no_ipc(view: &WebView) -> Result<()> {
     assert_js(view, "typeof window.__TAURI_INTERNALS__ === 'undefined' && typeof window.ipc === 'undefined' && !window.webkit?.messageHandlers?.ipc", "remote has no native IPC").await
 }
 
+async fn clear_work_profile(
+    app: &AppHandle,
+    shell: &WebView,
+    main: &Window,
+    work: &Window,
+    personal: &Window,
+    origin: &str,
+    app_origin: &str,
+) -> Result<()> {
+    let connections = eval(shell, "localStorage.getItem('takosumi.web-connections.v2')").await?;
+    menu(work, "接続先を切り替える").await?;
+    focused(main).await?;
+    ready(shell, "!document.querySelector('.web-connection:disabled')").await?;
+    click_connection(shell, "Work").await?;
+    focused(work).await?;
+    ready(shell, "!document.querySelector('.web-connection:disabled')").await?;
+    assert_js(shell, "[...document.querySelectorAll('.web-connection')].find(b => b.querySelector('strong').textContent === 'Work').querySelector('small').textContent === '前の画面へ戻る →'", "Work has a previous-page indicator before reset").await?;
+    menu(work, "接続先を切り替える").await?;
+    focused(main).await?;
+    ready(shell, "(() => { const b=[...document.querySelectorAll('.web-connections li')].find(row => row.querySelector('strong')?.textContent === 'Work')?.querySelectorAll('button'); return b?.length === 3 && !b[2].disabled; })()").await?;
+    action(shell, "[...document.querySelectorAll('.web-connections li')].find(row => row.querySelector('strong')?.textContent === 'Work').querySelectorAll('button')[2].click();").await?;
+    ready(shell, "document.querySelector('.web-clear')").await?;
+    assert_js(
+        shell,
+        "document.querySelector('.web-clear h3').textContent === 'Workの保存データを消去しますか？'",
+        "actual shared confirmation selects Work",
+    )
+    .await?;
+    action(
+        shell,
+        "document.querySelector('.web-clear button:last-of-type').click();",
+    )
+    .await?;
+    ready(shell, "document.querySelector('[role=alert]')").await?;
+    assert_js(shell, "document.querySelector('[role=alert]').textContent.includes('すべて閉じて') && !document.querySelector('[role=status]') && Boolean(document.querySelector('.web-clear'))", "real native IPC refuses clearing a live profile without reporting success").await?;
+
+    menu(work, "閉じる").await?;
+    let start = Instant::now();
+    while app.get_window(work.label()).is_some() {
+        if start.elapsed() > Duration::from_secs(3) {
+            return Err("Work window survived native Close before clear".into());
+        }
+        pause().await;
+    }
+    main.set_focus().map_err(|e| e.to_string())?;
+    focused(main).await?;
+    // The same confirmation remains after refusal. Invoke once after closing
+    // the selected profile; do not retry an unsuccessful data assertion.
+    action(
+        shell,
+        "document.querySelector('.web-clear button:last-of-type').click();",
+    )
+    .await?;
+    ready(shell, "document.querySelector('[role=status]')").await?;
+    assert_js(shell, "document.querySelector('[role=status]').textContent === 'Workのサイトデータを消去しました。' && !document.querySelector('.web-clear') && !document.querySelector('[role=alert]')", "shared UI acknowledges completed native clear").await?;
+    if eval(shell, "localStorage.getItem('takosumi.web-connections.v2')").await? != connections {
+        return Err("Native clear changed connection preferences".into());
+    }
+    assert_js(shell, "[...document.querySelectorAll('.web-connection')].find(b => b.querySelector('strong').textContent === 'Work').querySelector('small').textContent === '開く →'", "successful native clear resets the previous-page indicator").await?;
+
+    click_connection(shell, "Work").await?;
+    let reopened = remote(app, Some(personal.label())).await?;
+    let cleared = view(&reopened)?;
+    // This is the same cached context whose test certificate was trusted on
+    // first open. A second reload could hide an incorrect first response.
+    ready(
+        &cleared,
+        &format!(
+            "location.href === {} && document.querySelector('[data-page]')",
+            serde_json::to_string(&format!("{origin}/")).unwrap()
+        ),
+    )
+    .await?;
+    assert_js(
+        &cleared,
+        "document.querySelector('[data-page]').dataset.page === 'login'",
+        "cleared Work's first root document is logged out",
+    )
+    .await?;
+    no_ipc(&cleared).await?;
+    println!("PASS: cleared Work opens at its root, logged out instead of its saved editor");
+    // The mock editor needs no login. Navigate normally to the second origin
+    // to inspect its storage once, without creating a new mock login cookie.
+    cleared.load_uri(&format!("{app_origin}/"));
+    ready(
+        &cleared,
+        &format!(
+            "location.href === {} && document.querySelector('[data-page=editor]')",
+            serde_json::to_string(&format!("{app_origin}/")).unwrap()
+        ),
+    )
+    .await?;
+    assert_js(
+        &cleared,
+        "localStorage.getItem('draft') === null && document.querySelector('textarea').value === ''",
+        "cleared Work has no second-site editor draft",
+    )
+    .await?;
+    no_ipc(&cleared).await?;
+
+    let preserved = view(personal)?;
+    action(
+        &preserved,
+        "document.querySelector('[data-app=editor]').click();",
+    )
+    .await?;
+    ready(
+        &preserved,
+        &format!(
+            "location.href === {} && document.querySelector('[data-page=editor]')",
+            serde_json::to_string(&format!("{app_origin}/")).unwrap()
+        ),
+    )
+    .await?;
+    assert_draft(
+        &preserved,
+        "personal draft",
+        "native clear preserves the other profile's editor draft",
+    )
+    .await?;
+    no_ipc(&preserved).await?;
+    // A fresh request after the editor verifies the HttpOnly session cookie;
+    // the old home DOM alone could outlive an incorrectly cleared cookie.
+    menu(personal, "アプリホームへ").await?;
+    assert_home(&preserved, origin, "personal").await?;
+    close_profiles(app, &[personal.clone(), reopened]).await?;
+    println!("PASS: completed profile reset through shared UI and real native IPC preserves other profiles");
+    Ok(())
+}
+
 async fn flow(app: &AppHandle) -> Result<()> {
     let origin = required_env("TAKOSUMI_FIXTURE_HTTPS");
     let app_origin = required_env("TAKOSUMI_FIXTURE_APP_HTTPS");
@@ -575,6 +705,14 @@ async fn flow(app: &AppHandle) -> Result<()> {
         )
         .await?;
         assert_js(&shell, "(() => {const c=JSON.parse(localStorage.getItem('takosumi.web-connections.v2')); return c.length === 2 && c[0].profile !== c[1].profile && c.every(x => x.profile !== 'shared');})()", "real shared form persisted two distinct profiles").await?;
+    }
+    if readback() {
+        // Release fixture-only WebView references before closing Work. The
+        // production registry remains the authority for live-profile refusal.
+        drop(content);
+        drop(other);
+        clear_work_profile(app, &shell, &main, &work, &personal, &origin, &app_origin).await?;
+        return Ok(());
     }
     // Exercise ordinary native Close before exiting the App. This is not an
     // immediate-process-exit or crash-durability test; those remain separate.

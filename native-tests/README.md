@@ -226,13 +226,15 @@ this proves the UI/request path, not engine deletion or a mobile/desktop runtime
 The receipt includes browser/Node versions and before/after source hashes. PNGs
 live in the new artifact directory. CI runs this on Linux.
 
-The unpublished reset work adds a separate, explicitly confirmed action to the
+The reset candidate adds a separate, explicitly confirmed action to the
 shared Web home. Removing a connection remains a preference edit. A clear
 request is bound to a canonical isolated UUID and its exact connection key;
 the legacy shared profile is refused. Engines advertise the action through a
 separate capability and the shell requires an explicit completed receipt.
-The desktop native-completion candidate is implemented but still advertises no
-clear capability or bundled-shell grant pending its runtime qualification.
+The desktop candidate grants this only to the bundled `main` shell and exposes
+the same confirmation as mobile. macOS requires the UUID-store API (14+).
+Its native SDK/runtime qualification remains pending; source availability alone
+does not qualify data deletion.
 
 Android uses the selected profile's `WebStorage` and the
 `WebStorageCompat.deleteBrowsingData` completion callback, gated by both
@@ -298,5 +300,12 @@ does not establish the sole cause or qualify data deletion. Its timeout and
 data assertions remain unchanged. The bounded timeout snapshot reads only the
 owned session's process names/identities/waits, with no argv or page payload;
 a subprocess control verifies another session is untouched and unobserved.
-macOS/Windows compilation, native clear/error/teardown runtime, full WebHome
-confirmation/IPC and restart durability remain unqualified for this candidate.
+The full bundled App fixture also clears Work through the real shared
+confirmation/IPC after restart readback. It first checks refusal while Work is
+open, then closes Work and waits for the completed receipt. Reopening must land
+at its root logged out, with no editor draft at the second site. A live Personal
+profile must retain its draft and its HttpOnly session on a fresh home request;
+connection settings must be unchanged. These new assertions run once after DOM
+readiness, alongside the existing cold-restoration flow. They remain unrun until
+the changed App is rebuilt. macOS/Windows compilation, native clear/error/teardown
+runtime and restart durability remain unqualified for this candidate.

@@ -74,9 +74,13 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
 
 #[tauri::command]
 fn capabilities() -> CapabilitiesResponse {
+    #[cfg(target_os = "macos")]
+    let clear_profile = objc2::available!(macos = 14.0);
+    #[cfg(not(target_os = "macos"))]
+    let clear_profile = true;
     CapabilitiesResponse {
         pin_shortcut: false,
-        clear_profile: false,
+        clear_profile,
     }
 }
 
