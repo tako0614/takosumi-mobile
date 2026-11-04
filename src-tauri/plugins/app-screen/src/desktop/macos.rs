@@ -37,7 +37,7 @@ define_class!(
                 || self.ivars().original.respondsToSelector(selector)
         }
 
-        #[unsafe(method(forwardingTargetForSelector:))]
+        #[unsafe(method_id(forwardingTargetForSelector:))]
         fn forwarding_target(&self, _selector: Sel) -> Option<Retained<AnyObject>> {
             // SAFETY: every Objective-C protocol object is also an AnyObject;
             // the retained original outlives the forwarding operation.
