@@ -5,7 +5,7 @@
 use super::*;
 use javascriptcore::ValueExt;
 use std::{path::Path, time::Duration};
-use webkit2gtk::WebViewExt;
+use webkit2gtk::{WebContextExt, WebViewExt};
 use wry::WebViewExtUnix;
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
@@ -44,12 +44,30 @@ pub fn run() {
             )
             .title("Synthetic Takosumi picker")
             .build()?;
+            let certificate =
+                std::fs::read_to_string(std::env::var_os("TAKOSUMI_FIXTURE_CERT").unwrap())?;
+            let certificate = gtk::gio::TlsCertificate::from_pem(&certificate)?;
             for profile in [WORK, PERSONAL, "shared"] {
                 open_on_ui_thread(app.handle(), request(profile), directory.clone())?;
+                let view = SCREENS.with(|screens| {
+                    screens
+                        .borrow()
+                        .get(&label(profile))
+                        .unwrap()
+                        .view
+                        .webview()
+                });
+                // Only this fixture's ephemeral loopback certificate. Load
+                // again after trusting it, then await the real bootstrap
+                // document before replacing any factory-started navigation.
+                view.context()
+                    .unwrap()
+                    .allow_tls_certificate_for_host(&certificate, "127.0.0.1");
+                view.load_uri(&request(profile).url);
             }
             let handle = app.handle().clone();
-            gtk::glib::timeout_add_local_once(Duration::from_millis(300), move || {
-                step(handle, directory, readback, 0);
+            gtk::glib::idle_add_local_once(move || {
+                bootstrap(handle, directory, readback, 0);
             });
             Ok(())
         })
@@ -73,13 +91,57 @@ pub fn run() {
 }
 
 fn request(profile: &str) -> OpenRequest {
-    serde_json::from_value(serde_json::json!({
-        "key": if profile == "shared" { "web-home:https://sumi.invalid".to_string() }
-            else { format!("web-home:{profile}:https://sumi.invalid") },
-        "url": "https://sumi.invalid/", "title": "Fixture", "profile": profile,
+    let base =
+        std::env::var("TAKOSUMI_FIXTURE_HTTPS").expect("Run via native-tests/desktop/run.py");
+    let url = tauri::Url::parse(&base).expect("Fixture HTTPS URL");
+    assert!(
+        url.scheme() == "https"
+            && url.host_str() == Some("127.0.0.1")
+            && url.port().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "Fixture must use the runner's loopback HTTPS root"
+    );
+    let origin = url.origin().ascii_serialization();
+    let payload: OpenRequest = serde_json::from_value(serde_json::json!({
+        "key": if profile == "shared" { format!("web-home:{origin}") }
+            else { format!("web-home:{profile}:{origin}") },
+        "url": url.as_str(), "title": "Fixture", "profile": profile,
         "webHome": true, "resume": true
     }))
-    .unwrap()
+    .unwrap();
+    payload
+        .validate()
+        .expect("Fixture uses a valid production request");
+    payload
+}
+
+fn bootstrap(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
+    let Some(profile) = [WORK, PERSONAL, "shared"].get(index).copied() else {
+        step(app, directory, readback, 0);
+        return;
+    };
+    let view = SCREENS.with(|screens| {
+        screens
+            .borrow()
+            .get(&label(profile))
+            .unwrap()
+            .view
+            .webview()
+    });
+    after_document_load(
+        &view,
+        request(profile).url,
+        "bootstrap".into(),
+        app.clone(),
+        move || {
+            println!("PASS: factory bootstrap finished for profile={profile}");
+            bootstrap(app, directory, readback, index + 1);
+        },
+    );
 }
 
 fn label(profile: &str) -> String {
@@ -132,9 +194,9 @@ fn step(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
     let target_html = format!("<!doctype html><meta name='sumi-fixture' content='{nonce}'><title>Synthetic {nonce}</title><p>Takosumi engine fixture</p>");
     let native_view =
         SCREENS.with(|screens| screens.borrow().get(&screen_label).unwrap().view.webview());
-    // The production factory starts the site's root load. The synthetic
-    // observation replaces it; never let that initial/error load satisfy it.
-    native_view.stop_loading();
+    // All factory bootstrap loads finished before the first observation.
+    // Do not stop an in-flight initial load and race its cancellation/error
+    // document against this synthetic target.
     let expected_uri = target_uri.clone();
     let diagnostic_view = native_view.clone();
     after_document_load(
@@ -241,13 +303,14 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
             Ok(value) => value.to_json(0).map(|value| value.to_string()).unwrap_or_else(|| "No JSON result".into()),
             Err(error) => format!("Native WebKit error: {error:?}"),
         };
-        let ready = serde_json::from_str::<serde_json::Value>(&diagnostic).ok().is_some_and(|value|
+        let ready = !native.is_loading() && native.uri().as_deref() == Some(pending.uri.as_str())
+            && serde_json::from_str::<serde_json::Value>(&diagnostic).ok().is_some_and(|value|
             value["uri"] == pending.uri && value["nonce"] == pending.nonce && value["ready"] == "complete");
         if ready {
             let callback = pending.callback.borrow_mut().take();
             if let Some(next) = callback { next(); }
         } else if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, last={diagnostic}", pending.uri, pending.nonce);
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}", pending.uri, pending.nonce, native.uri(), native.is_loading());
             pending.app.exit(1);
         } else {
             // Readiness only. Cookies/storage are read and asserted exactly
@@ -295,7 +358,6 @@ fn title_and_back_probe(app: AppHandle) {
 }
 
 fn native_back_probe(app: AppHandle) {
-    use webkit2gtk::WebContextExt;
     let base =
         std::env::var("TAKOSUMI_FIXTURE_HTTPS").expect("Run via native-tests/desktop/run.py");
     let certificate =

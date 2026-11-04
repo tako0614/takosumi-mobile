@@ -9,7 +9,7 @@ export const CONNECTIONS_KEY = "takosumi.web-connections.v2";
 export const LEGACY_CONNECTIONS_KEY = "takosumi.web-connections.v1";
 export const WEB_CLIENT_KEY = "takosumi.web-client.selected.v1";
 
-/** Remember an explicit mode choice so a native screen can reopen the shell. */
+/** Open the Web home by default; retain an explicit legacy-mobile choice. */
 export function webClientSelected(
   search: string,
   storage?: Pick<Storage, "getItem" | "setItem">,
@@ -17,9 +17,9 @@ export function webClientSelected(
   const requested = new URLSearchParams(search).get("web-client");
   try {
     if (requested === "1" || requested === "0") storage?.setItem(WEB_CLIENT_KEY, requested);
-    return requested === "1" || (requested !== "0" && storage?.getItem(WEB_CLIENT_KEY) === "1");
+    return requested === "1" || (requested !== "0" && storage?.getItem(WEB_CLIENT_KEY) !== "0");
   } catch {
-    return requested === "1";
+    return requested !== "0";
   }
 }
 
@@ -50,7 +50,17 @@ export function isWebProfile(value: string): boolean {
   return value === "shared" || /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
-export function webConnection(input: string, name = "", profile: string = crypto.randomUUID()): WebConnection {
+/** Use the same Web Crypto primitive as the mobile kit; no randomUUID capability is required. */
+export function newWebProfile(random: Pick<Crypto, "getRandomValues"> = crypto): string {
+  const bytes = new Uint8Array(16);
+  random.getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function webConnection(input: string, name = "", profile: string = newWebProfile()): WebConnection {
   const origin = connectionOrigin(input);
   const title = name.trim();
   if (title.length > 80 || /[\p{Cc}\p{Cf}]/u.test(title)) {

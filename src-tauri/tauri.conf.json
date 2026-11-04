@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "Takosumi",
+        "backgroundColor": "#0a0a0b",
         "width": 390,
         "height": 844,
         "resizable": true
