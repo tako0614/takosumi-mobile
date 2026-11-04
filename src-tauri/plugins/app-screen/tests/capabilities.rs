@@ -47,7 +47,7 @@ fn no_capability_reaches_remote_pages_or_other_webviews() {
 }
 
 #[test]
-fn only_the_mobile_shell_capability_grants_app_screen_commands() {
+fn only_the_bundled_shell_capabilities_grant_app_screen_commands() {
     for (name, capability) in capabilities() {
         let grants = identifiers(&capability)
             .into_iter()
@@ -55,6 +55,8 @@ fn only_the_mobile_shell_capability_grants_app_screen_commands() {
             .collect::<Vec<_>>();
         if name == "mobile.json" {
             assert_eq!(grants, ["app-screen:default"]);
+        } else if name == "default.json" {
+            assert_eq!(grants, ["app-screen:allow-open", "app-screen:allow-capabilities"]);
         } else {
             assert!(grants.is_empty(), "{name} grants {grants:?}");
         }

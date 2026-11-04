@@ -4961,10 +4961,17 @@ dependencies = [
 name = "tauri-plugin-app-screen"
 version = "0.1.0-takosumi.1"
 dependencies = [
+ "block2",
+ "gtk",
+ "objc2",
+ "objc2-web-kit",
  "serde",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.19",
+ "webkit2gtk",
+ "webview2-com",
+ "wry",
 ]
 
 [[package]]

@@ -64,7 +64,10 @@ test("the app-screen plugin's commands are granted to the shell's capability onl
       (permission) => typeof permission === "string" && permission.startsWith("app-screen:"),
     ),
   );
-  expect(granting.map((capability) => capability.identifier)).toEqual(["mobile"]);
+  expect(granting.map((capability) => capability.identifier).sort()).toEqual(["default", "mobile"]);
+  expect(granting.find((capability) => capability.identifier === "default")?.permissions.filter(
+    (permission) => typeof permission === "string" && permission.startsWith("app-screen:"),
+  )).toEqual(["app-screen:allow-open", "app-screen:allow-capabilities"]);
   const permissions = await Bun.file(
     new URL("plugins/app-screen/permissions/default.toml", root),
   ).text();
