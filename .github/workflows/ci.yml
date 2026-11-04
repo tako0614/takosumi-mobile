@@ -179,6 +179,9 @@ jobs:
 
   desktop:
     needs: [quality, native-plugins]
+    # Wait for native checks, but collect independent OS evidence even if an
+    # Android SDK download/test fails. The failed native job remains red.
+    if: ${{ !cancelled() && needs.quality.result == 'success' }}
     strategy:
       fail-fast: false
       max-parallel: 1

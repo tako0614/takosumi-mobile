@@ -21,7 +21,10 @@ pinned CLI can import them before handling `--no-sign`.
 It requires one nonempty Simulator `.app` with the exact fixture identifier
 and Simulator platform, rejects a device IPA, and prints the executable digest.
 CI runs this after the macOS desktop compile, serialized with the other desktop
-SDK checks. This is an SDK compile check: it does not install or launch the App,
+SDK checks. The desktop matrix waits for the native job to finish but still
+runs if that independent job fails; a native failure keeps the workflow red.
+Quality failure or workflow cancellation prevents the matrix from running.
+This is an SDK compile check: it does not install or launch the App,
 test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
 Simulator/device runtime checks remain separate from the portable Swift policy tests.
 
