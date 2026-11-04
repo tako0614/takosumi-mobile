@@ -2,6 +2,7 @@
 """Run the full bundled App against disposable mock Web login/home/app sites."""
 
 import argparse
+import ctypes
 import http.server
 from http.cookies import SimpleCookie
 import os
@@ -106,6 +107,67 @@ def process_description(pid):
     return details
 
 
+def enable_child_subreaper():
+    # Only the dedicated session worker calls this. It adopts that worker's
+    # orphaned App descendants so a failed NetworkProcess cannot look like a
+    # successful shutdown merely because its PID disappeared.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def observe_children(parent, tracked, descriptions):
+    for pid in descendants(parent):
+        identity = process_identity(pid)
+        if not identity:
+            continue
+        if tracked.get(pid) != identity[0]:
+            descriptions[pid] = process_description(pid)
+        elif not is_network_process(descriptions[pid]):
+            # A launcher may exec/rename after its first observation without
+            # changing start time. Never lose a confirmed network role.
+            descriptions[pid] = process_description(pid)
+        tracked[pid] = identity[0]
+
+
+def is_network_process(description):
+    return (description.get("executable") == "WebKitNetworkProcess" or
+            description.get("name") == "WebKitNetworkPr")
+
+
+def reap_observed_children(tracked, descriptions, statuses):
+    for pid, start in tracked.items():
+        identity = process_identity(pid)
+        if not identity or identity[0] != start or identity[1] != "Z":
+            continue
+        # A zombie cannot exec/rename between this role check and waitpid.
+        if not is_network_process(descriptions[pid]):
+            descriptions[pid] = process_description(pid)
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            continue  # Still owned/reaped by an intermediate App descendant.
+        if waited:
+            statuses[pid] = (start, os.waitstatus_to_exitcode(status))
+
+
+def shutdown_description(pid):
+    details = process_description(pid)
+    threads = []
+    try:
+        for task in sorted(Path(f"/proc/{pid}/task").iterdir())[:12]:
+            try:
+                threads.append({"tid": int(task.name), "name": (task / "comm").read_text().strip(),
+                                "wait": (task / "wchan").read_text().strip()})
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                pass
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
+    details["threads"] = threads
+    return details
+
+
 def run_apps(binary, data, quick_close, legacy_entry):
     """Both Apps restart inside one disposable desktop session, as in use."""
     previous_pid = None
@@ -117,6 +179,8 @@ def run_apps(binary, data, quick_close, legacy_entry):
             flags.append("--legacy-entry")
         log = data / ("readback.log" if readback else "first.log")
         tracked = {}
+        descriptions = {}
+        statuses = {}
         with log.open("w") as output:
             child = subprocess.Popen([str(binary), *flags], stdout=output, stderr=subprocess.STDOUT)
             assert child.pid != previous_pid, "App restart must use a new process"
@@ -124,10 +188,7 @@ def run_apps(binary, data, quick_close, legacy_entry):
             deadline = time.monotonic() + 75
             try:
                 while child.poll() is None:
-                    for pid in descendants(child.pid):
-                        identity = process_identity(pid)
-                        if identity:
-                            tracked[pid] = identity[0]
+                    observe_children(child.pid, tracked, descriptions)
                     if time.monotonic() >= deadline:
                         raise TimeoutError("App process did not exit")
                     time.sleep(0.025)
@@ -148,23 +209,31 @@ def run_apps(binary, data, quick_close, legacy_entry):
         # This waits for process lifecycle only, never storage values or success.
         deadline = time.monotonic() + 5
         while True:
-            # Engine descendants may fork while shutting down. Scan every
-            # task's children and keep following the observed live generation.
-            for pid, start in list(tracked.items()):
-                identity = process_identity(pid)
-                if identity and identity[0] == start and identity[1] != "Z":
-                    for nested in descendants(pid):
-                        nested_identity = process_identity(nested)
-                        if nested_identity:
-                            tracked[nested] = nested_identity[0]
+            # After the App exits, all remaining descendants of this dedicated
+            # worker belong to that App generation, including a helper forked
+            # between the final observation and App exit.
+            observe_children(os.getpid(), tracked, descriptions)
+            reap_observed_children(tracked, descriptions, statuses)
+            failed_network = [dict(descriptions[pid], status=status) for pid, (start, status) in statuses.items()
+                              if tracked[pid] == start and status != 0 and
+                              is_network_process(descriptions[pid])]
+            if failed_network:
+                raise RuntimeError(f"App NetworkProcess exited abnormally: {failed_network}")
             alive = [pid for pid, start in tracked.items()
                      if (identity := process_identity(pid)) and identity[0] == start
-                     and identity[1] != "Z"]
+                     and (identity[1] != "Z" or statuses.get(pid, (None,))[0] != start)]
             if not alive:
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"Old App engine children still alive: {[process_description(pid) for pid in alive]}")
+                raise RuntimeError(f"Old App engine children still alive: {[shutdown_description(pid) for pid in alive]}")
             time.sleep(0.025)
+        # WebKit may deliberately kill a WebProcess. Record its status without
+        # treating that rendering-process policy as a NetworkProcess flush.
+        print(f"Observed orphaned App child exit codes: {statuses}", flush=True)
+        unknown_network = [pid for pid, start in tracked.items()
+                           if is_network_process(descriptions[pid]) and statuses.get(pid, (None,))[0] != start]
+        if unknown_network:
+            print(f"Unknown NetworkProcess exit status (not available to worker): {unknown_network}", flush=True)
         print(f"PASS: App {child.pid} and {len(tracked)} observed engine children exited, readback={readback}", flush=True)
 
 
@@ -204,6 +273,7 @@ def main():
     if args.session_worker:
         if not data.is_dir() or not os.environ.get("DISPLAY"):
             parser.error("session worker requires the isolated outer runner")
+        enable_child_subreaper()
         run_apps(binary, data, args.quick_close, args.legacy_entry)
         return
     if data.exists():

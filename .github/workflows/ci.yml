@@ -263,6 +263,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         working-directory: takosumi-mobile
         run: |
+          python3 native-tests/desktop/test_web_home.py
           cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-web-home-fixture
           python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-web-home"
           python3 native-tests/desktop/web_home.py --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-quick-close"

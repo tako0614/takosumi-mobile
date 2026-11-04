@@ -109,6 +109,16 @@ first App and its observed engine children to exit before starting a new App
 PID; it does not destroy the desktop session during App teardown. DOM readiness
 may be polled; data assertions run once. The actual views expose no native IPC.
 Failure/timeout or a lingering engine process exits nonzero.
+The dedicated Linux session worker adopts orphaned App children and records
+their exit status. An adopted NetworkProcess error or signal refuses readback;
+renderer termination policy is recorded separately. A NetworkProcess already
+reaped by an intermediate parent has an unknown exit status, reported explicitly;
+its disappearance is lifecycle evidence, not proof of graceful storage flush.
+Only observed matching PID start identities are reaped. A timeout prints bounded native thread wait names,
+without page URLs or stored data. The five-second shutdown bound is unchanged.
+`python3 native-tests/desktop/test_web_home.py` checks normal, abnormal and
+signalled synthetic helpers, delayed network-role detection, parent-reaped
+unknown status and a mismatched PID identity without starting a browser.
 
 `--quick-close` minimizes the flow to one connection's acknowledged editor write,
 immediate native Close, and new-process readback. CI runs it separately with a
