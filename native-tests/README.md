@@ -18,6 +18,13 @@ plugins for the host's Simulator architecture. A separate bundle identifier
 and `--no-sign` avoid installed App identity and Apple signing credentials.
 Signing environment inputs are refused before generation/build because the
 pinned CLI can import them before handling `--no-sign`.
+The disposable generated target is restricted to the Simulator SDK/platform,
+then regenerated with XcodeGen before the normal Tauri build, to address Xcode
+26 selecting the device archive destination for an Intel Simulator build.
+An unexpected template, existing platform override or wrong fixture identity
+fails before build. The normal product's generated projects are not reused.
+The normal kit Apple push writer runs again after regeneration; the development
+entitlement must survive before compilation. This is wiring evidence, not push delivery.
 It requires one nonempty Simulator `.app` with the exact fixture identifier
 and Simulator platform, rejects a device IPA, and prints the executable digest.
 CI runs this after the macOS desktop compile, serialized with the other desktop
