@@ -19,6 +19,7 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+mod resume_navigation;
 
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 #[path = "../tests/desktop/fixture.rs"]
@@ -31,6 +32,8 @@ static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
 const MAX_WINDOWS: usize = 48;
 
 struct Screen {
+    // Unsubscribe while the native view and its original delegates are alive.
+    resume_observer: Option<resume_navigation::Observer>,
     // Drop the view before its context. Contexts are also retained for reuse.
     view: WebView,
     _native_handlers: NativeHandlers,
@@ -220,11 +223,6 @@ fn create_screen(
                 // are provisional and can also represent iframe navigation.
                 // Finished may follow a failed navigation, so do not use it.
                 if matches!(event, wry::PageLoadEvent::Started) {
-                    if let Some(store) = &resume {
-                        if let Err(error) = store.record(&url) {
-                            eprintln!("Takosumi last page could not be saved: {error}");
-                        }
-                    }
                     let title = if is_launchable_url(&url) {
                         site_title(&url)
                     } else {
@@ -297,6 +295,9 @@ fn create_screen(
             .build_as_child(&window)
             .map_err(failure)?;
         disable_messaging(&view)?;
+        let resume_observer = resume
+            .map(|store| resume_navigation::Observer::new(&label, &view, store))
+            .transpose()?;
         let native_handlers = native_close_handler(&view, &window)?;
         if !is_popup {
             view.load_url(&start).map_err(failure)?;
@@ -327,6 +328,7 @@ fn create_screen(
             screens.borrow_mut().insert(
                 label.clone(),
                 Screen {
+                    resume_observer,
                     view,
                     _native_handlers: native_handlers,
                     _context: context,
@@ -354,6 +356,9 @@ fn create_screen(
         let event_app = app.clone();
         let event_label = label.clone();
         window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                snapshot_resume(&event_label);
+            }
             #[cfg(feature = "desktop-fixture")]
             eprintln!("fixture native-window event {event_label}: {event:?}");
             if matches!(event, WindowEvent::Destroyed) {
@@ -422,6 +427,18 @@ fn handle_action(app: &AppHandle, label: &str, action: &str) {
             }
         });
     }
+}
+
+fn snapshot_resume(label: &str) {
+    SCREENS.with(|screens| {
+        if let Some(observer) = screens
+            .borrow()
+            .get(label)
+            .and_then(|screen| screen.resume_observer.as_ref())
+        {
+            observer.snapshot();
+        }
+    });
 }
 
 fn site_title(url: &str) -> String {

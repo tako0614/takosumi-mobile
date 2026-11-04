@@ -6,6 +6,28 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testNativeNavigationOutcomesMatchSharedTransitions() throws {
+        let events = try XCTUnwrap(fixture("resume-navigation-cases.json")["events"] as? [[String: Any]])
+        var state = AppScreenResumeState()
+        var observations = 0
+        for item in events {
+            let event = try XCTUnwrap(item["event"] as? String)
+            let id = item["id"] as? Int ?? 0
+            switch event {
+            case "reset": state = AppScreenResumeState()
+            case "begin": state.begin(id)
+            case "commit": state.commit(id)
+            case "finish": state.finish(id, success: item["success"] as? Bool ?? false, url: item["url"] as? String)
+            case "observe":
+                observations += 1
+                let url = try XCTUnwrap(item["url"] as? String)
+                XCTAssertEqual(state.canRemember(url), try XCTUnwrap(item["remember"] as? Bool), url)
+            default: XCTFail("Unknown shared navigation event: \(event)")
+            }
+        }
+        XCTAssertEqual(observations, 15)
+    }
+
     func testCanonicalProfileNames() throws {
         let cases = try XCTUnwrap(fixture("profile-cases.json")["cases"] as? [[String: Any]])
         for item in cases {

@@ -24,6 +24,7 @@ import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -668,8 +669,10 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
+            bound.resumeState.started(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 // Something reached the main frame without passing the policy.
+                bound.resumeState.failed(url)
                 view.stopLoading()
                 leavePage(view, url, offerOnly = true)
                 return
@@ -685,8 +688,23 @@ class AppScreenActivity : AppCompatActivity() {
                 leavePage(view, url, offerOnly = false)
                 return
             }
-            rememberUrl(url)
+            // A stale completion must not qualify a newer provisional page.
+            if (url != view.url) return
+            bound.resumeState.finished(url)
+            if (url != null && bound.resumeState.canRemember(url)) rememberUrl(url)
             updateBar(url)
+        }
+
+        override fun onPageCommitVisible(view: WebView, url: String?) {
+            if (view === entry?.webView && url == view.url) bound.resumeState.committed(url)
+        }
+
+        override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+            // Subresources and rendered HTTP error responses do not turn a
+            // successful main document into a failed navigation.
+            if (view === entry?.webView && request.isForMainFrame) {
+                bound.resumeState.failed(request.url.toString())
+            }
         }
 
         /**
@@ -700,7 +718,18 @@ class AppScreenActivity : AppCompatActivity() {
                 leavePage(view, url, offerOnly = false)
                 return
             }
-            rememberUrl(url)
+            // History notifications may precede onPageStarted. Defer until
+            // the native turn has settled, without retaining the Activity/view.
+            val target = WeakReference(view)
+            val owner = WeakReference(this@AppScreenActivity)
+            val state = bound.resumeState
+            view.post {
+                val activity = owner.get() ?: return@post
+                val current = target.get() ?: return@post
+                if (current === activity.entry?.webView && current.progress == 100 &&
+                    url != null && url == current.url && state.canRemember(url)
+                ) activity.rememberUrl(url)
+            }
             updateBar(url)
         }
 
@@ -725,6 +754,11 @@ class AppScreenActivity : AppCompatActivity() {
         }
 
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+            if (view === entry?.webView) {
+                // This callback has no main-frame flag. Conservatively keep
+                // the last successful metadata even if a subframe failed TLS.
+                bound.resumeState.failed(error.url)
+            }
             handler.cancel()
         }
 
@@ -925,6 +959,22 @@ internal fun refusedMainFrame(request: WebResourceRequest, origins: ScreenOrigin
 
 /** Client for a webview no activity shows: keeps the policy, asks nothing. */
 internal class DetachedScreenClient(private val entry: AppScreenRegistry.Entry) : WebViewClient() {
+    override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+        entry.resumeState.started(url)
+    }
+
+    override fun onPageCommitVisible(view: WebView, url: String?) {
+        if (url == view.url) entry.resumeState.committed(url)
+    }
+
+    override fun onPageFinished(view: WebView, url: String?) {
+        if (url == view.url) entry.resumeState.finished(url)
+    }
+
+    override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+        if (request.isForMainFrame) entry.resumeState.failed(request.url.toString())
+    }
+
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
         AppScreenPolicy.decide(request.url.toString(), request.isForMainFrame, entry.origins).kind !=
             NavigationKind.IN_APP
@@ -933,6 +983,7 @@ internal class DetachedScreenClient(private val entry: AppScreenRegistry.Entry) 
         if (refusedMainFrame(request, entry.origins)) blockedResponse() else null
 
     override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+        entry.resumeState.failed(error.url)
         handler.cancel()
     }
 

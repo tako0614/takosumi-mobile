@@ -67,6 +67,15 @@ settled writes after orderly teardown, not last-write durability or crash recove
 This qualifies the GTK adapter's synthetic behavior; it is not Windows/macOS,
 real IdP, file operations or distribution evidence.
 
+Add `--spa-resume` with a fresh data directory to test `pushState` and
+`replaceState`, immediate ordinary native Close, then an exact-route restore in
+a new process without clicking an app link. `--failed-navigation` and
+`--cancelled-navigation` each add a real native failure/cancellation before
+Close; the next process must still restore the earlier successful SPA route.
+These cases use production profile metadata, not a fixture-side saved URL.
+GLib criticals fail the runner, including during teardown. Deferred URL snapshots
+use weak view references so queued work does not keep a closed view alive.
+
 ## Full Linux App Web-home flow
 
 This explicitly enabled fixture builds the entire App with its normal plugins
@@ -85,7 +94,10 @@ certificate settings are used. It drives connection input, mock Web login
 (POST and HttpOnly cookie), home, a cross-site editor, native Home/Back/picker,
 resume into the same focused native window, two isolated profiles, and native
 Close. A new App process must restore both saved connections, both mock sessions
-and each profile's editor storage. The two App processes share one disposable
+and each profile's editor storage. Cold opens must land directly in each
+profile's cross-site editor without clicking its home-page link. A synthetic
+credential callback before ordinary Close must never replace the safe start page.
+The two App processes share one disposable
 Xvfb/D-Bus desktop session. The runner observes App descendants and requires the
 first App and its observed engine children to exit before starting a new App
 PID; it does not destroy the desktop session during App teardown. DOM readiness
@@ -110,10 +122,16 @@ Xvfb/D-Bus session per App also lost storage during ordinary-close readback in
 CI and a local minimized control. No unique cause or production durability fix
 is established by these failures. The current runner checks an App restart
 within a persistent desktop session, not desktop logout or storage fsync.
-Immediate process termination, crashes, cold last-page restoration, real IdP,
+Immediate process termination, crashes, OS-by-OS cold restoration, real IdP,
 other OS runtimes, files, notifications and distribution remain separate checks.
 
 ## Android
+
+`resume-navigation-cases.json` exercises native success, provisional failure,
+post-commit failure, stale/duplicate completion, SPA routes and unknown failing
+URLs in Rust, Kotlin and Swift policy tests. The Kotlin callback adapter also
+tests URL-to-generation binding for a late error from an older navigation.
+These policy/JVM tests do not prove a device engine's callback order.
 
 The Android fixture builds the actual `app-screen` plugin and its pinned Tauri
 Android API without generating the full app or requiring Firebase configuration.

@@ -42,6 +42,7 @@ internal object AppScreenRegistry {
         /** URL the screen was opened with; reopening with it keeps the state. */
         var launchUrl: String = ""
         var lastUrl: String = ""
+        val resumeState = AppScreenResumeTracker()
         var title: String = ""
         var host: AppScreenActivity? = null
         /** For a popup: the screen whose page opened it. */

@@ -22,6 +22,7 @@ pub fn run() {
         "Fixture directory must be absolute"
     );
     let readback = std::env::args().any(|value| value == "--readback");
+    let spa = std::env::args().any(|value| value == "--spa-resume");
     assert!(
         !std::env::args().any(|value| value == "--missing-document") || readback,
         "Missing-document control requires readback mode"
@@ -47,7 +48,12 @@ pub fn run() {
             let certificate =
                 std::fs::read_to_string(std::env::var_os("TAKOSUMI_FIXTURE_CERT").unwrap())?;
             let certificate = gtk::gio::TlsCertificate::from_pem(&certificate)?;
-            for profile in [WORK, PERSONAL, "shared"] {
+            let profiles: &[&str] = if spa {
+                &[WORK]
+            } else {
+                &[WORK, PERSONAL, "shared"]
+            };
+            for &profile in profiles {
                 open_on_ui_thread(app.handle(), request(profile), directory.clone())?;
                 let view = SCREENS.with(|screens| {
                     screens
@@ -63,11 +69,19 @@ pub fn run() {
                 view.context()
                     .unwrap()
                     .allow_tls_certificate_for_host(&certificate, "127.0.0.1");
-                view.load_uri(&request(profile).url);
+                if spa && readback {
+                    view.reload();
+                } else {
+                    view.load_uri(&request(profile).url);
+                }
             }
             let handle = app.handle().clone();
             gtk::glib::idle_add_local_once(move || {
-                bootstrap(handle, directory, readback, 0);
+                if spa {
+                    spa_probe(handle, readback);
+                } else {
+                    bootstrap(handle, directory, readback, 0);
+                }
             });
             Ok(())
         })
@@ -117,6 +131,152 @@ fn request(profile: &str) -> OpenRequest {
         .validate()
         .expect("Fixture uses a valid production request");
     payload
+}
+
+fn spa_probe(app: AppHandle, readback: bool) {
+    let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
+    let home = request(WORK).url;
+    let target = format!("{home}document/work?view=edit");
+    let method = if std::env::args().any(|value| value == "--spa-replace") {
+        "replaceState"
+    } else {
+        "pushState"
+    };
+    let expected = if readback { target.clone() } else { home };
+    let probe = view.clone();
+    after_document_load(
+        &view,
+        expected,
+        "bootstrap".into(),
+        app.clone(),
+        move || {
+            if readback {
+                println!("PASS: new process restored native {method} route without a link click");
+                EXIT_STATUS.store(0, Ordering::SeqCst);
+                app.exit(0);
+                return;
+            }
+            let script = format!(
+                "history.{method}(null, '', '/document/work?view=edit'); location.href === {}",
+                serde_json::to_string(&target).unwrap()
+            );
+            probe.evaluate_javascript(
+                &script,
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    if !result.is_ok_and(|value| value.to_boolean()) {
+                        eprintln!("FAIL: controlled SPA route did not change");
+                        app.exit(1);
+                        return;
+                    }
+                    println!("PASS: {method} changed the current native page; closing immediately");
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if std::env::args().any(|arg| {
+                            arg == "--failed-navigation" || arg == "--cancelled-navigation"
+                        }) {
+                            fail_after_spa(handle, target);
+                        } else {
+                            close_spa(handle);
+                        }
+                    });
+                },
+            );
+        },
+    );
+}
+
+fn close_spa(app: AppHandle) {
+    let screen_label = label(WORK);
+    let window =
+        SCREENS.with(|screens| screens.borrow().get(&screen_label).unwrap().window.clone());
+    if let Err(error) = window.close() {
+        eprintln!("FAIL: native close: {error}");
+        app.exit(1);
+        return;
+    }
+    after_spa_close(
+        app,
+        screen_label,
+        std::time::Instant::now() + Duration::from_secs(5),
+    );
+}
+
+fn fail_after_spa(app: AppHandle, target: String) {
+    use gtk::glib::prelude::ObjectExt;
+    let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
+    let native = view.clone();
+    after_document_load(&view, target, "bootstrap".into(), app.clone(), move || {
+        let cancel = std::env::args().any(|arg| arg == "--cancelled-navigation");
+        let failed_uri = format!(
+            "{}{}",
+            request(WORK).url,
+            if cancel { "slow" } else { "failed" }
+        );
+        let expected = failed_uri.clone();
+        let id = Rc::new(RefCell::new(None));
+        let callback_id = id.clone();
+        let handle = app.clone();
+        let handler = native.connect_load_failed(move |view, _, uri, error| {
+            if uri == expected {
+                if let Some(id) = callback_id.borrow_mut().take() {
+                    view.disconnect(id);
+                }
+                if error.matches(webkit2gtk::NetworkError::Cancelled) != cancel {
+                    eprintln!("FAIL: wrong controlled failure: {error:?}");
+                    handle.exit(1);
+                    return false;
+                }
+                println!(
+                    "PASS: controlled native {} observed before Close",
+                    if cancel {
+                        "cancellation"
+                    } else {
+                        "network failure"
+                    }
+                );
+                let app = handle.clone();
+                gtk::glib::idle_add_local_once(move || close_spa(app));
+            }
+            false
+        });
+        *id.borrow_mut() = Some(handler);
+        if cancel {
+            let id = Rc::new(RefCell::new(None));
+            let callback_id = id.clone();
+            let expected = failed_uri.clone();
+            let handler = native.connect_load_changed(move |view, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Started)
+                    && view.uri().as_deref() == Some(expected.as_str())
+                {
+                    if let Some(id) = callback_id.borrow_mut().take() {
+                        view.disconnect(id);
+                    }
+                    let view = view.clone();
+                    gtk::glib::idle_add_local_once(move || view.stop_loading());
+                }
+            });
+            *id.borrow_mut() = Some(handler);
+        }
+        native.load_uri(&failed_uri);
+    });
+}
+
+fn after_spa_close(app: AppHandle, label: String, deadline: std::time::Instant) {
+    if !SCREENS.with(|screens| screens.borrow().contains_key(&label)) {
+        println!("PASS: primary native window closed before process exit");
+        EXIT_STATUS.store(0, Ordering::SeqCst);
+        app.exit(0);
+    } else if std::time::Instant::now() >= deadline {
+        eprintln!("FAIL: primary native window did not close");
+        app.exit(1);
+    } else {
+        gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
+            after_spa_close(app, label, deadline)
+        });
+    }
 }
 
 fn bootstrap(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {

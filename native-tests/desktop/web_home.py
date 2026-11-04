@@ -6,6 +6,7 @@ import http.server
 from http.cookies import SimpleCookie
 import os
 from pathlib import Path
+import resource
 import signal
 import ssl
 import subprocess
@@ -167,10 +168,10 @@ def run_apps(binary, data, quick_close, legacy_entry):
         print(f"PASS: App {child.pid} and {len(tracked)} observed engine children exited, readback={readback}", flush=True)
 
 
-def run_desktop_session(command, env, timeout=170):
+def run_desktop_session(command, env, timeout=170, *, stdout=None, stderr=None):
     # All session tools belong to this new process group. A timeout must clean
     # the owned session, not just kill xvfb-run and leave its children behind.
-    process = subprocess.Popen(command, env=env, start_new_session=True)
+    process = subprocess.Popen(command, env=env, start_new_session=True, stdout=stdout, stderr=stderr)
     try:
         result = process.wait(timeout=timeout)
         if result:
@@ -190,6 +191,7 @@ def run_desktop_session(command, env, timeout=170):
 
 
 def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
@@ -228,6 +230,7 @@ def main():
         env = dict(os.environ, TAKOSUMI_FIXTURE_CERT=str(cert),
                    TAKOSUMI_FIXTURE_HTTPS=f"https://127.0.0.1:{servers[1].server_port}",
                    TAKOSUMI_FIXTURE_APP_HTTPS=servers[1].app_origin)
+        env["G_DEBUG"] = ",".join(filter(None, (env.get("G_DEBUG"), "fatal-criticals")))
         # Scope all native plugin/shell/engine state, including cache and portal
         # helpers, to this runner. Never use an installed App's data or keyring.
         for variable, name in (("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),

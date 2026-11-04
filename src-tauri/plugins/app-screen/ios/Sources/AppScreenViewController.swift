@@ -242,6 +242,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// a navigation that has not committed yet (no spoofing by slow loads).
     private(set) var committedURL: URL?
     private(set) var needsReload = false
+    private let resumeState = AppScreenResumeState()
     private var observations: [NSKeyValueObservation] = []
 
     init(webView: WKWebView) {
@@ -302,7 +303,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         if !webView.isLoading, let url = webView.url {
             guard keepsCommitted(webView, url) else { return }
             committedURL = url
-            onCommitted?(url)
+            if resumeState.canRemember(url.absoluteString) { onCommitted?(url) }
         } else if !webView.isLoading {
             committedURL = webView.url
         }
@@ -393,14 +394,44 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decisionHandler(.allow)
     }
 
+    private func navigationID(_ navigation: WKNavigation) -> Int {
+        Int(bitPattern: Unmanaged.passUnretained(navigation).toOpaque())
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if let navigation = navigation { resumeState.begin(navigationID(navigation)) }
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        if let navigation = navigation { resumeState.commit(navigationID(navigation)) }
         if let url = webView.url, !keepsCommitted(webView, url) { return }
         committedURL = webView.url
         screen?.updateBar()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if let navigation = navigation {
+            resumeState.finish(navigationID(navigation), success: true, url: webView.url?.absoluteString)
+        }
         refreshCommitted(webView)
+    }
+
+    private func failedNavigation(_ webView: WKWebView, navigation: WKNavigation?, error: Error) {
+        guard let navigation = navigation else { return }
+        let info = (error as NSError).userInfo
+        let failedURL = (info[NSURLErrorFailingURLErrorKey] as? URL)?.absoluteString
+            ?? info[NSURLErrorFailingURLStringErrorKey] as? String
+        resumeState.finish(navigationID(navigation), success: false,
+                           url: failedURL)
+        screen?.updateProgress()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        failedNavigation(webView, navigation: navigation, error: error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        failedNavigation(webView, navigation: navigation, error: error)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
