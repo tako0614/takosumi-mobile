@@ -13,7 +13,18 @@ use tauri::{AppHandle, Manager, Window};
 use webkit2gtk::{WebContextExt, WebView, WebViewExt};
 
 static EXIT_STATUS: AtomicI32 = AtomicI32::new(1);
+thread_local! {
+    static WATCHDOG: std::cell::RefCell<Option<glib::SourceId>> = const { std::cell::RefCell::new(None) };
+}
 type Result<T> = std::result::Result<T, String>;
+
+fn clear_watchdog() {
+    WATCHDOG.with(|watchdog| {
+        if let Some(source) = watchdog.take() {
+            source.remove();
+        }
+    });
+}
 
 pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<tauri::Wry>) {
     // Do not borrow an installed App's preferences or native data directory.
@@ -25,12 +36,16 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     }
     let app = builder.build(context).expect("Full fixture App builds");
     let watchdog = app.handle().clone();
-    glib::timeout_add_local_once(Duration::from_secs(60), move || {
+    let source = glib::timeout_add_local_once(Duration::from_secs(60), move || {
+        // This callback removes itself; don't remove an expired source later.
+        WATCHDOG.with(|source| source.take());
         eprintln!("FAIL: full App fixture watchdog expired");
         EXIT_STATUS.store(1, Ordering::SeqCst);
         watchdog.exit(1);
     });
+    WATCHDOG.with(|watchdog| watchdog.replace(Some(source)));
     let _ = app.run_return(|_, _| {});
+    clear_watchdog();
     // The pinned Linux runtime can discard RequestExit's requested code.
     std::process::exit(EXIT_STATUS.load(Ordering::SeqCst));
 }
@@ -41,6 +56,9 @@ pub fn start(app: AppHandle) {
             Ok(()) => {
                 println!("PASS: full App Web-home flow, readback={}", readback());
                 EXIT_STATUS.store(0, Ordering::SeqCst);
+                // Its AppHandle otherwise keeps the managed WebContext alive
+                // after window closure. Release it while the UI loop runs.
+                clear_watchdog();
                 if let Err(error) = app.get_window("main").expect("main exists").close() {
                     eprintln!("FAIL: root window close: {error}");
                     EXIT_STATUS.store(1, Ordering::SeqCst);
@@ -48,6 +66,7 @@ pub fn start(app: AppHandle) {
                 }
             }
             Err(error) => {
+                clear_watchdog();
                 eprintln!("FAIL: full App Web-home flow: {error}");
                 app.exit(1);
             }
