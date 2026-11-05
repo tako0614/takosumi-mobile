@@ -4,7 +4,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-export async function inspectPermissions({pages,command,data,nonce,desktop,nativePid,decide=false}) {
+export async function inspectPermissions({pages,command,data,nonce,desktop,nativePid,decide=false,notificationProbe}) {
   const proof={permissionPassed:false,notificationPassed:false,method:decide?'Inspected English Chrome default UI; actual allow/deny, no CDP grant':'Default Chrome UI observation only; no grant or notification delivery qualified'};
   const [work,personal]=pages;
   const state=async page=>{
@@ -70,18 +70,26 @@ export async function inspectPermissions({pages,command,data,nonce,desktop,nativ
     if(decide) {
       assert.equal(proof.afterWork.work.notification,'granted');assert.equal(proof.afterWork.work.query,'granted');
       assert.equal(proof.afterWork.personal.notification,'default');assert.equal(proof.afterWork.personal.query,'prompt');
-      await request(personal,'personal','block');
+      const personalChoice=notificationProbe?'allow':'block';
+      proof.personalChoice=personalChoice;
+      await request(personal,'personal',personalChoice);
       proof.afterChoices={work:await state(work),personal:await state(personal)};
       assert.equal(proof.afterChoices.work.notification,'granted');assert.equal(proof.afterChoices.work.query,'granted');
-      assert.equal(proof.afterChoices.personal.notification,'denied');assert.equal(proof.afterChoices.personal.query,'denied');
+      const expectedPersonal=notificationProbe?'granted':'denied';
+      assert.equal(proof.afterChoices.personal.notification,expectedPersonal);assert.equal(proof.afterChoices.personal.query,expectedPersonal);
+      if(notificationProbe) {
+        proof.nativeNotifications=await notificationProbe({pages,windows:[proof.work,proof.personal]});
+      }else {
       const notification=page=>page.evaluate(`new Promise(resolve=>{let n;const result={event:null,error:null};const finish=event=>{result.event=event;clearTimeout(timer);n?.close();resolve(result)};const timer=setTimeout(()=>finish('timeout'),3000);try{n=new Notification(${JSON.stringify('Sumi probe '+nonce)},{body:'Owned browser notification component probe',tag:${JSON.stringify(nonce)}});n.onshow=()=>finish('show');n.onerror=()=>finish('error')}catch(e){result.error=String(e);finish('constructor-error')}})`);
       proof.notification={work:await notification(work),personal:await notification(personal),scope:'Observed API events only; OS display, delivery, click and Push remain unqualified'};
       assert.notEqual(proof.notification.personal.event,'show','Denied profile must not show a notification');
+      }
     }
     proof.after={work:await state(work),personal:await state(personal)};
     if(decide) {
       assert.equal(proof.after.work.notification,'granted');assert.equal(proof.after.work.query,'granted');
-      assert.equal(proof.after.personal.notification,'denied');assert.equal(proof.after.personal.query,'denied');
+      const expectedPersonal=notificationProbe?'granted':'denied';
+      assert.equal(proof.after.personal.notification,expectedPersonal);assert.equal(proof.after.personal.query,expectedPersonal);
       proof.permissionPassed=true;
     }
     return proof;

@@ -9,6 +9,8 @@ import path from 'node:path';
 import { waitForGtkConfirm } from './gtk-readiness.mjs';
 import { PROFILE_IDS, probeProfiles } from './profiles.mjs';
 import { inspectPermissions } from './permissions.mjs';
+import { startNotificationBackend } from './notification-backend.mjs';
+import { probeNotifications } from './notifications.mjs';
 
 const repo=fileURLToPath(new URL('../../',import.meta.url));
 const data=process.argv[2], app=process.argv[3], mode=process.argv[4], binary=process.argv[5];
@@ -18,8 +20,11 @@ assert(files!=='native-picker'||app==='excalidraw');
 assert(binary && path.isAbsolute(binary));
 assert((await lstat(binary)).isFile() && !(await lstat(binary)).isSymbolicLink());
 const urls={photopea:'https://www.photopea.com/',excalidraw:'https://excalidraw.com/'};
-assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate','profiles','profile-popup','permission-inspect','site-permissions'].includes(mode));
-const permissionMode=mode==='permission-inspect'||mode==='site-permissions';
+assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate','profiles','profile-popup','permission-inspect','site-permissions','site-notifications'].includes(mode));
+const notificationMode=mode==='site-notifications';
+const notifierBinary=process.argv[7];
+assert(notificationMode===Boolean(notifierBinary));
+const permissionMode=mode==='permission-inspect'||mode==='site-permissions'||notificationMode;
 const profileMode=mode==='profiles'||mode==='profile-popup'||permissionMode;
 assert(!profileMode||files==='cdp');
 assert(process.env.TAKOSUMI_CEF_RUNNER_CASE===data,'Use run.py to own the desktop session');
@@ -35,7 +40,7 @@ for(const [key,dir] of Object.entries({XDG_DATA_HOME:'data',XDG_CONFIG_HOME:'con
 }
 await mkdir(path.join(data,'Downloads'),{mode:0o700});
 const log=await open(path.join(data,'browser.log'),'wx',0o600);
-let browser,socket,exitPromise,sessionId,closed=false,error;
+let browser,socket,exitPromise,sessionId,closed=false,error,notificationBackend;
 const pending=new Map(), events=[], downloads=[];
 const navigation=[], documentRequests=new Set();
 let next=0;
@@ -150,6 +155,7 @@ async function screenshot(name) {
   await writeFile(path.join(data,name),Buffer.from(r.data,'base64'));
 }
 try {
+  if(notificationMode)notificationBackend=await startNotificationBackend({binary:notifierBinary,data,nonce,env,desktop});
   const reserve=createServer();
   await new Promise(resolve=>reserve.listen(0,'127.0.0.1',resolve));
   const port=reserve.address().port;
@@ -212,7 +218,8 @@ try {
   if(profileMode) {
     await stage('native two-profile bindings and same-origin state');
     receipt.profiles=await probeProfiles({command,data,url:urls[app],nonce,popup:mode==='profile-popup',
-      exercise:permissionMode?pages=>inspectPermissions({pages,command,data,nonce,desktop,nativePid:receipt.nativePid,decide:mode==='site-permissions'}):undefined});
+      exercise:permissionMode?pages=>inspectPermissions({pages,command,data,nonce,desktop,nativePid:receipt.nativePid,decide:mode!=='permission-inspect',
+        notificationProbe:notificationMode?({pages,windows})=>probeNotifications({pages,windows,data,nonce,desktop,backend:notificationBackend}):undefined}):undefined});
     receipt.profileVerified=receipt.profiles.passed===true;
   }else {
   const targetDeadline=Date.now()+10000;let target;
@@ -354,12 +361,18 @@ finally {
       closed=true;
     }
   }catch(e){receipt.cleanupError=String(e);error??=e;}
+  if(notificationBackend) {
+    try{await notificationBackend.stop();}catch(e){receipt.notificationCleanupError=String(e);error??=e;}
+    receipt.notificationBackend=notificationBackend.proof;
+  }
   for(const p of pending.values()){clearTimeout(p.timer);p.reject(Error('Owned CDP closed'));}pending.clear();
   receipt.cleanupConfirmed=closed;
   receipt.operationPassed=mode==='operate' && receipt.exportVerified===true && closed && !error;
   receipt.profilePassed=profileMode && receipt.profileVerified===true && closed && !error;
   receipt.popupPassed=mode==='profile-popup' && receipt.profiles?.popup?.passed===true && closed && !error;
-  receipt.permissionPassed=mode==='site-permissions' && receipt.profiles?.permissionObservations?.permissionPassed===true && closed && !error;
+  receipt.permissionPassed=(mode==='site-permissions'||notificationMode) && receipt.profiles?.permissionObservations?.permissionPassed===true && closed && !error;
+  receipt.notificationUiPassed=notificationMode && receipt.profiles?.permissionObservations?.nativeNotifications?.passed===true && closed && !error;
+  receipt.pushPassed=false;
   await writeFile(path.join(data,'reference.json'),JSON.stringify(receipt,null,2)+'\n');
 }
-if(error){console.error(error);process.exitCode=1;}else console.log(`${mode==='site-permissions'?'PASS native permission choices':permissionMode?'OBSERVATION ONLY permissions':mode==='operate'?'PASS actual export':profileMode?'PASS native profile state':'OBSERVATION ONLY'}: ${app} ${data}`);
+if(error){console.error(error);process.exitCode=1;}else console.log(`${notificationMode?'PASS owned native notification UI':mode==='site-permissions'?'PASS native permission choices':permissionMode?'OBSERVATION ONLY permissions':mode==='operate'?'PASS actual export':profileMode?'PASS native profile state':'OBSERVATION ONLY'}: ${app} ${data}`);

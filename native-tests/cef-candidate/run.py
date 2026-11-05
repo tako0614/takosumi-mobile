@@ -33,7 +33,8 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=("photopea", "excalidraw"), required=True)
-    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions"), default="operate")
+    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications"), default="operate")
+    parser.add_argument("--notification-daemon", type=Path, help="Already available Dunst 1.12.2 executable, used only inside the owned notification fixture")
     parser.add_argument("--files", choices=("cdp", "native-picker"), default="cdp",
                         help="Native picker uses a visible browser in the owned Xvfb session")
     args = parser.parse_args()
@@ -41,15 +42,24 @@ def main():
         parser.error("This candidate has only a Linux runner")
     if args.files == "native-picker" and args.app != "excalidraw":
         parser.error("The native-picker probe currently targets Excalidraw only")
-    if args.mode in ("profiles", "profile-popup", "permission-inspect", "site-permissions") and args.files != "cdp":
+    if args.mode in ("profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications") and args.files != "cdp":
         parser.error("The profile probe does not operate file dialogs")
     for tool in ("node", "python3", "xvfb-run", "dbus-run-session", "timeout", "convert"):
         if shutil.which(tool) is None:
             parser.error(f"Required existing capability is missing: {tool}")
-    if args.files == "native-picker" or args.mode in ("permission-inspect", "site-permissions"):
+    if args.files == "native-picker" or args.mode in ("permission-inspect", "site-permissions", "site-notifications"):
         for tool in ("xdotool", "import"):
             if shutil.which(tool) is None:
                 parser.error(f"Required existing capability is missing: {tool}")
+    if (args.mode == "site-notifications") != (args.notification_daemon is not None):
+        parser.error("--notification-daemon is required only for site-notifications")
+    daemon = args.notification_daemon.resolve(strict=True) if args.notification_daemon else None
+    if daemon and (not daemon.is_file() or not os.access(daemon, os.X_OK)):
+        parser.error("--notification-daemon must be an already available executable")
+    if daemon:
+        for tool in ("gdbus", "dbus-monitor"):
+            if shutil.which(tool) is None:
+                parser.error(f"Required existing notification capability is missing: {tool}")
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("--binary must be the already built candidate executable")
@@ -68,10 +78,13 @@ def main():
     nonce = str(uuid.uuid4())
     (data / ".owned-browser-reference").write_text(nonce)
     fixture = create_input(data, args.app, nonce)
-    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "run.py")]
+    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "notification-backend.mjs", "notifications.mjs", "x11-owner.py", "run.py")]
     sources += [HERE.parent / name for name in (
         "desktop/browser_apps.py", "desktop/web_home.py", "browser/guard.py", "browser/lifecycle.ts",
     )]
+    # The native candidate compiles the product's request validator library.
+    sources += [REPO / "src-tauri/plugins/app-screen" / name for name in
+                ("Cargo.toml", "build.rs", "src/lib.rs", "src/models.rs", "src/error.rs")]
     hashes = {str(path.relative_to(REPO)): digest(path) for path in sources}
     snapshots = data / "source-snapshot"
     for path in sources:
@@ -88,6 +101,7 @@ def main():
         "inputSha256": digest(fixture),
         "lockSha256": digest(HERE / "Cargo.lock"),
         "sources": hashes, "runtimeLibrarySha256": library_hash,
+        "notificationDaemonSha256": digest(daemon) if daemon else None,
     }
     (data / "source.json").write_text(json.dumps(source, indent=2) + "\n")
     # No inherited token, browser profile, keyring or operator configuration.
@@ -102,12 +116,13 @@ def main():
     env.update(PYTHONDONTWRITEBYTECODE="1", TAKOSUMI_CEF_RUNNER_CASE=str(data))
     print(f"CASE {data}", flush=True)
     result = {"exitCode": None, "error": None, "binaryUnchanged": False,
-              "sourcesUnchanged": False, "runtimeUnchanged": False, "passed": False}
+              "sourcesUnchanged": False, "runtimeUnchanged": False, "daemonUnchanged": False, "passed": False}
     try:
         with (data / "session.log").open("x") as output:
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "timeout", "150",
                 "node", str(HERE / "operate.mjs"), str(data), args.app, args.mode, str(binary), args.files,
+                *([str(daemon)] if daemon else []),
             ], env, timeout=170, stdout=output, stderr=subprocess.STDOUT)
         result["exitCode"] = 0
     except subprocess.CalledProcessError as error:
@@ -119,9 +134,10 @@ def main():
         result["sourcesUnchanged"] = all(path.is_file() and digest(path) == hashes[str(path.relative_to(REPO))]
                                          for path in sources)
         result["runtimeUnchanged"] = digest(library) == library_hash
+        result["daemonUnchanged"] = not daemon or digest(daemon) == source["notificationDaemonSha256"]
         result["passed"] = (result["exitCode"] == 0 and not result["error"]
                             and result["binaryUnchanged"] and result["sourcesUnchanged"]
-                            and result["runtimeUnchanged"])
+                            and result["runtimeUnchanged"] and result["daemonUnchanged"])
         (data / "execution.json").write_text(json.dumps(result, indent=2) + "\n")
         print((data / "session.log").read_text(), end="", flush=True)
     if not result["passed"]:

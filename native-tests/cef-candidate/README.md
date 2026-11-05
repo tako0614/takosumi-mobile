@@ -56,6 +56,8 @@ success flags also require root exit 0, no remaining child and no forced cleanup
 `site-permissions` requires `reference.profilePassed` and
 `reference.permissionPassed` as well as `execution.passed`.
 `permission-inspect` never qualifies a permission or notification capability.
+`site-notifications` additionally requires `reference.notificationUiPassed`;
+`reference.pushPassed` is always false in these local probes.
 
 ## Native profiles and popup primitive
 
@@ -127,6 +129,51 @@ profile emitted `error`. The owned session nevertheless reported a missing
 `free(): invalid pointer` outside the CEF log; normal CEF exit does not qualify
 the entire desktop service stack. `notificationPassed` remains false: a page
 event is insufficient for OS display, actual Push delivery, click or resume.
+
+## Owned native notification backend
+
+```bash
+python3 -B native-tests/cef-candidate/run.py --binary /absolute/owned/target/debug/takosumi-cef-candidate --data /absolute/new/notification-case --app photopea --mode site-notifications --notification-daemon /absolute/owned/dunst
+TMPDIR=/absolute/owned/tmp node --test native-tests/cef-candidate/notifications.test.mjs
+```
+
+This explicit mode needs an already available Dunst 1.12.2 executable, `gdbus`,
+`dbus-monitor`, X11/XRes 1.2 libraries, `xdotool` and ImageMagick `import`. It
+starts that real daemon only in the runner's fresh private D-Bus/Xvfb session;
+it neither registers an installed App service nor changes shared OS packages.
+The executable hash is recorded and checked after the run. The backend's real
+D-Bus owner PID and XRes server resource-owner PID must match the owned daemon.
+It preserves normal tag/replacement handling and uses one visible plus one
+waiting notification. The page API and desktop signals are never substituted.
+
+Both native UUID contexts receive an actual Allow choice in Chrome's existing
+notification prompt. Generated standard page Notifications use the same tag
+on the same origin, with different Work/Personal titles. Success would require
+coexistence, live page objects, native screenshots/input, trusted clicks only
+in the original profile, actual desktop action signals and native closure.
+Before each click the other owned browser window must have focus; only the
+page's standard onclick `window.focus()` may restore its own window. The test
+does not repair focus through CDP or X11 after the click. Network Push,
+Service Worker background delivery and closed-App resume are separate.
+
+The 2026-11-05 two-profile checks **failed**. Excalidraw's visible Work alert
+produced a native action for its desktop notification ID, but Personal received
+the callback. After strengthening state capture and the focus precondition,
+Photopea failed before clicking: Personal's same-tag creation had already
+closed Work's JS notification object while its OS alert remained displayed.
+Both CEF guards and owned daemons shut down normally; these are functional
+failures, with `notificationUiPassed` and `execution.passed` false. Four replay
+controls reject wrong-profile callbacks, closed page objects, foreign X11
+owners and an already-focused target; they are not native evidence.
+
+The matching Chromium source uses origin plus the non-persistent notification
+token as the ID; a nonempty tag becomes that token. Its process-wide listener
+registry replaces entries by this ID. This is consistent with the observed
+collision across isolated contexts. A future adapter must preserve profile
+identity before this listener boundary, or evaluate separate browser processes
+per profile. Merely routing the OS action by profile cannot recreate an already
+replaced listener. No such fix, engine replacement or App integration is made
+by this fixture; the same-tag failure must remain a required regression.
 
 On 2026-11-05 the basic same-origin profile test and the synthetic popup flow
 passed on native CEF, including normal closure. Earlier popup runs passed the

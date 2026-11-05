@@ -55,5 +55,23 @@ secure origin, resolved permission and the other profile's state must agree;
 five replay controls reject false evidence before clicking. Excalidraw passed
 this notification-permission component; Photopea's full final flow remains
 unqualified. API notification events do not prove OS display or Push: the
-owned D-Bus session lacked its notification service, and an unattributed
+earlier owned D-Bus session lacked its notification service, and an unattributed
 allocator diagnostic also prevents claiming desktop-service stability.
+
+The separate `site-notifications` fixture explicitly starts a supplied real
+Dunst 1.12.2 in a fresh owned session, attests D-Bus/XRes ownership and records
+native input. It does not install a notification daemon on the shared OS or
+implement an App push service. Actual same-origin/same-tag alerts in two native
+profiles failed: Excalidraw routed Work's action to Personal; Photopea closed
+Work's page object when Personal created its alert. Normal shutdown does not
+turn those functional failures into success. Native notification UI, profile
+isolation at that boundary, window restoration and network Push remain
+unqualified. The fixture does not rewrite page tags to avoid this failure.
+
+The matching Chromium 154.0.8037.98 source supports the collision hypothesis:
+[Blink tag/token](https://github.com/chromium/chromium/blob/154.0.8037.98/third_party/blink/renderer/modules/notifications/notification.cc),
+[origin/token ID](https://github.com/chromium/chromium/blob/154.0.8037.98/content/browser/notifications/notification_id_generator.cc),
+[singleton listener registration](https://github.com/chromium/chromium/blob/154.0.8037.98/content/browser/notifications/notification_event_dispatcher_impl.cc).
+These are source references for diagnosis, not copied product code or a
+qualified engine patch. Persistent Service Worker notifications use a different
+path and were not tested here.
