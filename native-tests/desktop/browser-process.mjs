@@ -121,7 +121,11 @@ async function attach(process) {
       (proof.landingButtons??=[]).push({pid:native.nativePid,...button});
       await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...button.point});
       await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...button.point});
-      await settled(()=>evaluate("document.body?.innerText.includes('Open From Computer')"),'Photopea editor did not open');
+      await settled(()=>evaluate("document.body?.innerText.includes('Open From Computer')"),'Photopea editor did not open').catch(async error=>{
+        // Same bound; only split a start click that never ran addPP() from a slow editor load.
+        const d=proof.landingDiagnosis=await evaluate("(()=>{const cap=document.getElementById('cap');return{capHidden:cap?getComputedStyle(cap).display==='none':null,added:typeof added==='boolean'?added:null,focus:document.hasFocus(),visibility:document.visibilityState,editorScripts:[...document.scripts].filter(s=>s.src.includes('/code/')).length}})()").catch(e=>({error:String(e)}));
+        throw d.capHidden===false&&d.added===false?Error('Photopea start click did not reach the page'):error;
+      });
     }
   } catch(error) {
     proof.startupFailure={native,error:String(error)};
@@ -141,6 +145,18 @@ async function attach(process) {
 const clients=[];
 try {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
+  // A guard forked on a retiring blocking-pool thread ended ~10 s after the
+  // last App command (ph13). Before any page step, send no App command past
+  // that keep-alive and require every native guard to be live; attach below
+  // then re-attests each native PID, window and document.
+  step('idle past blocking keep-alive');
+  const idleStart=Date.now();
+  await delay(12000);
+  for(const process of opened.processes) {
+    const ended=await readFile(process.guardReceipt).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
+    assert(!ended,`Browser guard for ${process.profile} ended during the idle hold`);
+  }
+  proof.idleHold={milliseconds:Date.now()-idleStart,guardsLive:opened.processes.length};
   const pages=[];
   for(const name of ['Work','Personal']) {
     const connection=opened.connections.find(c=>c.name===name);assert(connection);
@@ -157,18 +173,6 @@ try {
   }
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
-  // A guard forked on a retiring blocking-pool thread ended ~10 s after the
-  // last App command (ph13). Send no App command past that keep-alive, then
-  // require both native guards to be live and both exact documents retained.
-  step('idle past blocking keep-alive');
-  const idleStart=Date.now();
-  await delay(12000);
-  for(const page of pages) {
-    const ended=await readFile(page.process.guardReceipt).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
-    assert(!ended,`Browser guard for ${page.process.profile} ended during the idle hold`);
-  }
-  assert.deepEqual(await Promise.all(pages.map(sample)),expected,'Idle hold must retain both exact documents');
-  proof.idleHold={milliseconds:Date.now()-idleStart,guardsLive:pages.length};
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
   step('common UI resume');
   proof.resumed=await marker('app-browser-process.json');
