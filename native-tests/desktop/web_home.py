@@ -168,6 +168,41 @@ def shutdown_description(pid):
     return details
 
 
+def wait_engine_children(tracked, descriptions):
+    """Wait for this dedicated worker's native generation, without reading storage."""
+    statuses = {}
+    # Keep Xvfb/D-Bus alive until the previous generation actually exits.
+    # This waits for process lifecycle only, never storage values or success.
+    deadline = time.monotonic() + 5
+    while True:
+        # After the App exits, all remaining descendants of this dedicated
+        # worker belong to that App generation, including a helper forked
+        # between the final observation and App exit.
+        observe_children(os.getpid(), tracked, descriptions)
+        reap_observed_children(tracked, descriptions, statuses)
+        failed_network = [dict(descriptions[pid], status=status) for pid, (start, status) in statuses.items()
+                          if tracked[pid] == start and status != 0 and
+                          is_network_process(descriptions[pid])]
+        if failed_network:
+            raise RuntimeError(f"App NetworkProcess exited abnormally: {failed_network}")
+        alive = [pid for pid, start in tracked.items()
+                 if (identity := process_identity(pid)) and identity[0] == start
+                 and (identity[1] != "Z" or statuses.get(pid, (None,))[0] != start)]
+        if not alive:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Old App engine children still alive: {[shutdown_description(pid) for pid in alive]}")
+        time.sleep(0.025)
+    # WebKit may deliberately kill a WebProcess. Record its status without
+    # treating that rendering-process policy as a NetworkProcess flush.
+    print(f"Observed orphaned App child exit codes: {statuses}", flush=True)
+    unknown_network = [pid for pid, start in tracked.items()
+                       if is_network_process(descriptions[pid]) and statuses.get(pid, (None,))[0] != start]
+    if unknown_network:
+        print(f"Unknown NetworkProcess exit status (not available to worker): {unknown_network}", flush=True)
+    return statuses
+
+
 def run_apps(binary, data, quick_close, legacy_entry):
     """Both Apps restart inside one disposable desktop session, as in use."""
     previous_pid = None
@@ -180,7 +215,6 @@ def run_apps(binary, data, quick_close, legacy_entry):
         log = data / ("readback.log" if readback else "first.log")
         tracked = {}
         descriptions = {}
-        statuses = {}
         with log.open("w") as output:
             child = subprocess.Popen([str(binary), *flags], stdout=output, stderr=subprocess.STDOUT)
             assert child.pid != previous_pid, "App restart must use a new process"
@@ -205,35 +239,7 @@ def run_apps(binary, data, quick_close, legacy_entry):
         if child.returncode or "PASS: full App Web-home flow," not in text:
             raise RuntimeError(f"Full App fixture failed, status={child.returncode}")
         assert tracked, "Expected to observe native engine child processes"
-        # Keep Xvfb/D-Bus alive until the previous generation actually exits.
-        # This waits for process lifecycle only, never storage values or success.
-        deadline = time.monotonic() + 5
-        while True:
-            # After the App exits, all remaining descendants of this dedicated
-            # worker belong to that App generation, including a helper forked
-            # between the final observation and App exit.
-            observe_children(os.getpid(), tracked, descriptions)
-            reap_observed_children(tracked, descriptions, statuses)
-            failed_network = [dict(descriptions[pid], status=status) for pid, (start, status) in statuses.items()
-                              if tracked[pid] == start and status != 0 and
-                              is_network_process(descriptions[pid])]
-            if failed_network:
-                raise RuntimeError(f"App NetworkProcess exited abnormally: {failed_network}")
-            alive = [pid for pid, start in tracked.items()
-                     if (identity := process_identity(pid)) and identity[0] == start
-                     and (identity[1] != "Z" or statuses.get(pid, (None,))[0] != start)]
-            if not alive:
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"Old App engine children still alive: {[shutdown_description(pid) for pid in alive]}")
-            time.sleep(0.025)
-        # WebKit may deliberately kill a WebProcess. Record its status without
-        # treating that rendering-process policy as a NetworkProcess flush.
-        print(f"Observed orphaned App child exit codes: {statuses}", flush=True)
-        unknown_network = [pid for pid, start in tracked.items()
-                           if is_network_process(descriptions[pid]) and statuses.get(pid, (None,))[0] != start]
-        if unknown_network:
-            print(f"Unknown NetworkProcess exit status (not available to worker): {unknown_network}", flush=True)
+        wait_engine_children(tracked, descriptions)
         print(f"PASS: App {child.pid} and {len(tracked)} observed engine children exited, readback={readback}", flush=True)
 
 

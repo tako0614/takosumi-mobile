@@ -99,6 +99,31 @@ impl State {
             (self.save)(uri);
         }
     }
+    #[cfg(any(target_os = "linux", test))]
+    fn gtk_failed(&self, id: u64, stock_error_page: bool, uri: Option<&str>) {
+        if id != self.current.get() || !self.pending.get() {
+            return;
+        }
+        self.finish(id, false, uri);
+        // Unlike cancellation, GTK's default error handler replaces the old
+        // document. Keep its saved route, but no longer qualify property reads
+        // from that document or the stock error page being loaded after it.
+        if stock_error_page {
+            self.success.set(false);
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    fn gtk_finished(&self, id: u64, success: bool, resource_uri: Option<&str>, uri: Option<&str>) {
+        // A stock alternate HTML document emits a fresh successful load cycle
+        // with a failing display URI, but an about:blank resource. Cached Back
+        // restores recreate their original HTTPS resource, whose path may
+        // differ from the current SPA route. Never compare those two URLs.
+        self.finish(
+            id,
+            success && resource_uri.is_some_and(crate::models::is_launchable_url),
+            uri,
+        );
+    }
 }
 
 pub(super) struct Observer {
@@ -135,8 +160,8 @@ mod platform {
         SignalHandlerId,
     };
     use webkit2gtk::{
-        BackForwardList, BackForwardListExt, BackForwardListItemExt, WebView as NativeView,
-        WebViewExt,
+        BackForwardList, BackForwardListExt, BackForwardListItemExt, WebResourceExt,
+        WebView as NativeView, WebViewExt,
     };
     use wry::WebViewExtUnix;
 
@@ -146,6 +171,12 @@ mod platform {
         signals: Vec<SignalHandlerId>,
         history: BackForwardList,
         history_signal: Option<SignalHandlerId>,
+    }
+
+    pub(super) fn displays_default_error(error: &glib::Error) -> bool {
+        !(error.matches(webkit2gtk::NetworkError::Cancelled)
+            || error.matches(webkit2gtk::PolicyError::FrameLoadInterruptedByPolicyChange)
+            || error.matches(webkit2gtk::PluginError::WillHandleLoad))
     }
 
     fn document_uri(view: &NativeView) -> Option<glib::GString> {
@@ -182,16 +213,23 @@ mod platform {
             let changed = view.connect_load_changed(move |view, event| match event {
                 webkit2gtk::LoadEvent::Started => load.begin(load.current.get().wrapping_add(1)),
                 webkit2gtk::LoadEvent::Committed => load.commit(load.current.get(), false),
-                webkit2gtk::LoadEvent::Finished => load.finish(
+                webkit2gtk::LoadEvent::Finished => load.gtk_finished(
                     load.current.get(),
                     !load.failed.get(),
+                    view.main_resource()
+                        .and_then(|resource| resource.uri())
+                        .as_deref(),
                     document_uri(view).as_deref(),
                 ),
                 _ => (),
             });
             let failure = state.clone();
-            let failed = view.connect_load_failed(move |_, _, uri, _| {
-                failure.finish(failure.current.get(), false, Some(uri));
+            let failed = view.connect_load_failed(move |_, _, uri, error| {
+                failure.gtk_failed(
+                    failure.current.get(),
+                    displays_default_error(error),
+                    Some(uri),
+                );
                 false // Preserve WebKit/Wry's normal error handling.
             });
             let uri = {
@@ -524,6 +562,157 @@ mod tests {
         ));
         state.observe_history(Some("https://app.example/#access_token=fixture-secret"));
         assert_eq!(*saved.borrow(), ["https://app.example/document/1"]);
+    }
+    #[test]
+    fn gtk_stock_error_cannot_keep_the_old_document_qualified() {
+        let (state, saved) = recording();
+        state.begin(1);
+        state.commit(1, false);
+        state.gtk_finished(
+            1,
+            true,
+            Some("https://app.example/"),
+            Some("https://app.example/"),
+        );
+        state.observe_history(Some("https://app.example/document/1"));
+        state.begin(2);
+        state.gtk_failed(2, true, Some("https://app.example/failed"));
+        state.observe_history(Some("https://app.example/failed"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/1"
+        );
+    }
+    #[test]
+    fn gtk_stock_error_cycle_and_close_retain_the_last_good_spa() {
+        let (state, saved) = recording();
+        state.begin(1);
+        state.commit(1, false);
+        state.gtk_finished(
+            1,
+            true,
+            Some("https://app.example/"),
+            Some("https://app.example/"),
+        );
+        state.observe_history(Some("https://app.example/document/1"));
+        state.begin(2);
+        state.gtk_failed(2, true, Some("https://app.example/failed"));
+        // WebKit's stock alternate HTML can emit an entirely new load cycle.
+        // Its display/history URL is the failed URL; its resource is blank.
+        state.begin(3);
+        state.commit(3, false);
+        state.gtk_finished(
+            3,
+            true,
+            Some("about:blank"),
+            Some("https://app.example/failed"),
+        );
+        state.observe_history(Some("https://app.example/failed"));
+        state.snapshot(Some("https://app.example/failed"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/1"
+        );
+    }
+    #[test]
+    fn gtk_cached_document_and_same_url_retry_can_recover_after_error() {
+        let (state, saved) = recording();
+        state.begin(1);
+        state.commit(1, false);
+        state.gtk_finished(
+            1,
+            true,
+            Some("https://app.example/"),
+            Some("https://app.example/document/1"),
+        );
+        state.begin(2);
+        state.gtk_failed(2, true, Some("https://app.example/failed"));
+        state.begin(3);
+        state.commit(3, false);
+        state.gtk_finished(
+            3,
+            true,
+            Some("about:blank"),
+            Some("https://app.example/failed"),
+        );
+        state.begin(4);
+        state.commit(4, false);
+        // Cached resource URLs can predate same-document route changes.
+        state.gtk_finished(
+            4,
+            true,
+            Some("https://app.example/"),
+            Some("https://app.example/document/1"),
+        );
+        state.observe_history(Some("https://app.example/document/2"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/2"
+        );
+        state.begin(5);
+        state.commit(5, false);
+        state.gtk_finished(
+            5,
+            true,
+            Some("https://app.example/failed"),
+            Some("https://app.example/failed"),
+        );
+        assert_eq!(saved.borrow().last().unwrap(), "https://app.example/failed");
+    }
+    #[test]
+    fn gtk_cancelled_or_stale_failure_does_not_break_surviving_spa() {
+        let (state, saved) = recording();
+        state.begin(1);
+        state.commit(1, false);
+        state.gtk_finished(
+            1,
+            true,
+            Some("https://app.example/"),
+            Some("https://app.example/document/1"),
+        );
+        state.begin(2);
+        state.gtk_failed(2, false, Some("https://app.example/cancelled"));
+        state.observe_history(Some("https://app.example/cancelled"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/cancelled"
+        );
+        state.gtk_failed(1, true, Some("https://app.example/stale"));
+        state.observe_history(Some("https://app.example/document/2"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/2"
+        );
+        state.begin(3);
+        state.commit(3, false);
+        state.gtk_failed(3, false, Some("https://app.example/post-commit-cancelled"));
+        state.observe_history(Some("https://app.example/post-commit-cancelled"));
+        assert_eq!(
+            saved.borrow().last().unwrap(),
+            "https://app.example/document/2"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gtk_default_error_exemptions_are_exact() {
+        use gtk::glib::Error;
+        for error in [
+            Error::new(webkit2gtk::NetworkError::Cancelled, "fixture"),
+            Error::new(
+                webkit2gtk::PolicyError::FrameLoadInterruptedByPolicyChange,
+                "fixture",
+            ),
+            Error::new(webkit2gtk::PluginError::WillHandleLoad, "fixture"),
+        ] {
+            assert!(!platform::displays_default_error(&error));
+        }
+        for error in [
+            Error::new(webkit2gtk::NetworkError::Transport, "fixture"),
+            Error::new(webkit2gtk::PolicyError::CannotShowUri, "fixture"),
+            Error::new(webkit2gtk::PluginError::ConnectionCancelled, "fixture"),
+        ] {
+            assert!(platform::displays_default_error(&error));
+        }
     }
     #[test]
     fn duplicate_failure_and_late_commit_preserve_the_failed_target_exclusion() {
