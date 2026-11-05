@@ -95,8 +95,8 @@ def worker(args):
     enable_child_subreaper()
     result = {"passed": False}
     phase = os.environ.get("TAKOSUMI_BROWSER_PROCESS_PHASE", "")
-    require(phase in {"", "restart"}, "Unknown browser fixture phase")
-    suffix = "-restart" if phase else ""
+    require(phase in {"", "restart", "reset"}, "Unknown browser fixture phase")
+    suffix = f"-{phase}" if phase else ""
     with (args.data / f"app{suffix}.log").open("x") as log:
         app = subprocess.Popen([str(args.binary)], stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -197,6 +197,8 @@ def main():
     parser.add_argument("--app", choices=["excalidraw", "photopea"], default="excalidraw")
     parser.add_argument("--restart", action="store_true",
                         help="relaunch the App on the same data and verify per-profile state after restart")
+    parser.add_argument("--reset", action="store_true",
+                        help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
@@ -250,6 +252,11 @@ def main():
         # must survive a normal exit and stay separated after restart.
         restart = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="restart"), files, before, head, "-restart")
         require(restart["passed"] is True, "The restarted native execution did not pass")
+    if args.reset:
+        # Another launch on the same data: clear Work from the home's own UI;
+        # Personal (and a clear attempt while it runs) must keep its state.
+        reset = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="reset"), files, before, head, "-reset")
+        require(reset["passed"] is True, "The reset native execution did not pass")
 
 
 if __name__ == "__main__":

@@ -147,45 +147,79 @@ async fn open_saved(view: &WebView, app: &AppHandle, name: &str, count: usize) -
         Ok(())
     } else {
         Err(format!(
-            "Saved {name} connection did not open after restart"
+            "Saved {name} connection did not open after relaunch"
         ))
     }
 }
-/// Second launch on the same App data: the saved home reopens each profile.
-/// The observer checks per-profile site state survived and stayed separate.
-async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -> Result<()> {
+/// Tap a button inside the saved connection's row, matched by its exact label.
+async fn tap_in_row(view: &WebView, name: &str, label: &str) -> Result<()> {
+    let (name, label) = (
+        serde_json::to_string(name).unwrap(),
+        serde_json::to_string(label).unwrap(),
+    );
+    eval(view,&format!("(()=>{{const rows=[...document.querySelectorAll('.web-connections > li')].filter(row=>row.querySelector('.web-connection strong')?.textContent==={name});if(rows.length!==1)throw Error('Unique saved row required');const buttons=[...rows[0].querySelectorAll('button')].filter(button=>button.textContent.trim()==={label}&&!button.disabled);if(buttons.length!==1)throw Error('Unique enabled row button required');buttons[0].click();return true}})()")).await?;
+    Ok(())
+}
+/// A later launch on the same App data (`kind` is restart or reset). The saved
+/// home reopens each profile; for reset, Work's site data is first cleared
+/// through the home's own confirmation, and clearing a running profile must be
+/// refused. The observer checks the resulting per-profile state.
+async fn relaunch_flow(
+    app: &AppHandle,
+    view: &WebView,
+    case: &std::path::Path,
+    kind: &str,
+) -> Result<()> {
     ready(view,"document.querySelectorAll('.web-connection').length===2 && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await?;
     let connections = eval(
         view,
         "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
     )
     .await?;
-    println!("restart: saved home lists both connections");
+    println!("{kind}: saved home lists both connections");
     // The first launch's own guard receipts prove its browsers ended; the
     // runner checked them before this relaunch.
+    let mut running_clear_refused = false;
+    if kind == "reset" {
+        tap_in_row(view, "Work", "保存データを消去…").await?;
+        ready(view, "document.querySelector('.web-clear')").await?;
+        tap_in_row(view, "Work", "保存データを消去").await?;
+        ready(view,"document.body.innerText.includes('Workのサイトデータを消去しました。') && !document.querySelector('.web-error') && !document.querySelector('.web-clear')").await?;
+        println!("reset: Work site data cleared through the home");
+    }
     open_saved(view, app, "Work", 1).await?;
-    println!("restart: Work reopened");
+    println!("{kind}: Work reopened");
     open_saved(view, app, "Personal", 2).await?;
-    println!("restart: Personal reopened");
+    println!("{kind}: Personal reopened");
     let opened = browser_status(app)?;
+    if kind == "reset" {
+        // Personal is running: its data must not be cleared.
+        tap_in_row(view, "Personal", "保存データを消去…").await?;
+        ready(view, "document.querySelector('.web-clear')").await?;
+        tap_in_row(view, "Personal", "保存データを消去").await?;
+        ready(view,"document.querySelector('.web-error')?.textContent.includes(\"Close this connection's screens\")").await?;
+        running_clear_refused = browser_status(app)? == opened;
+        if !running_clear_refused {
+            return Err("Refused clear changed the running browsers".into());
+        }
+        println!("reset: clearing running Personal was refused");
+    }
     std::fs::write(
-        case.join("app-browser-process-restart-open.json"),
-        serde_json::to_vec_pretty(
-            &serde_json::json!({"connections":connections,"processes":opened}),
-        )
-        .unwrap(),
+        case.join(format!("app-browser-process-{kind}-open.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused}))
+            .unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    // The observer verifies persisted state, then closes Personal natively so
-    // the ordinary single-profile exit applies.
-    checkpoint(case, "restart-inspected").await?;
-    checkpoint(case, "restart-request-exit").await?;
+    // The observer verifies state, then closes Personal natively so the
+    // ordinary single-profile exit applies.
+    checkpoint(case, &format!("{kind}-inspected")).await?;
+    checkpoint(case, &format!("{kind}-request-exit")).await?;
     std::fs::write(
-        case.join("app-browser-process-restart-complete.json"),
+        case.join(format!("app-browser-process-{kind}-complete.json")),
         b"{\"passed\":true}\n",
     )
     .map_err(|error| error.to_string())?;
-    println!("PASS restarted App reopened both saved profiles");
+    println!("PASS {kind} App reopened both saved profiles");
     Ok(())
 }
 async fn flow(app: &AppHandle) -> Result<()> {
@@ -207,10 +241,13 @@ async fn flow(app: &AppHandle) -> Result<()> {
         "document.querySelector('#connection-url') && window.__TAURI_INTERNALS__",
     )
     .await?;
-    if std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE").as_deref() == Ok("restart") {
+    if let Ok(kind) = std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE") {
+        if kind != "restart" && kind != "reset" {
+            return Err("Unknown browser fixture phase".into());
+        }
         // Progress lines survive an outer timeout that kills the App mid-wait.
-        println!("restart: shell ready");
-        return restart_flow(app, &view, &case).await;
+        println!("{kind}: shell ready");
+        return relaunch_flow(app, &view, &case, &kind).await;
     }
     add(&view, "Work", 1).await?;
     add(&view, "Personal", 2).await?;

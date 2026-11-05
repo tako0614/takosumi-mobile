@@ -7,10 +7,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope:'Disposable Linux actual App/browser process fixture; no real login or Push'};
-const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase==='restart'?'-restart':'';
+const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
@@ -177,11 +177,13 @@ async function attach(process) {
   assert.equal(context.secure,true);for(const key of ['tauri','ipc','wry'])assert.equal(context[key],'undefined');
   page.context=context;return page;
 }
-// Second launch on the same App data (runner --restart): each profile's site
-// storage from the first launch must survive and stay separate.
-async function restartFlow() {
-  proof.scope='Disposable Linux actual App restart on the same data; no real login or Push';
-  const opened=await marker('app-browser-process-restart-open.json');proof.opened=opened;
+// A later launch on the same App data. restart: each profile's storage and
+// cookie from the first launch survive and stay separate. reset: Work was
+// cleared from the home, so only Personal keeps its state, and a clear of the
+// running Personal was refused.
+async function relaunchFlow(kind) {
+  proof.scope=`Disposable Linux actual App ${kind} on the same data; no real login or Push`;
+  const opened=await marker(`app-browser-process-${kind}-open.json`);proof.opened=opened;
   const pages=[];
   for(const name of ['Work','Personal']) {
     const connection=opened.connections.find(c=>c.name===name);assert(connection);
@@ -189,11 +191,17 @@ async function restartFlow() {
     pages.push(await attach(process));
   }
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
-  step('persisted per-profile storage after restart');
+  step(`per-profile state after ${kind}`);
   proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
-  assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},{storage:`1:${nonce}`,cookie:`1:${nonce}`}],'Each profile must keep its own site storage and cookie across App restart');
-  await writeFile(path.join(data,'restart-inspected'),'ready',{flag:'wx'});
-  step('Personal native close after restart',personal);
+  const kept={storage:`1:${nonce}`,cookie:`1:${nonce}`};
+  if(kind==='reset') {
+    assert.deepEqual(proof.persisted,[{storage:null,cookie:null},kept],'Only Work site data may be cleared');
+    assert.equal(opened.runningClearRefused,true,'Clearing a running profile must be refused');
+  } else {
+    assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},kept],'Each profile must keep its own site storage and cookie across App restart');
+  }
+  await writeFile(path.join(data,`${kind}-inspected`),'ready',{flag:'wx'});
+  step(`Personal native close after ${kind}`,personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
   desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
@@ -205,9 +213,9 @@ async function restartFlow() {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     if(!(await guardExited(personal)))return false;
     proof.personalClosed=receipt;return true;
-  },'Personal guard did not finish after restart');
-  step('Work ordinary exit after restart',pages[0]);
-  await writeFile(path.join(data,'restart-request-exit'),'ready',{flag:'wx'});
+  },`Personal guard did not finish after ${kind}`);
+  step(`Work ordinary exit after ${kind}`,pages[0]);
+  await writeFile(path.join(data,`${kind}-request-exit`),'ready',{flag:'wx'});
   proof.passed=true;
 }
 async function firstLaunch() {
@@ -344,7 +352,7 @@ async function firstLaunch() {
 }
 const clients=[];
 try {
-  if(phase==='restart')await restartFlow();
+  if(phase)await relaunchFlow(phase);
   else await firstLaunch();
 }catch(error){
   proof.error=String(error);
