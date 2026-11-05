@@ -70,6 +70,17 @@ async function guardEnded(receipt) {
   if(!text)return false;
   try{JSON.parse(text);return true;}catch(e){if(e instanceof SyntaxError)return false;throw e;}
 }
+// A guard's complete receipt that records a normal, unforced end.
+async function normalReceipt(file,message) {
+  let receipt;
+  await settled(async()=>{
+    if(!(await guardEnded(file)))return false;
+    receipt=JSON.parse(await readFile(file,'utf8'));return true;
+  },message);
+  assert.equal(receipt.rootExit,0,message);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
+  assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
+  return receipt;
+}
 async function failureClient() {
   const live=[];
   for(const c of clients) {
@@ -372,7 +383,24 @@ async function firstLaunch() {
   proof.longAlert={messageLength:9001,closed:true,documentRetained:true,source:'pristine same-origin realm',pageAlertName:proof.pageAlertName,
     frameId:alertEvent.params.frameId,topFrame:true,url:alertEvent.params.url};
   await work.evaluate("(()=>{window.__sumiAlertFrame.remove();delete window.__sumiAlertFrame;removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
-  step('Work final exit',work);
+  // The accepted sequential trade-off: Work (oldest) now agrees to leave and
+  // closes normally first; Personal cancels, so the quit stops with Work closed
+  // and Personal kept.
+  step('Personal cancels after Work closed',personal);
+  const personalUnload=personal.c.events.length;
+  await personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
+  await writeFile(path.join(data,'request-partial-exit'),'ready',{flag:'wx'});
+  await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Personal beforeunload did not open after Work closed');
+  proof.workClosedFirst=await normalReceipt(work.process.guardReceipt,'Work must have closed normally before Personal is asked');
+  desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
+  desktop('xdotool',['key','--clearmodifiers','Escape']);
+  await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel Personal beforeunload');
+  assert.deepEqual(await sample(personal),expected[1],'The cancelled Personal must keep its document');
+  await writeFile(path.join(data,'partial-inspected'),'ready',{flag:'wx'});
+  proof.partial=await marker('app-browser-process-partial.json');
+  assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
+  await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  step('Personal final exit',personal);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
 }

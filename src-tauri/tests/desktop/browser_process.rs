@@ -409,6 +409,35 @@ async fn flow(app: &AppHandle) -> Result<()> {
         serde_json::to_vec_pretty(&retained).unwrap(),
     )
     .map_err(|error| error.to_string())?;
+    checkpoint(&case, "request-partial-exit").await?;
+    // Work now agrees to leave and closes first; Personal cancels, so the quit
+    // stops with only Personal kept (the accepted sequential trade-off).
+    app.exit(0);
+    checkpoint(&case, "partial-inspected").await?;
+    let partial = exit_cancelled(app, 1).await?;
+    let personal_profile = connections
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "Personal"))
+        .and_then(|item| item["profile"].as_str())
+        .ok_or("Missing Personal")?;
+    let only_personal = partial.as_array().is_some_and(|items| {
+        items.len() == 1
+            && items[0]["profile"] == personal_profile
+            && items[0]["uncertain"] == false
+            && before.as_array().unwrap().iter().any(|original| {
+                original["profile"] == personal_profile && original["opened"] == items[0]["opened"]
+            })
+    });
+    if !only_personal {
+        return Err(
+            "Work must close and the original Personal must remain after its cancel".into(),
+        );
+    }
+    std::fs::write(
+        case.join("app-browser-process-partial.json"),
+        serde_json::to_vec_pretty(&partial).unwrap(),
+    )
+    .map_err(|error| error.to_string())?;
     checkpoint(&case, "request-final-exit").await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
