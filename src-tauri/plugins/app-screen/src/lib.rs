@@ -18,17 +18,23 @@ use tauri::{
 
 pub use models::*;
 
+#[cfg(feature = "browser-process")]
+pub mod browser_process;
 mod error;
 mod models;
+#[cfg(all(feature = "desktop-process-experiment", not(target_os = "linux")))]
+compile_error!("The browser-process experiment is Linux only.");
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+pub use desktop::{browser_process_experiment_status, shutdown_browser_process_experiment};
 #[cfg(any(test, all(desktop, feature = "desktop")))]
 mod resume;
 
 #[cfg(all(desktop, feature = "desktop"))]
 mod desktop;
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
-pub use desktop::fixture::run as run_desktop_profile_fixture;
-#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 pub use desktop::browser_probe::run as run_desktop_browser_probe;
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+pub use desktop::fixture::run as run_desktop_profile_fixture;
 #[cfg(all(desktop, feature = "desktop"))]
 pub use desktop::init;
 

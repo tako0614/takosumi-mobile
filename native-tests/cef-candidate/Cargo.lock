@@ -2978,6 +2978,7 @@ name = "tauri-plugin-app-screen"
 version = "0.1.0-takosumi.1"
 dependencies = [
  "serde",
+ "serde_json",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.19",

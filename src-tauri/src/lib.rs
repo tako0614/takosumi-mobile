@@ -1,8 +1,18 @@
 use tauri::Manager;
 
+#[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+#[path = "../tests/desktop/browser_process.rs"]
+mod browser_process_fixture;
 #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
 #[path = "../tests/desktop/web_home.rs"]
 mod web_home_fixture;
+#[cfg(all(feature = "native-browser-process-fixture", not(target_os = "linux")))]
+compile_error!("The browser-process App fixture requires Linux.");
+#[cfg(all(
+    feature = "native-browser-process-fixture",
+    feature = "native-web-home-fixture"
+))]
+compile_error!("Select one actual-App fixture at a time.");
 
 #[cfg(all(feature = "native-web-home-fixture", not(target_os = "linux")))]
 compile_error!("The native Web-home fixture requires Linux; it does not qualify other OSes.");
@@ -37,11 +47,18 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_takosumi_push::init())?;
             #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
             web_home_fixture::start(app.handle().clone());
+            #[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+            browser_process_fixture::start(app.handle().clone());
             Ok(())
         });
     #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
     web_home_fixture::run(builder, tauri::generate_context!());
-    #[cfg(not(feature = "native-web-home-fixture"))]
+    #[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+    browser_process_fixture::run(builder, tauri::generate_context!());
+    #[cfg(not(any(
+        feature = "native-web-home-fixture",
+        feature = "native-browser-process-fixture"
+    )))]
     builder
         .run(tauri::generate_context!())
         .expect("error while running Takosumi mobile");

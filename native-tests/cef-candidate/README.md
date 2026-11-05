@@ -7,7 +7,7 @@ installed App profiles. See [upstream attribution and scope](UPSTREAM.md).
 Build with an owned SDK/target directory and the committed candidate lockfile:
 
 ```bash
-CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-candidate
 python3 -B native-tests/cef-candidate/run.py --binary /absolute/owned/target/debug/takosumi-cef-candidate --data /absolute/new/case --app photopea
 ```
 
@@ -225,6 +225,70 @@ located a recorder EOF wait after SDK shutdown/client release; the recorder now
 ends on the explicit runtime-complete boundary and is still joined. This does
 not establish that all retained SDK references or cold-start issues are solved.
 
+## Actual Tauri shell and browser-process experiment
+
+An explicit Linux fixture now connects the existing bundled WebHome and its
+shell-only `app-screen.open` command to a separate CEF process per UUID profile.
+Normal builds keep their existing runtime. No shared-kit or remote page IPC is
+added, and installed profiles are not migrated. This is an integration probe,
+not an engine decision or a distributable browser service.
+
+```bash
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process
+cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+python3 -B native-tests/desktop/browser_process.py --binary src-tauri/target/debug/takosumi-mobile --browser /absolute/owned/target/debug/takosumi-cef-browser-process --data /root/dev/tmp/new-short-app-case --app excalidraw
+```
+
+Run `--app photopea` in another fresh case for the second anonymous origin.
+The runner needs the existing Python pidfd/subreaper guard, Node, Xvfb, D-Bus,
+XRes, xdotool and ImageMagick; it installs nothing. It supplies fresh HOME/XDG
+directories and explicitly enables PID-attested loopback inspection ports.
+The browser control pipe accepts only bounded validated open/close/shutdown
+requests, never JavaScript or arbitrary paths. Pipe writes and reply waits
+share a bounded deadline. The child retains a native CEF observer and enables
+Page observation only when a single-window close is requested. Native setup
+must succeed before closing; refusal/failure retains the browser and blocks
+later unobserved closes. It observes the default beforeunload UI's result; it neither
+replaces that UI nor exposes DevTools commands through the parent pipe.
+
+The driver inspects the shell-created processes, native profile/cache/window
+and XRes owner, actual document, absent page IPC, separate synthetic storage,
+and exact document retention after a real shell resume. After a cancelled close
+has enabled the native observer, it also dismisses a 9,001-character native
+alert and checks that the document survives. Beforeunload
+setup uses synthetic CDP user activation; cancellation uses native Escape.
+The App must then resume the original Work document through its existing UI
+and exit normally, with both browser guards and the outer session guard clean.
+`execution.passed` requires the App/observer flags, normal receipts, and unchanged
+source/artifacts; merely creating a window or writing a completion marker fails.
+
+**Coordinated quit is unsupported:** the parent refuses a quit while multiple
+profiles are live, and a child refuses shutdown with multiple native screens.
+The refusal happens before any close. Native browser windows must be closed
+individually first; the fixture verifies both original documents survive the
+multi-profile refusal, closes Personal through Chrome's native shortcut, then
+tests Work's cancellable ordinary App exit. A production quit UX, cross-window
+beforeunload coordination, profile reset/migration, restart persistence, popup
+authentication, files/permissions/notifications in this new App path, sandbox,
+packaging/update and other OSes remain unfinished. The Python guard and the
+root-only unsandboxed setup are fixture prerequisites, not release design.
+
+The Excalidraw ex5 actual-App flow passed, including native cancellation,
+an active-observer long alert and normal guards, on browser binary
+`2b94920c8a91cf24f908e5db54832219de33c9af84aa1c5fd00579dc840107e3`.
+The later failed-observation state repair compiled as
+`47f99c9ca8ee99849031e6f0ce5fb735429fa1d30ddd4405ebd4e1fc4d3437f2`,
+but its ex6 actual-App run remained at `about:blank` and failed before close
+was exercised. The earlier pass does not qualify the latest source or binary.
+Photopea remains unqualified in this path: its landing page
+and two visible equivalent start buttons were observed, but after the
+hit-tested start operation `Runtime.evaluate` stopped responding within the
+existing five-second bound. Deferring the internal Page agent until close did
+not remove the observed failure. No unique cause, CEF-wide inability or
+Photopea compatibility is inferred. These failed App cases do not erase the
+earlier standalone component results or establish App-wide file/notification
+support. Retain each exact-source receipt when comparing later candidates.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,
@@ -241,7 +305,7 @@ These successful file operations do not establish daily-use reliability.
 The native browser reports non-global request contexts whose cache paths equal
 the requested UUID directories. Same-origin synthetic storage/cookie separation
 and the popup primitive do not establish permission isolation, restart
-persistence or real authentication. Tauri UI integration, real login/popup
+persistence or real authentication. Production Tauri integration, real login/popup
 return, other site permissions/revocation, Web Push delivery, sandboxing, other OSes,
 updates and distribution remain unfinished. The runner
 uses `no_sandbox` in its disposable root test environment; it is not a release
