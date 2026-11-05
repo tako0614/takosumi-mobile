@@ -63,6 +63,22 @@ fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
     Ok(send)
 }
 static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+/// Why waiting for a reply ended without one: a timeout leaves a late answer
+/// queued, a closed channel means the browser is ending, a fault is an error.
+enum Wait {
+    TimedOut,
+    Closed,
+    Fault(Error),
+}
+impl From<Wait> for Error {
+    fn from(wait: Wait) -> Self {
+        match wait {
+            Wait::TimedOut => Error::InvalidRequest("Browser response timed out."),
+            Wait::Closed => Error::InvalidRequest("Browser replies closed."),
+            Wait::Fault(error) => error,
+        }
+    }
+}
 struct Process {
     child: Child,
     input: Option<ChildStdin>,
@@ -71,6 +87,9 @@ struct Process {
     directory: PathBuf,
     next: u64,
     uncertain: bool,
+    /// The key of the open being confirmed, so a late creation reply can still
+    /// be verified after a timeout.
+    opening: Option<String>,
     opened: serde_json::Value,
     guard_receipt: PathBuf,
     program: PathBuf,
@@ -621,6 +640,7 @@ impl Process {
             directory,
             next: 1,
             uncertain: false,
+            opening: None,
             opened: serde_json::Value::Null,
             guard_receipt,
             program,
@@ -660,19 +680,26 @@ impl Process {
             .ok_or(Error::InvalidRequest("Browser pipe is closed."))?;
         write_until(input, &bytes, deadline).map_err(failure)
     }
-    fn receive(&mut self, id: u64, deadline: std::time::Instant) -> Result<Reply> {
+    fn receive(
+        &mut self,
+        id: u64,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Reply, Wait> {
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or(Error::InvalidRequest("Browser response timed out."))?;
-            let reply = self
-                .replies
-                .recv_timeout(remaining)
-                .map_err(failure)?
-                .map_err(failure)?;
+                .ok_or(Wait::TimedOut)?;
+            let reply = match self.replies.recv_timeout(remaining) {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(message)) => return Err(Wait::Fault(failure(message))),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(Wait::TimedOut),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Wait::Closed),
+            };
             if let Reply::Closed { id: 0, profile, .. } = &reply {
                 if profile != &self.profile {
-                    return Err(Error::InvalidRequest("Foreign browser close reply."));
+                    return Err(Wait::Fault(Error::InvalidRequest(
+                        "Foreign browser close reply.",
+                    )));
                 }
                 continue;
             }
@@ -690,10 +717,12 @@ impl Process {
                 continue;
             }
             if actual != id {
-                return Err(Error::InvalidRequest("Browser response identity mismatch."));
+                return Err(Wait::Fault(Error::InvalidRequest(
+                    "Browser response identity mismatch.",
+                )));
             }
             if let Reply::Error { message, .. } = reply {
-                return Err(failure(message));
+                return Err(Wait::Fault(failure(message)));
             }
             return Ok(reply);
         }
@@ -707,7 +736,14 @@ impl Process {
         key: &str,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        match self.receive(id, deadline)? {
+        self.opening = Some(key.to_owned());
+        let reply = self.receive(id, deadline)?;
+        self.confirm_opened(reply, key)
+    }
+    /// Record a creation reply for this browser's own native child, profile
+    /// cache and key; anything else is unconfirmed.
+    fn confirm_opened(&mut self, reply: Reply, key: &str) -> Result<()> {
+        match reply {
             Reply::Opened {
                 key: actual,
                 profile,
@@ -728,6 +764,7 @@ impl Process {
                     == self.directory.join("cef-profiles").join(&self.profile) =>
             {
                 self.opened = serde_json::json!({"key":actual,"profile":profile,"browserId":browser_id,"nativeCache":cache_path,"windowId":window_id,"nativePid":native_pid});
+                self.opening = None;
                 Ok(())
             }
             _ => Err(Error::InvalidRequest(
@@ -767,6 +804,7 @@ impl Process {
             .checked_add(1)
             .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
         let id = self.next;
+        self.opening = None;
         let now = std::time::Instant::now();
         // A person answers each window's beforeunload in turn: the reply bound
         // is interactive, unlike the write bound.
@@ -779,15 +817,16 @@ impl Process {
                 .map(|()| true)
                 .map_err(|_| error);
         }
+        // A timeout leaves any late answer queued for `recover`.
         let reply = match self.receive(id, now + Duration::from_secs(300)) {
             Ok(reply) => reply,
-            Err(error) if self.replies_closed() => {
+            Err(Wait::Closed) => {
                 return self
                     .ended_within(Duration::from_secs(2))
                     .map(|()| true)
-                    .map_err(|_| error);
+                    .map_err(|_| Wait::Closed.into());
             }
-            Err(error) => return Err(error),
+            Err(wait) => return Err(wait.into()),
         };
         match reply {
             Reply::Cancelled { profile, .. } if profile == self.profile => return Ok(false),
@@ -816,19 +855,10 @@ impl Process {
             "Browser process did not finish shutdown.",
         ))
     }
-    /// Only user-close notices remain and the reply channel has closed.
-    fn replies_closed(&self) -> bool {
-        loop {
-            match self.replies.try_recv() {
-                Ok(Ok(Reply::Closed { id: 0, .. })) => continue,
-                Err(mpsc::TryRecvError::Disconnected) => return true,
-                _ => return false,
-            }
-        }
-    }
     /// Settle a browser left in doubt by an earlier timeout before using it:
-    /// a late reply to its last shutdown, or its own normal end. Returns true
-    /// when it has ended (the caller drops it); a late cancel makes it usable.
+    /// a late reply to its last request, or its own normal end. Returns true
+    /// when it has ended (the caller drops it); a late cancel, refusal or
+    /// verified creation makes it usable. Other replies keep it in doubt.
     fn recover(&mut self) -> Result<bool> {
         if !self.uncertain {
             return Ok(false);
@@ -842,11 +872,21 @@ impl Process {
         }
         while let Ok(Ok(reply)) = self.replies.try_recv() {
             match reply {
-                Reply::Cancelled { id, profile } if id == self.next && profile == self.profile => {
+                Reply::Cancelled { id, ref profile } | Reply::CloseBlocked { id, ref profile }
+                    if id == self.next && *profile == self.profile =>
+                {
                     self.uncertain = false;
                 }
                 Reply::Stopped { id } if id == self.next => {
+                    self.input.take();
                     return self.ended_within(Duration::from_secs(5)).map(|()| true);
+                }
+                Reply::Opened { id, .. } if id == self.next => {
+                    if let Some(key) = self.opening.clone() {
+                        if self.confirm_opened(reply, &key).is_ok() {
+                            self.uncertain = false;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1225,8 +1265,9 @@ mod tests {
     }
     #[test]
     fn a_late_answer_recovers_a_profile_left_in_doubt() {
-        // Stand-in guards answer the last shutdown late: one with a cancel (the
-        // browser stays usable), one with a stop and a normal end (it is dropped).
+        // As after a request with id 2 timed out. Replies are injected in order;
+        // the stand-in guard starts the "native" child (the program argument)
+        // and ends normally only once its input closes.
         let root = std::env::temp_dir().join(format!("sumi-recover-{}", std::process::id()));
         private_directory(&root).unwrap();
         let (work, personal) = (
@@ -1234,15 +1275,132 @@ mod tests {
             "22222222-2222-4222-8222-222222222222",
         );
         let receipt = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
-        let cancel = root.join("cancel.py");
-        std::fs::write(&cancel, format!("import time\ntime.sleep(0.2)\nprint('{{\"event\":\"cancelled\",\"id\":2,\"profile\":\"{work}\"}}',flush=True)\ntime.sleep(30)\n")).unwrap();
-        let stop = root.join("stop.py");
-        std::fs::write(&stop, format!("import json,sys,time\ntime.sleep(0.2)\nprint('{{\"event\":\"stopped\",\"id\":2}}',flush=True)\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,pathlib,subprocess,sys\nnative=subprocess.Popen([sys.argv[2],'30'])\npathlib.Path(sys.argv[1]).with_name('native').write_text(str(native.pid))\nsys.stdin.read()\nnative.kill();native.wait()\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        let program = std::fs::canonicalize("/bin/sleep").unwrap();
         let parent = spawner().unwrap();
-        let mut spawned = Vec::new();
-        for (index, (profile, guard)) in
-            [(work, &cancel), (personal, &stop)].into_iter().enumerate()
-        {
+        let mut index = 0;
+        let mut spawn = |profile: &str| {
+            index += 1;
+            let payload = serde_json::from_value(serde_json::json!({
+                "key":format!("web-home:{profile}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+            }))
+            .unwrap();
+            let mut process = Process::spawn(
+                program.clone(),
+                guard.clone(),
+                root.join(format!("{index}")).join(profile),
+                root.join(format!("r{index}")),
+                payload,
+                &parent,
+            )
+            .unwrap();
+            let (send, replies) = mpsc::channel();
+            process.replies = replies;
+            process.next = 2;
+            process.uncertain = true;
+            (process, send)
+        };
+        let cancelled = |id, profile: &str| {
+            Ok(Reply::Cancelled {
+                id,
+                profile: profile.to_owned(),
+            })
+        };
+        // A cancel: only the answer to the last request, for this profile, counts.
+        let (mut process, send) = spawn(work);
+        assert!(!process.recover().unwrap(), "no answer yet");
+        assert!(process.uncertain, "stays in doubt without an answer");
+        send.send(cancelled(1, work)).unwrap();
+        send.send(cancelled(2, personal)).unwrap();
+        send.send(Ok(Reply::Stopped { id: 1 })).unwrap();
+        assert!(!process.recover().unwrap(), "stale or foreign answers");
+        assert!(
+            process.uncertain,
+            "stale or foreign answers keep it in doubt"
+        );
+        assert!(
+            process.child.try_wait().unwrap().is_none(),
+            "and keep the browser"
+        );
+        send.send(cancelled(2, work)).unwrap();
+        assert!(
+            !process.recover().unwrap(),
+            "a late cancel keeps the browser"
+        );
+        assert!(!process.uncertain, "and makes it usable again");
+        drop(process);
+        // A stop: dropped only after the browser, told its input is done, ends normally.
+        let (mut process, send) = spawn(personal);
+        send.send(Ok(Reply::Stopped { id: 2 })).unwrap();
+        assert!(
+            process.recover().unwrap(),
+            "a late stop and normal end drops it"
+        );
+        drop(process);
+        // A creation: only a reply for this browser's own native child, profile
+        // cache and pending key makes it usable.
+        let (mut process, send) = spawn(work);
+        let key = format!("web-home:{work}:https://excalidraw.com");
+        process.opening = Some(key.clone());
+        let marker = process.guard_receipt.with_file_name("native");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let native_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in native child never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let cache = process.directory.join("cef-profiles").join(work);
+        let opened = |id, key: &str, native_pid| {
+            Ok(Reply::Opened {
+                id,
+                key: key.to_owned(),
+                profile: work.to_owned(),
+                browser_id: 1,
+                cache_path: cache.to_string_lossy().into_owned(),
+                window_id: 7,
+                native_pid,
+            })
+        };
+        send.send(opened(1, &key, native_pid)).unwrap();
+        send.send(opened(2, "web-home:other", native_pid)).unwrap();
+        send.send(opened(2, &key, std::process::id())).unwrap();
+        assert!(!process.recover().unwrap());
+        assert!(
+            process.uncertain,
+            "an unverified creation keeps it in doubt"
+        );
+        send.send(opened(2, &key, native_pid)).unwrap();
+        assert!(
+            !process.recover().unwrap(),
+            "a verified late creation keeps the browser"
+        );
+        assert!(!process.uncertain, "and makes it usable again");
+        assert_eq!(process.opened["nativePid"], native_pid);
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn a_closed_reply_channel_ends_a_shutdown_but_a_fault_stays_an_error() {
+        // The stand-in guard reads the shutdown request and ends normally
+        // without answering, as a browser whose last window just closed.
+        let root = std::env::temp_dir().join(format!("sumi-closed-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let receipt = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,sys\nsys.stdin.readline()\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        for (index, fault) in [false, true].into_iter().enumerate() {
             let payload = serde_json::from_value(serde_json::json!({
                 "key":format!("web-home:{profile}:https://excalidraw.com"),
                 "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
@@ -1251,30 +1409,28 @@ mod tests {
             let mut process = Process::spawn(
                 PathBuf::from("/bin/true"),
                 guard.clone(),
-                root.join(profile),
+                root.join(format!("{index}")).join(profile),
                 root.join(format!("r{index}")),
                 payload,
                 &parent,
             )
             .unwrap();
-            // As after a timed-out shutdown request with id 2.
-            process.next = 2;
-            process.uncertain = true;
-            spawned.push(process);
+            let (send, replies) = mpsc::channel();
+            process.replies = replies;
+            if fault {
+                send.send(Err("Invalid browser reply".into())).unwrap();
+            }
+            drop(send);
+            match (fault, process.shutdown()) {
+                (false, Ok(true)) => {}
+                // Even though the guard then ends normally.
+                (true, Err(Error::Desktop(message))) => {
+                    assert_eq!(message, "Invalid browser reply")
+                }
+                (_, other) => panic!("fault={fault}: {other:?}"),
+            }
+            drop(process);
         }
-        std::thread::sleep(Duration::from_millis(800));
-        let mut cancelled = spawned.remove(0);
-        assert!(
-            !cancelled.recover().unwrap(),
-            "a late cancel keeps the browser"
-        );
-        assert!(!cancelled.uncertain, "a late cancel makes it usable again");
-        let mut stopped = spawned.remove(0);
-        assert!(
-            stopped.recover().unwrap(),
-            "a late stop and normal end drops it"
-        );
-        drop((cancelled, stopped));
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
