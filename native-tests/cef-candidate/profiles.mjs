@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export const PROFILE_IDS=['11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222'];
 
-export async function probeProfiles({command,data,url,nonce,popup=false}) {
+export async function probeProfiles({command,data,url,nonce,popup=false,exercise}) {
   const proof={passed:false,stage:'native bindings'};
   try {
   const marker=path.join(data,'native-roots-ready.json');
@@ -90,6 +90,7 @@ export async function probeProfiles({command,data,url,nonce,popup=false}) {
     proof.cookies[index===0?'work':'personal']=actual;
     assert.equal(await page.evaluate(`document.cookie.includes(${JSON.stringify(cookieName)})`),false,'HttpOnly test cookie must remain hidden from JavaScript');
   }
+  if(exercise)proof.permissionObservations=await exercise(pages);
   const observeClose=async(page,survivors)=>{
   const closePath=path.join(data,`native-closed-${page.native.browserId}.json`);
   const closeDeadline=Date.now()+5000;let closedNative=false,remaining=[];

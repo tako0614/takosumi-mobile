@@ -46,3 +46,14 @@ handles. Strict process/guard checks still gate every success flag.
 Tauri UI integration, real login/cross-origin popup return, site permissions,
 Web Push, restart persistence, sandboxing, other OSes and distribution remain
 separate unfinished checks. These experiments do not select a product engine.
+
+The permission modes reuse Chrome's default prompt, with no native permission
+handler or CDP grant. They place a uniquely named, PID-verified owned window in
+the inspected English Linux geometry and click a single Allow/Block choice.
+The two known prompt layouts are test-fixture details. Actual pending request,
+secure origin, resolved permission and the other profile's state must agree;
+five replay controls reject false evidence before clicking. Excalidraw passed
+this notification-permission component; Photopea's full final flow remains
+unqualified. API notification events do not prove OS display or Push: the
+owned D-Bus session lacked its notification service, and an unattributed
+allocator diagnostic also prevents claiming desktop-service stability.

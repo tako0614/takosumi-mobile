@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { waitForGtkConfirm } from './gtk-readiness.mjs';
 import { PROFILE_IDS, probeProfiles } from './profiles.mjs';
+import { inspectPermissions } from './permissions.mjs';
 
 const repo=fileURLToPath(new URL('../../',import.meta.url));
 const data=process.argv[2], app=process.argv[3], mode=process.argv[4], binary=process.argv[5];
@@ -17,8 +18,9 @@ assert(files!=='native-picker'||app==='excalidraw');
 assert(binary && path.isAbsolute(binary));
 assert((await lstat(binary)).isFile() && !(await lstat(binary)).isSymbolicLink());
 const urls={photopea:'https://www.photopea.com/',excalidraw:'https://excalidraw.com/'};
-assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate','profiles','profile-popup'].includes(mode));
-const profileMode=mode==='profiles'||mode==='profile-popup';
+assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate','profiles','profile-popup','permission-inspect','site-permissions'].includes(mode));
+const permissionMode=mode==='permission-inspect'||mode==='site-permissions';
+const profileMode=mode==='profiles'||mode==='profile-popup'||permissionMode;
 assert(!profileMode||files==='cdp');
 assert(process.env.TAKOSUMI_CEF_RUNNER_CASE===data,'Use run.py to own the desktop session');
 assert((await lstat(data)).isDirectory() && !(await lstat(data)).isSymbolicLink());
@@ -156,7 +158,7 @@ try {
   const requests=(profileMode?PROFILE_IDS:[PROFILE_IDS[0]]).map(profile=>({key:`web-home:${profile}:${new URL(urls[app]).origin}`,url:urls[app],title:'Native CEF candidate',profile,webHome:true,resume:false}));
   await writeFile(path.join(data,'request.json'),JSON.stringify(profileMode?requests:requests[0]));
   browser=spawn('python3',['-B',path.join(repo,'native-tests/browser/guard.py'),path.join(data,'guard.json'),binary,
-    ...(files==='cdp'?['--headless=new']:[]),'--no-sandbox','--no-first-run','--no-default-browser-check','--disable-background-networking',
+    ...(files==='cdp'&&!permissionMode?['--headless=new']:[]),'--no-sandbox','--no-first-run','--no-default-browser-check','--disable-background-networking',
     '--disable-component-update','--disable-sync','--password-store=basic','--lang=en-US','--remote-debugging-address=127.0.0.1'],
     {env,stdio:['ignore','ignore',log.fd],detached:true});
   exitPromise=new Promise((resolve,reject)=>{browser.once('exit',resolve);browser.once('error',reject)});
@@ -209,7 +211,8 @@ try {
   await writeFile(path.join(data,'protocol.json'),JSON.stringify(protocol.domains.filter(d=>['Browser','Page','DOM'].includes(d.domain)).map(d=>({domain:d.domain,commands:d.commands.filter(c=>['setDownloadBehavior','setInterceptFileChooserDialog','setFileInputFiles'].includes(c.name)),events:d.events?.filter(e=>['downloadWillBegin','downloadProgress','fileChooserOpened'].includes(e.name))})),null,2));
   if(profileMode) {
     await stage('native two-profile bindings and same-origin state');
-    receipt.profiles=await probeProfiles({command,data,url:urls[app],nonce,popup:mode==='profile-popup'});
+    receipt.profiles=await probeProfiles({command,data,url:urls[app],nonce,popup:mode==='profile-popup',
+      exercise:permissionMode?pages=>inspectPermissions({pages,command,data,nonce,desktop,nativePid:receipt.nativePid,decide:mode==='site-permissions'}):undefined});
     receipt.profileVerified=receipt.profiles.passed===true;
   }else {
   const targetDeadline=Date.now()+10000;let target;
@@ -326,7 +329,7 @@ try {
     }catch{}
   }
   try{await screenshot('failure.png')}catch{}
-  if(files==='native-picker'){try{await desktop('import',['-window','root',path.join(data,'native-failure.png')])}catch{}}
+  if(files==='native-picker'||permissionMode){try{await desktop('import',['-window','root',path.join(data,'native-failure.png')])}catch{}}
 }
 finally {
   try {
@@ -356,6 +359,7 @@ finally {
   receipt.operationPassed=mode==='operate' && receipt.exportVerified===true && closed && !error;
   receipt.profilePassed=profileMode && receipt.profileVerified===true && closed && !error;
   receipt.popupPassed=mode==='profile-popup' && receipt.profiles?.popup?.passed===true && closed && !error;
+  receipt.permissionPassed=mode==='site-permissions' && receipt.profiles?.permissionObservations?.permissionPassed===true && closed && !error;
   await writeFile(path.join(data,'reference.json'),JSON.stringify(receipt,null,2)+'\n');
 }
-if(error){console.error(error);process.exitCode=1;}else console.log(`${mode==='operate'?'PASS actual export':profileMode?'PASS native profile state':'OBSERVATION ONLY'}: ${app} ${data}`);
+if(error){console.error(error);process.exitCode=1;}else console.log(`${mode==='site-permissions'?'PASS native permission choices':permissionMode?'OBSERVATION ONLY permissions':mode==='operate'?'PASS actual export':profileMode?'PASS native profile state':'OBSERVATION ONLY'}: ${app} ${data}`);

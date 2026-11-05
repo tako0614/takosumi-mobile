@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=("photopea", "excalidraw"), required=True)
-    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup"), default="operate")
+    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions"), default="operate")
     parser.add_argument("--files", choices=("cdp", "native-picker"), default="cdp",
                         help="Native picker uses a visible browser in the owned Xvfb session")
     args = parser.parse_args()
@@ -41,12 +41,12 @@ def main():
         parser.error("This candidate has only a Linux runner")
     if args.files == "native-picker" and args.app != "excalidraw":
         parser.error("The native-picker probe currently targets Excalidraw only")
-    if args.mode in ("profiles", "profile-popup") and args.files != "cdp":
+    if args.mode in ("profiles", "profile-popup", "permission-inspect", "site-permissions") and args.files != "cdp":
         parser.error("The profile probe does not operate file dialogs")
     for tool in ("node", "python3", "xvfb-run", "dbus-run-session", "timeout", "convert"):
         if shutil.which(tool) is None:
             parser.error(f"Required existing capability is missing: {tool}")
-    if args.files == "native-picker":
+    if args.files == "native-picker" or args.mode in ("permission-inspect", "site-permissions"):
         for tool in ("xdotool", "import"):
             if shutil.which(tool) is None:
                 parser.error(f"Required existing capability is missing: {tool}")
@@ -68,7 +68,7 @@ def main():
     nonce = str(uuid.uuid4())
     (data / ".owned-browser-reference").write_text(nonce)
     fixture = create_input(data, args.app, nonce)
-    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "run.py")]
+    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "run.py")]
     sources += [HERE.parent / name for name in (
         "desktop/browser_apps.py", "desktop/web_home.py", "browser/guard.py", "browser/lifecycle.ts",
     )]

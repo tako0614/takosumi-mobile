@@ -22,7 +22,8 @@ Use a short `--data` path: the pinned Linux Chromium's temporary singleton
 socket must fit `sockaddr_un`. The runner rejects an oversized path before
 allocating a case or starting the browser; it does not relocate profile data.
 
-Default `--files cdp` uses a headless browser. It supplies the site's actual
+Default `--files cdp` uses a headless browser except in the permission modes
+below. It supplies the site's actual
 existing file input through CDP and sets `allowAndName` for an owned download
 directory. Success requires the actual selected page's download GUID/frame,
 native completion, decoded exported data, no remote native IPC globals and
@@ -52,6 +53,9 @@ Every qualifying mode requires `execution.passed`. `operate` also requires
 `reference.operationPassed`. Both profile modes require `reference.profilePassed`; `profile-popup` additionally
 requires `reference.popupPassed`. Inspect never qualifies a capability. All
 success flags also require root exit 0, no remaining child and no forced cleanup.
+`site-permissions` requires `reference.profilePassed` and
+`reference.permissionPassed` as well as `execution.passed`.
+`permission-inspect` never qualifies a permission or notification capability.
 
 ## Native profiles and popup primitive
 
@@ -83,6 +87,47 @@ synthetic state, closes, and its still-live parent reads the new state while
 Personal remains separate. It does not qualify a real click, OS focus, popup
 blocking policy, cross-origin/provider authentication or login completion.
 
+## Default site permission UI
+
+```bash
+python3 -B native-tests/cef-candidate/run.py --binary /absolute/owned/target/debug/takosumi-cef-candidate --data /absolute/new/permission-case --app excalidraw --mode site-permissions
+TMPDIR=/absolute/owned/tmp node --test native-tests/cef-candidate/permissions.test.mjs
+```
+
+`permission-inspect` only requests notification permission and retains the
+native screenshot and state. `site-permissions` exercises Chrome's existing
+Allow/Block UI in a visible owned Xvfb session. Both modes additionally need
+existing `xdotool` and ImageMagick `import`. A generated document title binds
+the actual page to a unique visible window whose PID must equal the owned
+native process. Each window is placed in the inspected geometry, with both
+CDP and X11 geometry readback. The click coordinates are specific to this
+English Linux build and the separately inspected single-line Excalidraw and
+wrapped Photopea prompt layouts; this is not a portable prompt driver.
+
+The standard permission request uses CDP's synthetic userGesture, but the
+decision uses one native UI click. No permission handler, site API replacement
+or CDP grant is installed. Before every choice the request must still be
+pending without error at the original secure origin. All permission samples
+must retain that bound origin. Work's Allow must resolve to granted while
+Personal remains prompt; Personal's Block must resolve to denied while Work
+remains granted. The five replay controls reject wrong/insecure sites,
+redirected requests and pre-resolved or redirected pre-click snapshots before
+any native click; they are oracle tests, not native capability evidence.
+
+On 2026-11-05 Excalidraw passed the choices, state separation and normal CEF
+shutdown. Photopea's initial probe showed its real prompt, and an earlier
+partial run granted Work while Personal remained prompt, but its complete
+final flow is unqualified. Window-cascade/layout and cold-start failures are
+retained. Permission revocation, restart persistence and other permission
+types are still unfinished.
+
+The permitted notification constructor emitted `show`, while the denied
+profile emitted `error`. The owned session nevertheless reported a missing
+`org.freedesktop.Notifications` service. A session also printed an unattributed
+`free(): invalid pointer` outside the CEF log; normal CEF exit does not qualify
+the entire desktop service stack. `notificationPassed` remains false: a page
+event is insufficient for OS display, actual Push delivery, click or resume.
+
 On 2026-11-05 the basic same-origin profile test and the synthetic popup flow
 passed on native CEF, including normal closure. Earlier popup runs passed the
 functional assertions but failed shutdown and remain failures. Milestones
@@ -107,7 +152,7 @@ The native browser reports non-global request contexts whose cache paths equal
 the requested UUID directories. Same-origin synthetic storage/cookie separation
 and the popup primitive do not establish permission isolation, restart
 persistence or real authentication. Tauri UI integration, real login/popup
-return, site permission choices, Web Push delivery, sandboxing, other OSes,
+return, other site permissions/revocation, Web Push delivery, sandboxing, other OSes,
 updates and distribution remain unfinished. The runner
 uses `no_sandbox` in its disposable root test environment; it is not a release
 configuration or an engine-selection decision.
