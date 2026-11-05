@@ -10,7 +10,7 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
@@ -189,6 +189,7 @@ async function relaunchFlow(kind) {
   }
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
   step(`per-profile state after ${kind}`);
+  if(kind==='notify')return notifyProbes(pages);
   proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
   const kept={storage:`1:${nonce}`,cookie:`1:${nonce}`};
   if(kind==='reset') {
@@ -201,6 +202,10 @@ async function relaunchFlow(kind) {
     assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},kept],'Each profile must keep its own site storage and cookie across App restart');
   }
   await writeFile(path.join(data,`${kind}-inspected`),'ready',{flag:'wx'});
+  await closePersonalAfterRelaunch(personal,kind);
+  proof.passed=true;
+}
+async function closePersonalAfterRelaunch(personal,kind) {
   step(`Personal native close after ${kind}`,personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
@@ -213,8 +218,37 @@ async function relaunchFlow(kind) {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     proof.personalClosed=receipt;return true;
   },`Personal guard did not finish after ${kind}`);
-  step(`Work ordinary exit after ${kind}`,pages[0]);
+  step(`Work ordinary exit after ${kind}`);
   await writeFile(path.join(data,`${kind}-request-exit`),'ready',{flag:'wx'});
+}
+
+// notify (runner --notifications): native Chrome permission UI and real OS
+// notifications per profile, reusing the CEF candidate's inspected probes.
+// Permissions are only ever chosen through the native prompt, never by CDP.
+async function notifyProbes(pages) {
+  const [,personal]=pages;
+  await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
+  const notifier=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFIER;
+  assert(notifier&&path.isAbsolute(notifier),'The owned notification daemon is required');
+  const desktopAsync=async(tool,args,allowMissing=false)=>{
+    try{return desktop(tool,args);}catch(e){if(allowMissing&&e.status===1)return String(e.stdout??'').trim();throw e;}
+  };
+  const {startNotificationBackend}=await import('../cef-candidate/notification-backend.mjs');
+  const {probeNotifications}=await import('../cef-candidate/notifications.mjs');
+  const {inspectPermissions}=await import('../cef-candidate/permissions.mjs');
+  // The probes need the attested native PID and a process-local browser command.
+  const probePages=pages.map(page=>({...page,nativePid:page.native.nativePid,browserCommand:(method,params)=>page.c.command(method,params)}));
+  step('native permissions and OS notifications');
+  const backend=await startNotificationBackend({binary:notifier,data,nonce,env:process.env,desktop:desktopAsync});
+  try {
+    proof.permissions=await inspectPermissions({pages:probePages,data,nonce,desktop:desktopAsync,decide:true,
+      command:()=>{throw Error('Unscoped browser command is forbidden across processes');},
+      notificationProbe:({pages,windows})=>probeNotifications({pages,windows,data,nonce,desktop:desktopAsync,backend})});
+    assert(proof.permissions.permissionPassed&&proof.permissions.nativeNotifications.passed,'Native permission and notification probes must pass');
+  } finally {
+    await backend.stop();
+  }
+  await closePersonalAfterRelaunch(personal,'notify');
   proof.passed=true;
 }
 async function firstLaunch() {

@@ -287,7 +287,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     if let Ok(kind) = std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE") {
-        if kind != "restart" && kind != "reset" {
+        if !["restart", "reset", "notify"].contains(&kind.as_str()) {
             return Err("Unknown browser fixture phase".into());
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
