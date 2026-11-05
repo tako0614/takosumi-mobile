@@ -4,8 +4,14 @@ import android.app.Activity
 import android.app.Application
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.SystemClock
+import android.net.http.SslError
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.SslErrorHandler
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -14,6 +20,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.UUID
+import java.io.ByteArrayInputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -35,27 +42,91 @@ class ProfileResetActivityTest {
 
     private fun entry(key: String): AppScreenRegistry.Entry = main { requireNotNull(AppScreenRegistry.get(key)) }
 
-    /** Preserve the production callbacks, and await this document once. */
+    /** Use a real navigation, with a fixture response and production callbacks. */
     private fun editorDocument(entry: AppScreenRegistry.Entry) {
-        val finished = CountDownLatch(1)
+        val deadline = SystemClock.elapsedRealtime() + 20_000L
+        fun remaining() = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        val nonce = UUID.randomUUID().toString()
+        val settled = CountDownLatch(1)
+        var failure: String? = null
         var original: WebViewClient? = null
         main {
             val delegate = entry.webView.webViewClient
             original = delegate
             entry.webView.stopLoading()
             entry.webView.webViewClient = object : WebViewClient() {
+                private var committed = false
+                private var finished = false
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    if (request.isForMainFrame && request.url.toString() == editor) {
+                        return WebResourceResponse("text/html", "utf-8", 200, "OK", emptyMap(),
+                            ByteArrayInputStream("<!doctype html><title>Editor fixture</title><meta name=fixture-page content=$nonce>".toByteArray(Charsets.UTF_8)))
+                    }
+                    return delegate.shouldInterceptRequest(view, request)
+                }
                 override fun onPageStarted(view: WebView, url: String?, icon: Bitmap?) = delegate.onPageStarted(view, url, icon)
-                override fun onPageCommitVisible(view: WebView, url: String?) = delegate.onPageCommitVisible(view, url)
+                override fun onPageCommitVisible(view: WebView, url: String?) {
+                    delegate.onPageCommitVisible(view, url)
+                    if (url == editor && view.url == editor && !committed) {
+                        committed = true
+                        if (finished) settled.countDown()
+                    }
+                }
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, reload: Boolean) = delegate.doUpdateVisitedHistory(view, url, reload)
                 override fun onPageFinished(view: WebView, url: String?) {
                     delegate.onPageFinished(view, url)
-                    if (url == editor) finished.countDown()
+                    if (url == editor && view.url == editor && !finished) {
+                        finished = true
+                        if (committed) settled.countDown()
+                    }
+                }
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    delegate.onReceivedError(view, request, error)
+                    if (request.isForMainFrame && request.url.toString() == editor) {
+                        failure = "Editor native error ${error.errorCode}"
+                        settled.countDown()
+                    }
+                }
+                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                    delegate.onReceivedHttpError(view, request, response)
+                    if (request.isForMainFrame && request.url.toString() == editor) {
+                        failure = "Editor HTTP error ${response.statusCode}"
+                        settled.countDown()
+                    }
+                }
+                override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                    delegate.onReceivedSslError(view, handler, error)
+                    if (error.url == editor) {
+                        failure = "Editor SSL error ${error.primaryError}"
+                        settled.countDown()
+                    }
                 }
             }
-            entry.webView.loadDataWithBaseURL(editor, "<!doctype html><title>Editor fixture</title>", "text/html", "utf-8", null)
+            // A loadDataWithBaseURL document can finish with a synthetic view
+            // URL. It does not establish this control's remembered real page.
+            entry.webView.loadUrl(editor)
         }
-        assertTrue("Editor fixture did not finish", finished.await(20, TimeUnit.SECONDS))
-        main { entry.webView.webViewClient = requireNotNull(original) }
+        try {
+            assertTrue("Editor fixture did not commit and finish at its native URL", settled.await(remaining(), TimeUnit.MILLISECONDS))
+            val inspected = CountDownLatch(1)
+            var document: String? = null
+            main {
+                assertNull(failure)
+                entry.webView.evaluateJavascript("document.querySelector('meta[name=fixture-page]')?.content") {
+                    document = it
+                    inspected.countDown()
+                }
+            }
+            assertTrue("Editor fixture document was not inspected", inspected.await(remaining(), TimeUnit.MILLISECONDS))
+            main {
+                assertNull(failure)
+                assertEquals(editor, entry.webView.url)
+                // One data assertion; no retry can replace an error/old page.
+                assertEquals("The real fixture document must be loaded", "\"$nonce\"", document)
+            }
+        } finally {
+            main { entry.webView.webViewClient = requireNotNull(original) }
+        }
         instrumentation.waitForIdleSync()
     }
 
