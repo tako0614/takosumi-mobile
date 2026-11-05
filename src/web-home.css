@@ -21,6 +21,11 @@ body:has(.web-home) { margin: 0; background: #0a0a0b; }
 .web-connection span { color: #aaaab2; font-size: 14px; overflow-wrap: anywhere; }
 .web-connection small { color: #ff8881; margin-top: 8px; }
 .web-remove { border: 0; padding: 12px 0; background: transparent; color: #aaaab2; font-size: 13px; }
+.web-clear { margin: 8px 0 16px; padding: 16px; border: 1px solid #656570; border-radius: 12px; }
+.web-remove + .web-remove { margin-left: 20px; }
+.web-clear h3 { overflow-wrap: anywhere; }
+.web-clear p { color: #c8c8ce; font-size: 14px; line-height: 1.6; }
+.web-clear button { min-height: 44px; margin-right: 12px; margin-bottom: 8px; padding: 10px 14px; border: 1px solid #777781; border-radius: 8px; background: #28282d; color: #fff; }
 .web-note { font-size: 13px; line-height: 1.6; color: #aaaab2; }
 .web-home form { border-top: 1px solid #353539; padding-top: 28px; margin-top: 28px; }
 .web-home label { display: block; margin-bottom: 8px; font-size: 14px; }

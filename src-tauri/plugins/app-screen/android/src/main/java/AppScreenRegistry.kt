@@ -71,6 +71,8 @@ internal object AppScreenRegistry {
 
     fun get(key: String): Entry? = entries[key]?.takeUnless { it.destroyed }
 
+    fun hasProfile(profile: String): Boolean = entries.values.any { !it.destroyed && it.profile == profile }
+
     fun obtain(context: Context, key: String, popup: Boolean = false, profile: String = AppScreenProfiles.SHARED): Entry {
         get(key)?.let {
             check(it.profile == profile) { "A live screen cannot change its browsing profile." }

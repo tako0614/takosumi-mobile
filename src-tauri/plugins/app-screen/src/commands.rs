@@ -1,14 +1,24 @@
 use tauri::{command, AppHandle, Runtime};
 
 use crate::models::{
-    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, OpenClientRequest,
-    OpenClientResponse, OpenRequest, OpenWebRequest, PendingActionResponse, PinShortcutResponse,
+    BrowserViewRequest, BrowserViewResponse, CapabilitiesResponse, ClearProfileRequest,
+    ClearProfileResponse, OpenClientRequest, OpenClientResponse, OpenRequest, OpenWebRequest,
+    PendingActionResponse, PinShortcutResponse,
 };
 use crate::{AppScreenExt, Result};
 
 #[command]
 pub(crate) async fn capabilities<R: Runtime>(app: AppHandle<R>) -> Result<CapabilitiesResponse> {
     app.app_screen().capabilities()
+}
+
+#[command]
+pub(crate) async fn clear_profile<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ClearProfileRequest,
+) -> Result<ClearProfileResponse> {
+    payload.validate()?;
+    app.app_screen().clear_profile(payload)
 }
 
 #[command]

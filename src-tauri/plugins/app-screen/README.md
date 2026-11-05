@@ -1,4 +1,39 @@
-# Takosumi mobile app screen plugin
+# Takosumi app-screen plugin
+
+The product-owned content adapter supports the shared Web home on Android,
+iOS, Windows, macOS and Linux. The App entry and engine requirements are in
+the [product README](../../../README.md).
+
+## Default Web-home adapter
+
+The trusted shell calls `open` with `webHome: true`, an https site root and a
+matching connection key. New connections use an opaque UUID profile, with
+native cookies/storage isolated from other profiles and the trusted shell.
+Existing shared-profile connections keep their previous jar; no credentials
+are copied. Within a profile, normal Web origin rules apply and popups inherit
+the opener's profile. Takosumi management, sign-in and app pages use this same
+plain Web surface, with Home, Back, picker and ordinary Close actions.
+The page has no Tauri IPC or application bridge.
+
+`capabilities` returns `pinShortcut` and `clearProfile`. The bundled shell
+offers explicit data deletion only when `clearProfile` is true. Its separate
+`clear_profile` command takes `{ profile, key }`; shared profiles, mismatched
+identities and profiles with live views are refused. A successful
+`{ cleared: true }` follows native website-data deletion and removal of the
+profile's remembered page. Connection preferences, other profiles and the
+preserved mobile client's credentials remain. Removing a connection alone
+does not perform this operation.
+
+Source availability is distinct from OS runtime qualification. Current data
+deletion failures, engine-specific controls and unsigned SDK build limits are
+recorded in [native tests](../../../native-tests/README.md). Real IdP, files,
+notifications and distribution require their own checks.
+
+## Preserved mobile adapter
+
+The remaining sections describe the previous Android/iOS client with
+`webHome: false`. Its shared jar, restricted sign-in navigation, native-app
+handoffs and resume rules do not describe the default Web-home adapter.
 
 This product-owned Tauri plugin opens an installed app (or a URL the person
 added on the device) in its own native webview: `WKWebView` on iOS and
@@ -24,8 +59,8 @@ Intents come later.
 
 | Command | Payload | Result |
 | --- | --- | --- |
-| `capabilities` | none | `{ pinShortcut }` (Android launchers that can pin) |
-| `open` | `{ key, url, title, iconPng?, profile: "shared", accountsOrigin?, scope?, resume?, client? }` | opens or returns to the screen |
+| `capabilities` | none | `{ pinShortcut, clearProfile }` (`pinShortcut` is Android launcher support) |
+| `open` | `{ key, url, title, iconPng?, profile: "shared", accountsOrigins?, scope?, resume?, client? }` | opens or returns to the screen |
 | `pin_shortcut` | same as `open` | `{ requested }`; always `false` on iOS |
 | `open_client` | `{ platform, package?, appLink?, universalLink?, open? }` | `{ result: "opened" \| "not_installed" }` |
 | `open_browser_view` | `{ url, toolbarColor? }` | `{ result: "browser-view" \| "browser" }` |
@@ -35,8 +70,8 @@ Intents come later.
 `key` is the screen's stable identity (`app:<capsuleId>:<interfaceId>`,
 `custom:<id>` or `origin:<origin>`). `iconPng` is a base64 PNG the shell drew
 from the Interface `display.icon` (SVG and glyphs are rasterized in the shell;
-the native side only decodes PNG). `accountsOrigin` is the instance's Accounts
-(OIDC issuer) origin, `scope` the (instance, account) the last page is kept
+the native side only decodes PNG). `accountsOrigins` lists the instance's
+Accounts (OIDC issuer) and instance origins, `scope` the (instance, account) the last page is kept
 for, `resume` reopens at that page, and `client` the declared native app the
 bar offers (a verified one with its links, an unverified one with its label
 only). Rust, Kotlin and Swift each re-check that the URL is https without user

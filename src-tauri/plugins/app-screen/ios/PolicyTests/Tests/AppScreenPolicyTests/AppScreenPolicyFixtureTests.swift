@@ -6,6 +6,32 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testClearRemovesEveryScopeForTheExactKeyWithoutChangingOtherProfiles() {
+        let key = "web-home:11111111-1111-4111-8111-111111111111:https://sumi.example"
+        let personal = "web-home:22222222-2222-4222-8222-222222222222:https://sumi.example"
+        let stored: [String: [String: Any]] = [
+            "\(key)\n\(key)": ["url": "https://app.example/work"],
+            "alternate-scope\n\(key)": ["url": "https://app.example/alternate"],
+            "\(personal)\n\(personal)": ["url": "https://app.example/personal"],
+            "legacy-scope\nlegacy-app": ["url": "https://app.example/legacy"],
+            "unknown": ["url": "https://app.example/unknown"],
+        ]
+        let kept = AppScreenPolicy.clearingResumeMetadata(stored, key: key)
+        XCTAssertEqual(kept.count, 3)
+        XCTAssertEqual(kept["\(personal)\n\(personal)"]?["url"] as? String, "https://app.example/personal")
+        XCTAssertEqual(kept["legacy-scope\nlegacy-app"]?["url"] as? String, "https://app.example/legacy")
+        XCTAssertNotNil(kept["unknown"])
+    }
+
+    func testClearTargetsNeverSelectSharedOrAnotherConnection() throws {
+        let cases = try XCTUnwrap(fixture("clear-profile-cases.json")["cases"] as? [[String: Any]])
+        for item in cases {
+            let profile = try XCTUnwrap(item["profile"] as? String)
+            let key = try XCTUnwrap(item["key"] as? String)
+            XCTAssertEqual(AppScreenPolicy.canClearProfile(profile, key: key), try XCTUnwrap(item["valid"] as? Bool), key)
+        }
+    }
+
     func testNativeNavigationOutcomesMatchSharedTransitions() throws {
         let events = try XCTUnwrap(fixture("resume-navigation-cases.json")["events"] as? [[String: Any]])
         var state = AppScreenResumeState()

@@ -54,9 +54,16 @@ fn only_the_bundled_shell_capabilities_grant_app_screen_commands() {
             .filter(|identifier| identifier.starts_with("app-screen:"))
             .collect::<Vec<_>>();
         if name == "mobile.json" {
-            assert_eq!(grants, ["app-screen:default"]);
+            assert_eq!(grants, ["app-screen:default", "app-screen:allow-clear-profile"]);
         } else if name == "default.json" {
-            assert_eq!(grants, ["app-screen:allow-open", "app-screen:allow-capabilities"]);
+            assert_eq!(
+                grants,
+                [
+                    "app-screen:allow-open",
+                    "app-screen:allow-capabilities",
+                    "app-screen:allow-clear-profile"
+                ]
+            );
         } else {
             assert!(grants.is_empty(), "{name} grants {grants:?}");
         }

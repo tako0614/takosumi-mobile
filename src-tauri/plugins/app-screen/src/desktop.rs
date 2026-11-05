@@ -19,6 +19,7 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+mod profile_reset;
 mod resume_navigation;
 
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
@@ -51,7 +52,7 @@ thread_local! {
 
 pub fn init() -> TauriPlugin<tauri::Wry> {
     Builder::new("app-screen")
-        .invoke_handler(tauri::generate_handler![capabilities, open])
+        .invoke_handler(tauri::generate_handler![capabilities, open, clear_profile])
         .on_event(|_app, event| {
             #[cfg(target_os = "linux")]
             if matches!(event, tauri::RunEvent::Ready) {
@@ -60,8 +61,12 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
             if matches!(event, tauri::RunEvent::Exit) {
                 // Raw views do not belong to Tauri's managed-view registry.
                 // Clear remaining owned resources as a terminal fallback.
-                SCREENS.with(|screens| screens.borrow_mut().clear());
-                CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+                profile_reset::shutdown();
+                let screens = SCREENS.with(|screens| std::mem::take(&mut *screens.borrow_mut()));
+                drop(screens);
+                let contexts =
+                    CONTEXTS.with(|contexts| std::mem::take(&mut *contexts.borrow_mut()));
+                drop(contexts);
             }
         })
         .build()
@@ -69,9 +74,40 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
 
 #[tauri::command]
 fn capabilities() -> CapabilitiesResponse {
+    #[cfg(target_os = "macos")]
+    let clear_profile = objc2::available!(macos = 14.0);
+    #[cfg(not(target_os = "macos"))]
+    let clear_profile = true;
     CapabilitiesResponse {
         pin_shortcut: false,
+        clear_profile,
     }
+}
+
+#[tauri::command]
+async fn clear_profile(
+    app: AppHandle,
+    payload: crate::ClearProfileRequest,
+) -> Result<crate::ClearProfileResponse> {
+    payload.validate()?;
+    let directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(failure)?
+        .join("web-profiles");
+    let handle = app.clone();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let rejected = send.clone();
+        if let Err(error) = profile_reset::begin(&handle, payload, directory, send) {
+            let _ = rejected.send(Err(error));
+        }
+    })
+    .map_err(failure)?;
+    tauri::async_runtime::spawn_blocking(move || receive.recv().map_err(failure))
+        .await
+        .map_err(failure)?
+        .map_err(failure)?
 }
 
 #[tauri::command]
@@ -108,6 +144,7 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
 }
 
 fn open_on_ui_thread(app: &AppHandle, payload: OpenRequest, directory: PathBuf) -> Result<()> {
+    profile_reset::require_idle(&payload.profile)?;
     let existing = SCREENS.with(|screens| {
         screens
             .borrow()
@@ -170,6 +207,7 @@ fn create_screen(
     resume: Option<ResumeStore>,
     popup: Option<NewWindowFeatures>,
 ) -> Result<NewWindowResponse> {
+    profile_reset::require_idle(&profile)?;
     let is_popup = popup.is_some();
     let start = resume
         .as_ref()

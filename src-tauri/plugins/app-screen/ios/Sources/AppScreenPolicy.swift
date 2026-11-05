@@ -282,6 +282,21 @@ enum AppScreenPolicy {
         return profile == "shared" ? "web-home:\(origin)" : "web-home:\(profile):\(origin)"
     }
 
+    static func canClearProfile(_ profile: String, key: String) -> Bool {
+        guard profile != "shared", isWebProfile(profile), key.utf8.count <= 512 else { return false }
+        let prefix = "web-home:\(profile):"
+        guard key.hasPrefix(prefix) else { return false }
+        let origin = String(key.dropFirst(prefix.count))
+        return webHomeKey(origin + "/", profile: profile) == key
+    }
+
+    static func clearingResumeMetadata(_ stored: [String: [String: Any]], key: String) -> [String: [String: Any]] {
+        stored.filter { id, _ in
+            guard let separator = id.firstIndex(of: "\n") else { return true }
+            return String(id[id.index(after: separator)...]) != key
+        }
+    }
+
     static func isWebHomeURL(_ raw: String) -> Bool {
         guard isLaunchable(raw), let origin = origin(of: raw) else { return false }
         return raw == origin + "/"

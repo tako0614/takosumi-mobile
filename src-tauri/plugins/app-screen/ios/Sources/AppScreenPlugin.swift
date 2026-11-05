@@ -42,6 +42,11 @@ private class BrowserViewArgs: Decodable {
     let toolbarColor: String?
 }
 
+private struct ClearProfileArgs: Decodable {
+    let profile: String
+    let key: String
+}
+
 /// Shell-facing commands; the screens themselves are `AppScreenViewController`.
 /// Only the shell's `main` window has the capability for them. App screens are
 /// plain WKWebViews without script message handlers, so pages there cannot
@@ -50,7 +55,21 @@ final class AppScreenPlugin: Plugin {
     @objc func capabilities(_ invoke: Invoke) {
         // iOS has no API for an app to add a home-screen icon; the widget and
         // App Intents (TASK-0119 U4 step 5) take that role.
-        invoke.resolve(["pinShortcut": false])
+        if #available(iOS 17.0, *) {
+            invoke.resolve(["pinShortcut": false, "clearProfile": true])
+        } else {
+            invoke.resolve(["pinShortcut": false, "clearProfile": false])
+        }
+    }
+
+    @objc func clearProfile(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(ClearProfileArgs.self)
+        DispatchQueue.main.async {
+            AppScreenCoordinator.shared.clearProfile(args.profile, key: args.key) { error in
+                if let error = error { invoke.reject(error.localizedDescription) }
+                else { invoke.resolve(["cleared": true]) }
+            }
+        }
     }
 
     @objc func open(_ invoke: Invoke) throws {

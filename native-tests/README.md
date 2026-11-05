@@ -144,8 +144,10 @@ these recovery cases remain separate from the policy-model coverage.
 
 The runner requires the writer's exact completion markers before readback;
 an old or partial fixture that ignores a flag cannot qualify a case.
+The raw `--profile-reset` case also requires its native reset completion marker
+and uses the same bounded generation-shutdown worker, without a readback process.
 `python3 -B native-tests/desktop/test_run.py` rejects four synthetic old/partial
-fixtures and an abnormal native helper before readback. Those process controls
+recovery writers, an old reset writer and an abnormal native helper before readback. Those process controls
 also reject a helper failure after the expected missing-document timeout. They
 are not engine evidence.
 
@@ -176,6 +178,31 @@ first App and its observed engine children to exit before starting a new App
 PID; it does not destroy the desktop session during App teardown. DOM readiness
 may be polled; data assertions run once. The actual views expose no native IPC.
 Failure/timeout or a lingering engine process exits nonzero.
+Add `--reset-restart` with new data for three ordinary App generations: write
+both connections, read them back and clear Work through the shared UI/native
+IPC, then restart again and inspect the result. The final generation performs
+no login, native clear, connection seeding or native resume-file write. It opens
+Work from the saved picker, requires its root login page and an absent editor
+draft, and requires Personal's retained session, draft and exact non-root route.
+Personal's route is set through the real page History API before the clearer's
+ordinary Close. Its exact pre-clear connection preferences are passed as a
+fixture assertion expectation, never as replacement product state. The final
+App compares the full saved value and both views' native persistent data/cache
+directories to the original profiles, so a fresh replacement jar cannot pass
+as a cleared profile. This checks ordinary restart after deletion, not crash/fsync
+durability, OS logout or other OS runtimes.
+In the three-generation case Work stays closed after native clear until the
+final App opens it. Inspecting Work's editor earlier would itself create a new
+successful last page, so expecting its root at the next restart would be wrong.
+The independent warm case retains its immediate Work data inspections.
+
+The independent single-generation `--profile-reset` case remains available.
+The three-generation case requires the real clear completion marker before
+starting the final App and a separate persisted-state marker from that App.
+Old/partial Apps that ignore either mode cannot qualify a case. Four synthetic
+process controls cover missing markers, missing profile identity and the successful protocol; they
+are not native-engine evidence. Per-document, process and shutdown bounds and
+one-shot data assertions remain unchanged.
 The dedicated Linux session worker adopts orphaned App children and records
 their exit status. An adopted NetworkProcess error or signal refuses readback;
 renderer termination policy is recorded separately. A NetworkProcess already
@@ -208,7 +235,28 @@ within a persistent desktop session, not desktop logout or storage fsync.
 Immediate process termination, crashes, OS-by-OS cold restoration, real IdP,
 other OS runtimes, files, notifications and distribution remain separate checks.
 
+`--profile-reset` uses a fresh single App process to exercise the same shared-UI
+clear path after the two profiles' mock login and editor writes. It checks the
+native live-view refusal, completed receipt, cleared Work and preserved Personal
+without depending on an earlier App shutdown/readback. The normal full flow
+retains the clear assertions after cold restoration too. The runner requires
+the dedicated native-reset success marker, so an older binary that ignores the
+new mode cannot qualify it. `--quick-close`/`--legacy-entry` cannot be combined
+with this mode. CI runs reset and ordinary restoration as independent steps
+after one App build: a runtime failure keeps the job red while allowing the
+other case to return its own evidence. A failed/cancelled build never supplies
+an App acceptance result.
+
 ## Android
+
+The profile-reset instrumentation requires both `MULTI_PROFILE` and
+`DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
+The initial API35 emulator used WebView124 and passed profile isolation but
+failed the two deletion preconditions. The next CI candidate selects the
+official API36 Google APIs x86_64 image and logs its revision and actual WebView
+package. A newer image is not itself acceptance evidence: the same feature and
+data assertions must pass. The App's Android minimum and runtime capability
+guards remain unchanged; no default/shared-jar deletion fallback is used.
 
 `resume-navigation-cases.json` exercises native success, provisional failure,
 post-commit failure, stale/duplicate completion, SPA routes and unknown failing
@@ -249,3 +297,128 @@ swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests
 
 That suite verifies navigation and canonical profile names, not UIKit rendering
 or iOS data-store isolation. WKWebView/device qualification remains necessary.
+
+## Profile data reset candidate
+
+The shared WebHome confirmation has a separate actual-browser component test.
+From the product root on Linux, with modern Node (22.12+), Python with pidfd
+support, the existing dependencies and an installed Chrome:
+
+```bash
+bunx tsc --noEmit -p native-tests/browser/tsconfig.json
+PYTHONDONTWRITEBYTECODE=1 python3 native-tests/browser/test_guard.py
+node --experimental-strip-types native-tests/browser/run.ts /absolute/new/artifact-directory
+```
+
+It starts its own loopback-only Vite listener and fresh headless Chrome profile,
+and closes both. `CHROME_BIN` may select the test Chrome executable. It never
+uses an existing browser or login profile. The synthetic https connection labels
+are never opened. The browser's HTTP(S) proxy is configured for a loopback
+endpoint with loopback bypass. Chrome runs below a dedicated session/subreaper. Detached helper
+identities are tracked with pidfds and reaped before deleting the new profile;
+if cleanup cannot be confirmed within the bound, the private profile is retained
+and the command fails. The synthetic guard controls include a detached orphan
+and cancellation, late forks, observation failure, PID generation replacement,
+stale discovery from another ancestry and failed ancestry reads. They preserve
+a separate session. The final pass receipt is
+written only after browser and Vite cleanup succeed.
+The actual shared component and clear-request adapter render three synthetic
+connections. It checks cancel/confirmation locks, pending state, false receipts,
+native refusal, completed status and preservation of settings, then confirms
+that removing a setting does not invoke another deletion. Desktop and mobile
+width screenshots also reject horizontal overflow. Native results are simulated:
+this proves the UI/request path, not engine deletion or a mobile/desktop runtime.
+The receipt includes browser/Node versions and before/after source hashes. PNGs
+live in the new artifact directory. CI runs this on Linux.
+
+The reset candidate adds a separate, explicitly confirmed action to the
+shared Web home. Removing a connection remains a preference edit. A clear
+request is bound to a canonical isolated UUID and its exact connection key;
+the legacy shared profile is refused. Engines advertise the action through a
+separate capability and the shell requires an explicit completed receipt.
+The desktop candidate grants this only to the bundled `main` shell and exposes
+the same confirmation as mobile. macOS requires the UUID-store API (14+).
+Its native SDK/runtime qualification remains pending; source availability alone
+does not qualify data deletion.
+
+Android uses the selected profile's `WebStorage` and the
+`WebStorageCompat.deleteBrowsingData` completion callback, gated by both
+`MULTI_PROFILE` and `DELETE_BROWSING_DATA`. It does not clear process-default
+storage or use `ProfileStore.deleteProfile` as a completion receipt. Live views
+block deletion. A latch blocks opening the profile during deletion. Committed
+profile generations also invalidate stale Activity/saved-instance URLs and
+late callbacks after an inactive view was evicted. New resume metadata is
+indexed by profile; old opaque v1 hashes cannot be safely assigned for physical
+removal, so old-generation restoration is disabled without deleting another
+profile's preferences. This resets restoration, not forensic disk erasure.
+
+iOS removes all website data in the selected UUID store and waits for WebKit's
+completion callback. Any live same-profile session blocks the operation and
+configuration creation is refused while clearing. Resume metadata is removed
+for every scope with the exact cleared key. Other profiles, legacy native
+credentials, connection settings and files saved outside site storage are not
+selected. Completion does not claim fsync, crash or downgrade durability.
+
+The shared `clear-profile-cases.json` is consumed by Rust/Kotlin/Swift policy
+tests. The Android instrumentation case checks live-view refusal, pending-open
+refusal, two-site cookie/storage removal and preservation of a second profile
+and the shared store. `ProfileResetActivityTest` exercises an actual stopped
+Activity whose WebView is evicted, completes a profile reset, then resumes the
+same Activity. It also recreates an Activity with a deliberately pre-reset
+saved URL after dropping the live view; assertions require both controls to
+have run. A lifecycle probe is armed before each resume/recreation, attaches on
+the same UI turn after the new view is made, freezes its first native page-start
+callback and restores the production client before forwarding it. A later root
+load cannot replace an observed wrong URL. The document-load wrapper is also
+removed after its awaited completion; neither wrapper qualifies general error
+handling.
+The latter saved-state input is synthetic; this is not an OS process-kill test.
+
+The Android JVM suite passes (17 tests), and the instrumentation APK compiles
+locally. Rust passes 9 policy/unit tests and 2 capability tests. The new engine
+and Activity tests have not run on an emulator/device; there is no local KVM
+capability. Swift/native SDK checks remain separate. CI requires the two reset
+cases by class and test name, with zero
+failures/errors/skips. Portable TypeScript checks do not qualify native data
+deletion or UI behavior.
+
+Desktop uses an invisible blank raw view with the same cached profile context
+as normal screens. Navigation/popups and messaging are disabled. GTK validates
+the data/cache directory before `WebsiteDataManager.clear`; macOS validates the
+UUID store before WebKit removal; Windows waits for `ClearBrowsingDataAll`'s
+HRESULT callback. All native objects stay on the UI thread. The helper and
+profile latch remain until native completion, background removal of the known
+resume preference, and native helper teardown. Other profile files are not
+selected. Opens (including popups) and duplicate clears are refused meanwhile.
+Session-end teardown invalidates operations, drains outside the mutable borrow,
+and blocks new work; native construction rechecks the operation after any OS
+event pumping. Late callbacks cannot remove a newer operation's preference.
+
+The Linux plugin passes 17 unit/policy tests plus 2 capability tests and the
+fixture compiles. `run.py --profile-reset` adds live/shared/pending refusal,
+pre-clear reads of both target sites, one native clear, then one set of data
+observations for target emptiness and Personal/shared preservation. CI includes
+this new case. Locally its initial run and a failure-diagnostic control timed
+out before clearing, after observations 0/1. The diagnostic control observed
+two WebKit NetworkProcess persistent threads in `jbd2_log_wait_commit`; that
+does not establish the sole cause or qualify data deletion. Its timeout and
+data assertions remain unchanged. The bounded timeout snapshot reads only the
+owned session's process names/identities/waits, with no argv or page payload;
+a subprocess control verifies another session is untouched and unobserved.
+The full bundled App fixture also clears Work through the real shared
+confirmation/IPC after restart readback. It first checks refusal while Work is
+open, then closes Work and waits for the completed receipt. Reopening must land
+at its root logged out, with no editor draft at the second site. A live Personal
+profile must retain its draft and its HttpOnly session on a fresh home request;
+connection settings must be unchanged. These new assertions run once after DOM
+readiness, alongside the existing cold-restoration flow.
+Two local warm-mode attempts on WebKitGTK 2.52.3 remain overall red. The normal
+candidate passed live refusal but remained pending at the eight-second UI check.
+A separate diagnostic build observed native completion, metadata removal, helper
+teardown and reply, then passed the real shared-UI clear and preservation assertions.
+Its observed NetworkProcess shutdown exceeded the unchanged five-second bound;
+journal/bio waits and a test-desktop cleanup failure were recorded. That is
+component evidence, not a normal-candidate or whole-run pass, and does not prove
+the first delay's unique cause. Temporary observation code was removed.
+macOS/Windows compilation, native clear/error/teardown runtime across platforms
+and restart durability remain unqualified for this candidate.

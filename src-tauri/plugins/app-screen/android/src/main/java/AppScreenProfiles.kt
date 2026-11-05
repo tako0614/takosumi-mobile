@@ -16,7 +16,16 @@ internal object AppScreenProfiles {
 
     fun select(webView: WebView, profile: String) {
         require(isValid(profile)) { "Invalid Web profile." }
+        check(!AppScreenProfileData.isClearing(profile)) { "この接続先の保存データを消去しています。" }
         check(isSupported(profile)) { "この端末のWeb表示は、分離されたログイン領域に対応していません。" }
         if (profile != SHARED) WebViewCompat.setProfile(webView, "takosumi-web-$profile")
+    }
+
+    fun canClear(profile: String, key: String): Boolean {
+        if (profile == SHARED || !isValid(profile) || key.toByteArray(Charsets.UTF_8).size > 512) return false
+        val prefix = "web-home:$profile:"
+        if (!key.startsWith(prefix)) return false
+        val origin = key.removePrefix(prefix)
+        return ScreenRequest.isWebHomeUrl("$origin/") && ScreenRequest.webHomeKey("$origin/", profile) == key
     }
 }

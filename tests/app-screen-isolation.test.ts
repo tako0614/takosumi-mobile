@@ -67,11 +67,17 @@ test("the app-screen plugin's commands are granted to the shell's capability onl
   expect(granting.map((capability) => capability.identifier).sort()).toEqual(["default", "mobile"]);
   expect(granting.find((capability) => capability.identifier === "default")?.permissions.filter(
     (permission) => typeof permission === "string" && permission.startsWith("app-screen:"),
-  )).toEqual(["app-screen:allow-open", "app-screen:allow-capabilities"]);
+  )).toEqual(["app-screen:allow-open", "app-screen:allow-capabilities", "app-screen:allow-clear-profile"]);
   const permissions = await Bun.file(
     new URL("plugins/app-screen/permissions/default.toml", root),
   ).text();
   const build = await Bun.file(new URL("plugins/app-screen/build.rs", root)).text();
+  // Data deletion is an explicit grant on each trusted shell, not an
+  // inherited permission added to every caller of the existing default set.
+  expect(build.includes('"clear_profile"')).toBe(true);
+  expect(granting.find((capability) => capability.identifier === "mobile")?.permissions)
+    .toContain("app-screen:allow-clear-profile");
+  expect(permissions).not.toContain('"allow-clear-profile"');
   for (const command of [
     "capabilities",
     "open",

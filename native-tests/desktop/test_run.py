@@ -13,6 +13,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ErrorPageProtocolTests(unittest.TestCase):
+    def test_an_old_fixture_cannot_qualify_profile_reset(self):
+        with tempfile.TemporaryDirectory(prefix="sumi-raw-reset-protocol-") as temporary:
+            root = Path(temporary)
+            binary = root / "old-fixture"
+            binary.write_text("#!/usr/bin/env python3\nprint('Cookie/storage observations passed: 6, readback=false')\n")
+            binary.chmod(0o700)
+            result = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "native-tests/desktop/run.py"),
+                 "--binary", str(binary), "--data", str(root / "data"), "--profile-reset"],
+                env=dict(os.environ), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Native writer did not report: PASS: completed native profile reset", result.stdout)
+
     def test_missing_document_cannot_hide_an_abnormal_native_helper(self):
         with tempfile.TemporaryDirectory(prefix="sumi-raw-negative-helper-") as temporary:
             root = Path(temporary)

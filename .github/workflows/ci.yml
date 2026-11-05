@@ -133,10 +133,14 @@ jobs:
           sudo chmod 666 /dev/kvm
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          sdkmanager "system-images;android-35;google_apis;x86_64"
+          # The API35 image's WebView124 supports profiles but not the required
+          # DELETE_BROWSING_DATA API. Qualify a newer official engine; keep the
+          # instrumentation capability assertions and zero-skip checks below.
+          sdkmanager "system-images;android-36;google_apis;x86_64"
+          cat "$ANDROID_HOME/system-images/android-36/google_apis/x86_64/source.properties"
           export ANDROID_AVD_HOME="$RUNNER_TEMP/sumi-avd"
           mkdir -p "$ANDROID_AVD_HOME"
-          echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-35;google_apis;x86_64" --force
+          echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-36;google_apis;x86_64" --force
           "$ANDROID_HOME/emulator/emulator" -version
           "$ANDROID_HOME/emulator/emulator" -list-avds
           df -h "$ANDROID_HOME" "$RUNNER_TEMP"
@@ -168,13 +172,20 @@ jobs:
           reports = list(pathlib.Path('src-tauri/plugins/app-screen/android/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
           assert reports, 'No actual Android instrumentation reports'
           tests = failures = skipped = 0
+          actual_cases = set()
           for report in reports:
               root = E.parse(report).getroot()
               tests += int(root.get('tests', 0))
               failures += int(root.get('failures', 0)) + int(root.get('errors', 0))
               skipped += int(root.get('skipped', 0))
+              actual_cases.update((case.get('classname'), case.get('name')) for case in root.iter('testcase'))
           print(f'Actual WebView tests: {tests}, failures/errors: {failures}, skipped: {skipped}')
-          assert tests >= 2 and failures == 0 and skipped == 0
+          required = {
+              ('com.takosumi.appscreen.ProfileIsolationTest', 'clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles'),
+              ('com.takosumi.appscreen.ProfileResetActivityTest', 'completedResetDropsAnEvictedActivityUrlAndPreResetSavedState'),
+          }
+          assert required <= actual_cases, f'Missing actual profile reset controls: {required - actual_cases}'
+          assert tests >= 4 and failures == 0 and skipped == 0
           PY
 
   desktop:
@@ -221,6 +232,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11
+      - name: Shared Web-home confirmation in isolated Chromium
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        working-directory: takosumi-mobile
+        run: |
+          node --version
+          export CHROME_BIN="$(command -v google-chrome)"
+          "$CHROME_BIN" --version
+          PYTHONDONTWRITEBYTECODE=1 python3 native-tests/browser/test_guard.py
+          bunx tsc --noEmit -p native-tests/browser/tsconfig.json
+          PYTHONDONTWRITEBYTECODE=1 node --experimental-strip-types native-tests/browser/run.ts "$RUNNER_TEMP/takosumi-webhome-ui"
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: desktop-cache
         with:
@@ -256,6 +278,7 @@ jobs:
           cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop --lib --test capabilities
           python3 -B native-tests/desktop/test_run.py
           python3 native-tests/desktop/run.py --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA"
+          python3 native-tests/desktop/run.py --profile-reset --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-reset"
           python3 native-tests/desktop/run.py --spa-resume --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-spa"
           python3 native-tests/desktop/run.py --spa-resume --failed-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-failure"
           python3 native-tests/desktop/run.py --spa-resume --failed-navigation --error-page-close --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-error-page"
@@ -264,8 +287,9 @@ jobs:
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled"
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --cancelled-spa --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled-spa"
           python3 native-tests/desktop/run.py --spa-resume --pending-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-pending"
-      - name: Actual bundled App connection, mock login and home flow
-        if: runner.os == 'Linux'
+      - name: Build bundled App and verify the fixture observer
+        id: linux-app-fixture-build
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         shell: bash
         env:
           CARGO_BUILD_JOBS: "2"
@@ -273,6 +297,21 @@ jobs:
         run: |
           python3 native-tests/desktop/test_web_home.py
           cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-web-home-fixture
+      - name: Actual bundled App shared-UI profile reset
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux-app-fixture-build.outcome == 'success' }}
+        shell: bash
+        working-directory: takosumi-mobile
+        run: python3 native-tests/desktop/web_home.py --profile-reset --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-profile-reset"
+      - name: Actual bundled App restart after profile reset
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux-app-fixture-build.outcome == 'success' }}
+        shell: bash
+        working-directory: takosumi-mobile
+        run: python3 native-tests/desktop/web_home.py --reset-restart --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-reset-restart"
+      - name: Actual bundled App connection, mock login and home flow
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux-app-fixture-build.outcome == 'success' }}
+        shell: bash
+        working-directory: takosumi-mobile
+        run: |
           python3 native-tests/desktop/web_home.py --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-web-home"
           python3 native-tests/desktop/web_home.py --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-quick-close"
           python3 native-tests/desktop/web_home.py --legacy-entry --quick-close --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-legacy-return"

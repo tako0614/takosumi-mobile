@@ -53,6 +53,12 @@ class BrowserViewArgs {
     var toolbarColor: String? = null
 }
 
+@InvokeArg
+class ClearProfileArgs {
+    var profile: String = ""
+    var key: String = ""
+}
+
 /**
  * Shell-facing commands; the screens themselves live in [AppScreenActivity].
  * Only the shell's `main` window has the capability for them. App screens are
@@ -69,13 +75,29 @@ class AppScreenPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(
             JSObject().apply {
                 put("pinShortcut", AppScreenShortcuts.isPinSupported(activity))
+                put("clearProfile", AppScreenProfileData.isSupported())
             },
         )
     }
 
     @Command
+    fun clearProfile(invoke: Invoke) {
+        val args = invoke.parseArgs(ClearProfileArgs::class.java)
+        activity.runOnUiThread {
+            AppScreenProfileData.clear(activity.applicationContext, args.profile, args.key) { error ->
+                if (error == null) invoke.resolve(JSObject().apply { put("cleared", true) })
+                else invoke.reject(error)
+            }
+        }
+    }
+
+    @Command
     fun open(invoke: Invoke) {
         val request = screenRequestOrReject(invoke) ?: return
+        if (AppScreenProfileData.isClearing(request.profile)) {
+            invoke.reject("この接続先の保存データを消去しています。")
+            return
+        }
         try {
             AppScreenLaunch.remember(activity, request)
             activity.startActivity(AppScreenLaunch.documentIntent(activity, request))

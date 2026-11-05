@@ -8,6 +8,7 @@
   "permissions": [
     "app-screen:allow-open",
     "app-screen:allow-capabilities",
+    "app-screen:allow-clear-profile",
     "core:default",
     "core:event:default",
     "core:path:default",

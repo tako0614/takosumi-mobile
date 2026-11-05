@@ -112,6 +112,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--spa-resume", action="store_true")
+    parser.add_argument("--profile-reset", action="store_true")
     parser.add_argument("--failed-navigation", action="store_true")
     parser.add_argument("--error-page-close", action="store_true")
     parser.add_argument("--error-page-back", action="store_true")
@@ -120,6 +121,8 @@ def main():
     parser.add_argument("--cancelled-spa", action="store_true")
     parser.add_argument("--pending-navigation", action="store_true")
     args = parser.parse_args()
+    if args.profile_reset and (args.spa_resume or args.failed_navigation or args.error_page_close or args.error_page_back or args.error_page_retry or args.cancelled_navigation or args.cancelled_spa or args.pending_navigation):
+        parser.error("profile reset requires its fresh single-process fixture")
     if args.error_page_close and not args.failed_navigation:
         parser.error("error-page close requires --failed-navigation")
     if (args.error_page_back or args.error_page_retry) and not args.error_page_close:
@@ -161,6 +164,11 @@ def main():
             directory.mkdir(mode=0o700)
             env[variable] = str(directory)
         try:
+            if args.profile_reset:
+                run_native_writer(native_command(binary, ["--profile-reset"]), env,
+                                  Path(temporary) / "profile-reset.log",
+                                  ["PASS: completed native profile reset removes both sites and preserves personal/shared profiles"])
+                return
             if args.spa_resume:
                 data.mkdir(mode=0o700)
                 for method, extra in (("push", []), ("replace", ["--spa-replace"])):

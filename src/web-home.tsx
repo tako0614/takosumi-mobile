@@ -5,6 +5,7 @@ import {
 
 export function WebHome(props: {
   readonly open: (connection: WebConnection) => Promise<void>;
+  readonly clearData?: (connection: WebConnection) => Promise<void>;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly allowLegacyMobile?: boolean;
 }) {
@@ -14,6 +15,11 @@ export function WebHome(props: {
   const [error, setError] = createSignal("");
   const [opening, setOpening] = createSignal<string>();
   const [lastOpened, setLastOpened] = createSignal<string>();
+  const [clearCandidate, setClearCandidate] = createSignal<WebConnection>();
+  const [clearing, setClearing] = createSignal(false);
+  const [status, setStatus] = createSignal("");
+  const busy = () => Boolean(opening()) || clearing();
+  const locked = () => busy() || clearCandidate() !== undefined;
   try {
     setConnections(loadWebConnections(props.storage));
   } catch {
@@ -33,8 +39,9 @@ export function WebHome(props: {
   }
 
   async function open(connection: WebConnection) {
-    if (opening()) return;
+    if (locked()) return;
     setError("");
+    setStatus("");
     setOpening(connectionKey(connection));
     try {
       await props.open(connection);
@@ -48,6 +55,7 @@ export function WebHome(props: {
 
   function add(event: SubmitEvent) {
     event.preventDefault();
+    if (locked()) return;
     setError("");
     try {
       const connection = newWebConnection(connections(), url(), name());
@@ -60,6 +68,25 @@ export function WebHome(props: {
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "接続先を確認してください。");
+    }
+  }
+
+  async function clearData() {
+    const target = clearCandidate();
+    const clear = props.clearData;
+    if (!target || !clear || busy()) return;
+    setClearing(true);
+    setError("");
+    setStatus("");
+    try {
+      await clear(target);
+      if (lastOpened() === connectionKey(target)) setLastOpened(undefined);
+      setClearCandidate(undefined);
+      setStatus(`${target.name}のサイトデータを消去しました。`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "保存データを消去できませんでした。");
+    } finally {
+      setClearing(false);
     }
   }
 
@@ -77,18 +104,35 @@ export function WebHome(props: {
           <ul class="web-connections">
             <For each={connections()}>{(connection) => (
               <li>
-                <button class="web-connection" type="button" disabled={Boolean(opening())}
+                <button class="web-connection" type="button" disabled={locked()}
                   onClick={() => void open(connection)}>
                   <strong>{connection.name}</strong>
                   <span>{connection.origin}</span>
                   <small>{opening() === connectionKey(connection) ? "開いています…" :
                     lastOpened() === connectionKey(connection) ? "前の画面へ戻る →" : "開く →"}</small>
                 </button>
-                <button class="web-remove" type="button" disabled={Boolean(opening())}
+                <button class="web-remove" type="button" disabled={locked()}
                   aria-label={`${connection.name}を接続先から外す`}
                   onClick={() => { setError(""); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
                   接続先から外す
                 </button>
+                <Show when={props.clearData && connection.profile !== "shared"}>
+                  <button class="web-remove" type="button" disabled={locked()}
+                    onClick={() => { setError(""); setStatus(""); setClearCandidate(connection); }}>
+                    保存データを消去…
+                  </button>
+                </Show>
+                <Show when={clearCandidate() && connectionKey(clearCandidate()!) === connectionKey(connection)}>
+                  <section class="web-clear" aria-label={`${connection.name}の保存データ消去の確認`}>
+                    <h3>{connection.name}の保存データを消去しますか？</h3>
+                    <p>この接続先で開いたサイトからログアウトし、Cookie・サイト内の保存内容を消去します。前の画面への復帰も初期化します。接続先の設定は残ります。</p>
+                    <p>先にこの接続先の画面をすべて閉じてください。端末へ保存したファイルや、旧モバイル版のログインは対象外です。</p>
+                    <button type="button" disabled={busy()} onClick={() => setClearCandidate(undefined)}>キャンセル</button>
+                    <button type="button" disabled={busy()} onClick={() => void clearData()}>
+                      {clearing() ? "消去しています…" : "保存データを消去"}
+                    </button>
+                  </section>
+                </Show>
               </li>
             )}</For>
           </ul>
@@ -99,16 +143,17 @@ export function WebHome(props: {
           <p class="web-note">同じ接続先を、別のログインで追加することもできます。</p>
           <label for="connection-url">接続先URL</label>
           <input id="connection-url" type="url" required autocomplete="url"
-            placeholder="https://app.takosumi.com" value={url()} disabled={Boolean(opening())}
+            placeholder="https://app.takosumi.com" value={url()} disabled={locked()}
             onInput={(event) => setUrl(event.currentTarget.value)} />
           <label for="connection-name">名前 <span>（任意）</span></label>
           <input id="connection-name" type="text" maxlength={80} value={name()}
-            placeholder="自分のTakosumi" disabled={Boolean(opening())}
+            placeholder="自分のTakosumi" disabled={locked()}
             onInput={(event) => setName(event.currentTarget.value)} />
-          <button class="web-primary" type="submit" disabled={Boolean(opening())}>保存して開く</button>
+          <button class="web-primary" type="submit" disabled={locked()}>保存して開く</button>
         </form>
       </section>
       <Show when={error()}><p class="web-error" role="alert">{error()}</p></Show>
+      <Show when={status()}><p class="web-note" role="status">{status()}</p></Show>
       <Show when={props.allowLegacyMobile}>
         <details class="web-legacy">
           <summary>以前のモバイル版を使っていた方</summary>
