@@ -27,6 +27,8 @@ mod resume;
 mod desktop;
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 pub use desktop::fixture::run as run_desktop_profile_fixture;
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+pub use desktop::browser_probe::run as run_desktop_browser_probe;
 #[cfg(all(desktop, feature = "desktop"))]
 pub use desktop::init;
 

@@ -26,6 +26,10 @@ mod resume_navigation;
 #[path = "../tests/desktop/fixture.rs"]
 pub(crate) mod fixture;
 
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+#[path = "../tests/desktop/browser_probe.rs"]
+pub(crate) mod browser_probe;
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -257,7 +261,15 @@ fn create_screen(
         let mut builder = WebViewBuilder::new_with_web_context(&mut context_ref)
             .with_devtools(false)
             .with_navigation_handler(move |url| {
-                is_launchable_url(&url) || (is_popup && url == "about:blank")
+                let allowed = is_launchable_url(&url) || (is_popup && url == "about:blank");
+                #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+                eprintln!(
+                    "fixture navigation policy: scheme={}, allowed={allowed}, popup={is_popup}",
+                    tauri::Url::parse(&url)
+                        .map(|url| url.scheme().to_owned())
+                        .unwrap_or_else(|_| "invalid".into())
+                );
+                allowed
             })
             .with_on_page_load_handler(move |event, url| {
                 // Started maps to top-level didCommit/LoadEvent::Committed/

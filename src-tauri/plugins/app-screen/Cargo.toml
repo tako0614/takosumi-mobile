@@ -47,3 +47,7 @@ tauri-plugin = { version = "2.6.3", features = ["build"] }
 [[example]]
 name = "desktop-profile-probe"
 required-features = ["desktop-fixture"]
+
+[[example]]
+name = "desktop-browser-probe"
+required-features = ["desktop-fixture"]
