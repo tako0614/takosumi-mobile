@@ -35,6 +35,32 @@ struct State {
     directory: PathBuf,
     runtime_root: PathBuf,
     processes: BTreeMap<String, Process>,
+    spawner: mpsc::Sender<SpawnRequest>,
+}
+type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+
+/// Linux delivers a child's parent-death signal when the *thread* that forked
+/// it exits, not only when the App process exits. Tauri's blocking pool
+/// retires idle threads, which would SIGTERM every guard forked from one. Fork
+/// guards only from this thread, which stays alive for the whole App process.
+/// If it ever panicked, its guards drain their browsers and later opens fail
+/// as unavailable: closed, never an unowned browser. Requesters always wait
+/// for the reply, so a spawned guard is never left untracked.
+fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
+    let (send, requests) = mpsc::channel::<SpawnRequest>();
+    std::thread::Builder::new()
+        .name("browser-process-parent".into())
+        .spawn(move || {
+            for (mut command, reply) in requests {
+                let _ = reply.send(command.spawn());
+            }
+            // Never end the parent-death link before the App process exits.
+            loop {
+                std::thread::park();
+            }
+        })
+        .map_err(failure)?;
+    Ok(send)
 }
 static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
 struct Process {
@@ -95,6 +121,7 @@ pub(super) fn install(app: &AppHandle) -> Result<()> {
             directory,
             runtime_root,
             processes: BTreeMap::new(),
+            spawner: spawner()?,
         })),
         Arc::new(ExitPhase::default()),
     ));
@@ -153,6 +180,7 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 state.directory.join(&profile),
                 runtime,
                 payload,
+                &state.spawner,
             )?;
             // Retain ownership before waiting for the native creation reply.
             let result = process.expect_open(1, &key);
@@ -296,6 +324,7 @@ impl Process {
         directory: PathBuf,
         runtime: PathBuf,
         payload: OpenRequest,
+        spawner: &mpsc::Sender<SpawnRequest>,
     ) -> Result<Self> {
         private_directory(&directory)?;
         if directory
@@ -410,7 +439,7 @@ impl Process {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(output);
-        let mut child = command.spawn().map_err(failure)?;
+        let mut child = spawn_from_parent(spawner, command)?;
         let input = child.stdin.take().expect("Owned child stdin");
         let stdout = child.stdout.take().expect("Owned child stdout");
         let (send, replies) = mpsc::channel();
@@ -645,6 +674,121 @@ mod tests {
             assert!(require_normal_guard(&missing).is_err(), "missing {field}");
         }
     }
+    /// Asks for SIGTERM on parent death, as the browser guard does, with the
+    /// default disposition even if the runner ignores SIGTERM. Reports once
+    /// armed: argv[1] "ready" prints to stdout; any other path is a marker file
+    /// beside it (the guard receipt position in `Process::spawn`).
+    const PARENT_DEATH_CHILD: &str = "import ctypes,pathlib,signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_DFL)\nassert ctypes.CDLL(None).prctl(1,signal.SIGTERM,0,0,0)==0\nif sys.argv[1]=='ready': print('ready',flush=True)\nelse: pathlib.Path(sys.argv[1]).with_name('armed').write_text('1')\ntime.sleep(30)";
+    fn parent_death_child() -> Command {
+        let mut command = Command::new("python3");
+        command
+            .args(["-B", "-c", PARENT_DEATH_CHILD, "ready"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        command
+    }
+    fn ready(mut child: Child) -> Child {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut BufReader::new(child.stdout.take().unwrap()), &mut line)
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        child
+    }
+    fn exit_within(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+    #[test]
+    fn a_retired_forking_thread_terminates_a_parent_death_guarded_child() {
+        // Control for the hazard: the kernel ties the link to the forking thread.
+        let mut child = std::thread::spawn(|| ready(parent_death_child().spawn().unwrap()))
+            .join()
+            .unwrap();
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.and_then(|status| status.signal()),
+            Some(libc::SIGTERM)
+        );
+    }
+    #[test]
+    fn guards_forked_by_the_dedicated_parent_outlive_the_requesting_thread() {
+        let parent = spawner().unwrap();
+        let requester = parent.clone();
+        let mut child = std::thread::spawn(move || {
+            ready(spawn_from_parent(&requester, parent_death_child()).unwrap())
+        })
+        .join()
+        .unwrap();
+        // The signal follows the forking thread's exit at once; 2 s is ample.
+        let status = exit_within(&mut child, Duration::from_secs(2));
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(status, None, "a retired requester must not end the guard");
+        drop(parent);
+    }
+    #[test]
+    fn open_requests_fork_the_actual_guard_from_the_dedicated_parent() {
+        // Drive the real call site with a stand-in guard that only arms its
+        // parent-death link. Forking on the requester would end it below.
+        let root = std::env::temp_dir().join(format!("sumi-pa-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, PARENT_DEATH_CHILD).unwrap();
+        let runtime = root.join("r");
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":"web-home:11111111-1111-4111-8111-111111111111:https://excalidraw.com",
+            "url":"https://excalidraw.com/","title":"Work","profile":"11111111-1111-4111-8111-111111111111","webHome":true
+        }))
+        .unwrap();
+        let parent = spawner().unwrap();
+        let (requester, armed) = (parent.clone(), runtime.join("armed"));
+        let mut process = std::thread::spawn(move || {
+            let process = Process::spawn(
+                PathBuf::from("/bin/true"),
+                guard,
+                root.join("profile"),
+                runtime,
+                payload,
+                &requester,
+            )
+            .unwrap();
+            // Keep the requester alive until the link is armed, so a fork on
+            // this thread would be signalled when it returns.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !armed.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(armed.exists(), "stand-in guard never armed");
+            process
+        })
+        .join()
+        .unwrap();
+        let status = exit_within(&mut process.child, Duration::from_secs(2));
+        drop(process); // Drop's SIGTERM path ends the default-disposition stand-in.
+        std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("sumi-pa-{}", std::process::id())),
+        )
+        .unwrap();
+        assert_eq!(
+            status, None,
+            "the actual open path must not tie guards to a retiring thread"
+        );
+        drop(parent);
+    }
     #[test]
     fn a_nonreading_child_cannot_hold_the_pipe_writer_past_its_deadline() {
         let mut child = Command::new("sleep")
@@ -676,6 +820,13 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(1));
     }
+}
+fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> Result<Child> {
+    let (reply, spawned) = mpsc::sync_channel(1);
+    spawner
+        .send((command, reply))
+        .map_err(|_| Error::InvalidRequest("Browser process parent is unavailable."))?;
+    spawned.recv().map_err(failure)?.map_err(failure)
 }
 fn nonblocking(input: &ChildStdin) -> Result<()> {
     // SAFETY: this owned pipe is live and protected by the backend mutex.
