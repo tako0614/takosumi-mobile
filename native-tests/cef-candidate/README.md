@@ -262,6 +262,24 @@ and exit normally, with both browser guards and the outer session guard clean.
 `execution.passed` requires the App/observer flags, normal receipts, and unchanged
 source/artifacts; merely creating a window or writing a completion marker fails.
 
+Failure capture records the pending command, bounded frame/dialog/transport
+events, an owned-display screenshot and two kernel samples of the exact guard
+generation. It verifies start identity, native executable and stable ancestry
+before reading process/thread state; it neither signals processes nor reads
+target argv/environment or browser storage. A denied snapshot stays unknown and cannot qualify
+the browser. `python3 -B native-tests/desktop/test_browser_snapshot.py` runs
+bounded-hashing, source-scope, cleanup-failure and live/stale/foreign-generation
+controls without CEF/network. The outer runner retains explicitly selected Linux
+fixture sources, tracked frontend/app-screen/capability inputs and executable hardlinks per case, hashes
+large artifacts with 1 MiB reads, and writes the original failure even when
+cleanup also fails. Transport closure rejects pending commands directly.
+
+A later diagnostic startup failure retained a blank document and native
+thread waits in `jbd2_log_wait_commit`, followed by incomplete child cleanup.
+That is evidence of an I/O wait in that case, not a unique cause of all earlier
+Photopea/startup failures or an engine-wide incompatibility. No timeout or
+filesystem/global concurrency setting is changed to turn it into a pass.
+
 **Coordinated quit is unsupported:** the parent refuses a quit while multiple
 profiles are live, and a child refuses shutdown with multiple native screens.
 The refusal happens before any close. Native browser windows must be closed

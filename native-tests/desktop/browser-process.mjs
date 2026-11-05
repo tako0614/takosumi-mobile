@@ -28,12 +28,44 @@ class Client {
   constructor(socket){this.socket=socket;this.next=0;this.pending=new Map();this.events=[];socket.onmessage=e=>{
     const m=JSON.parse(String(e.data)), p=this.pending.get(m.id);
     if(p){clearTimeout(p.timer);this.pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result);}
-    else if(m.method)this.events.push(m);
-  };}
+    else if(m.method){this.events.push(m);if(this.events.length>4096)this.events.shift();}
+  };
+    socket.onclose=event=>{
+      (proof.cdpCloses??=[]).push({profile:this.binding?.process.profile,code:event.code,reason:event.reason.slice(0,256),pending:this.pending.size});
+      this.rejectPending(Error(`Owned CDP socket closed (${event.code})`));
+    };
+    socket.onerror=()=>this.rejectPending(Error('Owned CDP socket error'));
+  }
+  rejectPending(error){for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(error);}this.pending.clear();}
   command(method,params={},sessionId){const id=++this.next;return new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{this.pending.delete(id);proof.commandTimeout={method,sessionId,events:this.events.filter(e=>e.method.includes('detached')||e.method.includes('Crashed'))};reject(Error(`CDP timeout ${method}`));},5000);
+    if(this.socket.readyState!==WebSocket.OPEN){reject(Error('Owned CDP socket is not open'));return;}
+    const timer=setTimeout(()=>{this.pending.delete(id);proof.commandTimeout={method,sessionId,events:diagnosticEvents(this.events)};reject(Error(`CDP timeout ${method}`));},5000);
     this.pending.set(id,{resolve,reject,timer});this.socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));
   });}
+}
+const startTime=async pid=>(await readFile(`/proc/${pid}/stat`,'utf8')).split(') ').at(-1).split(/\s+/)[19];
+function diagnosticEvents(events) {
+  return events.filter(e=>e.method.includes('detached')||e.method.includes('Crashed')||e.method.startsWith('Page.javascriptDialog')||e.method.startsWith('Page.frame')).slice(-128).map(e=>{
+    const p=e.params??{},frame=p.frame??{};
+    return {method:e.method,sessionId:e.sessionId,frameId:p.frameId??frame.id,parentId:frame.parentId,url:p.url??frame.url,
+      type:p.type,result:p.result,reason:p.reason,disposition:p.disposition,messageLength:typeof p.message==='string'?p.message.length:undefined};
+  });
+}
+async function failureSnapshot(client) {
+  const binding=client.binding;
+  if(!binding||client.snapshotAttempted)return;
+  client.snapshotAttempted=true;
+  try {
+    proof.processSnapshot=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('./browser_snapshot.py',import.meta.url)),
+      '--data',data,'--profile',binding.process.profile,'--native-start',binding.nativeStart,'--guard-start',binding.guardStart]));
+  }catch(error){proof.snapshotError=String(error);}
+  try {
+    const owner=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(binding.process.opened.windowId)]));
+    assert.equal(owner.pid,binding.process.opened.nativePid);
+    desktop('import',['-window','root',path.join(data,'failure-desktop.png')]);
+    proof.failureWindowOwner=owner;
+  }catch(error){proof.screenshotError=String(error);}
+  proof.failureEvents=diagnosticEvents(client.events);
 }
 async function attach(process) {
   const native=process.opened, inspection=JSON.parse(await readFile(path.join(process.directory,'inspection.json'),'utf8'));
@@ -49,6 +81,7 @@ async function attach(process) {
   const socket=new WebSocket(endpoint);
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('CDP handshake timeout')),5000);socket.onopen=()=>{clearTimeout(timer);resolve();};socket.onerror=()=>{clearTimeout(timer);reject(Error('CDP handshake error'));};});
   const c=new Client(socket);clients.push(c);
+  c.binding={process,nativeStart:await startTime(native.nativePid),guardStart:await startTime(process.pid)};
   const targets=(await c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   assert.equal(targets.length,1,'Exactly one initial document per process');
   const target=targets[0], session=(await c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
@@ -74,7 +107,9 @@ async function attach(process) {
       await settled(()=>evaluate("document.body?.innerText.includes('Open From Computer')"),'Photopea editor did not open');
     }
   } catch(error) {
-    proof.startupFailure={native,error:String(error),document:await evaluate("({url:location.href,ready:document.readyState,title:document.title,canvas:document.querySelectorAll('canvas').length,body:document.body?.innerText.slice(0,500)})").catch(e=>({error:String(e)}))};
+    proof.startupFailure={native,error:String(error)};
+    await failureSnapshot(c);
+    if(!proof.commandTimeout)proof.startupFailure.document=await evaluate("({url:location.href,ready:document.readyState,title:document.title,canvas:document.querySelectorAll('canvas').length,body:document.body?.innerText.slice(0,500)})").catch(e=>({error:String(e)}));
     throw error;
   }
   proof.stage={name:'actual frame metadata',pid:native.nativePid};
@@ -153,7 +188,7 @@ try {
   await work.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
-}catch(error){proof.error=String(error);throw error;}
+}catch(error){proof.error=String(error);if(!proof.processSnapshot&&clients.length)await failureSnapshot(clients.at(-1));throw error;}
 finally {
   for(const c of clients)c.socket.close();
   await writeFile(path.join(data,'browser-observation.json'),JSON.stringify(proof,null,2)+'\n');
