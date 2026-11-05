@@ -334,6 +334,67 @@ async function filesProbe(pages) {
   await closePersonalAfterRelaunch(personal,'files');
   proof.passed=true;
 }
+// A sign-in style popup: window.open from Work opens a native popup in Work's
+// own browser process (same profile). It shares Work's storage and cookie,
+// reports Work as its opener, and hands a result back by postMessage before
+// closing itself; Personal sees neither. Synthetic state, not provider login.
+async function popupProbe(work,personal,key,expected,sample) {
+  // The app's own page, as the cef-candidate probe uses: a different document
+  // could carry a different opener policy and sever the opener.
+  const state={method:'Standard window.open/postMessage/window.close with synthetic state, not provider login'};
+  const ref=`sumi_popup_${nonce.replaceAll('-','')}`, url=`${origin}/?${ref}`, result=`popup:${nonce}`;
+  const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+  assert.deepEqual((await pages(work)).map(t=>t.targetId),[work.target.targetId],'Work must have one document before its popup');
+  state.accepted=await work.evaluate(`(()=>{window.__sumiMessages=[];window.__sumiOnMessage=e=>{if(e.data?.sumi===${JSON.stringify(nonce)})window.__sumiMessages.push({origin:e.origin,fromPopup:e.source===globalThis[${JSON.stringify(ref)}],data:e.data})};addEventListener('message',window.__sumiOnMessage);globalThis[${JSON.stringify(ref)}]=window.open(${JSON.stringify(url)},${JSON.stringify(ref)},'popup,width=600,height=500');return Boolean(globalThis[${JSON.stringify(ref)}])})()`,true);
+  assert.equal(state.accepted,true,'Popup request must be accepted');
+  let target;
+  await settled(async()=>{
+    const found=(await pages(work)).filter(t=>t.targetId!==work.target.targetId);
+    assert(found.length<=1,'Unexpected popup family');
+    target=found.find(t=>t.openerId===work.target.targetId);return Boolean(target);
+  },'Popup did not appear in Work\'s own browser process');
+  state.target={targetId:target.targetId,openerId:target.openerId,url:target.url};
+  assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'The popup must not appear in Personal');
+  const session=(await work.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
+  const evaluate=async(expression,userGesture=false)=>{
+    const value=await work.c.command('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,userGesture},session);
+    assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
+  };
+  // Same 25 s load bound as the cef-candidate popup probe.
+  const end=Date.now()+25000;let loaded=false;
+  while(Date.now()<end&&!loaded) {
+    loaded=await evaluate(`location.origin===${JSON.stringify(origin)}&&document.readyState==='complete'`).catch(()=>false);
+    if(!loaded)await delay(100);
+  }
+  assert(loaded,'Popup document must load');
+  state.context=await evaluate("({origin:location.origin,secure:isSecureContext,opener:window.opener!==null,openerOrigin:window.opener?.location.origin,tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc})");
+  assert.equal(state.context.origin,origin);assert.equal(state.context.secure,true);
+  assert.equal(state.context.opener,true);assert.equal(state.context.openerOrigin,origin);
+  for(const field of ['tauri','ipc','wry'])assert.equal(state.context[field],'undefined');
+  state.sharedBefore=await evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`);
+  assert.deepEqual(state.sharedBefore,{storage:expected[0].storage,cookie:expected[0].cookie},'The popup must share Work\'s storage and cookie');
+  await evaluate(`(()=>{localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(result)});document.cookie=${JSON.stringify(`${key}=${result}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};window.opener.postMessage({sumi:${JSON.stringify(nonce)},result:${JSON.stringify(result)}},${JSON.stringify(origin)});setTimeout(()=>window.close(),0);return true})()`,true);
+  await settled(async()=>await work.evaluate(`globalThis[${JSON.stringify(ref)}].closed`)&&!(await pages(work)).some(t=>t.targetId===target.targetId),'Popup did not close back to Work');
+  state.messages=await work.evaluate('window.__sumiMessages');
+  assert.deepEqual(state.messages,[{origin,fromPopup:true,data:{sumi:nonce,result}}],'Work must receive exactly its popup\'s result');
+  state.workAfter=await work.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`);
+  assert.deepEqual(state.workAfter,{storage:result,cookie:result},'Work must see the state its popup wrote');
+  assert.deepEqual(await sample(personal),expected[1],'Personal must see neither the popup nor its state');
+  await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible after its popup closed');
+  // Restore Work's first-launch state, which the later phases check.
+  await work.evaluate(`(()=>{localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(expected[0].storage)});document.cookie=${JSON.stringify(`${key}=${expected[0].cookie}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};removeEventListener('message',window.__sumiOnMessage);delete window.__sumiOnMessage;delete window.__sumiMessages;delete globalThis[${JSON.stringify(ref)}];return true})()`);
+  assert.deepEqual(await sample(work),expected[0],'Work must keep its document after the popup');
+  state.passed=true;return state;
+}
+// A popup left open when the App quits closes with its profile: the native
+// close chain covers it, and the runner then requires a normal guard and App exit.
+async function openPopupForQuit(page) {
+  const ref=`sumi_quit_popup_${nonce.replaceAll('-','')}`, url=`${origin}/?${ref}`;
+  assert.equal(await page.evaluate(`(()=>{globalThis[${JSON.stringify(ref)}]=window.open(${JSON.stringify(url)},${JSON.stringify(ref)},'popup,width=500,height=400');return Boolean(globalThis[${JSON.stringify(ref)}])})()`,true),true,'Popup request must be accepted');
+  let target;
+  await settled(async()=>{target=(await page.c.command('Target.getTargets')).targetInfos.find(t=>t.type==='page'&&t.openerId===page.target.targetId);return Boolean(target);},'Popup did not appear before the final quit');
+  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile};
+}
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -393,6 +454,8 @@ async function firstLaunch() {
   await settled(async()=>{try{return (await readFile(path.join(ownDownloads,fileName),'utf8'))===fileText;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'Work download did not land in its own Downloads');
   assert.deepEqual((await readdir(otherDownloads)).filter(name=>name.includes(nonce)),[],'Work download must not reach Personal Downloads');
   proof.download={profile:work.process.profile,file:fileName,bytes:Buffer.byteLength(fileText),otherProfileClean:true};
+  step('Work same-origin popup',work);
+  proof.popup=await popupProbe(work,personal,key,expected,sample);
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
@@ -467,6 +530,8 @@ async function firstLaunch() {
   proof.partial=await marker('app-browser-process-partial.json');
   assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
   await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  step('Personal popup open at the final quit',personal);
+  proof.finalPopup=await openPopupForQuit(personal);
   step('Personal final exit',personal);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
