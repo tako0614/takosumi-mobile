@@ -10,6 +10,9 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
+// Name the active operation and its exact page, so a failure snapshot inspects
+// that profile rather than whichever client happened to attach last.
+const step=(name,page)=>{proof.stage={name,pid:page?.native.nativePid,profile:page?.process.profile};};
 const json=async file=>JSON.parse(await readFile(path.join(data,file),'utf8'));
 async function marker(file) {
   const end=Date.now()+30000;
@@ -51,8 +54,20 @@ function diagnosticEvents(events) {
       type:p.type,result:p.result,reason:p.reason,disposition:p.disposition,messageLength:typeof p.message==='string'?p.message.length:undefined};
   });
 }
+// A finished guard's generation is gone by design: never snapshot it. Prefer
+// the failed stage's exact page; otherwise use a still-live owned client.
+async function failureClient() {
+  const live=[];
+  for(const c of clients) {
+    if(!c.binding)continue;
+    try{await readFile(c.binding.process.guardReceipt);}
+    catch(e){if(e.code==='ENOENT'){live.push(c);continue;}proof.snapshotTargetError=String(e);return undefined;}
+  }
+  proof.snapshotTarget={stage:proof.stage?.name,liveProfiles:live.map(c=>c.binding.process.profile)};
+  return live.find(c=>c.binding.process.opened.nativePid===proof.stage?.pid)??live[0];
+}
 async function failureSnapshot(client) {
-  const binding=client.binding;
+  const binding=client?.binding;
   if(!binding||client.snapshotAttempted)return;
   client.snapshotAttempted=true;
   try {
@@ -133,6 +148,7 @@ try {
   const [work,personal]=pages,key=`sumi_app_process_${nonce}`;
   const sample=page=>page.evaluate(`({document:globalThis[${JSON.stringify(key)}],storage:localStorage.getItem(${JSON.stringify(key)}),origin:location.origin,frame:window===top})`);
   proof.bindings=pages.map(p=>({native:p.native,target:p.target,frame:p.frame,owner:p.owner,context:p.context}));
+  step('separate initial state');
   for(const [index,page] of pages.entries()) {
     assert.equal(await page.evaluate(`localStorage.getItem(${JSON.stringify(key)})`),null);
     await page.evaluate(`(()=>{globalThis[${JSON.stringify(key)}]=${JSON.stringify(`${index}:${nonce}`)};localStorage.setItem(${JSON.stringify(key)},globalThis[${JSON.stringify(key)}]);return true})()`);
@@ -140,18 +156,22 @@ try {
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
+  step('common UI resume');
   proof.resumed=await marker('app-browser-process.json');
   assert.deepEqual(await Promise.all(pages.map(sample)),expected,'UI resume must retain both exact documents and storage');
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
+  step('Work beforeunload setup',work);
   await work.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
   await writeFile(path.join(data,'request-exit'),'ready',{flag:'wx'});
+  step('multi-profile quit refusal');
   proof.blocked=await marker('app-browser-process-blocked.json');
   assert.equal(proof.blocked.length,2);assert.deepEqual(await Promise.all(pages.map(sample)),expected,'Refused multi-profile quit must preserve every document');
   assert(!work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'),'Multi-profile refusal must occur before any close/dialog');
   // Close Personal using the existing Chrome window shortcut, then require
   // native guard completion before asking App to close the sole Work window.
+  step('Personal native close',personal);
   desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
   // Require the exact parent-attested guard receipt, not target IDs from a
@@ -163,6 +183,7 @@ try {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     proof.personalClosed=receipt;return true;
   },'Personal guard did not finish');
+  step('Work native beforeunload',work);
   await writeFile(path.join(data,'request-single-exit'),'ready',{flag:'wx'});
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Native beforeunload dialog did not open');
   proof.dialog=work.c.events.slice(unloadStart).find(e=>e.method==='Page.javascriptDialogOpening');
@@ -172,23 +193,31 @@ try {
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel beforeunload');
   assert.deepEqual(await sample(work),expected[0],'Cancelled native close must retain the actual Work document');
+  step('Work close cancelled',work);
   await writeFile(path.join(data,'cancel-inspected'),'ready',{flag:'wx'});
   proof.cancelled=await marker('app-browser-process-cancelled.json');
   assert.deepEqual(await sample(work),expected[0]);
   // The native Page observer is now enabled by the first real close attempt.
   // Exercise its handling of remote-controlled long dialog text while active.
+  // A page may replace window.alert (Photopea binds an in-page toast), which
+  // never reaches a native dialog. Use a pristine same-origin realm's native
+  // alert on this exact top window and record the page's own binding name.
+  step('Work long native alert',work);
   const previousClosed=work.c.events.filter(e=>e.method==='Page.javascriptDialogClosed').length;
-  await work.evaluate("(()=>{setTimeout(()=>alert('x'.repeat(9001)),0);return true})()");
-  await settled(()=>Promise.resolve(work.c.events.some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='alert'&&e.params.message.length===9001)),'Long native alert did not open');
+  proof.pageAlertName=await work.evaluate("String(window.alert?.name)");
+  await work.evaluate("(()=>{const f=document.createElement('iframe');f.hidden=true;document.documentElement.append(f);const native=f.contentWindow.alert;if(typeof native!=='function'||native.name!=='alert')throw Error('Pristine native alert unavailable');window.__sumiAlertFrame=f;setTimeout(()=>{try{native.call(window,'x'.repeat(9001));}catch(e){window.__sumiAlertError=String(e);}},0);return true})()");
+  await settled(()=>Promise.resolve(work.c.events.some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='alert'&&e.params.message.length===9001)),'Long native alert did not open')
+    .catch(async error=>{proof.longAlertError=await work.evaluate("window.__sumiAlertError??null").catch(e=>String(e));throw error;});
   desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(work.c.events.filter(e=>e.method==='Page.javascriptDialogClosed').length>previousClosed),'Long native alert did not close');
   assert.deepEqual(await sample(work),expected[0],'Long alert must not kill or replace the browser document');
-  proof.longAlert={messageLength:9001,closed:true,documentRetained:true};
-  await work.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  proof.longAlert={messageLength:9001,closed:true,documentRetained:true,source:'pristine same-origin realm',pageAlertName:proof.pageAlertName};
+  await work.evaluate("(()=>{window.__sumiAlertFrame.remove();delete window.__sumiAlertFrame;removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  step('Work final exit',work);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
-}catch(error){proof.error=String(error);if(!proof.processSnapshot&&clients.length)await failureSnapshot(clients.at(-1));throw error;}
+}catch(error){proof.error=String(error);if(!proof.processSnapshot&&clients.length)await failureSnapshot(await failureClient());throw error;}
 finally {
   for(const c of clients)c.socket.close();
   await writeFile(path.join(data,'browser-observation.json'),JSON.stringify(proof,null,2)+'\n');
