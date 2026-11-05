@@ -74,6 +74,16 @@ It also checks committed-origin display, pending/cancelled and iframe navigation
 native Back despite a page override, and native-keyboard-triggered popup creation,
 profile/opener inheritance and script-close cleanup. Process readback concerns
 settled writes after orderly teardown, not last-write durability or crash recovery.
+Each raw fixture generation now runs in a dedicated child-subreaper worker,
+keeping its Xvfb/D-Bus session alive until observed engine children exit. It
+reuses the full App runner's five-second shutdown observation and rejects a
+reaped NetworkProcess failure before readback; unknown exit statuses remain
+explicit. The missing-document negative also requires a completed generation
+shutdown receipt, so its expected fixture status 1 cannot hide a helper failure.
+This does not establish storage fsync or repair product durability.
+An earlier raw run returned empty Personal localStorage on readback despite
+a cookie and later correct disk contents. A guarded lifecycle control passed
+on the unchanged binary, but the unique cause of that earlier loss is unproven.
 This qualifies the GTK adapter's synthetic behavior; it is not Windows/macOS,
 real IdP, file operations or distribution evidence.
 
@@ -105,6 +115,39 @@ the disposable certificate on that context without reloading or loading the
 expected route from the fixture. A native readiness timeout prints the actual
 URI/loading state as well as the expected document; the five-second bound is
 unchanged. This distinguishes saved-route failure from startup loading failure.
+
+GTK stock error pages can emit a fresh Started/Committed/Finished cycle with
+the failed display URI while loading an `about:blank` main resource. The adapter
+preserves the saved route but invalidates active-document success for the
+native default error classes; cancellation and the two native policy/plugin
+exceptions retain their existing semantics. A later completed document must
+have a current eligible HTTPS main resource. Its original resource URL need
+not equal a same-document route, including when Back restores a cached page.
+
+`--spa-resume --failed-navigation --error-page-close` waits for the actual stock
+error document to commit and finish before ordinary Close, then checks the
+saved successful route in a new process. This exposed the old behavior on GTK
+2.52.3 even when immediate Close happened to pass. The same command passes
+after the resource qualification fix, with temporary diagnostics removed.
+
+Add `--error-page-back` to exercise native Back, require no new main-document
+Response policy event, change the restored page's SPA route and check that
+new route on restart. Add `--error-page-retry` instead to recover the synthetic
+server after the error, call native Reload at the same failed URL and check
+the now-successful route on restart. A file under the disposable fixture root
+arms only this test server; it never writes product resume metadata. These two
+controls require `--error-page-close` and are mutually exclusive.
+`--cancelled-navigation --cancelled-spa` instead changes the surviving document's
+SPA route to the very URL whose provisional load was cancelled, then checks
+that route on restart after arming the same test server. Runtime results for
+these recovery cases remain separate from the policy-model coverage.
+
+The runner requires the writer's exact completion markers before readback;
+an old or partial fixture that ignores a flag cannot qualify a case.
+`python3 -B native-tests/desktop/test_run.py` rejects four synthetic old/partial
+fixtures and an abnormal native helper before readback. Those process controls
+also reject a helper failure after the expected missing-document timeout. They
+are not engine evidence.
 
 ## Full Linux App Web-home flow
 
