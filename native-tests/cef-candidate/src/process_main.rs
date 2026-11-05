@@ -43,6 +43,8 @@ struct State {
     live: usize,
     last_id: u64,
     shutdown: Option<u64>,
+    /// The window an ordinary shutdown is closing now; the chain continues only after it.
+    chain: Option<i32>,
     failed: bool,
     unload_dialogs: BTreeSet<i32>,
 }
@@ -99,21 +101,26 @@ fn close_all(id: Option<u64>, failed: bool) {
             browser.host().unwrap().close_browser(1);
         }
     } else if let Some(browser) = browsers.into_iter().next() {
+        with_state(|state| state.chain = Some(browser.identifier()));
         request_close(browser);
     }
     maybe_quit();
 }
-/// During an ordinary shutdown, the next (oldest) window still open.
-fn next_to_close() -> Option<Browser> {
+/// During an ordinary shutdown, after the window the chain targeted has
+/// closed, the next (oldest) window still open. Windows the user or a popup
+/// closes meanwhile do not advance the chain or re-ask the target.
+fn next_to_close(closed: i32) -> Option<Browser> {
     with_state(|state| {
-        if state.shutdown.is_none() || state.failed {
+        if state.shutdown.is_none() || state.failed || state.chain != Some(closed) {
             return None;
         }
-        state
+        let next = state
             .screens
             .values()
             .next()
-            .map(|screen| screen.browser.clone())
+            .map(|screen| screen.browser.clone());
+        state.chain = next.as_ref().map(|browser| browser.identifier());
+        next
     })
 }
 fn request_close(browser: Browser) {
@@ -422,7 +429,7 @@ wrap_life_span_handler! {
                 state.live-=1;
             });
             // A cancel clears the shutdown, so the remaining windows stay open.
-            if let Some(next)=next_to_close() { request_close(next); }
+            if let Some(next)=next_to_close(id) { request_close(next); }
             maybe_quit();
         }
     }
@@ -677,6 +684,7 @@ fn main() {
             live: 0,
             last_id: 0,
             shutdown: None,
+            chain: None,
             failed: false,
             unload_dialogs: BTreeSet::new(),
         }))

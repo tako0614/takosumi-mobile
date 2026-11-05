@@ -204,6 +204,12 @@ fn drain(backend: &Backend) -> Result<bool> {
     // stops the quit with the remaining profiles still open. Profiles already
     // closed had agreed to leave; their data persists for the home to reopen.
     settle_exiting(&mut state, std::time::Instant::now())?;
+    // Never close earlier profiles and then fail on one already in doubt.
+    if state.processes.values().any(|process| process.uncertain) {
+        return Err(Error::InvalidRequest(
+            "Previous browser command is incomplete; profile data is retained.",
+        ));
+    }
     let mut profiles = state
         .processes
         .iter()
@@ -667,6 +673,11 @@ impl Process {
                 | Reply::CloseBlocked { id, .. }
                 | Reply::Cancelled { id, .. } => *id,
             };
+            // A reply to an earlier request that timed out (e.g. a person answering
+            // a beforeunload dialog late) is stale, not a protocol fault.
+            if actual != 0 && actual < id && !matches!(reply, Reply::Error { .. }) {
+                continue;
+            }
             if actual != id {
                 return Err(Error::InvalidRequest("Browser response identity mismatch."));
             }
@@ -745,19 +756,28 @@ impl Process {
             .checked_add(1)
             .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
         let id = self.next;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let now = std::time::Instant::now();
+        // A person answers each window's beforeunload in turn: the reply bound
+        // is interactive, unlike the write bound.
         let reply = match self
-            .send(Request::Shutdown { id }, deadline)
-            .and_then(|()| self.receive(id, deadline))
+            .send(Request::Shutdown { id }, now + Duration::from_secs(20))
+            .and_then(|()| self.receive(id, now + Duration::from_secs(300)))
         {
             Ok(reply) => reply,
-            // A browser whose last window was just closed is already ending:
-            // its pipe or replies close first. Accept only a normal end.
+            // A browser whose last window was just closed is already ending: its
+            // reply channel closes. Only then accept a normal end; a protocol
+            // fault stays an error.
             Err(error) => {
+                if !matches!(
+                    self.replies.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ) {
+                    return Err(error);
+                }
                 return match self.ended_within(Duration::from_secs(2)) {
                     Ok(()) => Ok(true),
                     Err(_) => Err(error),
-                }
+                };
             }
         };
         match reply {
