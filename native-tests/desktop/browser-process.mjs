@@ -126,11 +126,15 @@ async function attach(process) {
       // the hit target rather than requiring a unique DOM label.
       const button=await evaluate("(()=>{const nodes=[...document.querySelectorAll('button')].filter(e=>{const r=e.getBoundingClientRect();return e.innerText.trim()==='Start using Photopea'&&!e.disabled&&r.width>0&&r.top>=0&&r.bottom<=innerHeight});if(!nodes.length)throw Error('Visible Start button missing');const e=nodes[0],r=e.getBoundingClientRect(),point={x:r.x+r.width/2,y:r.y+r.height/2},hit=document.elementFromPoint(point.x,point.y);if(!hit||!(hit===e||e.contains(hit)))throw Error('Start button obscured');return{point,visibleMatches:nodes.length}})()");
       (proof.landingButtons??=[]).push({pid:native.nativePid,...button});
-      await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...button.point});
-      await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...button.point});
+      // Record what the page receives, to tell an input-routing drop from page behaviour (ph14/ph16).
+      await evaluate("(()=>{window.__sumiInput=[];for(const t of ['pointermove','pointerdown','mousedown','pointerup','mouseup','click'])addEventListener(t,e=>{if(window.__sumiInput.length<64)window.__sumiInput.push({t,trusted:e.isTrusted,x:Math.round(e.clientX),y:Math.round(e.clientY),target:e.target?.tagName})},true);return true})()");
+      // Move first, then press/release with button state, as a real pointer does.
+      await send('Input.dispatchMouseEvent',{type:'mouseMoved',button:'none',buttons:0,...button.point});
+      await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',buttons:1,clickCount:1,...button.point});
+      await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',buttons:0,clickCount:1,...button.point});
       await settled(()=>evaluate("document.body?.innerText.includes('Open From Computer')"),'Photopea editor did not open').catch(async error=>{
         // Same bound; only split a start click that never ran addPP() from a slow editor load.
-        const d=proof.landingDiagnosis=await evaluate("(()=>{const cap=document.getElementById('cap');return{capHidden:cap?getComputedStyle(cap).display==='none':null,added:typeof added==='boolean'?added:null,focus:document.hasFocus(),visibility:document.visibilityState,editorScripts:[...document.scripts].filter(s=>s.src.includes('/code/')).length}})()").catch(e=>({error:String(e)}));
+        const d=proof.landingDiagnosis=await evaluate("(()=>{const cap=document.getElementById('cap');return{capHidden:cap?getComputedStyle(cap).display==='none':null,added:typeof added==='boolean'?added:null,focus:document.hasFocus(),visibility:document.visibilityState,editorScripts:[...document.scripts].filter(s=>s.src.includes('/code/')).length,input:window.__sumiInput??null}})()").catch(e=>({error:String(e)}));
         throw d.capHidden===false&&d.added===false?Error('Photopea start click did not reach the page'):error;
       });
     }
