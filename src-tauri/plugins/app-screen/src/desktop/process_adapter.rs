@@ -164,6 +164,10 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             // requires its complete normal receipt, not its status alone.
             state.processes.get(&profile).unwrap().normal_guard()?;
             state.processes.remove(&profile);
+        } else if let Some(process) = state.processes.get_mut(&profile) {
+            if process.recover()? {
+                state.processes.remove(&profile);
+            }
         }
         if let Some(process) = state.processes.get_mut(&profile) {
             process.open(payload)
@@ -204,7 +208,14 @@ fn drain(backend: &Backend) -> Result<bool> {
     // stops the quit with the remaining profiles still open. Profiles already
     // closed had agreed to leave; their data persists for the home to reopen.
     settle_exiting(&mut state, std::time::Instant::now())?;
-    // Never close earlier profiles and then fail on one already in doubt.
+    // A profile left in doubt by a late answer recovers from its late reply
+    // or normal end; never close earlier profiles and then fail on one still
+    // in doubt.
+    for profile in state.processes.keys().cloned().collect::<Vec<_>>() {
+        if state.processes.get_mut(&profile).unwrap().recover()? {
+            state.processes.remove(&profile);
+        }
+    }
     if state.processes.values().any(|process| process.uncertain) {
         return Err(Error::InvalidRequest(
             "Previous browser command is incomplete; profile data is retained.",
@@ -759,26 +770,24 @@ impl Process {
         let now = std::time::Instant::now();
         // A person answers each window's beforeunload in turn: the reply bound
         // is interactive, unlike the write bound.
-        let reply = match self
-            .send(Request::Shutdown { id }, now + Duration::from_secs(20))
-            .and_then(|()| self.receive(id, now + Duration::from_secs(300)))
-        {
+        // A browser whose last window was just closed is already ending: its
+        // pipe or reply channel closes. Only then accept a normal end; a
+        // protocol fault stays an error.
+        if let Err(error) = self.send(Request::Shutdown { id }, now + Duration::from_secs(20)) {
+            return self
+                .ended_within(Duration::from_secs(2))
+                .map(|()| true)
+                .map_err(|_| error);
+        }
+        let reply = match self.receive(id, now + Duration::from_secs(300)) {
             Ok(reply) => reply,
-            // A browser whose last window was just closed is already ending: its
-            // reply channel closes. Only then accept a normal end; a protocol
-            // fault stays an error.
-            Err(error) => {
-                if !matches!(
-                    self.replies.try_recv(),
-                    Err(mpsc::TryRecvError::Disconnected)
-                ) {
-                    return Err(error);
-                }
-                return match self.ended_within(Duration::from_secs(2)) {
-                    Ok(()) => Ok(true),
-                    Err(_) => Err(error),
-                };
+            Err(error) if self.replies_closed() => {
+                return self
+                    .ended_within(Duration::from_secs(2))
+                    .map(|()| true)
+                    .map_err(|_| error);
             }
+            Err(error) => return Err(error),
         };
         match reply {
             Reply::Cancelled { profile, .. } if profile == self.profile => return Ok(false),
@@ -806,6 +815,43 @@ impl Process {
         Err(Error::InvalidRequest(
             "Browser process did not finish shutdown.",
         ))
+    }
+    /// Only user-close notices remain and the reply channel has closed.
+    fn replies_closed(&self) -> bool {
+        loop {
+            match self.replies.try_recv() {
+                Ok(Ok(Reply::Closed { id: 0, .. })) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => return true,
+                _ => return false,
+            }
+        }
+    }
+    /// Settle a browser left in doubt by an earlier timeout before using it:
+    /// a late reply to its last shutdown, or its own normal end. Returns true
+    /// when it has ended (the caller drops it); a late cancel makes it usable.
+    fn recover(&mut self) -> Result<bool> {
+        if !self.uncertain {
+            return Ok(false);
+        }
+        if let Some(status) = self.child.try_wait().map_err(failure)? {
+            return if status.success() {
+                self.normal_guard().map(|()| true)
+            } else {
+                Err(Error::InvalidRequest("Browser process ended abnormally."))
+            };
+        }
+        while let Ok(Ok(reply)) = self.replies.try_recv() {
+            match reply {
+                Reply::Cancelled { id, profile } if id == self.next && profile == self.profile => {
+                    self.uncertain = false;
+                }
+                Reply::Stopped { id } if id == self.next => {
+                    return self.ended_within(Duration::from_secs(5)).map(|()| true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
     /// The browser ended normally within the bound, with a complete receipt.
     fn ended_within(&mut self, bound: Duration) -> Result<()> {
@@ -1175,6 +1221,60 @@ mod tests {
         }
         assert!(state.processes.contains_key(work));
         drop(state); // Drop's SIGTERM path ends the lingering stand-in.
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn a_late_answer_recovers_a_profile_left_in_doubt() {
+        // Stand-in guards answer the last shutdown late: one with a cancel (the
+        // browser stays usable), one with a stop and a normal end (it is dropped).
+        let root = std::env::temp_dir().join(format!("sumi-recover-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let (work, personal) = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        let receipt = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
+        let cancel = root.join("cancel.py");
+        std::fs::write(&cancel, format!("import time\ntime.sleep(0.2)\nprint('{{\"event\":\"cancelled\",\"id\":2,\"profile\":\"{work}\"}}',flush=True)\ntime.sleep(30)\n")).unwrap();
+        let stop = root.join("stop.py");
+        std::fs::write(&stop, format!("import json,sys,time\ntime.sleep(0.2)\nprint('{{\"event\":\"stopped\",\"id\":2}}',flush=True)\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let mut spawned = Vec::new();
+        for (index, (profile, guard)) in
+            [(work, &cancel), (personal, &stop)].into_iter().enumerate()
+        {
+            let payload = serde_json::from_value(serde_json::json!({
+                "key":format!("web-home:{profile}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+            }))
+            .unwrap();
+            let mut process = Process::spawn(
+                PathBuf::from("/bin/true"),
+                guard.clone(),
+                root.join(profile),
+                root.join(format!("r{index}")),
+                payload,
+                &parent,
+            )
+            .unwrap();
+            // As after a timed-out shutdown request with id 2.
+            process.next = 2;
+            process.uncertain = true;
+            spawned.push(process);
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        let mut cancelled = spawned.remove(0);
+        assert!(
+            !cancelled.recover().unwrap(),
+            "a late cancel keeps the browser"
+        );
+        assert!(!cancelled.uncertain, "a late cancel makes it usable again");
+        let mut stopped = spawned.remove(0);
+        assert!(
+            stopped.recover().unwrap(),
+            "a late stop and normal end drops it"
+        );
+        drop((cancelled, stopped));
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
