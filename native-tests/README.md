@@ -191,6 +191,10 @@ App compares the full saved value and both views' native persistent data/cache
 directories to the original profiles, so a fresh replacement jar cannot pass
 as a cleared profile. This checks ordinary restart after deletion, not crash/fsync
 durability, OS logout or other OS runtimes.
+In the three-generation case Work stays closed after native clear until the
+final App opens it. Inspecting Work's editor earlier would itself create a new
+successful last page, so expecting its root at the next restart would be wrong.
+The independent warm case retains its immediate Work data inspections.
 
 The independent single-generation `--profile-reset` case remains available.
 The three-generation case requires the real clear completion marker before

@@ -397,45 +397,52 @@ async fn clear_work_profile(
     }
     assert_js(shell, "[...document.querySelectorAll('.web-connection')].find(b => b.querySelector('strong').textContent === 'Work').querySelector('small').textContent === '開く →'", "successful native clear resets the previous-page indicator").await?;
 
-    click_connection(shell, "Work").await?;
-    let reopened = remote(app, Some(personal.label())).await?;
-    let cleared = view(&reopened)?;
-    // This is the same cached context whose test certificate was trusted on
-    // first open. A second reload could hide an incorrect first response.
-    ready(
-        &cleared,
-        &format!(
-            "location.href === {} && document.querySelector('[data-page]')",
-            serde_json::to_string(&format!("{origin}/")).unwrap()
-        ),
-    )
-    .await?;
-    assert_js(
-        &cleared,
-        "document.querySelector('[data-page]').dataset.page === 'login'",
-        "cleared Work's first root document is logged out",
-    )
-    .await?;
-    no_ipc(&cleared).await?;
-    println!("PASS: cleared Work opens at its root, logged out instead of its saved editor");
-    // The mock editor needs no login. Navigate normally to the second origin
-    // to inspect its storage once, without creating a new mock login cookie.
-    cleared.load_uri(&format!("{app_origin}/"));
-    ready(
-        &cleared,
-        &format!(
-            "location.href === {} && document.querySelector('[data-page=editor]')",
-            serde_json::to_string(&format!("{app_origin}/")).unwrap()
-        ),
-    )
-    .await?;
-    assert_js(
-        &cleared,
-        "localStorage.getItem('draft') === null && document.querySelector('textarea').value === ''",
-        "cleared Work has no second-site editor draft",
-    )
-    .await?;
-    no_ipc(&cleared).await?;
+    let mut closing = vec![personal.clone()];
+    if !reset_restart() {
+        // The warm case inspects Work now. The restart case must leave Work
+        // closed: inspecting its editor here would legitimately remember that
+        // new post-clear page, contaminating the next App's root assertion.
+        click_connection(shell, "Work").await?;
+        let reopened = remote(app, Some(personal.label())).await?;
+        let cleared = view(&reopened)?;
+        // This is the same cached context whose test certificate was trusted on
+        // first open. A second reload could hide an incorrect first response.
+        ready(
+            &cleared,
+            &format!(
+                "location.href === {} && document.querySelector('[data-page]')",
+                serde_json::to_string(&format!("{origin}/")).unwrap()
+            ),
+        )
+        .await?;
+        assert_js(
+            &cleared,
+            "document.querySelector('[data-page]').dataset.page === 'login'",
+            "cleared Work's first root document is logged out",
+        )
+        .await?;
+        no_ipc(&cleared).await?;
+        println!("PASS: cleared Work opens at its root, logged out instead of its saved editor");
+        // The mock editor needs no login. Navigate normally to the second origin
+        // to inspect its storage once, without creating a new mock login cookie.
+        cleared.load_uri(&format!("{app_origin}/"));
+        ready(
+            &cleared,
+            &format!(
+                "location.href === {} && document.querySelector('[data-page=editor]')",
+                serde_json::to_string(&format!("{app_origin}/")).unwrap()
+            ),
+        )
+        .await?;
+        assert_js(
+            &cleared,
+            "localStorage.getItem('draft') === null && document.querySelector('textarea').value === ''",
+            "cleared Work has no second-site editor draft",
+        )
+        .await?;
+        no_ipc(&cleared).await?;
+        closing.push(reopened);
+    }
 
     let preserved = view(personal)?;
     action(
@@ -470,7 +477,7 @@ async fn clear_work_profile(
         ready(&preserved, &format!("location.href === {url}")).await?;
         println!("PASS: preserved Personal changes its route before the post-reset restart");
     }
-    close_profiles(app, &[personal.clone(), reopened]).await?;
+    close_profiles(app, &closing).await?;
     if reset_restart() {
         // Pass an expectation to the next fixture process, never product state.
         println!("FIXTURE: post-reset connection preferences {connections}");
