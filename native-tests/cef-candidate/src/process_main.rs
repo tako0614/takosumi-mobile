@@ -92,15 +92,29 @@ fn close_all(id: Option<u64>, failed: bool) {
             .collect::<Vec<_>>()
     });
     // Do not hold a RefCell borrow across native callbacks. Ordinary shutdown
-    // honors beforeunload; a lost/malformed parent pipe is an abnormal stop.
-    for browser in browsers {
-        if failed {
+    // honors beforeunload one window at a time (oldest first; on_before_close
+    // continues with the next); a lost/malformed parent pipe is an abnormal stop.
+    if failed {
+        for browser in browsers {
             browser.host().unwrap().close_browser(1);
-        } else {
-            request_close(browser);
         }
+    } else if let Some(browser) = browsers.into_iter().next() {
+        request_close(browser);
     }
     maybe_quit();
+}
+/// During an ordinary shutdown, the next (oldest) window still open.
+fn next_to_close() -> Option<Browser> {
+    with_state(|state| {
+        if state.shutdown.is_none() || state.failed {
+            return None;
+        }
+        state
+            .screens
+            .values()
+            .next()
+            .map(|screen| screen.browser.clone())
+    })
 }
 fn request_close(browser: Browser) {
     let observation = with_state(|state| {
@@ -407,6 +421,8 @@ wrap_life_span_handler! {
                 }
                 state.live-=1;
             });
+            // A cancel clears the shutdown, so the remaining windows stay open.
+            if let Some(next)=next_to_close() { request_close(next); }
             maybe_quit();
         }
     }
@@ -568,9 +584,11 @@ fn dispatch(bytes: Option<&[u8]>) {
             }
         }
         Request::Shutdown { id } => {
-            // Chrome-style CEF exposes no reversible close preparation. A
-            // later window's cancellation must not destroy an earlier one.
-            if with_state(|state| state.screens.len() + state.pending > 1) {
+            // Chrome-style CEF exposes no reversible close preparation, so
+            // windows close one at a time and a beforeunload cancel stops the
+            // rest (the owner's sequential-quit decision). A window still being
+            // created cannot take part yet.
+            if with_state(|state| state.pending > 0) {
                 reply(Reply::CloseBlocked {
                     id,
                     profile: with_state(|state| state.profile.clone()),

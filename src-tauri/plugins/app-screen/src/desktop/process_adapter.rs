@@ -74,7 +74,10 @@ struct Process {
     opened: serde_json::Value,
     guard_receipt: PathBuf,
     program: PathBuf,
+    /// Opening order: an App quit closes the oldest profile first.
+    order: u64,
 }
+static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn install(app: &AppHandle) -> Result<()> {
     let program = PathBuf::from(std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PROGRAM").ok_or(
@@ -195,23 +198,19 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
 
 fn drain(backend: &Backend) -> Result<bool> {
     let mut state = backend.0.lock().map_err(failure)?;
-    // This CEF interface cannot prepare/roll back a cross-process beforeunload
-    // transaction. Refuse before sending any close, rather than destroy one
-    // profile before a later profile can cancel. Users can close native
-    // browser windows individually; coordinated App quit remains unsupported.
-    // A profile whose last window was just closed is still exiting for a
-    // moment; give exiting browsers a short bounded grace before counting.
-    settle_exiting(
-        &mut state,
-        std::time::Instant::now() + Duration::from_secs(2),
-    )?;
-    if state.processes.len() > 1 {
-        return Err(Error::InvalidRequest(
-            "Coordinated browser quit is unavailable; close browser windows individually first.",
-        ));
-    }
-    let profiles = state.processes.keys().cloned().collect::<Vec<_>>();
-    for profile in profiles {
+    // CEF cannot ask every profile's beforeunload before closing any (there is
+    // no two-phase quit). Per the owner's decision (2026-11-05), close profiles
+    // one at a time, oldest first: each page may confirm leaving, and a cancel
+    // stops the quit with the remaining profiles still open. Profiles already
+    // closed had agreed to leave; their data persists for the home to reopen.
+    settle_exiting(&mut state, std::time::Instant::now())?;
+    let mut profiles = state
+        .processes
+        .iter()
+        .map(|(profile, process)| (process.order, profile.clone()))
+        .collect::<Vec<_>>();
+    profiles.sort();
+    for (_, profile) in profiles {
         let process = state.processes.get_mut(&profile).unwrap();
         match process.shutdown() {
             Ok(true) => {
@@ -608,6 +607,7 @@ impl Process {
             opened: serde_json::Value::Null,
             guard_receipt,
             program,
+            order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
         };
         nonblocking(process.input.as_ref().unwrap())?;
         std::thread::Builder::new()
@@ -746,13 +746,24 @@ impl Process {
             .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
         let id = self.next;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        self.send(Request::Shutdown { id }, deadline)?;
-        match self.receive(id, deadline)? {
+        let reply = match self
+            .send(Request::Shutdown { id }, deadline)
+            .and_then(|()| self.receive(id, deadline))
+        {
+            Ok(reply) => reply,
+            // A browser whose last window was just closed is already ending:
+            // its pipe or replies close first. Accept only a normal end.
+            Err(error) => {
+                return match self.ended_within(Duration::from_secs(2)) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Err(error),
+                }
+            }
+        };
+        match reply {
             Reply::Cancelled { profile, .. } if profile == self.profile => return Ok(false),
             Reply::CloseBlocked { profile, .. } if profile == self.profile => {
-                eprintln!(
-                    "Coordinated window quit unavailable; close native windows individually first."
-                );
+                eprintln!("A browser window is still opening; the quit stopped.");
                 return Ok(false);
             }
             Reply::Stopped { .. } => {}
@@ -775,6 +786,25 @@ impl Process {
         Err(Error::InvalidRequest(
             "Browser process did not finish shutdown.",
         ))
+    }
+    /// The browser ended normally within the bound, with a complete receipt.
+    fn ended_within(&mut self, bound: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            if let Some(status) = self.child.try_wait().map_err(failure)? {
+                return if status.success() {
+                    self.normal_guard()
+                } else {
+                    Err(Error::InvalidRequest("Browser process ended abnormally."))
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::InvalidRequest(
+                    "Browser process did not finish shutdown.",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     fn normal_guard(&self) -> Result<()> {
         let proof: serde_json::Value =
