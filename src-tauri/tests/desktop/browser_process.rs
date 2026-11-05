@@ -179,6 +179,12 @@ async fn relaunch_flow(
     println!("{kind}: saved home lists both connections");
     // The first launch's own guard receipts prove its browsers ended; the
     // runner checked them before this relaunch.
+    if kind == "notify" {
+        // A desktop's notification server runs before any browser starts. CEF
+        // picks its notification route at startup (a portal only as fallback).
+        checkpoint(case, "notify-backend-ready").await?;
+        println!("notify: notification server is up before the browsers");
+    }
     let mut running_clear_refused = false;
     if kind == "reset" {
         tap_in_row(view, "Work", "保存データを消去…").await?;

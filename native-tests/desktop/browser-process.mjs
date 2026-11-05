@@ -180,6 +180,9 @@ async function attach(process) {
 // running Personal was refused.
 async function relaunchFlow(kind) {
   proof.scope=`Disposable Linux actual App ${kind} on the same data; no real login or Push`;
+  // notify: start the owned notification server before the App opens any
+  // browser, as on a desktop session; CEF chooses its route at startup.
+  if(kind==='notify')await startNotifier();
   const opened=await marker(`app-browser-process-${kind}-open.json`);proof.opened=opened;
   const pages=[];
   for(const name of ['Work','Personal']) {
@@ -225,21 +228,26 @@ async function closePersonalAfterRelaunch(personal,kind) {
 // notify (runner --notifications): native Chrome permission UI and real OS
 // notifications per profile, reusing the CEF candidate's inspected probes.
 // Permissions are only ever chosen through the native prompt, never by CDP.
+const desktopAsync=async(tool,args,allowMissing=false)=>{
+  try{return desktop(tool,args);}catch(e){if(allowMissing&&e.status===1)return String(e.stdout??'').trim();throw e;}
+};
+let notifier=null;
+async function startNotifier() {
+  const binary=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFIER;
+  assert(binary&&path.isAbsolute(binary),'The owned notification daemon is required');
+  const {startNotificationBackend}=await import('../cef-candidate/notification-backend.mjs');
+  notifier=await startNotificationBackend({binary,data,nonce,env:process.env,desktop:desktopAsync});
+  await writeFile(path.join(data,'notify-backend-ready'),'ready',{flag:'wx'});
+}
 async function notifyProbes(pages) {
   const [,personal]=pages;
   await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
-  const notifier=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFIER;
-  assert(notifier&&path.isAbsolute(notifier),'The owned notification daemon is required');
-  const desktopAsync=async(tool,args,allowMissing=false)=>{
-    try{return desktop(tool,args);}catch(e){if(allowMissing&&e.status===1)return String(e.stdout??'').trim();throw e;}
-  };
-  const {startNotificationBackend}=await import('../cef-candidate/notification-backend.mjs');
   const {probeNotifications}=await import('../cef-candidate/notifications.mjs');
   const {inspectPermissions}=await import('../cef-candidate/permissions.mjs');
   // The probes need the attested native PID and a process-local browser command.
   const probePages=pages.map(page=>({...page,nativePid:page.native.nativePid,browserCommand:(method,params)=>page.c.command(method,params)}));
   step('native permissions and OS notifications');
-  const backend=await startNotificationBackend({binary:notifier,data,nonce,env:process.env,desktop:desktopAsync});
+  const backend=notifier;
   try {
     proof.permissions=await inspectPermissions({pages:probePages,data,nonce,desktop:desktopAsync,decide:true,
       command:()=>{throw Error('Unscoped browser command is forbidden across processes');},
@@ -401,5 +409,6 @@ try {
 }
 finally {
   for(const c of clients)c.socket.close();
+  if(notifier&&!notifier.proof.stopped)await notifier.stop().catch(e=>{proof.notifierStopError=String(e);});
   await writeFile(path.join(data,`browser-observation${suffix}.json`),JSON.stringify(proof,null,2)+'\n');
 }
