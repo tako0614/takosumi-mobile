@@ -341,26 +341,44 @@ pub(super) async fn clear_profile(
         if backend.1.state.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidRequest("The browser is closing."));
         }
-        if let Some(process) = state.processes.get_mut(&payload.profile) {
-            match process.child.try_wait().map_err(failure)? {
-                None => return Err(Error::InvalidRequest(STILL_OPEN)),
-                Some(status) if !status.success() => {
-                    return Err(Error::InvalidRequest(
-                        "Previous browser process ended abnormally; profile data is retained.",
-                    ))
-                }
-                Some(_) => {
-                    process.normal_guard()?;
-                    state.processes.remove(&payload.profile);
-                }
-            }
-        }
+        release_ended(
+            &mut state,
+            &payload.profile,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )?;
         // The backend lock stays held: no open of this profile can start meanwhile.
         clear_site_data(&state.directory, &payload.profile)?;
         Ok(crate::ClearProfileResponse { cleared: true })
     })
     .await
     .map_err(failure)?
+}
+
+/// Drop this profile's tracked browser once it has ended normally. One whose
+/// last window was just closed is still exiting for a moment, so wait within
+/// the bounded deadline before refusing it as still open; an abnormal end
+/// keeps the profile and fails.
+fn release_ended(state: &mut State, profile: &str, deadline: std::time::Instant) -> Result<()> {
+    let Some(process) = state.processes.get_mut(profile) else {
+        return Ok(());
+    };
+    let status = loop {
+        if let Some(status) = process.child.try_wait().map_err(failure)? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::InvalidRequest(STILL_OPEN));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !status.success() {
+        return Err(Error::InvalidRequest(
+            "Previous browser process ended abnormally; profile data is retained.",
+        ));
+    }
+    process.normal_guard()?;
+    state.processes.remove(profile);
+    Ok(())
 }
 
 static NEXT_CLEAR: AtomicU64 = AtomicU64::new(1);
@@ -1096,6 +1114,16 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "settled as soon as one remained"
         );
+        // A clear of the still-open Work is refused after the bounded wait.
+        match release_ended(
+            &mut state,
+            work,
+            std::time::Instant::now() + Duration::from_millis(200),
+        ) {
+            Err(Error::InvalidRequest(message)) => assert_eq!(message, STILL_OPEN),
+            other => panic!("{other:?}"),
+        }
+        assert!(state.processes.contains_key(work));
         drop(state); // Drop's SIGTERM path ends the lingering stand-in.
         std::fs::remove_dir_all(&root).unwrap();
     }
