@@ -83,6 +83,8 @@ async function failureSnapshot(client) {
   proof.failureEvents=diagnosticEvents(client.events);
 }
 async function attach(process) {
+  // Set before any await, so an attach failure never inherits the previous page's stage.
+  proof.stage={name:'attach',pid:process.opened.nativePid,profile:process.profile};
   const native=process.opened, inspection=JSON.parse(await readFile(path.join(process.directory,'inspection.json'),'utf8'));
   assert.equal(inspection.pid,native.nativePid);
   const rows=(await readFile('/proc/net/tcp','utf8')).split('\n').slice(1).map(line=>line.trim().split(/\s+/));
@@ -206,18 +208,40 @@ try {
   const previousClosed=work.c.events.filter(e=>e.method==='Page.javascriptDialogClosed').length;
   proof.pageAlertName=await work.evaluate("String(window.alert?.name)");
   await work.evaluate("(()=>{const f=document.createElement('iframe');f.hidden=true;document.documentElement.append(f);const native=f.contentWindow.alert;if(typeof native!=='function'||native.name!=='alert')throw Error('Pristine native alert unavailable');window.__sumiAlertFrame=f;setTimeout(()=>{try{native.call(window,'x'.repeat(9001));}catch(e){window.__sumiAlertError=String(e);}},0);return true})()");
-  await settled(()=>Promise.resolve(work.c.events.some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='alert'&&e.params.message.length===9001)),'Long native alert did not open')
-    .catch(async error=>{proof.longAlertError=await work.evaluate("window.__sumiAlertError??null").catch(e=>String(e));throw error;});
+  // The dialog must belong to Work's exact top frame and origin, as the old top-document alert did.
+  const longAlert=e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='alert'&&e.params.message.length===9001&&
+    e.params.frameId===work.frame.id&&URL.canParse(e.params.url)&&new URL(e.params.url).origin===origin;
+  await settled(()=>Promise.resolve(work.c.events.some(longAlert)),'Long native alert did not open').catch(async error=>{
+    // An open dialog blocks evaluation; record observed alerts and read the page error only when none opened.
+    proof.longAlertDialogs=work.c.events.filter(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='alert')
+      .map(e=>({length:e.params.message.length,frameId:e.params.frameId,url:e.params.url,topFrame:e.params.frameId===work.frame.id}));
+    if(!proof.longAlertDialogs.length)proof.longAlertError=await work.evaluate("window.__sumiAlertError??null").catch(e=>String(e));
+    throw error;
+  });
+  const alertEvent=work.c.events.find(longAlert);
   desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(work.c.events.filter(e=>e.method==='Page.javascriptDialogClosed').length>previousClosed),'Long native alert did not close');
   assert.deepEqual(await sample(work),expected[0],'Long alert must not kill or replace the browser document');
-  proof.longAlert={messageLength:9001,closed:true,documentRetained:true,source:'pristine same-origin realm',pageAlertName:proof.pageAlertName};
+  proof.longAlert={messageLength:9001,closed:true,documentRetained:true,source:'pristine same-origin realm',pageAlertName:proof.pageAlertName,
+    frameId:alertEvent.params.frameId,topFrame:true,url:alertEvent.params.url};
   await work.evaluate("(()=>{window.__sumiAlertFrame.remove();delete window.__sumiAlertFrame;removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
   step('Work final exit',work);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
-}catch(error){proof.error=String(error);if(!proof.processSnapshot&&clients.length)await failureSnapshot(await failureClient());throw error;}
+}catch(error){
+  proof.error=String(error);
+  if(!proof.processSnapshot&&clients.length) {
+    const target=await failureClient();
+    if(target)await failureSnapshot(target);
+    else {
+      // No live process to inspect, e.g. the stage page crashed: still keep its in-memory events.
+      const stage=clients.find(c=>c.binding?.process.opened.nativePid===proof.stage?.pid);
+      if(stage)proof.failureEvents=diagnosticEvents(stage.events);
+    }
+  }
+  throw error;
+}
 finally {
   for(const c of clients)c.socket.close();
   await writeFile(path.join(data,'browser-observation.json'),JSON.stringify(proof,null,2)+'\n');
