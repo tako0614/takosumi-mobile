@@ -249,6 +249,15 @@ an App acceptance result.
 
 ## Android
 
+The profile-reset instrumentation requires both `MULTI_PROFILE` and
+`DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
+The initial API35 emulator used WebView124 and passed profile isolation but
+failed the two deletion preconditions. The next CI candidate selects the
+official API36 Google APIs x86_64 image and logs its revision and actual WebView
+package. A newer image is not itself acceptance evidence: the same feature and
+data assertions must pass. The App's Android minimum and runtime capability
+guards remain unchanged; no default/shared-jar deletion fallback is used.
+
 `resume-navigation-cases.json` exercises native success, provisional failure,
 post-commit failure, stale/duplicate completion, SPA routes and unknown failing
 URLs in Rust, Kotlin and Swift policy tests. The Kotlin callback adapter also

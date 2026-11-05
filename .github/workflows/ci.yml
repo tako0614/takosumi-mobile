@@ -133,10 +133,14 @@ jobs:
           sudo chmod 666 /dev/kvm
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          sdkmanager "system-images;android-35;google_apis;x86_64"
+          # The API35 image's WebView124 supports profiles but not the required
+          # DELETE_BROWSING_DATA API. Qualify a newer official engine; keep the
+          # instrumentation capability assertions and zero-skip checks below.
+          sdkmanager "system-images;android-36;google_apis;x86_64"
+          cat "$ANDROID_HOME/system-images/android-36/google_apis/x86_64/source.properties"
           export ANDROID_AVD_HOME="$RUNNER_TEMP/sumi-avd"
           mkdir -p "$ANDROID_AVD_HOME"
-          echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-35;google_apis;x86_64" --force
+          echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-36;google_apis;x86_64" --force
           "$ANDROID_HOME/emulator/emulator" -version
           "$ANDROID_HOME/emulator/emulator" -list-avds
           df -h "$ANDROID_HOME" "$RUNNER_TEMP"
