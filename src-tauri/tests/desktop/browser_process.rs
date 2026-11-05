@@ -249,8 +249,8 @@ async fn relaunch_flow(
     checkpoint(case, &format!("{kind}-request-exit")).await?;
     if kind == "reset" {
         // The observer closed Personal normally in this session: now it can be
-        // cleared here (normal guard receipt, then removal from the map).
-        tap_in_row(view, "Personal", "保存データを消去…").await?;
+        // cleared here (normal guard receipt, then removal from the map). The
+        // refused attempt left the confirmation open, so a user retries there.
         ready(view, "document.querySelector('.web-clear')").await?;
         tap_in_row(view, "Personal", "保存データを消去").await?;
         ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') && !document.querySelector('.web-clear')").await?;
