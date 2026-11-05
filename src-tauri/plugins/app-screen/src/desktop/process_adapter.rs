@@ -307,6 +307,91 @@ pub(super) fn terminal(app: &AppHandle) {
     }
 }
 
+/// Clear one idle isolated profile's site data. Cookies, storage, cache and
+/// site permissions live under its CEF cache root, which CEF holds open while
+/// the browser runs, so the profile's browser must have ended normally first.
+/// Downloads, logs, other profiles and the saved connection are kept.
+pub(super) async fn clear_profile(
+    app: AppHandle,
+    payload: crate::ClearProfileRequest,
+) -> Result<crate::ClearProfileResponse> {
+    payload.validate()?;
+    let backend = app.state::<Backend>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let mut state = backend.0.lock().map_err(failure)?;
+        if let Some(process) = state.processes.get_mut(&payload.profile) {
+            match process.child.try_wait().map_err(failure)? {
+                None => {
+                    return Err(Error::InvalidRequest(
+                        "Close this connection's screens before clearing its data.",
+                    ))
+                }
+                Some(status) if !status.success() => {
+                    return Err(Error::InvalidRequest(
+                        "Previous browser process ended abnormally; profile data is retained.",
+                    ))
+                }
+                Some(_) => {
+                    process.normal_guard()?;
+                    state.processes.remove(&payload.profile);
+                }
+            }
+        }
+        // The backend lock stays held: no open of this profile can start meanwhile.
+        clear_site_data(&state.directory, &payload.profile)?;
+        Ok(crate::ClearProfileResponse { cleared: true })
+    })
+    .await
+    .map_err(failure)?
+}
+
+static NEXT_CLEAR: AtomicU64 = AtomicU64::new(1);
+const CLEARING: &str = "cef-profiles.clearing-";
+
+/// Detach the profile's CEF cache root by rename, then remove it. An
+/// interrupted removal leaves only a detached directory, never a half-cleared
+/// live profile; leftovers are removed by the next clear. Links are refused,
+/// never followed.
+fn clear_site_data(directory: &std::path::Path, profile: &str) -> Result<()> {
+    fn plain_directory(path: &std::path::Path) -> Result<bool> {
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+            Ok(_) => Err(Error::InvalidRequest(
+                "Browser profile data is not a plain directory.",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(failure(error)),
+        }
+    }
+    let profile_directory = directory.join(profile);
+    if !plain_directory(&profile_directory)? {
+        return Ok(());
+    }
+    let root = profile_directory.join("cef-profiles");
+    if plain_directory(&root)? {
+        let detached = profile_directory.join(format!(
+            "{CLEARING}{}-{}",
+            std::process::id(),
+            NEXT_CLEAR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::rename(&root, &detached).map_err(failure)?;
+    }
+    for entry in std::fs::read_dir(&profile_directory).map_err(failure)? {
+        let entry = entry.map_err(failure)?;
+        if entry.file_name().to_string_lossy().starts_with(CLEARING) {
+            let path = entry.path();
+            if plain_directory(&path)? {
+                // Symlink-safe: std's remove_dir_all never follows links.
+                std::fs::remove_dir_all(&path).map_err(failure)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn status(app: &AppHandle) -> Result<serde_json::Value> {
     let backend = app.state::<Backend>();
     let state = backend.0.lock().map_err(failure)?;
@@ -788,6 +873,88 @@ mod tests {
             "the actual open path must not tie guards to a retiring thread"
         );
         drop(parent);
+    }
+    #[test]
+    fn clearing_site_data_removes_only_that_profiles_cache_and_never_follows_links() {
+        let root = std::env::temp_dir().join(format!("sumi-clear-{}", std::process::id()));
+        let (work, personal) = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        let outside = root.join("outside");
+        for path in [
+            root.join(work).join("cef-profiles").join(work),
+            root.join(work).join("Downloads"),
+            root.join(personal).join("cef-profiles").join(personal),
+            outside.clone(),
+        ] {
+            private_directory(&path).unwrap();
+        }
+        std::fs::write(
+            root.join(work)
+                .join("cef-profiles")
+                .join(work)
+                .join("Cookies"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(root.join(work).join("Downloads").join("keep.txt"), b"keep").unwrap();
+        std::fs::write(
+            root.join(personal)
+                .join("cef-profiles")
+                .join(personal)
+                .join("Cookies"),
+            b"y",
+        )
+        .unwrap();
+        std::fs::write(outside.join("target.txt"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(work).join("cef-profiles").join("link"))
+            .unwrap();
+        // A leftover detached directory from an interrupted earlier clear.
+        private_directory(&root.join(work).join(format!("{CLEARING}0-0"))).unwrap();
+
+        clear_site_data(&root, work).unwrap();
+        assert!(!root.join(work).join("cef-profiles").exists());
+        assert!(std::fs::read_dir(root.join(work))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(CLEARING)));
+        assert_eq!(
+            std::fs::read(root.join(work).join("Downloads").join("keep.txt")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(
+                root.join(personal)
+                    .join("cef-profiles")
+                    .join(personal)
+                    .join("Cookies")
+            )
+            .unwrap(),
+            b"y"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("target.txt")).unwrap(),
+            b"outside"
+        );
+
+        // A linked cache root or profile directory is refused, not followed.
+        std::fs::remove_dir_all(root.join(personal).join("cef-profiles")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(personal).join("cef-profiles")).unwrap();
+        assert!(clear_site_data(&root, personal).is_err());
+        std::os::unix::fs::symlink(&outside, root.join("33333333-3333-4333-8333-333333333333"))
+            .unwrap();
+        assert!(clear_site_data(&root, "33333333-3333-4333-8333-333333333333").is_err());
+        assert_eq!(
+            std::fs::read(outside.join("target.txt")).unwrap(),
+            b"outside"
+        );
+        // Missing data is already clear.
+        assert!(clear_site_data(&root, "44444444-4444-4444-8444-444444444444").is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn a_nonreading_child_cannot_hold_the_pipe_writer_past_its_deadline() {

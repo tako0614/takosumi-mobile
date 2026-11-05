@@ -117,7 +117,7 @@ fn capabilities() -> CapabilitiesResponse {
     let clear_profile = true;
     CapabilitiesResponse {
         pin_shortcut: false,
-        clear_profile: clear_profile && !cfg!(feature = "desktop-process-experiment"),
+        clear_profile,
     }
 }
 
@@ -129,9 +129,7 @@ async fn clear_profile(
     payload.validate()?;
     #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
     if app.try_state::<process_adapter::Backend>().is_some() {
-        return Err(Error::InvalidRequest(
-            "Profile reset is not qualified for the browser-process experiment.",
-        ));
+        return process_adapter::clear_profile(app, payload).await;
     }
     let directory = app
         .path()
