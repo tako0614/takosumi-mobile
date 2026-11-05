@@ -4,6 +4,7 @@
 import os
 import contextlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -55,7 +56,7 @@ def worker(root, mode):
         web_home.process_description = acknowledge_observation
     fake = root / "fake-app"
     fake.write_text("""#!/usr/bin/env python3
-import ctypes,os,signal,time
+import ctypes,os,signal,sys,time
 from pathlib import Path
 root=Path(__file__).parent
 pid=os.fork()
@@ -69,12 +70,19 @@ if pid==0:
     %s
 %s
 print('PASS: full App Web-home flow, synthetic process control', flush=True)
+%s
+%s
+%s
 """ % ("while not (root/'observed').exists(): time.sleep(0.01)" if mode == "late-error" else "pass",
        "WebKitNetworkPr" if network else "WebKitWebProces",
        "while not (root/'observed').exists(): time.sleep(0.01)" if mode == "parent-reaped" else "pass",
        "os.kill(os.getpid(), signal.SIGTERM)" if mode in ("signal", "renderer-signal")
        else f"os._exit({7 if mode in ('error', 'late-error', 'parent-reaped') else 0})",
-       "os.waitpid(pid,0)" if mode == "parent-reaped" else "time.sleep(0.10)"))
+       "os.waitpid(pid,0)" if mode == "parent-reaped" else "time.sleep(0.10)",
+       "print('PASS: completed profile reset through shared UI and real native IPC preserves other profiles', flush=True)" if mode in ("missing-after-reset", "missing-reset-identity", "reset-restart") else "pass",
+       f"print({'FIXTURE: post-reset connection preferences ' + json.dumps('synthetic prefs')!r}, flush=True)" if mode in ("missing-after-reset", "reset-restart") else "pass",
+       "if '--after-reset' in sys.argv:\n    assert os.environ.get('TAKOSUMI_FIXTURE_EXPECTED_CONNECTIONS') == 'synthetic prefs'\n    print('PASS: post-reset App restart preserves deletion and other profiles', flush=True)" if mode == "reset-restart" else
+       "if '--after-reset' in sys.argv: print('PASS: post-reset App restart preserves deletion and other profiles', flush=True)" if mode == "missing-reset-identity" else "pass"))
     fake.chmod(0o700)
     try:
         if mode in ("error", "signal", "late-error"):
@@ -86,14 +94,34 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
                 assert not (root / "readback.log").exists()
             else:
                 raise AssertionError("Abnormal NetworkProcess accepted as successful shutdown")
-        elif mode == "missing-reset":
+        elif mode in ("missing-reset", "missing-reset-before-restart"):
             try:
-                web_home.run_apps(fake, root, False, False, profile_reset=True)
+                web_home.run_apps(fake, root, False, False, profile_reset=mode == "missing-reset",
+                                  reset_restart=mode == "missing-reset-before-restart")
             except RuntimeError as error:
                 assert "Profile reset case did not report" in str(error), error
-                assert not (root / "readback.log").exists()
+                assert not (root / ("readback.log" if mode == "missing-reset" else "after-reset.log")).exists()
             else:
                 raise AssertionError("An old App that ignored reset mode was accepted")
+        elif mode == "missing-after-reset":
+            try:
+                web_home.run_apps(fake, root, False, False, reset_restart=True)
+            except RuntimeError as error:
+                assert "Post-reset restart case did not report" in str(error), error
+                assert (root / "after-reset.log").exists()
+            else:
+                raise AssertionError("An old App that ignored after-reset mode was accepted")
+        elif mode == "missing-reset-identity":
+            try:
+                web_home.run_apps(fake, root, False, False, reset_restart=True)
+            except RuntimeError as error:
+                assert "Reset restart did not report exact connection preferences" in str(error), error
+                assert not (root / "after-reset.log").exists()
+            else:
+                raise AssertionError("Reset restart accepted without the cleared profile's exact identity")
+        elif mode == "reset-restart":
+            web_home.run_apps(fake, root, False, False, reset_restart=True)
+            assert (root / "after-reset.log").exists()
         else:
             web_home.run_apps(fake, root, False, False)
             assert (root / "readback.log").exists()
@@ -107,6 +135,18 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
 
 
 class ProcessLifecycleTests(unittest.TestCase):
+    def test_reset_restart_requires_the_cleared_profile_identity(self):
+        self.run_control("missing-reset-identity")
+
+    def test_reset_restart_requires_clear_before_starting_the_last_app(self):
+        self.run_control("missing-reset-before-restart")
+
+    def test_reset_restart_rejects_a_generic_last_app_success(self):
+        self.run_control("missing-after-reset")
+
+    def test_reset_restart_accepts_three_qualified_generations(self):
+        self.run_control("reset-restart")
+
     def test_reset_mode_rejects_a_generic_success_without_reset_assertions(self):
         self.run_control("missing-reset")
 

@@ -178,6 +178,27 @@ first App and its observed engine children to exit before starting a new App
 PID; it does not destroy the desktop session during App teardown. DOM readiness
 may be polled; data assertions run once. The actual views expose no native IPC.
 Failure/timeout or a lingering engine process exits nonzero.
+Add `--reset-restart` with new data for three ordinary App generations: write
+both connections, read them back and clear Work through the shared UI/native
+IPC, then restart again and inspect the result. The final generation performs
+no login, native clear, connection seeding or native resume-file write. It opens
+Work from the saved picker, requires its root login page and an absent editor
+draft, and requires Personal's retained session, draft and exact non-root route.
+Personal's route is set through the real page History API before the clearer's
+ordinary Close. Its exact pre-clear connection preferences are passed as a
+fixture assertion expectation, never as replacement product state. The final
+App compares the full saved value and both views' native persistent data/cache
+directories to the original profiles, so a fresh replacement jar cannot pass
+as a cleared profile. This checks ordinary restart after deletion, not crash/fsync
+durability, OS logout or other OS runtimes.
+
+The independent single-generation `--profile-reset` case remains available.
+The three-generation case requires the real clear completion marker before
+starting the final App and a separate persisted-state marker from that App.
+Old/partial Apps that ignore either mode cannot qualify a case. Four synthetic
+process controls cover missing markers, missing profile identity and the successful protocol; they
+are not native-engine evidence. Per-document, process and shutdown bounds and
+one-shot data assertions remain unchanged.
 The dedicated Linux session worker adopts orphaned App children and records
 their exit status. An adopted NetworkProcess error or signal refuses readback;
 renderer termination policy is recorded separately. A NetworkProcess already

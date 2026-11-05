@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, Window};
-use webkit2gtk::{WebContextExt, WebView, WebViewExt};
+use webkit2gtk::{WebContextExt, WebView, WebViewExt, WebsiteDataManagerExt};
 
 static EXIT_STATUS: AtomicI32 = AtomicI32::new(1);
 thread_local! {
@@ -88,6 +88,18 @@ fn legacy_entry() -> bool {
 
 fn profile_reset() -> bool {
     std::env::args().any(|arg| arg == "--profile-reset")
+}
+
+fn reset_restart() -> bool {
+    std::env::args().any(|arg| arg == "--reset-restart")
+}
+
+fn after_reset() -> bool {
+    std::env::args().any(|arg| arg == "--after-reset")
+}
+
+fn kept_personal_url(origin: &str) -> String {
+    format!("{origin}/kept?view=personal")
 }
 
 fn required_env(name: &str) -> String {
@@ -450,14 +462,100 @@ async fn clear_work_profile(
     // the old home DOM alone could outlive an incorrectly cleared cookie.
     menu(personal, "アプリホームへ").await?;
     assert_home(&preserved, origin, "personal").await?;
+    if reset_restart() {
+        // Leave an observable non-root route for the next App generation.
+        // Use the page's real History API; never write native resume metadata.
+        let url = serde_json::to_string(&kept_personal_url(origin)).unwrap();
+        action(&preserved, &format!("history.replaceState(null, '', {url});")).await?;
+        ready(&preserved, &format!("location.href === {url}")).await?;
+        println!("PASS: preserved Personal changes its route before the post-reset restart");
+    }
     close_profiles(app, &[personal.clone(), reopened]).await?;
+    if reset_restart() {
+        // Pass an expectation to the next fixture process, never product state.
+        println!("FIXTURE: post-reset connection preferences {connections}");
+    }
     println!("PASS: completed profile reset through shared UI and real native IPC preserves other profiles");
+    Ok(())
+}
+
+fn assert_native_profile(app: &AppHandle, view: &WebView, expected: &Value) -> Result<()> {
+    let profile = expected["profile"].as_str().ok_or("expected profile missing")?;
+    let path = app.path().app_local_data_dir().map_err(|e| e.to_string())?
+        .join("web-profiles").join(profile);
+    let manager = view.context().and_then(|context| context.website_data_manager())
+        .ok_or("restarted view has no native website data manager")?;
+    if manager.is_ephemeral() || manager.base_data_directory().as_deref() != path.to_str()
+        || manager.base_cache_directory().as_deref() != path.to_str()
+    {
+        return Err("restarted view selected a different native profile".into());
+    }
+    println!("PASS: restarted view selects its exact retained native profile");
+    Ok(())
+}
+
+async fn after_reset_flow(
+    app: &AppHandle,
+    shell: &WebView,
+    main: &Window,
+    origin: &str,
+    app_origin: &str,
+) -> Result<()> {
+    let expected = required_env("TAKOSUMI_FIXTURE_EXPECTED_CONNECTIONS");
+    if eval(shell, "localStorage.getItem('takosumi.web-connections.v2')").await? != Value::String(expected.clone()) {
+        return Err("post-reset App changed the exact connection preferences".into());
+    }
+    let expected: Value = serde_json::from_str(&expected).map_err(|e| format!("invalid fixture expectation: {e}"))?;
+    assert_js(shell, "(() => { const c=JSON.parse(localStorage.getItem('takosumi.web-connections.v2')); return c.length === 2 && c[0].name === 'Work' && c[1].name === 'Personal' && c[0].profile !== c[1].profile && c.every(x => x.profile !== 'shared'); })()", "connection preferences survive the post-reset App restart").await?;
+    assert_js(shell, "[...document.querySelectorAll('.web-connection')].find(b => b.querySelector('strong').textContent === 'Work').querySelector('small').textContent === '開く →'", "cleared Work has no previous-page indicator after App restart").await?;
+    click_connection(shell, "Work").await?;
+    let work = remote(app, None).await?;
+    let cleared = view(&work)?;
+    assert_native_profile(app, &cleared, &expected[0])?;
+    trust_fixture(&cleared)?;
+    ready(&cleared, &format!("location.href === {} && document.querySelector('[data-page]')",
+                            serde_json::to_string(&format!("{origin}/")).unwrap())).await?;
+    assert_js(&cleared, "document.querySelector('[data-page]').dataset.page === 'login'",
+              "Work remains logged out at its root after the post-reset App restart").await?;
+    no_ipc(&cleared).await?;
+    // Inspect the second site's storage once, without logging in or writing it.
+    cleared.load_uri(&format!("{app_origin}/"));
+    ready(&cleared, &format!("location.href === {} && document.querySelector('[data-page=editor]')",
+                            serde_json::to_string(&format!("{app_origin}/")).unwrap())).await?;
+    assert_js(&cleared, "localStorage.getItem('draft') === null && document.querySelector('textarea').value === ''",
+              "Work's second-site draft remains absent after App restart").await?;
+    no_ipc(&cleared).await?;
+
+    menu(&work, "接続先を切り替える").await?;
+    focused(main).await?;
+    click_connection(shell, "Personal").await?;
+    let personal = remote(app, Some(work.label())).await?;
+    let preserved = view(&personal)?;
+    assert_native_profile(app, &preserved, &expected[1])?;
+    trust_fixture(&preserved)?;
+    ready(&preserved, &format!("location.href === {} && document.querySelector('[data-page=home]')",
+                              serde_json::to_string(&kept_personal_url(origin)).unwrap())).await?;
+    assert_js(&preserved, "document.querySelector('[data-page=home]').dataset.user === 'personal'",
+              "Personal's session and exact non-root route survive the other profile's clear and App restart").await?;
+    no_ipc(&preserved).await?;
+    action(&preserved, "document.querySelector('[data-app=editor]').click();").await?;
+    ready(&preserved, &format!("location.href === {} && document.querySelector('[data-page=editor]')",
+                              serde_json::to_string(&format!("{app_origin}/")).unwrap())).await?;
+    assert_draft(&preserved, "personal draft", "Personal's draft survives the other profile's clear and App restart").await?;
+    no_ipc(&preserved).await?;
+    close_profiles(app, &[personal, work]).await?;
+    println!("PASS: post-reset App restart preserves deletion and other profiles");
     Ok(())
 }
 
 async fn flow(app: &AppHandle) -> Result<()> {
     if profile_reset() && (quick_close() || legacy_entry() || readback()) {
         return Err("Profile reset uses its own fresh, single-process flow".into());
+    }
+    if (after_reset() && (profile_reset() || quick_close() || legacy_entry() || readback() || reset_restart()))
+        || (reset_restart() && (!readback() || profile_reset() || quick_close() || legacy_entry()))
+    {
+        return Err("Post-reset restart modes require their own App generations".into());
     }
     let origin = required_env("TAKOSUMI_FIXTURE_HTTPS");
     let app_origin = required_env("TAKOSUMI_FIXTURE_APP_HTTPS");
@@ -524,6 +622,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
 
+    if after_reset() {
+        return after_reset_flow(app, &shell, &main, &origin, &app_origin).await;
+    }
     if readback() {
         assert_js(
             &shell,

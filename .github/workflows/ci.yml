@@ -298,6 +298,11 @@ jobs:
         shell: bash
         working-directory: takosumi-mobile
         run: python3 native-tests/desktop/web_home.py --profile-reset --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-full-profile-reset"
+      - name: Actual bundled App restart after profile reset
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux-app-fixture-build.outcome == 'success' }}
+        shell: bash
+        working-directory: takosumi-mobile
+        run: python3 native-tests/desktop/web_home.py --reset-restart --binary src-tauri/target/debug/takosumi-mobile --data "$RUNNER_TEMP/takosumi-reset-restart"
       - name: Actual bundled App connection, mock login and home flow
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux-app-fixture-build.outcome == 'success' }}
         shell: bash

@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 import http.server
+import json
 from http.cookies import SimpleCookie
 import os
 from pathlib import Path
@@ -204,22 +205,35 @@ def wait_engine_children(tracked, descriptions):
     return statuses
 
 
-def run_apps(binary, data, quick_close, legacy_entry, profile_reset=False):
+def run_apps(binary, data, quick_close, legacy_entry, profile_reset=False, reset_restart=False):
     """Run isolated App flows, optionally restarting in the same desktop session."""
     previous_pid = None
-    for readback in ((False,) if profile_reset else (False, True)):
-        flags = ["--readback"] if readback else []
+    expected_connections = None
+    for generation in range(3 if reset_restart else (1 if profile_reset else 2)):
+        readback = generation == 1
+        after_reset = generation == 2
+        flags = ["--after-reset"] if after_reset else (["--readback"] if readback else [])
+        if reset_restart and readback:
+            flags.append("--reset-restart")
         if quick_close:
             flags.append("--quick-close")
         if legacy_entry:
             flags.append("--legacy-entry")
         if profile_reset:
             flags.append("--profile-reset")
-        log = data / ("readback.log" if readback else "first.log")
+        log = data / ("after-reset.log" if after_reset else ("readback.log" if readback else "first.log"))
         tracked = {}
         descriptions = {}
+        child_env = dict(os.environ)
+        child_env.pop("TAKOSUMI_FIXTURE_EXPECTED_CONNECTIONS", None)
+        if after_reset:
+            if expected_connections is None:
+                raise RuntimeError("Reset restart did not report exact connection preferences")
+            # An assertion expectation only. The App never restores preferences
+            # or native resume state from this environment value.
+            child_env["TAKOSUMI_FIXTURE_EXPECTED_CONNECTIONS"] = expected_connections
         with log.open("w") as output:
-            child = subprocess.Popen([str(binary), *flags], stdout=output, stderr=subprocess.STDOUT)
+            child = subprocess.Popen([str(binary), *flags], env=child_env, stdout=output, stderr=subprocess.STDOUT)
             assert child.pid != previous_pid, "App restart must use a new process"
             previous_pid = child.pid
             deadline = time.monotonic() + 75
@@ -241,8 +255,19 @@ def run_apps(binary, data, quick_close, legacy_entry, profile_reset=False):
         print(text, end="", flush=True)
         if child.returncode or "PASS: full App Web-home flow," not in text:
             raise RuntimeError(f"Full App fixture failed, status={child.returncode}")
-        if profile_reset and "PASS: completed profile reset through shared UI and real native IPC preserves other profiles" not in text:
+        if (profile_reset or (reset_restart and readback)) and "PASS: completed profile reset through shared UI and real native IPC preserves other profiles" not in text.splitlines():
             raise RuntimeError("Profile reset case did not report the required completed native UI assertions")
+        if after_reset and "PASS: post-reset App restart preserves deletion and other profiles" not in text.splitlines():
+            raise RuntimeError("Post-reset restart case did not report the required persisted data assertions")
+        if reset_restart and readback:
+            prefix = "FIXTURE: post-reset connection preferences "
+            records = [line.removeprefix(prefix) for line in text.splitlines() if line.startswith(prefix)]
+            try:
+                expected_connections = json.loads(records[0]) if len(records) == 1 else None
+            except json.JSONDecodeError:
+                expected_connections = None
+            if not isinstance(expected_connections, str):
+                raise RuntimeError("Reset restart did not report exact connection preferences")
         assert tracked, "Expected to observe native engine child processes"
         wait_engine_children(tracked, descriptions)
         print(f"PASS: App {child.pid} and {len(tracked)} observed engine children exited, readback={readback}", flush=True)
@@ -285,17 +310,20 @@ def main():
     parser.add_argument("--quick-close", action="store_true")
     parser.add_argument("--legacy-entry", action="store_true")
     parser.add_argument("--profile-reset", action="store_true")
+    parser.add_argument("--reset-restart", action="store_true")
     parser.add_argument("--session-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.profile_reset and (args.quick_close or args.legacy_entry):
         parser.error("profile reset requires its own fresh, single-process fixture")
+    if args.reset_restart and (args.quick_close or args.legacy_entry or args.profile_reset):
+        parser.error("reset restart requires its own three-process fixture")
     binary = args.binary.resolve(strict=True)
     data = args.data.absolute()
     if args.session_worker:
         if not data.is_dir() or not os.environ.get("DISPLAY"):
             parser.error("session worker requires the isolated outer runner")
         enable_child_subreaper()
-        run_apps(binary, data, args.quick_close, args.legacy_entry, args.profile_reset)
+        run_apps(binary, data, args.quick_close, args.legacy_entry, args.profile_reset, args.reset_restart)
         return
     if data.exists():
         parser.error("--data must be a new disposable directory")
@@ -337,6 +365,8 @@ def main():
                 flags.append("--legacy-entry")
             if args.profile_reset:
                 flags.append("--profile-reset")
+            if args.reset_restart:
+                flags.append("--reset-restart")
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "python3", str(Path(__file__).resolve()),
                 "--session-worker", "--binary", str(binary), "--data", str(data), *flags,
