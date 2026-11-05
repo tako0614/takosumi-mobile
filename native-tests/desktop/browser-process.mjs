@@ -56,12 +56,19 @@ function diagnosticEvents(events) {
 }
 // A finished guard's generation is gone by design: never snapshot it. Prefer
 // the failed stage's exact page; otherwise use a still-live owned client.
+// The guard creates its receipt when it starts and writes JSON only at its end.
+async function guardEnded(receipt) {
+  let text;
+  try{text=await readFile(receipt,'utf8');}catch(e){if(e.code==='ENOENT')return false;throw e;}
+  if(!text)return false;
+  try{JSON.parse(text);return true;}catch(e){if(e instanceof SyntaxError)return false;throw e;}
+}
 async function failureClient() {
   const live=[];
   for(const c of clients) {
     if(!c.binding)continue;
-    try{await readFile(c.binding.process.guardReceipt);}
-    catch(e){if(e.code==='ENOENT'){live.push(c);continue;}proof.snapshotTargetError=String(e);return undefined;}
+    try{if(!(await guardEnded(c.binding.process.guardReceipt)))live.push(c);}
+    catch(e){proof.snapshotTargetError=String(e);return undefined;}
   }
   proof.snapshotTarget={stage:proof.stage?.name,liveProfiles:live.map(c=>c.binding.process.profile)};
   return live.find(c=>c.binding.process.opened.nativePid===proof.stage?.pid)??live[0];
@@ -153,8 +160,7 @@ try {
   const idleStart=Date.now();
   await delay(12000);
   for(const process of opened.processes) {
-    const ended=await readFile(process.guardReceipt).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
-    assert(!ended,`Browser guard for ${process.profile} ended during the idle hold`);
+    assert(!(await guardEnded(process.guardReceipt)),`Browser guard for ${process.profile} ended during the idle hold`);
   }
   proof.idleHold={milliseconds:Date.now()-idleStart,guardsLive:opened.processes.length};
   const pages=[];
