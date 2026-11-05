@@ -391,7 +391,10 @@ async function firstLaunch() {
   await personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
   await writeFile(path.join(data,'request-partial-exit'),'ready',{flag:'wx'});
   await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Personal beforeunload did not open after Work closed');
-  proof.workClosedFirst=await normalReceipt(work.process.guardReceipt,'Work must have closed normally before Personal is asked');
+  // The App drops Work only after its normal receipt, before asking Personal:
+  // check once, at the moment Personal's dialog is open, without polling.
+  assert.equal(await guardEnded(work.process.guardReceipt),true,'Work must have closed before Personal is asked');
+  proof.workClosedFirst=await normalReceipt(work.process.guardReceipt,'Work must have closed normally');
   desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel Personal beforeunload');
