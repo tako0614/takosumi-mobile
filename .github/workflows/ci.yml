@@ -271,11 +271,17 @@ jobs:
         run: |
           cp src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
           cargo build --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-fixture --example desktop-profile-probe
+          cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop --lib --test capabilities
+          python3 -B native-tests/desktop/test_run.py
           python3 native-tests/desktop/run.py --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA"
           python3 native-tests/desktop/run.py --profile-reset --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-reset"
           python3 native-tests/desktop/run.py --spa-resume --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-spa"
           python3 native-tests/desktop/run.py --spa-resume --failed-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-failure"
+          python3 native-tests/desktop/run.py --spa-resume --failed-navigation --error-page-close --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-error-page"
+          python3 native-tests/desktop/run.py --spa-resume --failed-navigation --error-page-close --error-page-back --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-error-back"
+          python3 native-tests/desktop/run.py --spa-resume --failed-navigation --error-page-close --error-page-retry --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-error-retry"
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled"
+          python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --cancelled-spa --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled-spa"
           python3 native-tests/desktop/run.py --spa-resume --pending-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-pending"
       - name: Build bundled App and verify the fixture observer
         id: linux-app-fixture-build

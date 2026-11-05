@@ -3,10 +3,10 @@
 //! HTML assigned an https base URI. Never loads a real service or user profile.
 
 use super::*;
-use gtk::glib::prelude::ObjectExt;
+use gtk::glib::prelude::{Cast, ObjectExt};
 use javascriptcore::ValueExt;
 use std::{path::Path, time::Duration};
-use webkit2gtk::{WebContextExt, WebViewExt};
+use webkit2gtk::{ResponsePolicyDecision, ResponsePolicyDecisionExt, WebContextExt, WebViewExt};
 use wry::WebViewExtUnix;
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
@@ -64,7 +64,7 @@ pub fn run() {
             for &profile in profiles {
                 if spa && readback {
                     let payload = request(profile);
-                    let expected = format!("{}document/work?view=edit", payload.url);
+                    let expected = spa_saved_target();
                     let stored = ResumeStore::new(directory.join(profile), payload.key).recall()?;
                     assert_eq!(stored.as_deref(), Some(expected.as_str()),
                         "SPA readback must start with the saved successful route, before constructing a view");
@@ -151,6 +151,23 @@ fn request(profile: &str) -> OpenRequest {
     payload
 }
 
+fn recovery_target(path: &str) -> String {
+    let method = if std::env::args().any(|arg| arg == "--spa-replace") { "replace" } else { "push" };
+    format!("{}{path}?case={method}", request(WORK).url)
+}
+
+fn spa_saved_target() -> String {
+    if std::env::args().any(|arg| arg == "--cancelled-spa") {
+        recovery_target("slow")
+    } else if std::env::args().any(|arg| arg == "--error-page-back") {
+        format!("{}document/after-error?view=edit", request(WORK).url)
+    } else if std::env::args().any(|arg| arg == "--error-page-retry") {
+        recovery_target("retry")
+    } else {
+        format!("{}document/work?view=edit", request(WORK).url)
+    }
+}
+
 fn spa_probe(app: AppHandle, readback: bool) {
     let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
     let home = request(WORK).url;
@@ -160,7 +177,7 @@ fn spa_probe(app: AppHandle, readback: bool) {
     } else {
         "pushState"
     };
-    let expected = if readback { target.clone() } else { home };
+    let expected = if readback { spa_saved_target() } else { home };
     let probe = view.clone();
     after_document_load(
         &view,
@@ -169,7 +186,15 @@ fn spa_probe(app: AppHandle, readback: bool) {
         app.clone(),
         move || {
             if readback {
-                println!("PASS: new process restored native {method} route without a link click");
+                if std::env::args().any(|arg| arg == "--cancelled-spa") {
+                    println!("PASS: new process restored the legitimate SPA at a previously cancelled URL");
+                } else if std::env::args().any(|arg| arg == "--error-page-retry") {
+                    println!("PASS: new process restored the successfully retried URL");
+                } else if std::env::args().any(|arg| arg == "--error-page-back") {
+                    println!("PASS: new process restored the SPA route after native cached Back");
+                } else {
+                    println!("PASS: new process restored native {method} route without a link click");
+                }
                 EXIT_STATUS.store(0, Ordering::SeqCst);
                 app.exit(0);
                 return;
@@ -296,11 +321,15 @@ fn fail_after_spa(app: AppHandle, target: String) {
             return;
         }
         let cancel = std::env::args().any(|arg| arg == "--cancelled-navigation");
-        let failed_uri = format!(
+        let failed_uri = if std::env::args().any(|arg| arg == "--cancelled-spa") {
+            recovery_target("slow")
+        } else if std::env::args().any(|arg| arg == "--error-page-retry") {
+            recovery_target("retry")
+        } else { format!(
             "{}{}",
             request(WORK).url,
             if cancel { "slow" } else { "failed" }
-        );
+        ) };
         let expected = failed_uri.clone();
         let id = Rc::new(RefCell::new(None));
         let callback_id = id.clone();
@@ -324,7 +353,23 @@ fn fail_after_spa(app: AppHandle, target: String) {
                     }
                 );
                 let app = handle.clone();
-                gtk::glib::idle_add_local_once(move || close_spa(app));
+                if std::env::args().any(|arg| arg == "--cancelled-spa") {
+                    let weak = view.downgrade();
+                    gtk::glib::idle_add_local_once(move || {
+                        if let Some(view) = weak.upgrade() {
+                            if arm_synthetic_recovery(&app) {
+                                change_spa_and_close(app, &view, spa_saved_target(), "PASS: surviving document changed to the previously cancelled URL");
+                            }
+                        } else {
+                            eprintln!("FAIL: cancelled document disappeared before SPA recovery");
+                            app.exit(1);
+                        }
+                    });
+                } else if std::env::args().any(|arg| arg == "--error-page-close") {
+                    close_after_error_document(app, view, uri.to_owned());
+                } else {
+                    gtk::glib::idle_add_local_once(move || close_spa(app));
+                }
             }
             false
         });
@@ -347,6 +392,115 @@ fn fail_after_spa(app: AppHandle, target: String) {
             *id.borrow_mut() = Some(handler);
         }
         native.load_uri(&failed_uri);
+    });
+}
+
+fn close_after_error_document(app: AppHandle, view: &webkit2gtk::WebView, failed_uri: String) {
+    let committed = Rc::new(std::cell::Cell::new(false));
+    let done = Rc::new(std::cell::Cell::new(false));
+    let signal = Rc::new(RefCell::new(None));
+    let signal_id = signal.clone();
+    let completed = done.clone();
+    let handle = app.clone();
+    let id = view.connect_load_changed(move |view, event| {
+        if view.uri().as_deref() != Some(failed_uri.as_str()) {
+            return;
+        }
+        if matches!(event, webkit2gtk::LoadEvent::Committed) {
+            committed.set(true);
+        }
+        if matches!(event, webkit2gtk::LoadEvent::Finished) && committed.get()
+            && !completed.replace(true)
+        {
+            if let Some(id) = signal_id.borrow_mut().take() {
+                view.disconnect(id);
+            }
+            println!("PASS: stock error document committed and finished before native Close");
+            let app = handle.clone();
+            let target = failed_uri.clone();
+            let weak = view.downgrade();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(view) = weak.upgrade() {
+                    after_error_document(app, &view, target);
+                } else {
+                    eprintln!("FAIL: error document disappeared before recovery/Close");
+                    app.exit(1);
+                }
+            });
+        }
+    });
+    *signal.borrow_mut() = Some(id);
+    gtk::glib::timeout_add_local_once(Duration::from_secs(5), move || {
+        if !done.get() {
+            eprintln!("FAIL: stock error document did not finish before Close control");
+            app.exit(1);
+        }
+    });
+}
+
+fn after_error_document(app: AppHandle, view: &webkit2gtk::WebView, failed_uri: String) {
+    if std::env::args().any(|arg| arg == "--error-page-retry") {
+        if !arm_synthetic_recovery(&app) {
+            return;
+        }
+        let complete = app.clone();
+        after_document_load(view, failed_uri, "bootstrap".into(), app, move || {
+            println!("PASS: native Reload completed at the previously failed URL");
+            close_spa(complete);
+        });
+        view.reload();
+    } else if std::env::args().any(|arg| arg == "--error-page-back") {
+        let responses = Rc::new(std::cell::Cell::new(0u32));
+        let observed = responses.clone();
+        let policy = view.connect_decide_policy(move |_, decision, _| {
+            if decision.downcast_ref::<ResponsePolicyDecision>().is_some_and(|response| response.is_main_frame_main_resource()) {
+                observed.set(observed.get() + 1);
+            }
+            false
+        });
+        let probe = view.clone();
+        let expected = format!("{}document/work?view=edit", request(WORK).url);
+        let handle = app.clone();
+        after_document_load(view, expected, "bootstrap".into(), handle, move || {
+            probe.disconnect(policy);
+            if responses.get() != 0 {
+                eprintln!("FAIL: Back requested a new main response instead of exercising the cached document");
+                app.exit(1);
+                return;
+            }
+            println!("PASS: native Back restored a cached document before a later SPA change");
+            change_spa_and_close(app, &probe, spa_saved_target(), "PASS: cached Back accepts the next same-document route");
+        });
+        view.go_back();
+    } else {
+        close_spa(app);
+    }
+}
+
+fn arm_synthetic_recovery(app: &AppHandle) -> bool {
+    // Arm only the owned synthetic server; never write resume metadata.
+    let gate = PathBuf::from(std::env::var_os("TAKOSUMI_FIXTURE_DATA").unwrap()).join("native-recovery-ready");
+    if let Err(error) = std::fs::write(gate, "ready") {
+        eprintln!("FAIL: could not arm the synthetic network recovery: {error}");
+        app.exit(1);
+        false
+    } else {
+        true
+    }
+}
+
+fn change_spa_and_close(app: AppHandle, view: &webkit2gtk::WebView, target: String, marker: &'static str) {
+    let url = serde_json::to_string(&target).unwrap();
+    let script = format!("(() => {{ if (document.querySelector('meta[name=sumi-fixture]')?.content !== 'bootstrap') return false; history.replaceState(null, '', {url}); return location.href === {url}; }})()");
+    view.evaluate_javascript(&script, None, None, None::<&gtk::gio::Cancellable>, move |result| {
+        if !result.is_ok_and(|value| value.to_boolean()) {
+            eprintln!("FAIL: surviving document could not change its same-document route");
+            app.exit(1);
+            return;
+        }
+        println!("{marker}");
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || close_spa(handle));
     });
 }
 
