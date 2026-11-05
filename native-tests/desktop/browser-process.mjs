@@ -157,6 +157,18 @@ try {
   }
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
+  // A guard forked on a retiring blocking-pool thread ended ~10 s after the
+  // last App command (ph13). Send no App command past that keep-alive, then
+  // require both native guards to be live and both exact documents retained.
+  step('idle past blocking keep-alive');
+  const idleStart=Date.now();
+  await delay(12000);
+  for(const page of pages) {
+    const ended=await readFile(page.process.guardReceipt).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
+    assert(!ended,`Browser guard for ${page.process.profile} ended during the idle hold`);
+  }
+  assert.deepEqual(await Promise.all(pages.map(sample)),expected,'Idle hold must retain both exact documents');
+  proof.idleHold={milliseconds:Date.now()-idleStart,guardsLive:pages.length};
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
   step('common UI resume');
   proof.resumed=await marker('app-browser-process.json');
