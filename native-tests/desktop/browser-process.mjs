@@ -323,42 +323,28 @@ async function firstLaunch() {
   const unloadStart=work.c.events.length;
   step('Work beforeunload setup',work);
   await work.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
+  // Sequential App quit (owner's decision): profiles close oldest first, so
+  // Work closes first; cancelling its native beforeunload stops the quit and
+  // Personal is never asked to close.
+  const personalStart=personal.c.events.length;
   await writeFile(path.join(data,'request-exit'),'ready',{flag:'wx'});
-  step('multi-profile quit refusal');
-  proof.blocked=await marker('app-browser-process-blocked.json');
-  assert.equal(proof.blocked.length,2);assert.deepEqual(await Promise.all(pages.map(sample)),expected,'Refused multi-profile quit must preserve every document');
-  assert(!work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'),'Multi-profile refusal must occur before any close/dialog');
-  // Close Personal using the existing Chrome window shortcut, then require
-  // native guard completion before asking App to close the sole Work window.
-  step('Personal native close',personal);
-  // Resume raised Work over Personal; a user clicks Personal to the front first.
-  desktop('xdotool',['windowraise',String(personal.native.windowId)]);
-  await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
-  desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
-  desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
-  // Require the exact parent-attested guard receipt, not target IDs from a
-  // different process or a process-name search.
-  await settled(async()=>{
-    let receipt;try {receipt=JSON.parse(await readFile(personal.process.guardReceipt,'utf8'));}
-    catch(e){if(e.code==='ENOENT'||e instanceof SyntaxError)return false;throw e;}
-    assert.equal(receipt.rootExit,0);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
-    assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
-    proof.personalClosed=receipt;return true;
-  },'Personal guard did not finish');
-  step('Work native beforeunload',work);
-  await writeFile(path.join(data,'request-single-exit'),'ready',{flag:'wx'});
+  step('Work native beforeunload on sequential quit',work);
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Native beforeunload dialog did not open');
   proof.dialog=work.c.events.slice(unloadStart).find(e=>e.method==='Page.javascriptDialogOpening');
   assert.equal(new URL(proof.dialog.params.url).origin,origin);
+  assert(!personal.c.events.slice(personalStart).some(e=>e.method.startsWith('Page.javascriptDialog')),'Personal must not be asked to close before Work agrees');
+  assert.equal(await guardEnded(personal.process.guardReceipt),false,'Personal must still be running during Work\'s dialog');
   desktop('import',['-window','root',path.join(data,'beforeunload.png')]);
   desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel beforeunload');
-  assert.deepEqual(await sample(work),expected[0],'Cancelled native close must retain the actual Work document');
-  step('Work close cancelled',work);
+  assert.deepEqual(await Promise.all(pages.map(sample)),expected,'A cancelled sequential quit must keep every document');
+  step('sequential quit stopped at the cancel',work);
   await writeFile(path.join(data,'cancel-inspected'),'ready',{flag:'wx'});
+  proof.blocked=await marker('app-browser-process-blocked.json');
+  assert.equal(proof.blocked.length,2,'Both profiles must remain after the cancelled quit');
   proof.cancelled=await marker('app-browser-process-cancelled.json');
-  assert.deepEqual(await sample(work),expected[0]);
+  assert.deepEqual(await Promise.all(pages.map(sample)),expected);
   // The native Page observer is now enabled by the first real close attempt.
   // Exercise its handling of remote-controlled long dialog text while active.
   // A page may replace window.alert (Photopea binds an in-page toast), which

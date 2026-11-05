@@ -370,23 +370,28 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .map_err(|error| error.to_string())?;
     checkpoint(&case, "request-exit").await?;
-    // Multiple profiles must be refused before any destructive close.
+    // Sequential quit, oldest first: Work closes first, the observer cancels
+    // its native beforeunload, and the quit stops with both profiles open.
     app.exit(0);
-    let blocked = exit_cancelled(app, 0).await?;
-    if blocked.as_array().unwrap().len() != 2 {
-        return Err("Multi-profile exit destroyed a profile".into());
+    checkpoint(&case, "cancel-inspected").await?;
+    let stopped = exit_cancelled(app, 0).await?;
+    let kept = stopped.as_array().ok_or("Missing process array")?;
+    let unchanged = kept.len() == 2
+        && kept.iter().all(|process| {
+            process["uncertain"] == false
+                && before.as_array().unwrap().iter().any(|original| {
+                    original["profile"] == process["profile"]
+                        && original["opened"] == process["opened"]
+                })
+        });
+    if !unchanged {
+        return Err("A cancelled sequential quit must keep both original browsers".into());
     }
     std::fs::write(
         case.join("app-browser-process-blocked.json"),
-        serde_json::to_vec_pretty(&blocked).unwrap(),
+        serde_json::to_vec_pretty(&stopped).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    checkpoint(&case, "request-single-exit").await?;
-    // The observer has closed Personal through its actual native UI. Test
-    // ordinary App exit against Work's real beforeunload dialog now.
-    app.exit(0);
-    checkpoint(&case, "cancel-inspected").await?;
-    exit_cancelled(app, 1).await?;
     resume_work(&view).await?;
     let retained = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
@@ -410,6 +415,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
         b"{\"passed\":true}\n",
     )
     .map_err(|error| error.to_string())?;
-    println!("PASS actual App shell-to-browser creation/reuse and native close cancellation; normal exit still requires outer receipt");
+    // Returning lets the ordinary exit close Work and then Personal.
+    println!("PASS actual App shell-to-browser creation/reuse and sequential quit cancellation; normal exit still requires outer receipt");
     Ok(())
 }
