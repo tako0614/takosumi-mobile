@@ -65,9 +65,13 @@ site download, reuse the browser foundation's download lifecycle, and verify
 destination selection, cancellation, failure and file contents. Broadly
 allowing every Blob navigation is not an accepted fix. Engine selection,
 regular login/popup return, site permissions and Web Push delivery remain open.
-An existing Chrome 149 reference exposed PushManager and file-system picker
-APIs and separated two isolated contexts. Its file-operation automation and
-editor readiness were incomplete, so it supplies no export or push success.
+The initial Chrome 149 comparison exposed PushManager and file-system picker
+APIs and separated two isolated contexts; that initial operation was incomplete.
+The later [standalone CEF candidate](cef-candidate/README.md) is a separate
+existing-browser-foundation experiment. Its Photopea component verifies actual
+PNG bytes and normal shutdown with explicit headless/CDP download settings.
+It does not repair the GTK App's failed export or qualify default Save UI,
+regular login, site permissions or Web Push delivery.
 
 ## Whole App iOS Simulator SDK build
 
