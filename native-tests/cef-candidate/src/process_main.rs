@@ -177,98 +177,179 @@ fn observation_result(browser: &Browser, success: bool) {
 }
 /// Bring a reused X11 browser window to the front when the home returns to it.
 /// Raises it directly (works without a window manager) and asks an EWMH window
-/// manager to activate it as a task switcher would. libX11 is loaded at run
-/// time so the candidate gains no link-time or crate dependency.
+/// manager to activate it as a task switcher would. Uses XCB checked requests,
+/// so a stale window yields an error value instead of reaching a process-wide
+/// Xlib error handler that could exit the browser. libxcb is loaded at run
+/// time (libcef already links it); the candidate gains no crate dependency.
 mod x11_front {
-    use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+    use std::ffi::{c_char, c_int, c_uint, c_void};
     extern "C" {
         fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn free(pointer: *mut c_void);
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct ClientMessage {
-        kind: c_int,
-        serial: c_ulong,
-        send_event: c_int,
-        display: *mut c_void,
-        window: c_ulong,
-        message_type: c_ulong,
-        format: c_int,
-        data: [c_long; 5],
+    struct Cookie {
+        sequence: c_uint,
     }
     #[repr(C)]
-    union Event {
-        client: ClientMessage,
-        pad: [c_long; 24],
+    struct ScreenIterator {
+        data: *const u32, // xcb_screen_t starts with its root window id.
+        rem: c_int,
+        index: c_int,
+    }
+    #[repr(C)]
+    struct AtomReply {
+        response_type: u8,
+        pad: u8,
+        sequence: u16,
+        length: u32,
+        atom: u32,
+    }
+    #[repr(C)]
+    struct ClientMessage {
+        response_type: u8,
+        format: u8,
+        sequence: u16,
+        window: u32,
+        message_type: u32,
+        data: [u32; 5],
     }
     const RTLD_NOW: c_int = 2;
-    const CLIENT_MESSAGE: c_int = 33;
-    const SUBSTRUCTURE_NOTIFY_AND_REDIRECT: c_long = (1 << 19) | (1 << 20);
-    const SOURCE_PAGER: c_long = 2;
+    const CLIENT_MESSAGE: u8 = 33;
+    const SUBSTRUCTURE_NOTIFY_AND_REDIRECT: u32 = (1 << 19) | (1 << 20);
+    const CONFIG_STACK_MODE: u16 = 64;
+    const STACK_ABOVE: u32 = 0;
+    const SOURCE_PAGER: u32 = 2;
 
-    pub fn raise(window: c_ulong) -> Result<(), &'static str> {
+    pub fn raise(window: u64) -> Result<(), &'static str> {
+        let window = u32::try_from(window).map_err(|_| "invalid X window id")?;
         if window == 0 {
             return Err("no native window");
         }
-        // SAFETY: symbols are resolved from the system libX11 with their
-        // documented C signatures; the display is opened and closed here only.
+        // SAFETY: symbols come from the system libxcb with their documented C
+        // signatures. The connection is private to this call; replies and
+        // errors it returns are freed here.
         unsafe {
-            let lib = dlopen(c"libX11.so.6".as_ptr(), RTLD_NOW);
+            let lib = dlopen(c"libxcb.so.1".as_ptr(), RTLD_NOW);
             if lib.is_null() {
-                return Err("libX11 unavailable");
+                return Err("libxcb unavailable");
             }
             macro_rules! symbol {
                 ($name:expr) => {{
                     let found = dlsym(lib, $name.as_ptr());
                     if found.is_null() {
-                        return Err("libX11 symbol unavailable");
+                        return Err("libxcb symbol unavailable");
                     }
                     std::mem::transmute(found)
                 }};
             }
-            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void = symbol!(c"XOpenDisplay");
-            let root: unsafe extern "C" fn(*mut c_void) -> c_ulong = symbol!(c"XDefaultRootWindow");
-            let atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong =
-                symbol!(c"XInternAtom");
-            let send: unsafe extern "C" fn(
+            let connect: unsafe extern "C" fn(*const c_char, *mut c_int) -> *mut c_void =
+                symbol!(c"xcb_connect");
+            let has_error: unsafe extern "C" fn(*mut c_void) -> c_int =
+                symbol!(c"xcb_connection_has_error");
+            let disconnect: unsafe extern "C" fn(*mut c_void) = symbol!(c"xcb_disconnect");
+            let setup: unsafe extern "C" fn(*mut c_void) -> *const c_void =
+                symbol!(c"xcb_get_setup");
+            let roots: unsafe extern "C" fn(*const c_void) -> ScreenIterator =
+                symbol!(c"xcb_setup_roots_iterator");
+            let intern: unsafe extern "C" fn(*mut c_void, u8, u16, *const c_char) -> Cookie =
+                symbol!(c"xcb_intern_atom");
+            let intern_reply: unsafe extern "C" fn(
                 *mut c_void,
-                c_ulong,
-                c_int,
-                c_long,
-                *mut Event,
-            ) -> c_int = symbol!(c"XSendEvent");
-            let raise_window: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int =
-                symbol!(c"XRaiseWindow");
-            let flush: unsafe extern "C" fn(*mut c_void) -> c_int = symbol!(c"XFlush");
-            let close: unsafe extern "C" fn(*mut c_void) -> c_int = symbol!(c"XCloseDisplay");
-            let display = open(std::ptr::null());
-            if display.is_null() {
+                Cookie,
+                *mut *mut c_void,
+            ) -> *mut AtomReply = symbol!(c"xcb_intern_atom_reply");
+            let send: unsafe extern "C" fn(*mut c_void, u8, u32, u32, *const c_char) -> Cookie =
+                symbol!(c"xcb_send_event_checked");
+            let configure: unsafe extern "C" fn(*mut c_void, u32, u16, *const u32) -> Cookie =
+                symbol!(c"xcb_configure_window_checked");
+            let check: unsafe extern "C" fn(*mut c_void, Cookie) -> *mut c_void =
+                symbol!(c"xcb_request_check");
+            let connection = connect(std::ptr::null(), std::ptr::null_mut());
+            if connection.is_null() || has_error(connection) != 0 {
+                if !connection.is_null() {
+                    disconnect(connection);
+                }
                 return Err("X display unavailable");
             }
-            let mut event = Event { pad: [0; 24] };
-            event.client = ClientMessage {
-                kind: CLIENT_MESSAGE,
-                serial: 0,
-                send_event: 1,
-                display,
-                window,
-                message_type: atom(display, c"_NET_ACTIVE_WINDOW".as_ptr(), 0),
+            let finish = |result| {
+                disconnect(connection);
+                result
+            };
+            let screen = roots(setup(connection));
+            if screen.data.is_null() || screen.rem < 1 {
+                return finish(Err("no X screen"));
+            }
+            let root = *screen.data;
+            let name = c"_NET_ACTIVE_WINDOW";
+            let mut error = std::ptr::null_mut();
+            let reply = intern_reply(
+                connection,
+                intern(connection, 0, name.to_bytes().len() as u16, name.as_ptr()),
+                &mut error,
+            );
+            if !error.is_null() {
+                free(error);
+            }
+            if reply.is_null() {
+                return finish(Err("EWMH atom unavailable"));
+            }
+            let active = (*reply).atom;
+            free(reply.cast());
+            let event = ClientMessage {
+                response_type: CLIENT_MESSAGE,
                 format: 32,
+                sequence: 0,
+                window,
+                message_type: active,
                 data: [SOURCE_PAGER, 0, 0, 0, 0],
             };
-            send(
-                display,
-                root(display),
-                0,
-                SUBSTRUCTURE_NOTIFY_AND_REDIRECT,
-                &mut event,
+            let sent = check(
+                connection,
+                send(
+                    connection,
+                    0,
+                    root,
+                    SUBSTRUCTURE_NOTIFY_AND_REDIRECT,
+                    (&event as *const ClientMessage).cast(),
+                ),
             );
-            raise_window(display, window);
-            flush(display);
-            close(display);
+            let raised = check(
+                connection,
+                configure(connection, window, CONFIG_STACK_MODE, &STACK_ABOVE),
+            );
+            let failed = !sent.is_null() || !raised.is_null();
+            for problem in [sent, raised] {
+                if !problem.is_null() {
+                    free(problem);
+                }
+            }
+            finish(if failed {
+                Err("X window activation or raise was rejected")
+            } else {
+                Ok(())
+            })
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        #[ignore = "needs an X display; run under xvfb-run with --ignored"]
+        fn a_stale_window_is_an_error_value_not_a_process_exit() {
+            assert!(
+                std::env::var_os("DISPLAY").is_some(),
+                "run under an X display"
+            );
+            assert_eq!(super::raise(0), Err("no native window"));
+            // An id no client owns: the checked raise must report, not exit.
+            assert_eq!(
+                super::raise(0x3ff_fff0),
+                Err("X window activation or raise was rejected")
+            );
+        }
     }
 }
 
@@ -403,7 +484,7 @@ fn open(id: u64, payload: OpenRequest) {
         host.set_focus(1);
         // set_focus only moves keyboard focus inside the browser. A window
         // covered by another profile stays hidden unless it is raised.
-        if let Err(problem) = x11_front::raise(host.window_handle() as std::ffi::c_ulong) {
+        if let Err(problem) = x11_front::raise(host.window_handle() as u64) {
             eprintln!("Reused browser window was not raised: {problem}");
         }
         opened(id, payload.key, &browser);
