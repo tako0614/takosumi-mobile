@@ -382,7 +382,8 @@ mod platform {
             target
                 .ClearBrowsingDataAll(&ClearBrowsingDataCompletedHandler::create(Box::new(
                     move |result| {
-                        completed(result.ok().map_err(failure));
+                        // The callback wrapper already converts HRESULT to Result.
+                        completed(result.map_err(failure));
                         Ok(())
                     },
                 )))
