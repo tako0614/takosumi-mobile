@@ -12,6 +12,73 @@ import java.io.File
  * with, so Kotlin and TypeScript decide the same way.
  */
 class AppScreenRulesTest {
+    @Test
+    fun aCurrentVisibleRedirectCanReturnToAnOlderSuccessfulUrl() {
+        val state = AppScreenResumeTracker()
+        val home = "https://sumi.example/"
+        state.started(home)
+        state.committed(home)
+        state.finished(home)
+        state.started("https://accounts.example/sign-in")
+        // Native commit/finish both match WebView.url, without another start.
+        state.committed(home)
+        state.finished(home)
+        assertTrue(state.canRemember(home))
+        assertTrue(state.canRemember("https://sumi.example/apps?view=grid"))
+    }
+
+    @Test
+    fun actualCallbackUrlsBindErrorsToTheirStartedGeneration() {
+        val state = AppScreenResumeTracker()
+        val home = "https://sumi.example/"
+        val a = "https://a.example/"
+        val b = "https://b.example/"
+        state.started(home)
+        state.committed(home)
+        state.finished(home)
+        assertTrue(state.canRemember(home))
+        state.started(a)
+        state.started(b)
+        state.failed(a) // An old callback carries no native ID.
+        assertFalse(state.canRemember(b))
+        state.failed(b)
+        state.finished(b)
+        state.committed(a)
+        assertFalse(state.canRemember(b))
+        assertTrue(state.canRemember("https://sumi.example/document/1"))
+        state.started(b)
+        state.failed("https://unknown-redirect.example/")
+        state.finished(b)
+        assertFalse(state.canRemember(b))
+        state.started(home)
+        state.committed(home)
+        state.finished(home)
+        assertTrue(state.canRemember(home))
+    }
+
+    @Test
+    fun nativeNavigationOutcomesMatchTheSharedTransitions() {
+        var state = AppScreenResumeState()
+        var observations = 0
+        for (line in fixture("resume-navigation-cases.json").lines()) {
+            val event = field(line, "event") ?: continue
+            val id = Regex("\"id\": ([0-9]+)").find(line)?.groupValues?.get(1)?.toLong() ?: 0L
+            when (event) {
+                "reset" -> state = AppScreenResumeState()
+                "begin" -> state.begin(id)
+                "commit" -> state.commit(id)
+                "finish" -> state.finish(id, line.contains("\"success\": true"), field(line, "url"))
+                "observe" -> {
+                    observations++
+                    val url = field(line, "url")!!
+                    assertEquals(line, line.contains("\"remember\": true"), state.canRemember(url))
+                }
+                else -> error("Unknown shared navigation event: $event")
+            }
+        }
+        assertEquals(15, observations)
+    }
+
     private fun fixture(name: String): String {
         val candidates = listOf(File("../$name"), File(name), File("../../$name"))
         return candidates.first { it.isFile }.readText()
@@ -33,6 +100,18 @@ class AppScreenRulesTest {
         assertFalse(
             AppScreenRules.isRememberable("https://app.example/" + "a".repeat(4_096), "https://app.example"),
         )
+    }
+
+    @Test
+    fun webHomeResumeCasesMatchTheSharedTable() {
+        val lines = fixture("web-home-resume-cases.json").lines().filter { it.contains("\"remember\"") }
+        assertTrue(lines.size >= 20)
+        for (line in lines) {
+            val url = field(line, "url")!!
+            assertEquals(url, line.contains("\"remember\": true"),
+                AppScreenRules.isRememberable(url, "https://sumi.example", webHome = true))
+        }
+        assertFalse(AppScreenRules.isRememberable("https://office.example/document/1", "https://sumi.example"))
     }
 
     @Test

@@ -17,7 +17,9 @@ use tauri::{
 };
 use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
+use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+mod resume_navigation;
 
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 #[path = "../tests/desktop/fixture.rs"]
@@ -30,6 +32,8 @@ static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
 const MAX_WINDOWS: usize = 48;
 
 struct Screen {
+    // Unsubscribe while the native view and its original delegates are alive.
+    resume_observer: Option<resume_navigation::Observer>,
     // Drop the view before its context. Contexts are also retained for reuse.
     view: WebView,
     _native_handlers: NativeHandlers,
@@ -48,10 +52,14 @@ thread_local! {
 pub fn init() -> TauriPlugin<tauri::Wry> {
     Builder::new("app-screen")
         .invoke_handler(tauri::generate_handler![capabilities, open])
-        .on_event(|_, event| {
+        .on_event(|_app, event| {
+            #[cfg(target_os = "linux")]
+            if matches!(event, tauri::RunEvent::Ready) {
+                install_shell_message_cleanup(_app);
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 // Raw views do not belong to Tauri's managed-view registry.
-                // Release them explicitly while the UI runtime still exists.
+                // Clear remaining owned resources as a terminal fallback.
                 SCREENS.with(|screens| screens.borrow_mut().clear());
                 CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
             }
@@ -135,15 +143,19 @@ fn open_on_ui_thread(app: &AppHandle, payload: OpenRequest, directory: PathBuf) 
         contexts
             .borrow_mut()
             .entry(context_path.clone())
-            .or_insert_with(|| Rc::new(RefCell::new(WebContext::new(Some(context_path)))))
+            .or_insert_with(|| Rc::new(RefCell::new(WebContext::new(Some(context_path.clone())))))
             .clone()
     });
+    let resume = payload
+        .resume
+        .then(|| ResumeStore::new(context_path, payload.key.clone()));
     create_screen(
         app,
         payload.key,
         payload.profile,
         payload.url,
         context,
+        resume,
         None,
     )?;
     Ok(())
@@ -155,9 +167,20 @@ fn create_screen(
     profile: String,
     home: String,
     context: Rc<RefCell<WebContext>>,
+    resume: Option<ResumeStore>,
     popup: Option<NewWindowFeatures>,
 ) -> Result<NewWindowResponse> {
     let is_popup = popup.is_some();
+    let start = resume
+        .as_ref()
+        .and_then(|store| match store.recall() {
+            Ok(url) => url,
+            Err(error) => {
+                eprintln!("Takosumi last page could not be read: {error}");
+                None
+            }
+        })
+        .unwrap_or_else(|| home.clone());
     if SCREENS.with(|screens| screens.borrow().len()) >= MAX_WINDOWS {
         return Err(Error::InvalidRequest(
             "Close a Takosumi window before opening another.",
@@ -225,6 +248,7 @@ fn create_screen(
                     popup_profile.clone(),
                     popup_home.clone(),
                     popup_context.clone(),
+                    None,
                     Some(features),
                 ) {
                     Ok(response) => response,
@@ -275,9 +299,12 @@ fn create_screen(
             .build_as_child(&window)
             .map_err(failure)?;
         disable_messaging(&view)?;
+        let resume_observer = resume
+            .map(|store| resume_navigation::Observer::new(&label, &view, store))
+            .transpose()?;
         let native_handlers = native_close_handler(&view, &window)?;
         if !is_popup {
-            view.load_url(&home).map_err(failure)?;
+            view.load_url(&start).map_err(failure)?;
         }
         #[cfg(target_os = "linux")]
         let response = {
@@ -305,6 +332,7 @@ fn create_screen(
             screens.borrow_mut().insert(
                 label.clone(),
                 Screen {
+                    resume_observer,
                     view,
                     _native_handlers: native_handlers,
                     _context: context,
@@ -332,6 +360,9 @@ fn create_screen(
         let event_app = app.clone();
         let event_label = label.clone();
         window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                snapshot_resume(&event_label);
+            }
             #[cfg(feature = "desktop-fixture")]
             eprintln!("fixture native-window event {event_label}: {event:?}");
             if matches!(event, WindowEvent::Destroyed) {
@@ -402,6 +433,18 @@ fn handle_action(app: &AppHandle, label: &str, action: &str) {
     }
 }
 
+fn snapshot_resume(label: &str) {
+    SCREENS.with(|screens| {
+        if let Some(observer) = screens
+            .borrow()
+            .get(label)
+            .and_then(|screen| screen.resume_observer.as_ref())
+        {
+            observer.snapshot();
+        }
+    });
+}
+
 fn site_title(url: &str) -> String {
     tauri::Url::parse(url)
         .map(|url| format!("{} — Takosumi", url.origin().ascii_serialization()))
@@ -421,6 +464,7 @@ fn disable_messaging(view: &WebView) -> Result<()> {
             ))?;
         manager.remove_all_scripts();
         manager.unregister_script_message_handler("ipc");
+        disconnect_gtk_messages(&manager)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -447,6 +491,63 @@ fn disable_messaging(view: &WebView) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn disconnect_gtk_messages(manager: &webkit2gtk::UserContentManager) -> Result<()> {
+    use gtk::glib::{
+        gobject_ffi,
+        prelude::{ObjectExt, ObjectType},
+        subclass::SignalId,
+        translate::IntoGlib,
+    };
+    let signal = SignalId::lookup("script-message-received", manager.type_()).ok_or(
+        Error::InvalidRequest("The Web message signal is unavailable."),
+    )?;
+    // Unregistering a JS channel leaves Wry's native signal closure alive.
+    // It captures the view even with no IPC handler, forming a manager/view
+    // cycle that retains this profile's context after ordinary Close.
+    // SAFETY: the caller owns a live manager on its UI thread. Raw managers
+    // have no IPC; the trusted shell calls this only on native destruction.
+    unsafe {
+        gobject_ffi::g_signal_handlers_disconnect_matched(
+            manager.as_ptr().cast(),
+            gobject_ffi::G_SIGNAL_MATCH_ID,
+            signal.into_glib(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_shell_message_cleanup(app: &AppHandle) {
+    use gtk::prelude::*;
+    use webkit2gtk::{UserContentManagerExt, WebViewExt};
+    let Some(main) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Err(error) = main.with_webview(|platform| {
+        let native = platform.inner();
+        if let Some(manager) = native.user_content_manager() {
+            let manager = manager.downgrade();
+            native.connect_destroy(move |_| {
+                // Actual destruction, never a close request that can be vetoed.
+                // A weak capture does not add a manager/view ownership cycle.
+                if let Some(manager) = manager.upgrade() {
+                    manager.unregister_script_message_handler("ipc");
+                    if let Err(error) = disconnect_gtk_messages(&manager) {
+                        eprintln!("Takosumi closed-view messaging cleanup failed: {error}");
+                    }
+                }
+            });
+        }
+    }) {
+        eprintln!("Takosumi shell cleanup could not be installed: {error}");
+    }
 }
 
 struct NativeHandlers {

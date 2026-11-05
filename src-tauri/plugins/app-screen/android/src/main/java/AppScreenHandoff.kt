@@ -130,7 +130,7 @@ internal object AppScreenResume {
     fun record(context: Context, request: ScreenRequest, url: String) {
         val scope = request.scope ?: return
         val appOrigin = request.appOrigin ?: return
-        if (request.popup || !AppScreenRules.isRememberable(url, appOrigin)) return
+        if (request.popup || !AppScreenRules.isRememberable(url, appOrigin, request.webHome)) return
         try {
             val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             val id = id(scope, request.key)
@@ -160,7 +160,7 @@ internal object AppScreenResume {
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
                 .getString(id(scope, request.key), null)
                 ?.let { JSONObject(it).optString("url") }
-                ?.takeIf { AppScreenRules.isRememberable(it, appOrigin) }
+                ?.takeIf { AppScreenRules.isRememberable(it, appOrigin, request.webHome) }
         } catch (_: Exception) {
             null
         }

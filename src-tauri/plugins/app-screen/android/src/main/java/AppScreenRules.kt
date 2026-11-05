@@ -172,12 +172,18 @@ internal object AppScreenRules {
     /**
      * A page the screen may reopen at: https on the app's own origin, no user
      * info, no fragment, no credential-named query parameter with a value.
+     * Web-home mode also accepts other app origins within this profile,
+     * excluding the known temporary authorization/sign-in paths.
      */
-    fun isRememberable(rawUrl: String, appOrigin: String): Boolean {
+    fun isRememberable(rawUrl: String, appOrigin: String, webHome: Boolean = false): Boolean {
         if (rawUrl.length > RESUME_URL_MAX_LENGTH || rawUrl.contains('#')) return false
         if (!rawUrl.startsWith("https://", ignoreCase = true)) return false
         val origin = originOf(rawUrl) ?: return false
-        if (origin != appOrigin || isShellHost(hostOf(origin))) return false
+        if ((!webHome && origin != appOrigin) || isShellHost(hostOf(origin))) return false
+        if (webHome) {
+            val path = runCatching { java.net.URI(rawUrl).rawPath }.getOrNull() ?: return false
+            if (path in ACCOUNTS_SIGN_IN_PATHS) return false
+        }
         if (rawUrl.any { it.isWhitespace() }) return false
         val query = rawUrl.substringAfter('?', "")
         if (query.isEmpty()) return true

@@ -77,6 +77,35 @@ settled writes after orderly teardown, not last-write durability or crash recove
 This qualifies the GTK adapter's synthetic behavior; it is not Windows/macOS,
 real IdP, file operations or distribution evidence.
 
+Add `--spa-resume` with a fresh data directory to test `pushState` and
+`replaceState`, immediate ordinary native Close, then an exact-route restore in
+a new process without clicking an app link. `--failed-navigation` and
+`--cancelled-navigation` each add a real native failure/cancellation before
+Close; the next process must still restore the earlier successful SPA route.
+`--pending-navigation` requires the exact next URI to remain loading at native
+CloseRequested with no intervening failure/completion, then requires the same
+saved SPA route on readback. The GTK adapter observes URI and native history
+notifications synchronously, accepting a stable route only when both agree.
+This covers replaceState when no history-list signal arrives. Active/requested
+URI settlement and unqualified Close snapshots after a failure cannot overwrite
+the last successful route. Later qualified history changes remain eligible,
+including the URL of an earlier failed load, with the same credential filters.
+These cases use production profile metadata, not a fixture-side saved URL.
+GLib criticals fail the runner, including during teardown. Deferred URL snapshots
+use weak view references so queued work does not keep a closed view alive.
+The SPA close case also releases the raw profile cache while the UI loop is
+alive and requires the native context's weak reference to clear within the same
+five-second close bound. This detects the view/manager message-signal cycle
+without relying on process exit. Context disposal and helper-process shutdown
+remain separate checks. DOM probes start only after the native target URI has
+settled; cookie/storage assertions still run once after the document nonce matches.
+SPA readback asserts the saved successful route once before constructing its
+view, then lets the production factory's initial navigation finish. It trusts
+the disposable certificate on that context without reloading or loading the
+expected route from the fixture. A native readiness timeout prints the actual
+URI/loading state as well as the expected document; the five-second bound is
+unchanged. This distinguishes saved-route failure from startup loading failure.
+
 ## Full Linux App Web-home flow
 
 This explicitly enabled fixture builds the entire App with its normal plugins
@@ -95,12 +124,25 @@ certificate settings are used. It drives connection input, mock Web login
 (POST and HttpOnly cookie), home, a cross-site editor, native Home/Back/picker,
 resume into the same focused native window, two isolated profiles, and native
 Close. A new App process must restore both saved connections, both mock sessions
-and each profile's editor storage. The two App processes share one disposable
+and each profile's editor storage. Cold opens must land directly in each
+profile's cross-site editor without clicking its home-page link. A synthetic
+credential callback before ordinary Close must never replace the safe start page.
+The two App processes share one disposable
 Xvfb/D-Bus desktop session. The runner observes App descendants and requires the
 first App and its observed engine children to exit before starting a new App
 PID; it does not destroy the desktop session during App teardown. DOM readiness
 may be polled; data assertions run once. The actual views expose no native IPC.
 Failure/timeout or a lingering engine process exits nonzero.
+The dedicated Linux session worker adopts orphaned App children and records
+their exit status. An adopted NetworkProcess error or signal refuses readback;
+renderer termination policy is recorded separately. A NetworkProcess already
+reaped by an intermediate parent has an unknown exit status, reported explicitly;
+its disappearance is lifecycle evidence, not proof of graceful storage flush.
+Only observed matching PID start identities are reaped. A timeout prints bounded native thread wait names,
+without page URLs or stored data. The five-second shutdown bound is unchanged.
+`python3 native-tests/desktop/test_web_home.py` checks normal, abnormal and
+signalled synthetic helpers, delayed network-role detection, parent-reaped
+unknown status and a mismatched PID identity without starting a browser.
 
 `--quick-close` minimizes the flow to one connection's acknowledged editor write,
 immediate native Close, and new-process readback. CI runs it separately with a
@@ -120,10 +162,16 @@ Xvfb/D-Bus session per App also lost storage during ordinary-close readback in
 CI and a local minimized control. No unique cause or production durability fix
 is established by these failures. The current runner checks an App restart
 within a persistent desktop session, not desktop logout or storage fsync.
-Immediate process termination, crashes, cold last-page restoration, real IdP,
+Immediate process termination, crashes, OS-by-OS cold restoration, real IdP,
 other OS runtimes, files, notifications and distribution remain separate checks.
 
 ## Android
+
+`resume-navigation-cases.json` exercises native success, provisional failure,
+post-commit failure, stale/duplicate completion, SPA routes and unknown failing
+URLs in Rust, Kotlin and Swift policy tests. The Kotlin callback adapter also
+tests URL-to-generation binding for a late error from an older navigation.
+These policy/JVM tests do not prove a device engine's callback order.
 
 The Android fixture builds the actual `app-screen` plugin and its pinned Tauri
 Android API without generating the full app or requiring Firebase configuration.

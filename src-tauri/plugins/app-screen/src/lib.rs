@@ -20,6 +20,8 @@ pub use models::*;
 
 mod error;
 mod models;
+#[cfg(any(test, all(desktop, feature = "desktop")))]
+mod resume;
 
 #[cfg(all(desktop, feature = "desktop"))]
 mod desktop;

@@ -3,12 +3,15 @@
 //! HTML assigned an https base URI. Never loads a real service or user profile.
 
 use super::*;
+use gtk::glib::prelude::ObjectExt;
 use javascriptcore::ValueExt;
 use std::{path::Path, time::Duration};
 use webkit2gtk::{WebContextExt, WebViewExt};
 use wry::WebViewExtUnix;
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+static PENDING_CLOSE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_CLOSE_VALID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const WORK: &str = "11111111-1111-4111-8111-111111111111";
 const PERSONAL: &str = "22222222-2222-4222-8222-222222222222";
@@ -22,6 +25,7 @@ pub fn run() {
         "Fixture directory must be absolute"
     );
     let readback = std::env::args().any(|value| value == "--readback");
+    let spa = std::env::args().any(|value| value == "--spa-resume");
     assert!(
         !std::env::args().any(|value| value == "--missing-document") || readback,
         "Missing-document control requires readback mode"
@@ -47,7 +51,20 @@ pub fn run() {
             let certificate =
                 std::fs::read_to_string(std::env::var_os("TAKOSUMI_FIXTURE_CERT").unwrap())?;
             let certificate = gtk::gio::TlsCertificate::from_pem(&certificate)?;
-            for profile in [WORK, PERSONAL, "shared"] {
+            let profiles: &[&str] = if spa {
+                &[WORK]
+            } else {
+                &[WORK, PERSONAL, "shared"]
+            };
+            for &profile in profiles {
+                if spa && readback {
+                    let payload = request(profile);
+                    let expected = format!("{}document/work?view=edit", payload.url);
+                    let stored = ResumeStore::new(directory.join(profile), payload.key).recall()?;
+                    assert_eq!(stored.as_deref(), Some(expected.as_str()),
+                        "SPA readback must start with the saved successful route, before constructing a view");
+                    println!("PASS: saved SPA route matches before native view construction");
+                }
                 open_on_ui_thread(app.handle(), request(profile), directory.clone())?;
                 let view = SCREENS.with(|screens| {
                     screens
@@ -63,11 +80,21 @@ pub fn run() {
                 view.context()
                     .unwrap()
                     .allow_tls_certificate_for_host(&certificate, "127.0.0.1");
-                view.load_uri(&request(profile).url);
+                // SPA readback must finish the factory's saved-route load.
+                // Reloading here can interrupt it before its URI settles.
+                // Trust is set in the same setup turn after construction;
+                // do not force the expected route or start a second request.
+                if !(spa && readback) {
+                    view.load_uri(&request(profile).url);
+                }
             }
             let handle = app.handle().clone();
             gtk::glib::idle_add_local_once(move || {
-                bootstrap(handle, directory, readback, 0);
+                if spa {
+                    spa_probe(handle, readback);
+                } else {
+                    bootstrap(handle, directory, readback, 0);
+                }
             });
             Ok(())
         })
@@ -117,6 +144,239 @@ fn request(profile: &str) -> OpenRequest {
         .validate()
         .expect("Fixture uses a valid production request");
     payload
+}
+
+fn spa_probe(app: AppHandle, readback: bool) {
+    let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
+    let home = request(WORK).url;
+    let target = format!("{home}document/work?view=edit");
+    let method = if std::env::args().any(|value| value == "--spa-replace") {
+        "replaceState"
+    } else {
+        "pushState"
+    };
+    let expected = if readback { target.clone() } else { home };
+    let probe = view.clone();
+    after_document_load(
+        &view,
+        expected,
+        "bootstrap".into(),
+        app.clone(),
+        move || {
+            if readback {
+                println!("PASS: new process restored native {method} route without a link click");
+                EXIT_STATUS.store(0, Ordering::SeqCst);
+                app.exit(0);
+                return;
+            }
+            let script = format!(
+                "history.{method}(null, '', '/document/work?view=edit'); location.href === {}",
+                serde_json::to_string(&target).unwrap()
+            );
+            probe.evaluate_javascript(
+                &script,
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    if !result.is_ok_and(|value| value.to_boolean()) {
+                        eprintln!("FAIL: controlled SPA route did not change");
+                        app.exit(1);
+                        return;
+                    }
+                    println!("PASS: {method} changed the current native page; closing immediately");
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if std::env::args().any(|arg| {
+                            arg == "--failed-navigation" || arg == "--cancelled-navigation"
+                                || arg == "--pending-navigation"
+                        }) {
+                            fail_after_spa(handle, target);
+                        } else {
+                            close_spa(handle);
+                        }
+                    });
+                },
+            );
+        },
+    );
+}
+
+fn close_spa(app: AppHandle) {
+    let screen_label = label(WORK);
+    let (window, context) = SCREENS.with(|screens| {
+        let screens = screens.borrow();
+        let screen = screens.get(&screen_label).unwrap();
+        let context = screen.view.webview().context().unwrap().downgrade();
+        (screen.window.clone(), context)
+    });
+    if let Err(error) = window.close() {
+        eprintln!("FAIL: native close: {error}");
+        app.exit(1);
+        return;
+    }
+    after_spa_close(
+        app,
+        screen_label,
+        std::time::Instant::now() + Duration::from_secs(5),
+        context,
+    );
+}
+
+fn fail_after_spa(app: AppHandle, target: String) {
+    let view = SCREENS.with(|screens| screens.borrow().get(&label(WORK)).unwrap().view.webview());
+    let native = view.clone();
+    after_document_load(&view, target, "bootstrap".into(), app.clone(), move || {
+        if std::env::args().any(|arg| arg == "--pending-navigation") {
+            let pending_uri = format!("{}slow", request(WORK).url);
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finished_armed = armed.clone();
+            let finished_terminal = terminal.clone();
+            native.connect_load_changed(move |_, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Finished)
+                    && finished_armed.load(Ordering::SeqCst)
+                {
+                    finished_terminal.store(true, Ordering::SeqCst);
+                }
+            });
+            let failed_armed = armed.clone();
+            let failed_terminal = terminal.clone();
+            let failed_uri = pending_uri.clone();
+            native.connect_load_failed(move |_, _, uri, _| {
+                if failed_armed.load(Ordering::SeqCst) && uri == failed_uri {
+                    failed_terminal.store(true, Ordering::SeqCst);
+                }
+                false
+            });
+            let close_label = label(WORK);
+            let close_uri = pending_uri.clone();
+            let window = SCREENS.with(|screens| screens.borrow().get(&close_label).unwrap().window.clone());
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                    && !PENDING_CLOSE_SEEN.swap(true, Ordering::SeqCst)
+                {
+                    let valid = !terminal.load(Ordering::SeqCst) && SCREENS.with(|screens| {
+                        screens.borrow().get(&close_label).is_some_and(|screen| {
+                            let view = screen.view.webview();
+                            view.is_loading() && view.uri().as_deref() == Some(close_uri.as_str())
+                        })
+                    });
+                    PENDING_CLOSE_VALID.store(valid, Ordering::SeqCst);
+                    if valid {
+                        println!("PASS: controlled native load is still pending at CloseRequested");
+                    } else {
+                        eprintln!("FAIL: pending control settled before native CloseRequested");
+                    }
+                }
+            });
+            let expected = pending_uri.clone();
+            let id = Rc::new(RefCell::new(None));
+            let callback_id = id.clone();
+            let handle = app.clone();
+            let handler = native.connect_load_changed(move |view, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Started)
+                    && view.uri().as_deref() == Some(expected.as_str())
+                {
+                    if let Some(id) = callback_id.borrow_mut().take() {
+                        view.disconnect(id);
+                    }
+                    armed.store(true, Ordering::SeqCst);
+                    let app = handle.clone();
+                    gtk::glib::idle_add_local_once(move || close_spa(app));
+                }
+            });
+            *id.borrow_mut() = Some(handler);
+            native.load_uri(&pending_uri);
+            return;
+        }
+        let cancel = std::env::args().any(|arg| arg == "--cancelled-navigation");
+        let failed_uri = format!(
+            "{}{}",
+            request(WORK).url,
+            if cancel { "slow" } else { "failed" }
+        );
+        let expected = failed_uri.clone();
+        let id = Rc::new(RefCell::new(None));
+        let callback_id = id.clone();
+        let handle = app.clone();
+        let handler = native.connect_load_failed(move |view, _, uri, error| {
+            if uri == expected {
+                if let Some(id) = callback_id.borrow_mut().take() {
+                    view.disconnect(id);
+                }
+                if error.matches(webkit2gtk::NetworkError::Cancelled) != cancel {
+                    eprintln!("FAIL: wrong controlled failure: {error:?}");
+                    handle.exit(1);
+                    return false;
+                }
+                println!(
+                    "PASS: controlled native {} observed before Close",
+                    if cancel {
+                        "cancellation"
+                    } else {
+                        "network failure"
+                    }
+                );
+                let app = handle.clone();
+                gtk::glib::idle_add_local_once(move || close_spa(app));
+            }
+            false
+        });
+        *id.borrow_mut() = Some(handler);
+        if cancel {
+            let id = Rc::new(RefCell::new(None));
+            let callback_id = id.clone();
+            let expected = failed_uri.clone();
+            let handler = native.connect_load_changed(move |view, event| {
+                if matches!(event, webkit2gtk::LoadEvent::Started)
+                    && view.uri().as_deref() == Some(expected.as_str())
+                {
+                    if let Some(id) = callback_id.borrow_mut().take() {
+                        view.disconnect(id);
+                    }
+                    let view = view.clone();
+                    gtk::glib::idle_add_local_once(move || view.stop_loading());
+                }
+            });
+            *id.borrow_mut() = Some(handler);
+        }
+        native.load_uri(&failed_uri);
+    });
+}
+
+fn after_spa_close(
+    app: AppHandle,
+    label: String,
+    deadline: std::time::Instant,
+    context: gtk::glib::WeakRef<webkit2gtk::WebContext>,
+) {
+    let closed = !SCREENS.with(|screens| screens.borrow().contains_key(&label));
+    if closed {
+        // Only WORK is opened in this case. Drop its production cache after
+        // ordinary Close while the UI loop is alive; no helper can hide a
+        // view/manager cycle behind process exit.
+        CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    }
+    if closed && context.upgrade().is_none() {
+        if std::env::args().any(|arg| arg == "--pending-navigation")
+            && !(PENDING_CLOSE_SEEN.load(Ordering::SeqCst) && PENDING_CLOSE_VALID.load(Ordering::SeqCst))
+        {
+            eprintln!("FAIL: pending control did not prove its native Close boundary");
+            app.exit(1);
+            return;
+        }
+        println!("PASS: primary window and native context released before process exit");
+        EXIT_STATUS.store(0, Ordering::SeqCst);
+        app.exit(0);
+    } else if std::time::Instant::now() >= deadline {
+        eprintln!("FAIL: primary window or native context retained after ordinary Close");
+        app.exit(1);
+    } else {
+        gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
+            after_spa_close(app, label, deadline, context)
+        });
+    }
 }
 
 fn bootstrap(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
@@ -296,6 +556,20 @@ fn after_document_load(
 }
 
 fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
+    // The caller registers readiness before starting its target navigation.
+    // Do not launch an async evaluation into the document it is about to
+    // replace. Check the native document first, including across process swaps.
+    if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
+        if std::time::Instant::now() >= pending.deadline {
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}", pending.uri, pending.nonce, view.uri(), view.is_loading());
+            pending.app.exit(1);
+        } else {
+            gtk::glib::timeout_add_local_once(Duration::from_millis(25), move || {
+                poll_document(view, pending)
+            });
+        }
+        return;
+    }
     let probe = "({uri: location.href, nonce: document.querySelector('meta[name=sumi-fixture]')?.content, ready: document.readyState})";
     let native = view.clone();
     view.evaluate_javascript(probe, None, None, None::<&gtk::gio::Cancellable>, move |result| {

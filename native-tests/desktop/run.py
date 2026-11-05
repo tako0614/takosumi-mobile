@@ -5,16 +5,30 @@ import argparse
 import http.server
 import os
 from pathlib import Path
+import resource
 import ssl
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
+from urllib.parse import urlsplit
+sys.dont_write_bytecode = True
+from web_home import run_desktop_session
 
 
 class Pages(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        page = self.path.removeprefix("/")
-        if page not in ("", "first", "second"):
+        page = urlsplit(self.path).path.removeprefix("/")
+        if page == "failed":
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        if page == "slow":
+            threading.Event().wait(2)
+            return
+        if page not in ("", "first", "second", "document/work"):
             self.send_error(404)
             return
         body = ("<!doctype html><meta name='sumi-fixture' content='bootstrap'>"
@@ -30,10 +44,21 @@ class Pages(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    # Native criticals fail the fixture, including teardown after GTK destroys
+    # the widget. Keep owned subprocess crashes from leaving large core files.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--spa-resume", action="store_true")
+    parser.add_argument("--failed-navigation", action="store_true")
+    parser.add_argument("--cancelled-navigation", action="store_true")
+    parser.add_argument("--pending-navigation", action="store_true")
     args = parser.parse_args()
+    if (args.failed_navigation or args.cancelled_navigation or args.pending_navigation) and not args.spa_resume:
+        parser.error("navigation failure controls require --spa-resume")
+    if sum((args.failed_navigation, args.cancelled_navigation, args.pending_navigation)) > 1:
+        parser.error("select one navigation failure/pending control")
     binary = args.binary.resolve(strict=True)
     data = args.data.absolute()
     if data.exists():
@@ -55,19 +80,40 @@ def main():
         env = dict(os.environ, TAKOSUMI_FIXTURE_DATA=str(data),
                    TAKOSUMI_FIXTURE_HTTPS=f"https://127.0.0.1:{server.server_port}",
                    TAKOSUMI_FIXTURE_CERT=str(cert))
+        env["G_DEBUG"] = ",".join(filter(None, (env.get("G_DEBUG"), "fatal-criticals")))
+        for variable, name in (("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),
+                               ("XDG_CACHE_HOME", "cache"), ("XDG_RUNTIME_DIR", "runtime")):
+            directory = Path(temporary) / name
+            directory.mkdir(mode=0o700)
+            env[variable] = str(directory)
         try:
+            if args.spa_resume:
+                data.mkdir(mode=0o700)
+                for method, extra in (("push", []), ("replace", ["--spa-replace"])):
+                    controls = (["--failed-navigation"] if args.failed_navigation else []) + (
+                        ["--cancelled-navigation"] if args.cancelled_navigation else [])
+                    if args.pending_navigation:
+                        controls.append("--pending-navigation")
+                    scoped = dict(env, TAKOSUMI_FIXTURE_DATA=str(data / method))
+                    for flags in ([], ["--readback"]):
+                        run_desktop_session(["xvfb-run", "-a", "dbus-run-session", "--", str(binary),
+                                             "--spa-resume", *extra, *controls, *flags], scoped, timeout=50)
+                return
             for flags in ([], ["--readback"]):
-                subprocess.run(["xvfb-run", "-a", "dbus-run-session", "--", str(binary), *flags],
-                               env=env, check=True)
-            rejected = subprocess.run([
-                "xvfb-run", "-a", "dbus-run-session", "--", str(binary),
-                "--readback", "--missing-document",
-            ], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=50)
-            (data / "missing-document.log").write_text(rejected.stdout)
-            if (rejected.returncode != 1 or "expected fixture document not ready" not in rejected.stdout
-                    or "observation " in rejected.stdout):
-                raise RuntimeError(f"Wrong document was not rejected before storage access:\n{rejected.stdout}")
+                run_desktop_session(["xvfb-run", "-a", "dbus-run-session", "--", str(binary), *flags], env, timeout=50)
+            negative = data / "missing-document.log"
+            code = 0
+            with negative.open("w") as output:
+                try:
+                    run_desktop_session(["xvfb-run", "-a", "dbus-run-session", "--", str(binary),
+                                         "--readback", "--missing-document"], env, timeout=50,
+                                        stdout=output, stderr=subprocess.STDOUT)
+                except subprocess.CalledProcessError as error:
+                    code = error.returncode
+            result = negative.read_text()
+            if (code != 1 or "expected fixture document not ready" not in result
+                    or "observation " in result):
+                raise RuntimeError(f"Wrong document was not rejected before storage access:\n{result}")
             print("PASS: missing document rejects before any storage observation", flush=True)
         finally:
             server.shutdown()

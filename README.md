@@ -71,12 +71,25 @@ opener's native environment/store. The shell and mobile/desktop adapters share
 CEF across every desktop OS would require a separate Tauri 3 alpha migration;
 this candidate keeps the existing Tauri 2 mobile plugins.
 
+Web homes remember an eligible last page separately for each connection and
+profile, including another app's https origin. Native document outcomes gate
+this metadata: provisional loads and transport failures do not replace a working
+page, while successful same-document routes can be resumed. Credential callback
+queries, fragments and transient sign-in paths are excluded. The shared URL and
+navigation-transition fixtures keep Rust, Kotlin and Swift rules aligned.
+Unknown failure identities keep the saved metadata rather than qualify a new
+page. OS runtime qualification is still required for these native callbacks.
+
 Wry's default content messaging is removed on GTK/WK before navigation.
+GTK also disconnects the raw manager's native message signal: unregistering the
+JS channel alone leaves a Wry callback that retains the view and its context.
+The trusted shell's IPC stays active until actual GTK widget destruction;
+document reloads and cancelled close requests keep their normal connection.
 On Windows the WebMessage transport is disabled before navigation; Wry's inert
 `window.ipc` JS stub may remain, with no application/Tauri handler behind it.
 No remote page is granted a capability, custom protocol, OS opener or host object.
 
-Current limits: site-data deletion, per-app cold restoration,
+Current limits: site-data deletion, OS-by-OS cold-restoration qualification,
 notification/deep-link routing and distribution/update are unfinished. Web
 authentication (including third-party IdPs), popups and file operations still
 need Android/iOS device qualification; some IdPs refuse embedded browsers. No

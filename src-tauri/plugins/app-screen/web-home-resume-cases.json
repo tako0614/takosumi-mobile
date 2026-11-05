@@ -1,0 +1,28 @@
+{
+  "description": "Primary Web-home screens may resume an app on another https origin within the same connection/profile. The existing legacy-app same-origin rule is unchanged. Known temporary authorization/sign-in paths, fragments, user info, shell hosts, undecodable query pairs and nonblank credential-named query values are not persisted. These cases are shared by TS, Rust, Kotlin and Swift.",
+  "cases": [
+    { "url": "https://sumi.example/", "remember": true },
+    { "url": "https://office.example/document/123?view=edit", "remember": true },
+    { "url": "https://office.example:8443/document/123", "remember": true },
+    { "url": "https://office.example/x?token=", "remember": true },
+    { "url": "https://accounts.example/oauth/authorize?client_id=fixture&state=s", "remember": false },
+    { "url": "https://sumi.example/sign-in", "remember": false },
+    { "url": "https://sumi.example/sign-in/callback?state=s", "remember": false },
+    { "url": "https://office.example/x?code=fixture-secret", "remember": false },
+    { "url": "https://sumi.example/sign-in/callback?state=s&code=fixture-secret", "remember": false },
+    { "url": "https://office.example/x?ID%5FToken=fixture-secret", "remember": false },
+    { "url": "https://office.example/x?X-Amz-Signature=fixture-secret", "remember": false },
+    { "url": "https://office.example/x?SAMLResponse=fixture-secret", "remember": false },
+    { "url": "https://office.example/x?%zz=1", "remember": false },
+    { "url": "https://office.example/x?q=%zz", "remember": false },
+    { "url": "https://office.example/x#access_token=fixture-secret", "remember": false },
+    { "url": "https://office.example/x#section", "remember": false },
+    { "url": "https://user:pass@office.example/", "remember": false },
+    { "url": "https://ipc.localhost/", "remember": false },
+    { "url": "https://asset.localhost./", "remember": false },
+    { "url": "http://office.example/", "remember": false },
+    { "url": "file:///tmp/fixture", "remember": false },
+    { "url": "about:blank", "remember": false },
+    { "url": "not a URL", "remember": false }
+  ]
+}

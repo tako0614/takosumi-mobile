@@ -13,7 +13,18 @@ use tauri::{AppHandle, Manager, Window};
 use webkit2gtk::{WebContextExt, WebView, WebViewExt};
 
 static EXIT_STATUS: AtomicI32 = AtomicI32::new(1);
+thread_local! {
+    static WATCHDOG: std::cell::RefCell<Option<glib::SourceId>> = const { std::cell::RefCell::new(None) };
+}
 type Result<T> = std::result::Result<T, String>;
+
+fn clear_watchdog() {
+    WATCHDOG.with(|watchdog| {
+        if let Some(source) = watchdog.take() {
+            source.remove();
+        }
+    });
+}
 
 pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<tauri::Wry>) {
     // Do not borrow an installed App's preferences or native data directory.
@@ -25,12 +36,16 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     }
     let app = builder.build(context).expect("Full fixture App builds");
     let watchdog = app.handle().clone();
-    glib::timeout_add_local_once(Duration::from_secs(60), move || {
+    let source = glib::timeout_add_local_once(Duration::from_secs(60), move || {
+        // This callback removes itself; don't remove an expired source later.
+        WATCHDOG.with(|source| source.take());
         eprintln!("FAIL: full App fixture watchdog expired");
         EXIT_STATUS.store(1, Ordering::SeqCst);
         watchdog.exit(1);
     });
+    WATCHDOG.with(|watchdog| watchdog.replace(Some(source)));
     let _ = app.run_return(|_, _| {});
+    clear_watchdog();
     // The pinned Linux runtime can discard RequestExit's requested code.
     std::process::exit(EXIT_STATUS.load(Ordering::SeqCst));
 }
@@ -41,6 +56,9 @@ pub fn start(app: AppHandle) {
             Ok(()) => {
                 println!("PASS: full App Web-home flow, readback={}", readback());
                 EXIT_STATUS.store(0, Ordering::SeqCst);
+                // Its AppHandle otherwise keeps the managed WebContext alive
+                // after window closure. Release it while the UI loop runs.
+                clear_watchdog();
                 if let Err(error) = app.get_window("main").expect("main exists").close() {
                     eprintln!("FAIL: root window close: {error}");
                     EXIT_STATUS.store(1, Ordering::SeqCst);
@@ -48,6 +66,7 @@ pub fn start(app: AppHandle) {
                 }
             }
             Err(error) => {
+                clear_watchdog();
                 eprintln!("FAIL: full App Web-home flow: {error}");
                 app.exit(1);
             }
@@ -97,9 +116,10 @@ async fn ready(view: &WebView, condition: &str) -> Result<()> {
             return Ok(());
         }
         if start.elapsed() > Duration::from_secs(8) {
+            let snapshot = eval(view, "({ready: document.readyState, title: document.title, body: document.body?.textContent?.slice(0, 1200), scripts: [...document.scripts].map(script => script.src)})").await;
             return Err(format!(
-                "DOM not ready: {condition}; uri={:?}; last={result:?}",
-                view.uri()
+                "DOM not ready: {condition}; uri={:?}; last={result:?}; document={snapshot:?}",
+                view.uri(),
             ));
         }
         pause().await;
@@ -113,6 +133,27 @@ async fn assert_js(view: &WebView, condition: &str, name: &str) -> Result<()> {
     }
     println!("PASS: {name}");
     Ok(())
+}
+
+async fn assert_home(view: &WebView, origin: &str, user: &str) -> Result<()> {
+    ready(
+        view,
+        &format!(
+            "location.href === {} && document.querySelector('[data-page=home]')",
+            serde_json::to_string(&format!("{origin}/")).unwrap()
+        ),
+    )
+    .await?;
+    // Session data is asserted once after the expected document arrives.
+    assert_js(
+        view,
+        &format!(
+            "document.querySelector('[data-page=home]').dataset.user === {}",
+            serde_json::to_string(user).unwrap()
+        ),
+        "mock home has the expected profile session",
+    )
+    .await
 }
 
 async fn assert_draft(view: &WebView, expected: &str, name: &str) -> Result<()> {
@@ -282,7 +323,8 @@ async fn no_ipc(view: &WebView) -> Result<()> {
 
 async fn flow(app: &AppHandle) -> Result<()> {
     let origin = required_env("TAKOSUMI_FIXTURE_HTTPS");
-    if !origin.starts_with("https://127.0.0.1:") {
+    let app_origin = required_env("TAKOSUMI_FIXTURE_APP_HTTPS");
+    if !origin.starts_with("https://127.0.0.1:") || !app_origin.starts_with("https://127.0.0.2:") {
         return Err("fixture must use owned loopback HTTPS".into());
     }
     let main = app.get_window("main").ok_or("main window missing")?;
@@ -373,25 +415,25 @@ async fn flow(app: &AppHandle) -> Result<()> {
         ready(&content, "document.querySelector('[data-page=login]')").await?;
         no_ipc(&content).await?;
         action(&content, "document.querySelector('input[name=user]').value='work'; document.querySelector('form').requestSubmit();").await?;
+        assert_home(&content, &origin, "work").await?;
+        println!("PASS: mock Web login/session reaches home");
+        action(
+            &content,
+            "document.querySelector('[data-app=editor]').click();",
+        )
+        .await?;
     }
     ready(
         &content,
-        "document.querySelector('[data-page=home][data-user=work]')",
+        &format!(
+            "location.href === {} && document.querySelector('[data-page=editor]')",
+            serde_json::to_string(&format!("{app_origin}/")).unwrap()
+        ),
     )
     .await?;
-    no_ipc(&content).await?;
-    println!(
-        "PASS: {} Web login/session reaches home",
-        if readback() { "restored mock" } else { "mock" }
-    );
-    action(
-        &content,
-        "document.querySelector('[data-app=editor]').click();",
-    )
-    .await?;
-    ready(&content, "document.querySelector('[data-page=editor]')").await?;
     no_ipc(&content).await?;
     if readback() {
+        println!("PASS: cold open restores Work's cross-site editor without clicking its app link");
         assert_draft(&content, "work draft", "app storage survives App restart").await?;
     } else {
         action(&content, "const input=document.querySelector('textarea'); input.value='work draft'; input.dispatchEvent(new Event('input')); ").await?;
@@ -404,6 +446,10 @@ async fn flow(app: &AppHandle) -> Result<()> {
         .await?;
     }
     if quick_close() {
+        if readback() {
+            menu(&work, "アプリホームへ").await?;
+            assert_home(&content, &origin, "work").await?;
+        }
         // Minimal reproduction: native Close immediately after acknowledged
         // storage write, without Home/Back/other-profile work settling it.
         close_profiles(app, &[work]).await?;
@@ -440,11 +486,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     menu(&work, "アプリホームへ").await?;
-    ready(
-        &content,
-        "document.querySelector('[data-page=home][data-user=work]')",
-    )
-    .await?;
+    assert_home(&content, &origin, "work").await?;
     println!("PASS: native Home returns to logged-in mock Web home");
     menu(&work, "戻る").await?;
     ready(&content, "document.querySelector('[data-page=editor]')").await?;
@@ -455,11 +497,24 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     menu(&work, "アプリホームへ").await?;
-    ready(
+    assert_home(&content, &origin, "work").await?;
+    action(
         &content,
-        "document.querySelector('[data-page=home][data-user=work]')",
+        "document.querySelector('[data-app=editor]').click();",
     )
     .await?;
+    ready(&content, "document.querySelector('[data-page=editor]')").await?;
+    if !readback() {
+        // Real committed navigation with a synthetic credential must not
+        // replace the earlier safe editor as the next process's start page.
+        action(
+            &content,
+            "location.assign('/oauth/callback?code=fixture-only-secret&state=s')",
+        )
+        .await?;
+        ready(&content, "document.querySelector('[data-page=editor]') && location.pathname === '/oauth/callback' && new URL(location.href).searchParams.get('code') === 'fixture-only-secret'").await?;
+        println!("PASS: controlled credential callback committed before ordinary Close");
+    }
 
     menu(&work, "接続先を切り替える").await?;
     focused(&main).await?;
@@ -476,31 +531,34 @@ async fn flow(app: &AppHandle) -> Result<()> {
         no_ipc(&other).await?;
         println!("PASS: second login profile does not inherit Work session");
         action(&other, "document.querySelector('input[name=user]').value='personal'; document.querySelector('form').requestSubmit();").await?;
-        ready(
+        assert_home(&other, &origin, "personal").await?;
+        action(
             &other,
-            "document.querySelector('[data-page=home][data-user=personal]')",
+            "document.querySelector('[data-app=editor]').click();",
         )
         .await?;
     }
     ready(
         &other,
-        "document.querySelector('[data-page=home][data-user=personal]')",
+        &format!(
+            "location.href === {} && document.querySelector('[data-page=editor]')",
+            serde_json::to_string(&format!("{app_origin}/")).unwrap()
+        ),
     )
     .await?;
-    action(
-        &other,
-        "document.querySelector('[data-app=editor]').click();",
-    )
-    .await?;
-    ready(&other, "document.querySelector('[data-page=editor]')").await?;
     no_ipc(&other).await?;
     if readback() {
+        println!(
+            "PASS: cold open restores Personal's cross-site editor without clicking its app link"
+        );
         assert_draft(
             &other,
             "personal draft",
             "second profile session and app storage survive restart",
         )
         .await?;
+        menu(&personal, "アプリホームへ").await?;
+        assert_home(&other, &origin, "personal").await?;
     } else {
         assert_js(
             &other,

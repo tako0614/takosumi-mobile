@@ -1,5 +1,44 @@
 import Foundation
 
+/// Native success is separate from URL eligibility. The same transition table
+/// exercises this state, Kotlin and the desktop Rust observer.
+final class AppScreenResumeState {
+    private var current = 0
+    private var pending = false
+    private var successful = false
+    private var previousSuccessful = false
+    private var committed = false
+    private var blocked: String?
+
+    func begin(_ id: Int) {
+        if pending && current == id { return }
+        current = id
+        previousSuccessful = successful
+        pending = true
+        committed = false
+    }
+
+    func commit(_ id: Int) {
+        guard id == current && pending else { return }
+        committed = true
+        successful = false
+    }
+
+    func finish(_ id: Int, success: Bool, url: String?) {
+        guard id == current && pending else { return }
+        pending = false
+        if success {
+            successful = true
+            blocked = nil
+        } else {
+            successful = !committed && previousSuccessful && url != nil
+            blocked = url
+        }
+    }
+
+    func canRemember(_ url: String) -> Bool { !pending && successful && url != blocked }
+}
+
 /// Mirror of `src/url-policy.ts`. The shared tables are
 /// `navigation-policy-cases.json` and `resume-url-cases.json`; keep the three
 /// implementations equal (`ios/Tests/PolicyTests` runs this file against
@@ -306,11 +345,16 @@ enum AppScreenPolicy {
 
     /// A page the screen may reopen at: https on the app's own origin, no user
     /// info, no fragment, no credential-named query parameter with a value.
-    static func isRememberable(_ rawUrl: String, appOrigin: String) -> Bool {
+    /// Web homes may cross app origins in the same profile, excluding the
+    /// known temporary authorization/sign-in paths.
+    static func isRememberable(_ rawUrl: String, appOrigin: String, webHome: Bool = false) -> Bool {
         if rawUrl.count > resumeURLMaxLength || rawUrl.contains("#") { return false }
         if !rawUrl.lowercased().hasPrefix("https://") { return false }
         if rawUrl.contains(where: { $0.isWhitespace }) { return false }
-        guard let origin = origin(of: rawUrl), origin == appOrigin,
+        if webHome {
+            guard let path = encodedPath(rawUrl), !accountsSignInPaths.contains(path) else { return false }
+        }
+        guard let origin = origin(of: rawUrl), webHome || origin == appOrigin,
               let host = URL(string: rawUrl)?.host, !isShellHost(host) else {
             return false
         }
