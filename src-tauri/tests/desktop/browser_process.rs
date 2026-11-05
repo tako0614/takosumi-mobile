@@ -129,6 +129,9 @@ fn browser_status(app: &AppHandle) -> Result<Value> {
 /// Open a saved connection through the home's own button, as a user tap does.
 async fn open_saved(view: &WebView, app: &AppHandle, name: &str, count: usize) -> Result<()> {
     let label = serde_json::to_string(name).unwrap();
+    // The home disables every connection while an open is in flight; a tap on
+    // a disabled button is ignored, so wait for the UI lock to clear first.
+    ready(view,"document.querySelectorAll('.web-connection').length===2 && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await?;
     eval(view,&format!("(()=>{{const buttons=[...document.querySelectorAll('.web-connection')].filter(button=>button.querySelector('strong').textContent==={label});if(buttons.length!==1)throw Error('Unique saved connection required');buttons[0].click();return true}})()")).await?;
     let end = Instant::now() + Duration::from_secs(20);
     while Instant::now() < end {
