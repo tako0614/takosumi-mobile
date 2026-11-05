@@ -19,12 +19,20 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+#[cfg(target_os = "linux")]
+mod gtk_navigation;
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+mod process_adapter;
 mod profile_reset;
 mod resume_navigation;
 
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 #[path = "../tests/desktop/fixture.rs"]
 pub(crate) mod fixture;
+
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+#[path = "../tests/desktop/browser_probe.rs"]
+pub(crate) mod browser_probe;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -51,14 +59,43 @@ thread_local! {
 }
 
 pub fn init() -> TauriPlugin<tauri::Wry> {
-    Builder::new("app-screen")
-        .invoke_handler(tauri::generate_handler![capabilities, open, clear_profile])
+    let builder = Builder::new("app-screen").invoke_handler(tauri::generate_handler![
+        capabilities,
+        open,
+        clear_profile
+    ]);
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    let builder = builder.setup(|app, _api| {
+        process_adapter::install(app)?;
+        Ok(())
+    });
+    builder
         .on_event(|_app, event| {
+            #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+            match event {
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: WindowEvent::CloseRequested { api, .. },
+                    ..
+                } if label == "main" => {
+                    if process_adapter::request_exit(_app, 0) {
+                        api.prevent_close();
+                    }
+                }
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if process_adapter::request_exit(_app, code.unwrap_or(0)) {
+                        api.prevent_exit();
+                    }
+                }
+                _ => {}
+            }
             #[cfg(target_os = "linux")]
             if matches!(event, tauri::RunEvent::Ready) {
                 install_shell_message_cleanup(_app);
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+                process_adapter::terminal(_app);
                 // Raw views do not belong to Tauri's managed-view registry.
                 // Clear remaining owned resources as a terminal fallback.
                 profile_reset::shutdown();
@@ -90,6 +127,10 @@ async fn clear_profile(
     payload: crate::ClearProfileRequest,
 ) -> Result<crate::ClearProfileResponse> {
     payload.validate()?;
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if app.try_state::<process_adapter::Backend>().is_some() {
+        return process_adapter::clear_profile(app, payload).await;
+    }
     let directory = app
         .path()
         .app_local_data_dir()
@@ -118,6 +159,10 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             "Desktop app screens currently require Web-home mode.",
         ));
     }
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if app.try_state::<process_adapter::Backend>().is_some() {
+        return process_adapter::open(app, payload).await;
+    }
     // Wry otherwise silently selects the default store on older macOS.
     #[cfg(target_os = "macos")]
     if !objc2::available!(macos = 14.0) {
@@ -141,6 +186,16 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
         .await
         .map_err(failure)?
         .map_err(failure)?
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+pub fn shutdown_browser_process_experiment(app: &AppHandle) -> Result<()> {
+    process_adapter::shutdown(app)
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+pub fn browser_process_experiment_status(app: &AppHandle) -> Result<serde_json::Value> {
+    process_adapter::status(app)
 }
 
 fn open_on_ui_thread(app: &AppHandle, payload: OpenRequest, directory: PathBuf) -> Result<()> {
@@ -256,9 +311,6 @@ fn create_screen(
         // the first navigation (Wry adds it even without an IPC handler).
         let mut builder = WebViewBuilder::new_with_web_context(&mut context_ref)
             .with_devtools(false)
-            .with_navigation_handler(move |url| {
-                is_launchable_url(&url) || (is_popup && url == "about:blank")
-            })
             .with_on_page_load_handler(move |event, url| {
                 // Started maps to top-level didCommit/LoadEvent::Committed/
                 // WebView2 ContentLoading in pinned Wry 0.55.1. Policy callbacks
@@ -296,6 +348,12 @@ fn create_screen(
                     }
                 }
             });
+        #[cfg(not(target_os = "linux"))]
+        {
+            builder = builder.with_navigation_handler(move |url| {
+                is_launchable_url(&url) || (is_popup && url == "about:blank")
+            });
+        }
         #[cfg(target_os = "macos")]
         {
             use wry::{WebViewBuilderExtDarwin, WebViewBuilderExtMacos};
@@ -336,6 +394,11 @@ fn create_screen(
             })
             .build_as_child(&window)
             .map_err(failure)?;
+        #[cfg(target_os = "linux")]
+        {
+            use wry::WebViewExtUnix;
+            gtk_navigation::install(&view.webview(), is_popup);
+        }
         disable_messaging(&view)?;
         let resume_observer = resume
             .map(|store| resume_navigation::Observer::new(&label, &view, store))

@@ -3,6 +3,95 @@
 These tests exercise the product's plain WebViews. They do not sign in to any
 real service, use provider/DB/SSO credentials, or qualify distribution.
 
+## Public Web-app operation probe (experimental)
+
+The explicit Linux-only `desktop-browser-probe` example uses the production
+validated request and raw view factory with fresh Work/Personal profiles. It
+opens only the reviewed Photopea or Excalidraw public root. No authentication,
+account action, cloud save, provider/DB state or installed profile is used.
+Normal App builds do not compile this probe.
+
+Build once with the existing cached GTK SDK, then use a new owned data path:
+
+```bash
+cargo build --offline --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-fixture --example desktop-browser-probe
+python3 native-tests/desktop/browser_apps.py --binary /absolute/path/to/desktop-browser-probe --data /absolute/new/case --app excalidraw
+python3 native-tests/desktop/browser_apps.py --binary /absolute/path/to/desktop-browser-probe --data /absolute/another/new/case --app photopea
+```
+
+This runner also needs existing Xvfb, D-Bus, xdotool and ImageMagick tools.
+It scopes XDG profiles/cache/runtime and Downloads to the case, keeps the
+desktop session alive through observed engine shutdown, and fingerprints the
+binary before/after. It never changes HOME or installs OS infrastructure.
+Before any public page opens, native startup requires GLib's Downloads path
+to equal the disposable case's directory. It uses the existing WebKit default
+download behavior without installing a destination override.
+The selected file is a generated rectangle scene or red/blue SVG, opened
+through the actual native file dialog. Excalidraw must export the imported
+nonce-bearing rectangle with its keyboard edit; Photopea must export a PNG
+with the actual fixture dimensions and decoded pixels. Data is checked once
+after the real native download-finished event, without data retries.
+The download must report the actual original Work view and the app's HTTPS
+Blob origin. A per-document nonce is installed once immediately before export;
+the native completion is followed by one read of that nonce and the exact
+pre-export native URI. A same-origin reload or document replacement cannot
+qualify as retaining the editor. Post-download HTTPS context and absent native
+messaging are also required.
+Native persistent directories and same-origin localStorage are checked in
+both profiles. These are explicit checks, not proof of every app's IndexedDB,
+authentication, file permission or service-worker behavior.
+
+`--mode observe` is for UI discovery: it writes context/API observations and
+screenshots and prints **OBSERVATION ONLY**. It never qualifies a file operation.
+Default `operate` cannot accept an observer's receipt or a missing/unfinished/
+foreign download. `python3 -B native-tests/desktop/test_browser_apps.py` checks
+those false-success cases and the actual export verifier without opening sites.
+The operation driver is experimental and needs actual native execution;
+a selector/readiness failure must be diagnosed before attributing it to an
+engine capability. A failure does not by itself select an engine or justify
+growing bespoke WebView adapters instead of reusing an existing browser base.
+API presence is not Web Push delivery, real IdP, background operation, another
+OS or distribution qualification.
+
+Initial 2026-11-05 probes at `1c82996` on WebKitGTK 2.52.3 reached both public editors and
+checked their original persistent Work/Personal directories, same-origin
+localStorage separation and absence of all three native messaging globals.
+Both **file operations failed**: native Open imported the owned fixtures, but
+the existing App navigation policy rejected `blob:` during export. Excalidraw
+even displayed `File saved.` while the disposable Downloads directory stayed
+empty. Photopea displayed the imported 128×96 red/blue image in `Save for web`,
+then hit the same policy refusal. No completed native download or verified
+export was obtained. That original scheme-only policy diagnostic preserved
+the original allow decision. Probe load diagnostics retain public
+URLs in private artifacts; this runner must not be used for real accounts.
+
+The GTK adapter now makes an explicit native download decision for
+HTTPS-origin Blob requests, rather than allowing them as page navigation.
+It uses WebKit's existing default destination and original view/context; no
+site API, download path or native dialog implementation is substituted.
+With that repair, both public editors passed actual native Open and export:
+Excalidraw saved the imported scene nonce and keyboard edit; Photopea saved
+the actual 128×96 red/blue PNG. The strengthened checks also retained the
+same live editor document and exact URI. The original failure cases remain
+failures at their recorded source. Root processes exited successfully and
+the existing observer waited for engine children; some WebKit children had
+signal exits, so this is not a claim that every helper exited normally.
+Native profile/popup/Back/new-process readback controls also passed separately.
+
+Download cancellation/UI, authenticated downloads, active-download profile
+deletion, Blob popup behavior and other platforms still need checks. Engine
+selection, regular login/popup return, site permissions and Web Push delivery
+remain open. Broadly allowing every Blob page navigation is not the repair.
+The initial Chrome 149 comparison exposed PushManager and file-system picker
+APIs and separated two isolated contexts; that initial operation was incomplete.
+The later [standalone CEF candidate](cef-candidate/README.md) is a separate
+existing-browser-foundation experiment. Its Photopea component verifies actual
+PNG bytes and normal shutdown with explicit headless/CDP download settings.
+Those Photopea headless/CDP results do not qualify default Save UI, regular
+login, site permissions or Web Push delivery. The candidate README separately
+describes its native picker/profile/prompt components and their limits. Those
+CEF experiments are separate from this GTK repair and Tauri App integration.
+
 ## Whole App iOS Simulator SDK build
 
 On a disposable macOS checkout with Xcode, CocoaPods, Rust and Bun:

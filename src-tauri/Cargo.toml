@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
+native-browser-process-fixture = ["tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs", "tauri-plugin-app-screen/desktop-process-experiment"]
 # Explicit actual-App fixture; never enabled by normal builds or releases.
 native-web-home-fixture = ["tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
 

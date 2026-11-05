@@ -15,6 +15,15 @@ the opener's profile. Takosumi management, sign-in and app pages use this same
 plain Web surface, with Home, Back, picker and ordinary Close actions.
 The page has no Tauri IPC or application bridge.
 
+On Linux, the GTK policy distinguishes page navigation from native downloads.
+HTTPS pages and the opener's initial `about:blank` popup keep their existing
+rules. An HTTPS-origin Blob request goes to WebKit's download decision, never
+to page `use`; opaque, local/shell, credential-bearing and non-HTTPS Blob
+sources remain blocked. WebKit retains the original view's request context,
+default Downloads destination and download lifecycle. Direct Blob launch and
+Blob popup creation remain refused. Other platforms' download behavior needs
+separate runtime evidence; this does not select a product engine.
+
 `capabilities` returns `pinShortcut` and `clearProfile`. The bundled shell
 offers explicit data deletion only when `clearProfile` is true. Its separate
 `clear_profile` command takes `{ profile, key }`; shared profiles, mismatched
