@@ -253,7 +253,19 @@ async fn relaunch_flow(
         // refused attempt left the confirmation open, so a user retries there.
         ready(view, "document.querySelector('.web-clear')").await?;
         tap_in_row(view, "Personal", "保存データを消去").await?;
-        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') && !document.querySelector('.web-clear')").await?;
+        // Wait for either outcome so a refusal fails at once with its own text.
+        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') || document.querySelector('.web-error')").await?;
+        if let Value::String(error) = eval(
+            view,
+            "document.querySelector('.web-error')?.textContent ?? null",
+        )
+        .await?
+        {
+            return Err(format!(
+                "In-session clear of closed Personal was refused: {error}"
+            ));
+        }
+        ready(view, "!document.querySelector('.web-clear')").await?;
         if personal_data.join("cef-profiles").exists() {
             return Err("In-session clear left Personal's site data".into());
         }
