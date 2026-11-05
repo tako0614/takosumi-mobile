@@ -1,6 +1,6 @@
 // Observe the actual bundled App's browser children. No replacement shell IPC.
 import assert from 'node:assert/strict';
-import { readFile, readdir, readlink, writeFile } from 'node:fs/promises';
+import { lstat, readFile, readdir, readlink, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
@@ -10,7 +10,7 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset','notify'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
@@ -204,6 +204,7 @@ async function relaunchFlow(kind) {
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
   step(`per-profile state after ${kind}`);
   if(kind==='notify')return notifyProbes(pages);
+  if(kind==='files')return filesProbe(pages);
   proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
   const kept={storage:`1:${nonce}`,cookie:`1:${nonce}`};
   if(kind==='reset') {
@@ -268,6 +269,69 @@ async function notifyProbes(pages) {
     await backend.stop();
   }
   await closePersonalAfterRelaunch(personal,'notify');
+  proof.passed=true;
+}
+// files (runner --files, Excalidraw only): the actual OS file chooser through
+// File System Access on the App path. Native Open of the owned input and Save
+// As to a new path in Work's own Downloads, each dialog attributed to Work's
+// native browser; the saved scene is verified once with the standalone oracle.
+async function filesProbe(pages) {
+  const [work,personal]=pages;
+  assert(origin.includes('excalidraw'),'The native chooser probe is inspected for Excalidraw only');
+  const input=process.env.TAKOSUMI_BROWSER_PROCESS_FILES_INPUT,filesNonce=process.env.TAKOSUMI_BROWSER_PROCESS_FILES_NONCE;
+  assert(input&&path.isAbsolute(input)&&filesNonce,'The owned file input is required');
+  const desktopIo=async(tool,args,allowMissing=false,raw=false)=>{
+    try{const out=execFileSync(tool,args,{timeout:5000,maxBuffer:64*1024*1024});return raw?out:out.toString('utf8').trim();}
+    catch(e){if(allowMissing&&e.status===1)return raw?Buffer.alloc(0):String(e.stdout??'').trim();throw e;}
+  };
+  const {nativeFiles,key,ready}=await import('./native-files.mjs');
+  const files=nativeFiles({desktop:desktopIo,data});
+  const owner=id=>JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(id)]));
+  const front=async()=>{
+    // Personal opened last and covers Work; Chrome holds input to a covered window.
+    desktop('xdotool',['windowraise',String(work.native.windowId)]);
+    await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Raised Work window did not become visible');
+    desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
+  };
+  const personalDownloads=path.join(personal.process.directory,'Downloads'),listing=async()=>(await readdir(personalDownloads)).sort();
+  proof.files={input,started:Date.now(),personalDownloadsBefore:await listing()};
+  step('native Open in Work',work);
+  await front();
+  await ready(work.evaluate,"document.querySelector('.excalidraw canvas') !== null");
+  // Excalidraw uses File System Access whenever the page has it; without it the
+  // site falls back to <input type=file> and a download, a different route.
+  proof.files.fileSystemAccess=await work.evaluate("typeof showOpenFilePicker==='function'&&typeof showSaveFilePicker==='function'");
+  assert.equal(proof.files.fileSystemAccess,true,'The page must use File System Access, not the input/download fallback');
+  const before=await files.visibleWindows();
+  await key(work.send,'o',2);
+  const open=await files.nativeDialog(before,'open');
+  proof.files.openOwner=owner(open.id);
+  assert.equal(proof.files.openOwner.pid,work.native.nativePid,"The Open dialog must belong to Work's native browser");
+  await files.selectNativePath(open,input,'files-native-open');
+  proof.files.open=open;
+  await ready(work.evaluate,"[...document.querySelectorAll('.excalidraw canvas')].some(c=>{const context=c.getContext('2d');if(!context||!c.width||!c.height)return false;const p=context.getImageData(Math.floor(c.width/2),Math.floor(c.height/2),1,1).data;return p[0]>240&&p[1]<15&&p[2]<15&&p[3]>240})",12);
+  proof.files.openedMs=Date.now()-proof.files.started;
+  await writeFile(path.join(data,'files-inspected'),'ready',{flag:'wx'});
+  step('native Save As in Work',work);
+  await front();
+  await key(work.send,'a',2);await key(work.send,'ArrowRight');
+  const output=path.join(work.process.directory,'Downloads','SumiProbeSaved.excalidraw');
+  await assert.rejects(lstat(output),{code:'ENOENT'});
+  const beforeSave=await files.visibleWindows();
+  await key(work.send,'s',2);
+  const save=await files.nativeDialog(beforeSave,'save');
+  proof.files.saveOwner=owner(save.id);
+  assert.equal(proof.files.saveOwner.pid,work.native.nativePid,"The Save As dialog must belong to Work's native browser");
+  await files.selectNativePath(save,output,'files-native-save');
+  proof.files.save=save;
+  await ready(work.evaluate,"document.body.innerText.includes('File saved.')",8);
+  const saved=await lstat(output);
+  assert(saved.isFile()&&!saved.isSymbolicLink()&&saved.size>0&&saved.size<=1024*1024,'Missing or oversized actual Save As output');
+  proof.files.export=JSON.parse(desktop('python3',['-B','-c','import sys,json;from pathlib import Path;sys.path.insert(0,sys.argv[1]);from browser_apps import verify_export;print(json.dumps(verify_export(Path(sys.argv[2]),sys.argv[3],sys.argv[4])))',
+    fileURLToPath(new URL('.',import.meta.url)),output,'excalidraw',filesNonce]));
+  assert.deepEqual(await listing(),proof.files.personalDownloadsBefore,"Personal's Downloads must not change");
+  proof.files.savedMs=Date.now()-proof.files.started;
+  await closePersonalAfterRelaunch(personal,'files');
   proof.passed=true;
 }
 async function firstLaunch() {
