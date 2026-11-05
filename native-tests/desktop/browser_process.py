@@ -212,6 +212,8 @@ def main():
     args.data.mkdir(mode=0o700)
     args.data.joinpath(".owned-browser-reference").write_text(args.data.name)
     env = dict(os.environ)
+    # Only --restart selects the restart phase; never inherit it from the caller.
+    env.pop("TAKOSUMI_BROWSER_PROCESS_PHASE", None)
     for key, name in {"HOME":"home", "XDG_DATA_HOME":"data", "XDG_CONFIG_HOME":"config",
                       "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "TMPDIR":"tmp"}.items():
         directory = args.data / name

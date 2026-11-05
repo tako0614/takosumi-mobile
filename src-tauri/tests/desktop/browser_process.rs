@@ -133,22 +133,23 @@ async fn open_saved(view: &WebView, app: &AppHandle, name: &str, count: usize) -
     // a disabled button is ignored, so wait for the UI lock to clear first.
     ready(view,"document.querySelectorAll('.web-connection').length===2 && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await?;
     eval(view,&format!("(()=>{{const buttons=[...document.querySelectorAll('.web-connection')].filter(button=>button.querySelector('strong').textContent==={label});if(buttons.length!==1)throw Error('Unique saved connection required');buttons[0].click();return true}})()")).await?;
-    let end = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < end {
-        let status = browser_status(app)?;
-        if status.as_array().is_some_and(|items| {
-            items.len() == count
-                && items
-                    .iter()
-                    .all(|process| process["uncertain"] == false && !process["opened"].is_null())
-        }) {
-            return Ok(());
-        }
-        glib::timeout_future(Duration::from_millis(50)).await;
+    // The tap sets the home's open lock synchronously. Wait on the UI for the
+    // open to finish instead of polling native status, whose mutex an
+    // in-flight open holds (that would stall this GTK main loop).
+    ready(view,"!document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await?;
+    let status = browser_status(app)?;
+    if status.as_array().is_some_and(|items| {
+        items.len() == count
+            && items
+                .iter()
+                .all(|process| process["uncertain"] == false && !process["opened"].is_null())
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Saved {name} connection did not open after restart"
+        ))
     }
-    Err(format!(
-        "Saved {name} connection did not open after restart"
-    ))
 }
 /// Second launch on the same App data: the saved home reopens each profile.
 /// The observer checks per-profile site state survived and stayed separate.
@@ -160,12 +161,8 @@ async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -
     )
     .await?;
     println!("restart: saved home lists both connections");
-    if browser_status(app)?
-        .as_array()
-        .is_none_or(|items| !items.is_empty())
-    {
-        return Err("Restart began with live browser processes".into());
-    }
+    // The first launch's own guard receipts prove its browsers ended; the
+    // runner checked them before this relaunch.
     open_saved(view, app, "Work", 1).await?;
     println!("restart: Work reopened");
     open_saved(view, app, "Personal", 2).await?;
@@ -181,6 +178,7 @@ async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -
     .map_err(|error| error.to_string())?;
     // The observer verifies persisted state, then closes Personal natively so
     // the ordinary single-profile exit applies.
+    checkpoint(case, "restart-inspected").await?;
     checkpoint(case, "restart-request-exit").await?;
     std::fs::write(
         case.join("app-browser-process-restart-complete.json"),
