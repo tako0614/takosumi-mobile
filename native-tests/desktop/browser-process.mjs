@@ -190,9 +190,11 @@ try {
   }
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
-  // Precondition for the return check below: Personal was raised last, so it
-  // covers Work and Chrome reports Work hidden. Without that, the check is vacuous.
+  // Precondition for the return check below: raise Personal over Work (any
+  // app, any creation order) and require Chrome to report Work hidden.
+  // Without that, the check is vacuous.
   step('Work covered before resume',work);
+  desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>work.evaluate("document.visibilityState==='hidden'"),'Precondition: Personal must cover Work before resume');
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
   step('common UI resume');
