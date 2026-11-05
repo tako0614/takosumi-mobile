@@ -192,21 +192,54 @@ async fn relaunch_flow(
     open_saved(view, app, "Personal", 2).await?;
     println!("{kind}: Personal reopened");
     let opened = browser_status(app)?;
+    let personal = connections
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "Personal"))
+        .and_then(|item| item["profile"].as_str())
+        .ok_or("Missing saved Personal")?
+        .to_owned();
+    let personal_data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("browser-process-experiment")
+        .join(&personal);
+    let mut personal_singleton = Value::Null;
     if kind == "reset" {
-        // Personal is running: its data must not be cleared.
+        // Personal is running: its data must stay, on disk as well as in memory.
+        use std::os::unix::fs::MetadataExt;
+        let root = personal_data.join("cef-profiles");
+        let before = std::fs::symlink_metadata(&root)
+            .map_err(|error| error.to_string())?
+            .ino();
+        personal_singleton = std::fs::read_link(root.join("SingletonLock"))
+            .map(|target| Value::String(target.to_string_lossy().into_owned()))
+            .unwrap_or(Value::Null);
         tap_in_row(view, "Personal", "保存データを消去…").await?;
         ready(view, "document.querySelector('.web-clear')").await?;
         tap_in_row(view, "Personal", "保存データを消去").await?;
-        ready(view,"document.querySelector('.web-error')?.textContent.includes(\"Close this connection's screens\")").await?;
-        running_clear_refused = browser_status(app)? == opened;
+        ready(view,"document.querySelector('.web-error')?.textContent.includes('この接続先の画面をすべて閉じてから消去してください。')").await?;
+        let after = std::fs::symlink_metadata(&root)
+            .map_err(|error| error.to_string())?
+            .ino();
+        let detached = std::fs::read_dir(&personal_data)
+            .map_err(|error| error.to_string())?
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cef-profiles.clearing-")
+            });
+        running_clear_refused = browser_status(app)? == opened && before == after && !detached;
         if !running_clear_refused {
-            return Err("Refused clear changed the running browsers".into());
+            return Err("Refused clear changed the running browser or its data".into());
         }
-        println!("reset: clearing running Personal was refused");
+        println!("reset: clearing running Personal was refused; its data stayed on disk");
     }
     std::fs::write(
         case.join(format!("app-browser-process-{kind}-open.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused}))
+        serde_json::to_vec_pretty(&serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalSingleton":personal_singleton}))
             .unwrap(),
     )
     .map_err(|error| error.to_string())?;
@@ -214,6 +247,18 @@ async fn relaunch_flow(
     // ordinary single-profile exit applies.
     checkpoint(case, &format!("{kind}-inspected")).await?;
     checkpoint(case, &format!("{kind}-request-exit")).await?;
+    if kind == "reset" {
+        // The observer closed Personal normally in this session: now it can be
+        // cleared here (normal guard receipt, then removal from the map).
+        tap_in_row(view, "Personal", "保存データを消去…").await?;
+        ready(view, "document.querySelector('.web-clear')").await?;
+        tap_in_row(view, "Personal", "保存データを消去").await?;
+        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') && !document.querySelector('.web-clear')").await?;
+        if personal_data.join("cef-profiles").exists() {
+            return Err("In-session clear left Personal's site data".into());
+        }
+        println!("reset: Personal cleared in-session after its normal close");
+    }
     std::fs::write(
         case.join(format!("app-browser-process-{kind}-complete.json")),
         b"{\"passed\":true}\n",

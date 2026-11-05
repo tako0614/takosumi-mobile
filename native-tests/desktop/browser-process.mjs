@@ -197,6 +197,9 @@ async function relaunchFlow(kind) {
   if(kind==='reset') {
     assert.deepEqual(proof.persisted,[{storage:null,cookie:null},kept],'Only Work site data may be cleared');
     assert.equal(opened.runningClearRefused,true,'Clearing a running profile must be refused');
+    // The clear's liveness signal is CEF's own process singleton: it must name
+    // the running Personal browser's exact native PID.
+    assert.equal(String(opened.personalSingleton).split('-').at(-1),String(personal.native.nativePid),'CEF must mark the running Personal with its process singleton');
   } else {
     assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},kept],'Each profile must keep its own site storage and cookie across App restart');
   }
