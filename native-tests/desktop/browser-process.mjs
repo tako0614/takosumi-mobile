@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope:'Disposable Linux actual App/browser process fixture; no real login or Push'};
+const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase==='restart'?'-restart':'';
+assert(['','restart'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
@@ -160,8 +162,38 @@ async function attach(process) {
   assert.equal(context.secure,true);for(const key of ['tauri','ipc','wry'])assert.equal(context[key],'undefined');
   page.context=context;return page;
 }
-const clients=[];
-try {
+// Second launch on the same App data (runner --restart): each profile's site
+// storage from the first launch must survive and stay separate.
+async function restartFlow() {
+  proof.scope='Disposable Linux actual App restart on the same data; no real login or Push';
+  const opened=await marker('app-browser-process-restart-open.json');proof.opened=opened;
+  const pages=[];
+  for(const name of ['Work','Personal']) {
+    const connection=opened.connections.find(c=>c.name===name);assert(connection);
+    const process=opened.processes.find(p=>p.profile===connection.profile);assert(process);
+    pages.push(await attach(process));
+  }
+  const [,personal]=pages,key=`sumi_app_process_${nonce}`;
+  step('persisted per-profile storage after restart');
+  proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`localStorage.getItem(${JSON.stringify(key)})`)));
+  assert.deepEqual(proof.persisted,[`0:${nonce}`,`1:${nonce}`],'Each profile must keep its own site storage across App restart');
+  step('Personal native close after restart',personal);
+  desktop('xdotool',['windowraise',String(personal.native.windowId)]);
+  await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
+  desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
+  desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
+  await settled(async()=>{
+    if(!(await guardEnded(personal.process.guardReceipt)))return false;
+    const receipt=JSON.parse(await readFile(personal.process.guardReceipt,'utf8'));
+    assert.equal(receipt.rootExit,0);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
+    assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
+    proof.personalClosed=receipt;return true;
+  },'Personal guard did not finish after restart');
+  step('Work ordinary exit after restart',pages[0]);
+  await writeFile(path.join(data,'restart-request-exit'),'ready',{flag:'wx'});
+  proof.passed=true;
+}
+async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
   // last App command (ph13). Before any page step, send no App command past
@@ -289,6 +321,11 @@ try {
   step('Work final exit',work);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
+}
+const clients=[];
+try {
+  if(phase==='restart')await restartFlow();
+  else await firstLaunch();
 }catch(error){
   proof.error=String(error);
   if(!proof.processSnapshot&&clients.length) {
@@ -304,5 +341,5 @@ try {
 }
 finally {
   for(const c of clients)c.socket.close();
-  await writeFile(path.join(data,'browser-observation.json'),JSON.stringify(proof,null,2)+'\n');
+  await writeFile(path.join(data,`browser-observation${suffix}.json`),JSON.stringify(proof,null,2)+'\n');
 }

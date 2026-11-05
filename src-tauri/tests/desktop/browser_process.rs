@@ -122,6 +122,68 @@ async fn exit_cancelled(app: &AppHandle, previous: u64) -> Result<Value> {
     }
     Err("Ordinary exit did not return to running".into())
 }
+fn browser_status(app: &AppHandle) -> Result<Value> {
+    tauri_plugin_app_screen::browser_process_experiment_status(app)
+        .map_err(|error| error.to_string())
+}
+/// Open a saved connection through the home's own button, as a user tap does.
+async fn open_saved(view: &WebView, app: &AppHandle, name: &str, count: usize) -> Result<()> {
+    let label = serde_json::to_string(name).unwrap();
+    eval(view,&format!("(()=>{{const buttons=[...document.querySelectorAll('.web-connection')].filter(button=>button.querySelector('strong').textContent==={label});if(buttons.length!==1)throw Error('Unique saved connection required');buttons[0].click();return true}})()")).await?;
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end {
+        let status = browser_status(app)?;
+        if status.as_array().is_some_and(|items| {
+            items.len() == count
+                && items
+                    .iter()
+                    .all(|process| process["uncertain"] == false && !process["opened"].is_null())
+        }) {
+            return Ok(());
+        }
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
+    Err(format!(
+        "Saved {name} connection did not open after restart"
+    ))
+}
+/// Second launch on the same App data: the saved home reopens each profile.
+/// The observer checks per-profile site state survived and stayed separate.
+async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -> Result<()> {
+    ready(view,"document.querySelectorAll('.web-connection').length===2 && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await?;
+    let connections = eval(
+        view,
+        "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+    )
+    .await?;
+    if browser_status(app)?
+        .as_array()
+        .is_none_or(|items| !items.is_empty())
+    {
+        return Err("Restart began with live browser processes".into());
+    }
+    open_saved(view, app, "Work", 1).await?;
+    open_saved(view, app, "Personal", 2).await?;
+    let opened = browser_status(app)?;
+    std::fs::write(
+        case.join("app-browser-process-restart-open.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"connections":connections,"processes":opened}),
+        )
+        .unwrap(),
+    )
+    .map_err(|error| error.to_string())?;
+    // The observer verifies persisted state, then closes Personal natively so
+    // the ordinary single-profile exit applies.
+    checkpoint(case, "restart-request-exit").await?;
+    std::fs::write(
+        case.join("app-browser-process-restart-complete.json"),
+        b"{\"passed\":true}\n",
+    )
+    .map_err(|error| error.to_string())?;
+    println!("PASS restarted App reopened both saved profiles");
+    Ok(())
+}
 async fn flow(app: &AppHandle) -> Result<()> {
     let case = PathBuf::from(
         std::env::var_os("TAKOSUMI_BROWSER_PROCESS_CASE").ok_or("Owned fixture case missing")?,
@@ -141,6 +203,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
         "document.querySelector('#connection-url') && window.__TAURI_INTERNALS__",
     )
     .await?;
+    if std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE").as_deref() == Ok("restart") {
+        return restart_flow(app, &view, &case).await;
+    }
     add(&view, "Work", 1).await?;
     add(&view, "Personal", 2).await?;
     let connections = eval(

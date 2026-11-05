@@ -94,20 +94,23 @@ def digest(file):
 def worker(args):
     enable_child_subreaper()
     result = {"passed": False}
-    with (args.data / "app.log").open("x") as log:
+    phase = os.environ.get("TAKOSUMI_BROWSER_PROCESS_PHASE", "")
+    require(phase in {"", "restart"}, "Unknown browser fixture phase")
+    suffix = "-restart" if phase else ""
+    with (args.data / f"app{suffix}.log").open("x") as log:
         app = subprocess.Popen([str(args.binary)], stdout=log, stderr=subprocess.STDOUT)
         try:
-            with (args.data / "observer.log").open("x") as observer:
+            with (args.data / f"observer{suffix}.log").open("x") as observer:
                 subprocess.run(["node", str(REPO / "native-tests/desktop/browser-process.mjs"),
                                 str(args.data)], check=True, timeout=85,
                                stdout=observer, stderr=subprocess.STDOUT)
             result["appExit"] = app.wait(timeout=15)
             require(result["appExit"] == 0, "The App must exit normally")
-            require(json.loads((args.data / "app-browser-process-complete.json").read_text())["passed"] is True,
+            require(json.loads((args.data / f"app-browser-process{suffix}-complete.json").read_text())["passed"] is True,
                     "The actual App flow must pass")
-            require(json.loads((args.data / "browser-observation.json").read_text())["passed"] is True,
+            require(json.loads((args.data / f"browser-observation{suffix}.json").read_text())["passed"] is True,
                     "The browser observation must pass")
-            opened = json.loads((args.data / "app-browser-process-open.json").read_text())
+            opened = json.loads((args.data / f"app-browser-process{suffix}-open.json").read_text())
             result["browserGuards"] = []
             for process in opened["processes"]:
                 receipt = json.loads(Path(process["guardReceipt"]).read_text())
@@ -137,7 +140,52 @@ def worker(args):
                 result["cleanupError"] = str(error)
                 raise
             finally:
-                (args.data / "app-execution.json").write_text(json.dumps(result, indent=2)+"\n")
+                (args.data / f"app-execution{suffix}.json").write_text(json.dumps(result, indent=2)+"\n")
+
+
+def run_session(args, env, files, before, head, suffix):
+    receipt = args.data / f"session-guard{suffix}.json"
+    command = ["python3", "-B", str(GUARD), str(receipt), "xvfb-run", "-a", "-s", "-screen 0 1280x960x24",
+               "dbus-run-session", "--", "python3", "-B", str(Path(__file__).resolve()), "--worker",
+               "--binary", str(args.binary), "--browser", str(args.browser), "--data", str(args.data)]
+    proof = {"passed":False,"sourceHead":head,"artifactsBefore":before}
+    with (args.data / f"session{suffix}.log").open("x") as log:
+        process = subprocess.Popen(command, env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
+        proof["sessionPid"] = process.pid
+        identity = process_identity(process.pid)
+        proof["sessionStart"] = identity[0] if identity else None
+        try:
+            proof["sessionExit"] = process.wait(timeout=110)
+            proof["sessionGuard"] = json.loads(receipt.read_text())
+            normal(proof["sessionGuard"])
+            require(proof["sessionExit"] == 0, "The owned session must exit normally")
+            require(json.loads((args.data / f"app-execution{suffix}.json").read_text())["passed"] is True,
+                    "The actual App execution must pass")
+            proof["passed"] = True
+        except Exception as error:
+            proof["error"] = str(error)
+            raise
+        finally:
+            try:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=15)
+            except Exception as error:
+                proof["passed"] = False
+                proof["cleanupError"] = str(error)
+                raise
+            finally:
+                try:
+                    proof["artifactsAfter"] = {str(file):digest(file) for file in files}
+                    proof["sourceHeadAfter"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+                    if proof["artifactsAfter"] != before or proof["sourceHeadAfter"] != head:
+                        proof["passed"] = False
+                except Exception as error:
+                    proof["passed"] = False
+                    proof["artifactError"] = str(error)
+                finally:
+                    (args.data / f"execution{suffix}.json").write_text(json.dumps(proof, indent=2)+"\n")
+    return proof
 
 
 def main():
@@ -147,6 +195,8 @@ def main():
     parser.add_argument("--browser", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=["excalidraw", "photopea"], default="excalidraw")
+    parser.add_argument("--restart", action="store_true",
+                        help="relaunch the App on the same data and verify per-profile state after restart")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
@@ -191,48 +241,13 @@ def main():
     os.link(args.binary, args.data / "app-executable")
     os.link(args.browser, args.data / "browser-executable")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
-    receipt = args.data / "session-guard.json"
-    command = ["python3", "-B", str(GUARD), str(receipt), "xvfb-run", "-a", "-s", "-screen 0 1280x960x24",
-               "dbus-run-session", "--", "python3", "-B", str(Path(__file__).resolve()), "--worker",
-               "--binary", str(args.binary), "--browser", str(args.browser), "--data", str(args.data)]
-    proof = {"passed":False,"sourceHead":head,"artifactsBefore":before}
-    with (args.data / "session.log").open("x") as log:
-        process = subprocess.Popen(command, env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
-        proof["sessionPid"] = process.pid
-        identity = process_identity(process.pid)
-        proof["sessionStart"] = identity[0] if identity else None
-        try:
-            proof["sessionExit"] = process.wait(timeout=110)
-            proof["sessionGuard"] = json.loads(receipt.read_text())
-            normal(proof["sessionGuard"])
-            require(proof["sessionExit"] == 0, "The owned session must exit normally")
-            require(json.loads((args.data / "app-execution.json").read_text())["passed"] is True,
-                    "The actual App execution must pass")
-            proof["passed"] = True
-        except Exception as error:
-            proof["error"] = str(error)
-            raise
-        finally:
-            try:
-                if process.poll() is None:
-                    process.send_signal(signal.SIGTERM)
-                    process.wait(timeout=15)
-            except Exception as error:
-                proof["passed"] = False
-                proof["cleanupError"] = str(error)
-                raise
-            finally:
-                try:
-                    proof["artifactsAfter"] = {str(file):digest(file) for file in files}
-                    proof["sourceHeadAfter"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
-                    if proof["artifactsAfter"] != before or proof["sourceHeadAfter"] != head:
-                        proof["passed"] = False
-                except Exception as error:
-                    proof["passed"] = False
-                    proof["artifactError"] = str(error)
-                finally:
-                    (args.data / "execution.json").write_text(json.dumps(proof, indent=2)+"\n")
+    proof = run_session(args, env, files, before, head, "")
     require(proof["passed"] is True, "The native execution did not pass")
+    if args.restart:
+        # Relaunch the App on the same HOME/XDG data: each profile's site state
+        # must survive a normal exit and stay separated after restart.
+        restart = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="restart"), files, before, head, "-restart")
+        require(restart["passed"] is True, "The restarted native execution did not pass")
 
 
 if __name__ == "__main__":
