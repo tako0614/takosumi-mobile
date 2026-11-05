@@ -322,13 +322,12 @@ pub(super) async fn clear_profile(
             return Err(Error::InvalidRequest("The browser is closing."));
         }
         let mut state = backend.0.lock().map_err(failure)?;
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
         if let Some(process) = state.processes.get_mut(&payload.profile) {
             match process.child.try_wait().map_err(failure)? {
-                None => {
-                    return Err(Error::InvalidRequest(
-                        "Close this connection's screens before clearing its data.",
-                    ))
-                }
+                None => return Err(Error::InvalidRequest(STILL_OPEN)),
                 Some(status) if !status.success() => {
                     return Err(Error::InvalidRequest(
                         "Previous browser process ended abnormally; profile data is retained.",
@@ -350,6 +349,38 @@ pub(super) async fn clear_profile(
 
 static NEXT_CLEAR: AtomicU64 = AtomicU64::new(1);
 const CLEARING: &str = "cef-profiles.clearing-";
+const STILL_OPEN: &str = "この接続先の画面をすべて閉じてから消去してください。";
+
+/// CEF's own process singleton marks a live browser on this cache root, even
+/// one this App instance does not track (another instance, or a browser still
+/// draining after an App crash). Anything unexpected counts as live.
+fn singleton_live(root: &std::path::Path) -> bool {
+    match std::fs::read_link(root.join("SingletonLock")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(target) => target
+            .to_str()
+            .and_then(|target| target.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok())
+            .is_none_or(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
+    }
+}
+
+/// Remove detached cache roots left by an interrupted clear. Links are never
+/// followed: only plain directories are removed, with std's link-safe removal.
+fn remove_detached(profile_directory: &std::path::Path) -> Result<()> {
+    for entry in std::fs::read_dir(profile_directory).map_err(failure)? {
+        let entry = entry.map_err(failure)?;
+        if entry.file_name().to_string_lossy().starts_with(CLEARING) {
+            let path = entry.path();
+            let metadata = path.symlink_metadata().map_err(failure)?;
+            if metadata.file_type().is_dir() {
+                std::fs::remove_dir_all(&path).map_err(failure)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Detach the profile's CEF cache root by rename, then remove it. An
 /// interrupted removal leaves only a detached directory, never a half-cleared
@@ -372,6 +403,9 @@ fn clear_site_data(directory: &std::path::Path, profile: &str) -> Result<()> {
     }
     let root = profile_directory.join("cef-profiles");
     if plain_directory(&root)? {
+        if singleton_live(&root) {
+            return Err(Error::InvalidRequest(STILL_OPEN));
+        }
         let detached = profile_directory.join(format!(
             "{CLEARING}{}-{}",
             std::process::id(),
@@ -379,17 +413,7 @@ fn clear_site_data(directory: &std::path::Path, profile: &str) -> Result<()> {
         ));
         std::fs::rename(&root, &detached).map_err(failure)?;
     }
-    for entry in std::fs::read_dir(&profile_directory).map_err(failure)? {
-        let entry = entry.map_err(failure)?;
-        if entry.file_name().to_string_lossy().starts_with(CLEARING) {
-            let path = entry.path();
-            if plain_directory(&path)? {
-                // Symlink-safe: std's remove_dir_all never follows links.
-                std::fs::remove_dir_all(&path).map_err(failure)?;
-            }
-        }
-    }
-    Ok(())
+    remove_detached(&profile_directory)
 }
 
 pub(super) fn status(app: &AppHandle) -> Result<serde_json::Value> {
@@ -423,6 +447,10 @@ impl Process {
             ));
         }
         let directory = directory.canonicalize().map_err(failure)?;
+        // An interrupted clear may have left a detached old cache root.
+        if let Err(problem) = remove_detached(&directory) {
+            eprintln!("Detached browser data was not removed: {problem}");
+        }
         let profile = payload.profile.clone();
         if runtime
             .join("tmp/org.chromium.Chromium.XXXXXX/SingletonSocket")
@@ -952,6 +980,32 @@ mod tests {
             std::fs::read(outside.join("target.txt")).unwrap(),
             b"outside"
         );
+        // CEF's singleton of a live browser (this test process) refuses the clear;
+        // a stale one left by an ended process does not.
+        let live = root.join("55555555-5555-4555-8555-555555555555");
+        private_directory(&live.join("cef-profiles")).unwrap();
+        std::fs::write(live.join("cef-profiles").join("Cookies"), b"z").unwrap();
+        std::os::unix::fs::symlink(
+            format!("test-host-{}", std::process::id()),
+            live.join("cef-profiles").join("SingletonLock"),
+        )
+        .unwrap();
+        assert!(clear_site_data(&root, "55555555-5555-4555-8555-555555555555").is_err());
+        assert_eq!(
+            std::fs::read(live.join("cef-profiles").join("Cookies")).unwrap(),
+            b"z"
+        );
+        let mut ended = Command::new("true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        std::fs::remove_file(live.join("cef-profiles").join("SingletonLock")).unwrap();
+        std::os::unix::fs::symlink(
+            format!("test-host-{ended_pid}"),
+            live.join("cef-profiles").join("SingletonLock"),
+        )
+        .unwrap();
+        clear_site_data(&root, "55555555-5555-4555-8555-555555555555").unwrap();
+        assert!(!live.join("cef-profiles").exists());
         // Missing data is already clear.
         assert!(clear_site_data(&root, "44444444-4444-4444-8444-444444444444").is_ok());
         std::fs::remove_dir_all(&root).unwrap();
