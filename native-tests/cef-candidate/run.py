@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=("photopea", "excalidraw"), required=True)
-    parser.add_argument("--mode", choices=("inspect", "operate"), default="operate")
+    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup"), default="operate")
     parser.add_argument("--files", choices=("cdp", "native-picker"), default="cdp",
                         help="Native picker uses a visible browser in the owned Xvfb session")
     args = parser.parse_args()
@@ -41,6 +41,8 @@ def main():
         parser.error("This candidate has only a Linux runner")
     if args.files == "native-picker" and args.app != "excalidraw":
         parser.error("The native-picker probe currently targets Excalidraw only")
+    if args.mode in ("profiles", "profile-popup") and args.files != "cdp":
+        parser.error("The profile probe does not operate file dialogs")
     for tool in ("node", "python3", "xvfb-run", "dbus-run-session", "timeout", "convert"):
         if shutil.which(tool) is None:
             parser.error(f"Required existing capability is missing: {tool}")
@@ -57,11 +59,16 @@ def main():
     # Resolve the existing parent before making the owned directory; no symlink
     # case/profile paths are passed to the native candidate.
     data = data.parent.resolve(strict=True) / data.name
+    # This pinned Linux Chromium creates its process-singleton socket below
+    # TMPDIR. sockaddr_un reserves one byte for NUL in its 108-byte path.
+    socket_path = data / "tmp/org.chromium.Chromium.XXXXXX/SingletonSocket"
+    if len(os.fsencode(socket_path)) >= 108:
+        parser.error("--data is too long for the Linux Chromium socket; choose a shorter owned case path")
     data.mkdir(mode=0o700)
     nonce = str(uuid.uuid4())
     (data / ".owned-browser-reference").write_text(nonce)
     fixture = create_input(data, args.app, nonce)
-    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "run.py")]
+    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "run.py")]
     sources += [HERE.parent / name for name in (
         "desktop/browser_apps.py", "desktop/web_home.py", "browser/guard.py", "browser/lifecycle.ts",
     )]

@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { waitForGtkConfirm } from './gtk-readiness.mjs';
+import { PROFILE_IDS, probeProfiles } from './profiles.mjs';
 
 const repo=fileURLToPath(new URL('../../',import.meta.url));
 const data=process.argv[2], app=process.argv[3], mode=process.argv[4], binary=process.argv[5];
@@ -16,7 +17,9 @@ assert(files!=='native-picker'||app==='excalidraw');
 assert(binary && path.isAbsolute(binary));
 assert((await lstat(binary)).isFile() && !(await lstat(binary)).isSymbolicLink());
 const urls={photopea:'https://www.photopea.com/',excalidraw:'https://excalidraw.com/'};
-assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate'].includes(mode));
+assert(data && path.isAbsolute(data) && urls[app] && ['inspect','operate','profiles','profile-popup'].includes(mode));
+const profileMode=mode==='profiles'||mode==='profile-popup';
+assert(!profileMode||files==='cdp');
 assert(process.env.TAKOSUMI_CEF_RUNNER_CASE===data,'Use run.py to own the desktop session');
 assert((await lstat(data)).isDirectory() && !(await lstat(data)).isSymbolicLink());
 const nonce=(await readFile(path.join(data,'.owned-browser-reference'),'utf8')).trim();
@@ -150,8 +153,8 @@ try {
   const port=reserve.address().port;
   await new Promise((resolve,reject)=>reserve.close(e=>e?reject(e):resolve()));
   env.TAKOSUMI_CEF_PORT=String(port);
-  const profile='11111111-1111-4111-8111-111111111111';
-  await writeFile(path.join(data,'request.json'),JSON.stringify({key:`web-home:${profile}:${new URL(urls[app]).origin}`,url:urls[app],title:'Native CEF candidate',profile,webHome:true,resume:false}));
+  const requests=(profileMode?PROFILE_IDS:[PROFILE_IDS[0]]).map(profile=>({key:`web-home:${profile}:${new URL(urls[app]).origin}`,url:urls[app],title:'Native CEF candidate',profile,webHome:true,resume:false}));
+  await writeFile(path.join(data,'request.json'),JSON.stringify(profileMode?requests:requests[0]));
   browser=spawn('python3',['-B',path.join(repo,'native-tests/browser/guard.py'),path.join(data,'guard.json'),binary,
     ...(files==='cdp'?['--headless=new']:[]),'--no-sandbox','--no-first-run','--no-default-browser-check','--disable-background-networking',
     '--disable-component-update','--disable-sync','--password-store=basic','--lang=en-US','--remote-debugging-address=127.0.0.1'],
@@ -204,6 +207,11 @@ try {
   receipt.version=await command('Browser.getVersion');
   const protocol=await (await fetch(`http://127.0.0.1:${port}/json/protocol`,{signal:AbortSignal.timeout(5000)})).json();
   await writeFile(path.join(data,'protocol.json'),JSON.stringify(protocol.domains.filter(d=>['Browser','Page','DOM'].includes(d.domain)).map(d=>({domain:d.domain,commands:d.commands.filter(c=>['setDownloadBehavior','setInterceptFileChooserDialog','setFileInputFiles'].includes(c.name)),events:d.events?.filter(e=>['downloadWillBegin','downloadProgress','fileChooserOpened'].includes(e.name))})),null,2));
+  if(profileMode) {
+    await stage('native two-profile bindings and same-origin state');
+    receipt.profiles=await probeProfiles({command,data,url:urls[app],nonce,popup:mode==='profile-popup'});
+    receipt.profileVerified=receipt.profiles.passed===true;
+  }else {
   const targetDeadline=Date.now()+10000;let target;
   while(Date.now()<targetDeadline&&!target) {
     const targets=(await command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
@@ -306,6 +314,7 @@ try {
     const status=await new Promise(resolve=>proof.once('exit',resolve));assert(status===0,err);
     receipt.export=JSON.parse(out);receipt.exportVerified=true;
   }
+  }
 }catch(e){
   error=e;receipt.error=String(e);
   try {receipt.failedFrame=(await page('Page.getFrameTree')).frameTree.frame;}catch{}
@@ -323,11 +332,30 @@ finally {
   try {
     if(socket?.readyState===WebSocket.OPEN)await command('Browser.close').catch(()=>{});
     socket?.close();
-    if(browser){let ended=await Promise.race([exitPromise.then(()=>true),delay(5000).then(()=>false)]);if(!ended){browser.kill('SIGTERM');ended=await Promise.race([exitPromise.then(()=>true),delay(5000).then(()=>false)])}assert(ended,'Owned guard cleanup did not finish');receipt.lifecycle=confirmBrowserCleanup(browser.exitCode,JSON.parse(await readFile(path.join(data,'guard.json'),'utf8')),!error);if(!error)assert(receipt.lifecycle.forcedCleanup===0,'Normal closure must not force cleanup');closed=true;}
+    if(browser){
+      let ended=await Promise.race([exitPromise.then(()=>true),delay(5000).then(()=>false)]);
+      if(!ended){
+        if(receipt.nativePid) {
+          try {
+            const tasks=await readdir(`/proc/${receipt.nativePid}/task`);
+            receipt.shutdownWaits=await Promise.all(tasks.slice(0,24).map(async tid=>({tid:Number(tid),name:(await readFile(`/proc/${receipt.nativePid}/task/${tid}/comm`,'utf8')).trim(),wait:(await readFile(`/proc/${receipt.nativePid}/task/${tid}/wchan`,'utf8')).trim()})));
+          }catch{}
+        }
+        browser.kill('SIGTERM');
+        ended=await Promise.race([exitPromise.then(()=>true),delay(5000).then(()=>false)]);
+      }
+      assert(ended,'Owned guard cleanup did not finish');
+      receipt.guard=JSON.parse(await readFile(path.join(data,'guard.json'),'utf8'));
+      receipt.lifecycle=confirmBrowserCleanup(browser.exitCode,receipt.guard,!error);
+      if(!error)assert(receipt.lifecycle.forcedCleanup===0,'Normal closure must not force cleanup');
+      closed=true;
+    }
   }catch(e){receipt.cleanupError=String(e);error??=e;}
   for(const p of pending.values()){clearTimeout(p.timer);p.reject(Error('Owned CDP closed'));}pending.clear();
   receipt.cleanupConfirmed=closed;
   receipt.operationPassed=mode==='operate' && receipt.exportVerified===true && closed && !error;
+  receipt.profilePassed=profileMode && receipt.profileVerified===true && closed && !error;
+  receipt.popupPassed=mode==='profile-popup' && receipt.profiles?.popup?.passed===true && closed && !error;
   await writeFile(path.join(data,'reference.json'),JSON.stringify(receipt,null,2)+'\n');
 }
-if(error){console.error(error);process.exitCode=1;}else console.log(`${mode==='operate'?'PASS actual export':'OBSERVATION ONLY'}: ${app} ${data}`);
+if(error){console.error(error);process.exitCode=1;}else console.log(`${mode==='operate'?'PASS actual export':profileMode?'PASS native profile state':'OBSERVATION ONLY'}: ${app} ${data}`);

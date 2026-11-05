@@ -35,7 +35,14 @@ download service. It selects a previously absent owned output and requires
 the exact file with the imported nonce and keyboard edit. The English GTK
 confirm-pixel heuristic is scoped to the inspected theme/geometry.
 
-Actual bytes and normal native shutdown are required for operation success.
-A verified single UUID context does not qualify two-profile data/session
-isolation. Tauri UI integration, popup/login, site permissions, Web Push,
-sandboxing, other OSes and distribution remain separate unfinished checks.
+Actual bytes and normal native shutdown are required for file-operation success.
+The separate two-profile modes use the same native factory with two request
+contexts, native main-frame/CDP page identity and actual native close receipts.
+They test synthetic same-origin storage/cookies and a CDP-driven standard popup;
+cookies are set through CDP, not obtained from a provider. The recorder ends only
+after SDK shutdown and owned client release, independently of remaining Sender
+handles. Strict process/guard checks still gate every success flag.
+
+Tauri UI integration, real login/cross-origin popup return, site permissions,
+Web Push, restart persistence, sandboxing, other OSes and distribution remain
+separate unfinished checks. These experiments do not select a product engine.
