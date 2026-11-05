@@ -353,17 +353,24 @@ const STILL_OPEN: &str = "この接続先の画面をすべて閉じてから消
 
 /// CEF's own process singleton marks a live browser on this cache root, even
 /// one this App instance does not track (another instance, or a browser still
-/// draining after an App crash). Anything unexpected counts as live.
+/// draining after an App crash). The lock names `<hostname>-<pid>`; a lock from
+/// another host, an unreadable or unparsable one, or a live PID counts as live.
+/// A reused PID refuses on the safe side; reopening the profile renews the lock.
 fn singleton_live(root: &std::path::Path) -> bool {
-    match std::fs::read_link(root.join("SingletonLock")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-        Ok(target) => target
-            .to_str()
-            .and_then(|target| target.rsplit_once('-'))
-            .and_then(|(_, pid)| pid.parse::<u32>().ok())
-            .is_none_or(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
-    }
+    let target = match std::fs::read_link(root.join("SingletonLock")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(target) => target,
+    };
+    let Some((host, pid)) = target
+        .to_str()
+        .and_then(|target| target.rsplit_once('-'))
+        .and_then(|(host, pid)| Some((host, pid.parse::<u32>().ok()?)))
+    else {
+        return true;
+    };
+    let local = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    host != local.trim() || std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Remove detached cache roots left by an interrupted clear. Links are never
@@ -985,25 +992,30 @@ mod tests {
         let live = root.join("55555555-5555-4555-8555-555555555555");
         private_directory(&live.join("cef-profiles")).unwrap();
         std::fs::write(live.join("cef-profiles").join("Cookies"), b"z").unwrap();
-        std::os::unix::fs::symlink(
-            format!("test-host-{}", std::process::id()),
-            live.join("cef-profiles").join("SingletonLock"),
-        )
-        .unwrap();
-        assert!(clear_site_data(&root, "55555555-5555-4555-8555-555555555555").is_err());
-        assert_eq!(
-            std::fs::read(live.join("cef-profiles").join("Cookies")).unwrap(),
-            b"z"
-        );
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        let host = host.trim();
+        let lock = live.join("cef-profiles").join("SingletonLock");
         let mut ended = Command::new("true").spawn().unwrap();
         let ended_pid = ended.id();
         ended.wait().unwrap();
-        std::fs::remove_file(live.join("cef-profiles").join("SingletonLock")).unwrap();
-        std::os::unix::fs::symlink(
-            format!("test-host-{ended_pid}"),
-            live.join("cef-profiles").join("SingletonLock"),
-        )
-        .unwrap();
+        for target in [
+            format!("{host}-{}", std::process::id()), // live browser on this host
+            format!("other-host-{ended_pid}"),        // another host: cannot tell
+            "not-a-pid".to_owned(),                   // unparsable
+        ] {
+            let _ = std::fs::remove_file(&lock);
+            std::os::unix::fs::symlink(&target, &lock).unwrap();
+            match clear_site_data(&root, "55555555-5555-4555-8555-555555555555") {
+                Err(Error::InvalidRequest(message)) => assert_eq!(message, STILL_OPEN, "{target}"),
+                other => panic!("{target}: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read(live.join("cef-profiles").join("Cookies")).unwrap(),
+                b"z"
+            );
+        }
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(format!("{host}-{ended_pid}"), &lock).unwrap();
         clear_site_data(&root, "55555555-5555-4555-8555-555555555555").unwrap();
         assert!(!live.join("cef-profiles").exists());
         // Missing data is already clear.
