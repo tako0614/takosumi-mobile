@@ -190,10 +190,18 @@ try {
   }
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
+  // Precondition for the return check below: Personal was raised last, so it
+  // covers Work and Chrome reports Work hidden. Without that, the check is vacuous.
+  step('Work covered before resume',work);
+  await settled(()=>work.evaluate("document.visibilityState==='hidden'"),'Precondition: Personal must cover Work before resume');
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
   step('common UI resume');
   proof.resumed=await marker('app-browser-process.json');
   assert.deepEqual(await Promise.all(pages.map(sample)),expected,'UI resume must retain both exact documents and storage');
+  // Returning to Work from the common home must bring its window to the front.
+  step('Work brought to front by resume',work);
+  await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Resumed Work window stayed hidden behind another profile');
+  proof.resumeFront={work:'visible',precondition:'hidden'};
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
