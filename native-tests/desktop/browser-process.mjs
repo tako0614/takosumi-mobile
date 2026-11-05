@@ -168,12 +168,17 @@ try {
   // that keep-alive and require every native guard to be live; attach below
   // then re-attests each native PID, window and document.
   step('idle past blocking keep-alive');
-  const idleStart=Date.now();
+  const openSeen=Date.now();
+  // The same guard process (start identity), not a zombie, and no final receipt.
+  const guardState=async pid=>{try{const f=(await readFile(`/proc/${pid}/stat`,'utf8')).split(') ').at(-1).split(/\s+/);return{state:f[0],start:f[19]};}catch(e){if(e.code==='ENOENT')return null;throw e;}};
+  const guardStarts=await Promise.all(opened.processes.map(process=>guardState(process.pid)));
   await delay(12000);
-  for(const process of opened.processes) {
+  for(const [index,process] of opened.processes.entries()) {
+    const now=await guardState(process.pid),before=guardStarts[index];
+    assert(before&&now&&now.start===before.start&&!['Z','X'].includes(now.state),`Browser guard for ${process.profile} was not the same live process after the idle hold`);
     assert(!(await guardEnded(process.guardReceipt)),`Browser guard for ${process.profile} ended during the idle hold`);
   }
-  proof.idleHold={milliseconds:Date.now()-idleStart,guardsLive:opened.processes.length};
+  proof.idleHold={milliseconds:Date.now()-openSeen,guardsLive:opened.processes.length};
   const pages=[];
   for(const name of ['Work','Personal']) {
     const connection=opened.connections.find(c=>c.name===name);assert(connection);
@@ -196,6 +201,7 @@ try {
   step('Work covered before resume',work);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>work.evaluate("document.visibilityState==='hidden'"),'Precondition: Personal must cover Work before resume');
+  proof.inspectReadyAfterOpenMs=Date.now()-openSeen;
   await writeFile(path.join(data,'inspect-ready'),'ready',{flag:'wx'});
   step('common UI resume');
   proof.resumed=await marker('app-browser-process.json');
@@ -204,6 +210,14 @@ try {
   step('Work brought to front by resume',work);
   await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Resumed Work window stayed hidden behind another profile');
   proof.resumeFront={work:'visible',precondition:'hidden'};
+  // A site file export lands only in that profile's own Downloads directory.
+  step('Work Blob download',work);
+  const fileName=`sumi-${nonce}.txt`,fileText=`work:${nonce}`;
+  const ownDownloads=path.join(work.process.directory,'Downloads'),otherDownloads=path.join(personal.process.directory,'Downloads');
+  await work.evaluate(`(()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([${JSON.stringify(fileText)}],{type:'text/plain'}));a.download=${JSON.stringify(fileName)};document.body.append(a);a.click();a.remove();return true})()`,true);
+  await settled(async()=>{try{return (await readFile(path.join(ownDownloads,fileName),'utf8'))===fileText;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'Work download did not land in its own Downloads');
+  assert.deepEqual((await readdir(otherDownloads)).filter(name=>name.includes(nonce)),[],'Work download must not reach Personal Downloads');
+  proof.download={profile:work.process.profile,file:fileName,bytes:Buffer.byteLength(fileText),otherProfileClean:true};
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
@@ -217,6 +231,9 @@ try {
   // Close Personal using the existing Chrome window shortcut, then require
   // native guard completion before asking App to close the sole Work window.
   step('Personal native close',personal);
+  // Resume raised Work over Personal; a user clicks Personal to the front first.
+  desktop('xdotool',['windowraise',String(personal.native.windowId)]);
+  await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
   desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
   // Require the exact parent-attested guard receipt, not target IDs from a
