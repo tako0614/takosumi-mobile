@@ -17,6 +17,11 @@ const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout
 // Name the active operation and its exact page, so a failure snapshot inspects
 // that profile rather than whichever client happened to attach last.
 const step=(name,page)=>{proof.stage={name,pid:page?.native.nativePid,profile:page?.process.profile};};
+// The same guard process (start identity) and its kernel state, or null once reaped.
+const guardState=async pid=>{try{const f=(await readFile(`/proc/${pid}/stat`,'utf8')).split(') ').at(-1).split(/\s+/);return{state:f[0],start:f[19]};}catch(e){if(e.code==='ENOENT')return null;throw e;}};
+// The guard writes its receipt shortly before its process ends. The App counts a
+// profile until it reaps that process, so wait for the exit itself as well.
+const guardExited=async page=>{const now=await guardState(page.process.pid);return !now||now.state==='Z'||now.start!==page.c.binding.guardStart;};
 const json=async file=>JSON.parse(await readFile(path.join(data,file),'utf8'));
 async function marker(file) {
   const end=Date.now()+30000;
@@ -198,6 +203,7 @@ async function restartFlow() {
     const receipt=JSON.parse(await readFile(personal.process.guardReceipt,'utf8'));
     assert.equal(receipt.rootExit,0);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
+    if(!(await guardExited(personal)))return false;
     proof.personalClosed=receipt;return true;
   },'Personal guard did not finish after restart');
   step('Work ordinary exit after restart',pages[0]);
@@ -213,7 +219,6 @@ async function firstLaunch() {
   step('idle past blocking keep-alive');
   const openSeen=Date.now();
   // The same guard process (start identity), not a zombie, and no final receipt.
-  const guardState=async pid=>{try{const f=(await readFile(`/proc/${pid}/stat`,'utf8')).split(') ').at(-1).split(/\s+/);return{state:f[0],start:f[19]};}catch(e){if(e.code==='ENOENT')return null;throw e;}};
   const guardStarts=await Promise.all(opened.processes.map(process=>guardState(process.pid)));
   await delay(12000);
   for(const [index,process] of opened.processes.entries()) {
@@ -289,6 +294,7 @@ async function firstLaunch() {
     catch(e){if(e.code==='ENOENT'||e instanceof SyntaxError)return false;throw e;}
     assert.equal(receipt.rootExit,0);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
+    if(!(await guardExited(personal)))return false;
     proof.personalClosed=receipt;return true;
   },'Personal guard did not finish');
   step('Work native beforeunload',work);
