@@ -156,6 +156,7 @@ async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -
         "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
     )
     .await?;
+    println!("restart: saved home lists both connections");
     if browser_status(app)?
         .as_array()
         .is_none_or(|items| !items.is_empty())
@@ -163,7 +164,9 @@ async fn restart_flow(app: &AppHandle, view: &WebView, case: &std::path::Path) -
         return Err("Restart began with live browser processes".into());
     }
     open_saved(view, app, "Work", 1).await?;
+    println!("restart: Work reopened");
     open_saved(view, app, "Personal", 2).await?;
+    println!("restart: Personal reopened");
     let opened = browser_status(app)?;
     std::fs::write(
         case.join("app-browser-process-restart-open.json"),
@@ -204,6 +207,8 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     if std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE").as_deref() == Ok("restart") {
+        // Progress lines survive an outer timeout that kills the App mid-wait.
+        println!("restart: shell ready");
         return restart_flow(app, &view, &case).await;
     }
     add(&view, "Work", 1).await?;
