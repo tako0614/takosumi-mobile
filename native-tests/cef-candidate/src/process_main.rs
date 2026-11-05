@@ -175,6 +175,103 @@ fn observation_result(browser: &Browser, success: bool) {
         close_unavailable(browser.identifier());
     }
 }
+/// Bring a reused X11 browser window to the front when the home returns to it.
+/// Raises it directly (works without a window manager) and asks an EWMH window
+/// manager to activate it as a task switcher would. libX11 is loaded at run
+/// time so the candidate gains no link-time or crate dependency.
+mod x11_front {
+    use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+    extern "C" {
+        fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ClientMessage {
+        kind: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut c_void,
+        window: c_ulong,
+        message_type: c_ulong,
+        format: c_int,
+        data: [c_long; 5],
+    }
+    #[repr(C)]
+    union Event {
+        client: ClientMessage,
+        pad: [c_long; 24],
+    }
+    const RTLD_NOW: c_int = 2;
+    const CLIENT_MESSAGE: c_int = 33;
+    const SUBSTRUCTURE_NOTIFY_AND_REDIRECT: c_long = (1 << 19) | (1 << 20);
+    const SOURCE_PAGER: c_long = 2;
+
+    pub fn raise(window: c_ulong) -> Result<(), &'static str> {
+        if window == 0 {
+            return Err("no native window");
+        }
+        // SAFETY: symbols are resolved from the system libX11 with their
+        // documented C signatures; the display is opened and closed here only.
+        unsafe {
+            let lib = dlopen(c"libX11.so.6".as_ptr(), RTLD_NOW);
+            if lib.is_null() {
+                return Err("libX11 unavailable");
+            }
+            macro_rules! symbol {
+                ($name:expr) => {{
+                    let found = dlsym(lib, $name.as_ptr());
+                    if found.is_null() {
+                        return Err("libX11 symbol unavailable");
+                    }
+                    std::mem::transmute(found)
+                }};
+            }
+            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void = symbol!(c"XOpenDisplay");
+            let root: unsafe extern "C" fn(*mut c_void) -> c_ulong = symbol!(c"XDefaultRootWindow");
+            let atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong =
+                symbol!(c"XInternAtom");
+            let send: unsafe extern "C" fn(
+                *mut c_void,
+                c_ulong,
+                c_int,
+                c_long,
+                *mut Event,
+            ) -> c_int = symbol!(c"XSendEvent");
+            let raise_window: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int =
+                symbol!(c"XRaiseWindow");
+            let flush: unsafe extern "C" fn(*mut c_void) -> c_int = symbol!(c"XFlush");
+            let close: unsafe extern "C" fn(*mut c_void) -> c_int = symbol!(c"XCloseDisplay");
+            let display = open(std::ptr::null());
+            if display.is_null() {
+                return Err("X display unavailable");
+            }
+            let mut event = Event { pad: [0; 24] };
+            event.client = ClientMessage {
+                kind: CLIENT_MESSAGE,
+                serial: 0,
+                send_event: 1,
+                display,
+                window,
+                message_type: atom(display, c"_NET_ACTIVE_WINDOW".as_ptr(), 0),
+                format: 32,
+                data: [SOURCE_PAGER, 0, 0, 0, 0],
+            };
+            send(
+                display,
+                root(display),
+                0,
+                SUBSTRUCTURE_NOTIFY_AND_REDIRECT,
+                &mut event,
+            );
+            raise_window(display, window);
+            flush(display);
+            close(display);
+        }
+        Ok(())
+    }
+}
+
 fn opened(id: u64, key: String, browser: &Browser) {
     let context = browser.host().unwrap().request_context().unwrap();
     let actual = PathBuf::from(CefString::from(&context.cache_path()).to_string());
@@ -302,7 +399,13 @@ fn open(id: u64, payload: OpenRequest) {
                 .unwrap()
                 .load_url(Some(&CefString::from(payload.url.as_str())));
         }
-        browser.host().unwrap().set_focus(1);
+        let host = browser.host().unwrap();
+        host.set_focus(1);
+        // set_focus only moves keyboard focus inside the browser. A window
+        // covered by another profile stays hidden unless it is raised.
+        if let Err(problem) = x11_front::raise(host.window_handle() as std::ffi::c_ulong) {
+            eprintln!("Reused browser window was not raised: {problem}");
+        }
         opened(id, payload.key, &browser);
         return;
     }
