@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope:'Disposable Linux actual App/browser process fixture; no real login or Push'};
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase==='restart'?'-restart':'';
+// Reads only this case's synthetic cookie; site cookies are not inspected.
+const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
 assert(['','restart'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
@@ -175,8 +177,8 @@ async function restartFlow() {
   }
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
   step('persisted per-profile storage after restart');
-  proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`localStorage.getItem(${JSON.stringify(key)})`)));
-  assert.deepEqual(proof.persisted,[`0:${nonce}`,`1:${nonce}`],'Each profile must keep its own site storage across App restart');
+  proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
+  assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},{storage:`1:${nonce}`,cookie:`1:${nonce}`}],'Each profile must keep its own site storage and cookie across App restart');
   step('Personal native close after restart',personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
@@ -218,15 +220,18 @@ async function firstLaunch() {
     const page=await attach(process);pages.push(page);
   }
   const [work,personal]=pages,key=`sumi_app_process_${nonce}`;
-  const sample=page=>page.evaluate(`({document:globalThis[${JSON.stringify(key)}],storage:localStorage.getItem(${JSON.stringify(key)}),origin:location.origin,frame:window===top})`);
+  const sample=page=>page.evaluate(`({document:globalThis[${JSON.stringify(key)}],storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)},origin:location.origin,frame:window===top})`);
   proof.bindings=pages.map(p=>({native:p.native,target:p.target,frame:p.frame,owner:p.owner,context:p.context}));
   step('separate initial state');
   for(const [index,page] of pages.entries()) {
     assert.equal(await page.evaluate(`localStorage.getItem(${JSON.stringify(key)})`),null);
-    await page.evaluate(`(()=>{globalThis[${JSON.stringify(key)}]=${JSON.stringify(`${index}:${nonce}`)};localStorage.setItem(${JSON.stringify(key)},globalThis[${JSON.stringify(key)}]);return true})()`);
+    assert.equal(await page.evaluate(cookieOf(key)),null);
+    await page.evaluate(`(()=>{globalThis[${JSON.stringify(key)}]=${JSON.stringify(`${index}:${nonce}`)};localStorage.setItem(${JSON.stringify(key)},globalThis[${JSON.stringify(key)}]);document.cookie=${JSON.stringify(`${key}=${index}:${nonce}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};return true})()`);
   }
   const expected=proof.initial=await Promise.all(pages.map(sample));
   assert.notEqual(expected[0].storage,expected[1].storage);
+  // Login state lives in cookies: each profile sees only its own value.
+  assert.deepEqual(expected.map(e=>e.cookie),[`0:${nonce}`,`1:${nonce}`],'Each profile must see only its own cookie');
   // Precondition for the return check below: raise Personal over Work (any
   // app, any creation order) and require Chrome to report Work hidden.
   // Without that, the check is vacuous.
