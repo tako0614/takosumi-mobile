@@ -19,6 +19,8 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+#[cfg(target_os = "linux")]
+mod gtk_navigation;
 mod profile_reset;
 mod resume_navigation;
 
@@ -260,17 +262,6 @@ fn create_screen(
         // the first navigation (Wry adds it even without an IPC handler).
         let mut builder = WebViewBuilder::new_with_web_context(&mut context_ref)
             .with_devtools(false)
-            .with_navigation_handler(move |url| {
-                let allowed = is_launchable_url(&url) || (is_popup && url == "about:blank");
-                #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
-                eprintln!(
-                    "fixture navigation policy: scheme={}, allowed={allowed}, popup={is_popup}",
-                    tauri::Url::parse(&url)
-                        .map(|url| url.scheme().to_owned())
-                        .unwrap_or_else(|_| "invalid".into())
-                );
-                allowed
-            })
             .with_on_page_load_handler(move |event, url| {
                 // Started maps to top-level didCommit/LoadEvent::Committed/
                 // WebView2 ContentLoading in pinned Wry 0.55.1. Policy callbacks
@@ -308,6 +299,12 @@ fn create_screen(
                     }
                 }
             });
+        #[cfg(not(target_os = "linux"))]
+        {
+            builder = builder.with_navigation_handler(move |url| {
+                is_launchable_url(&url) || (is_popup && url == "about:blank")
+            });
+        }
         #[cfg(target_os = "macos")]
         {
             use wry::{WebViewBuilderExtDarwin, WebViewBuilderExtMacos};
@@ -348,6 +345,11 @@ fn create_screen(
             })
             .build_as_child(&window)
             .map_err(failure)?;
+        #[cfg(target_os = "linux")]
+        {
+            use wry::WebViewExtUnix;
+            gtk_navigation::install(&view.webview(), is_popup);
+        }
         disable_messaging(&view)?;
         let resume_observer = resume
             .map(|store| resume_navigation::Observer::new(&label, &view, store))

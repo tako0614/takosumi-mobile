@@ -6,7 +6,7 @@ pub const SHARED_PROFILE: &str = "shared";
 
 const KEY_MAX_LENGTH: usize = 512;
 const TITLE_MAX_CHARS: usize = 128;
-const URL_MAX_LENGTH: usize = 8 * 1024;
+pub(crate) const URL_MAX_LENGTH: usize = 8 * 1024;
 /// Base64 of a 192px PNG is far below this; anything larger is not an icon.
 const ICON_PNG_MAX_LENGTH: usize = 512 * 1024;
 const SCOPE_MAX_LENGTH: usize = 512;

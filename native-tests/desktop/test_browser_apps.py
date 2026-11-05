@@ -26,10 +26,16 @@ class ReceiptTests(unittest.TestCase):
                         "ipc": "undefined", "wryHandler": "undefined"},
             "personalContext": {"origin": ORIGINS["excalidraw"], "secure": True, "tauri": "undefined",
                                 "ipc": "undefined", "wryHandler": "undefined"},
+            "afterDownloadContext": {"origin": ORIGINS["excalidraw"], "secure": True, "tauri": "undefined",
+                                     "ipc": "undefined", "wryHandler": "undefined", "documentNonce": self.nonce},
+            "afterDownloadUri": ORIGINS["excalidraw"] + "/",
+            "beforeDownloadUri": ORIGINS["excalidraw"] + "/",
+            "beforeDownloadDocumentNonce": self.nonce,
             "profiles": {name: {"data": str(self.data / "profiles" / value),
                                 "cache": str(self.data / "profiles" / value / "cache")}
                          for name, value in PROFILES.items()},
-            "downloads": [{"finished": True, "failed": False,
+            "downloads": [{"finished": True, "failed": False, "workView": True,
+                           "source": "blob:" + ORIGINS["excalidraw"] + "/11111111-1111-4111-8111-111111111111",
                            "destination": (self.data / "Downloads" / "result.excalidraw").as_uri()}],
         }
         self.path = self.data / "Downloads" / "result.excalidraw"
@@ -97,6 +103,33 @@ class ReceiptTests(unittest.TestCase):
         self.path.unlink()
         with self.assertRaises(RuntimeError):
             self.validate(self.report)
+
+    def test_download_must_keep_its_native_view_and_https_document(self):
+        for source in (None, "blob:null/id", "blob:https://other.example/id", "file:///tmp/export"):
+            bad = copy.deepcopy(self.report)
+            bad["downloads"][0]["source"] = source
+            with self.subTest(source=source), self.assertRaises(RuntimeError):
+                self.validate(bad)
+        for key, value in (("workView", False), ("workView", None)):
+            bad = copy.deepcopy(self.report)
+            bad["downloads"][0][key] = value
+            with self.assertRaises(RuntimeError):
+                self.validate(bad)
+        for key, value in (("afterDownloadContext", {}), ("afterDownloadUri", "blob:" + ORIGINS["excalidraw"] + "/id")):
+            bad = copy.deepcopy(self.report)
+            bad[key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.validate(bad)
+        for key, value in (("beforeDownloadDocumentNonce", None), ("afterDownloadUri", ORIGINS["excalidraw"] + "/new-page")):
+            bad = copy.deepcopy(self.report)
+            bad[key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.validate(bad)
+        for value in (None, "replacement-document"):
+            bad = copy.deepcopy(self.report)
+            bad["afterDownloadContext"]["documentNonce"] = value
+            with self.assertRaises(RuntimeError):
+                self.validate(bad)
 
     def test_real_export_must_preserve_nonce_and_include_the_edit(self):
         source = create_input(self.data, "excalidraw", self.nonce)

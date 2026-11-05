@@ -71,6 +71,11 @@ opener's native environment/store. The shell and mobile/desktop adapters share
 CEF across every desktop OS would require a separate Tauri 3 alpha migration;
 this candidate keeps the existing Tauri 2 mobile plugins.
 
+The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
+native download service while keeping them out of page navigation. Its
+Excalidraw/Photopea file checks and remaining platform limits are described in
+[native tests](native-tests/README.md).
+
 Web homes remember an eligible last page separately for each connection and
 profile, including another app's https origin. Native document outcomes gate
 this metadata: provisional loads and transport failures do not replace a working

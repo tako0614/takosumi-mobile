@@ -31,6 +31,12 @@ through the actual native file dialog. Excalidraw must export the imported
 nonce-bearing rectangle with its keyboard edit; Photopea must export a PNG
 with the actual fixture dimensions and decoded pixels. Data is checked once
 after the real native download-finished event, without data retries.
+The download must report the actual original Work view and the app's HTTPS
+Blob origin. A per-document nonce is installed once immediately before export;
+the native completion is followed by one read of that nonce and the exact
+pre-export native URI. A same-origin reload or document replacement cannot
+qualify as retaining the editor. Post-download HTTPS context and absent native
+messaging are also required.
 Native persistent directories and same-origin localStorage are checked in
 both profiles. These are explicit checks, not proof of every app's IndexedDB,
 authentication, file permission or service-worker behavior.
@@ -47,7 +53,7 @@ growing bespoke WebView adapters instead of reusing an existing browser base.
 API presence is not Web Push delivery, real IdP, background operation, another
 OS or distribution qualification.
 
-On 2026-11-05, actual WebKitGTK 2.52.3 probes reached both public editors and
+Initial 2026-11-05 probes at `1c82996` on WebKitGTK 2.52.3 reached both public editors and
 checked their original persistent Work/Personal directories, same-origin
 localStorage separation and absence of all three native messaging globals.
 Both **file operations failed**: native Open imported the owned fixtures, but
@@ -55,23 +61,36 @@ the existing App navigation policy rejected `blob:` during export. Excalidraw
 even displayed `File saved.` while the disposable Downloads directory stayed
 empty. Photopea displayed the imported 128×96 red/blue image in `Save for web`,
 then hit the same policy refusal. No completed native download or verified
-export was obtained. The scheme-only policy diagnostic is fixture-only and
-preserves the original allow decision. Probe load diagnostics retain public
+export was obtained. That original scheme-only policy diagnostic preserved
+the original allow decision. Probe load diagnostics retain public
 URLs in private artifacts; this runner must not be used for real accounts.
 
-These observations identify work at the App's download boundary. The next
-adapter comparison must distinguish launch/navigation policy from an actual
-site download, reuse the browser foundation's download lifecycle, and verify
-destination selection, cancellation, failure and file contents. Broadly
-allowing every Blob navigation is not an accepted fix. Engine selection,
-regular login/popup return, site permissions and Web Push delivery remain open.
+The GTK adapter now makes an explicit native download decision for
+HTTPS-origin Blob requests, rather than allowing them as page navigation.
+It uses WebKit's existing default destination and original view/context; no
+site API, download path or native dialog implementation is substituted.
+With that repair, both public editors passed actual native Open and export:
+Excalidraw saved the imported scene nonce and keyboard edit; Photopea saved
+the actual 128×96 red/blue PNG. The strengthened checks also retained the
+same live editor document and exact URI. The original failure cases remain
+failures at their recorded source. Root processes exited successfully and
+the existing observer waited for engine children; some WebKit children had
+signal exits, so this is not a claim that every helper exited normally.
+Native profile/popup/Back/new-process readback controls also passed separately.
+
+Download cancellation/UI, authenticated downloads, active-download profile
+deletion, Blob popup behavior and other platforms still need checks. Engine
+selection, regular login/popup return, site permissions and Web Push delivery
+remain open. Broadly allowing every Blob page navigation is not the repair.
 The initial Chrome 149 comparison exposed PushManager and file-system picker
 APIs and separated two isolated contexts; that initial operation was incomplete.
 The later [standalone CEF candidate](cef-candidate/README.md) is a separate
 existing-browser-foundation experiment. Its Photopea component verifies actual
 PNG bytes and normal shutdown with explicit headless/CDP download settings.
-It does not repair the GTK App's failed export or qualify default Save UI,
-regular login, site permissions or Web Push delivery.
+Those Photopea headless/CDP results do not qualify default Save UI, regular
+login, site permissions or Web Push delivery. The candidate README separately
+describes its native picker/profile/prompt components and their limits. Those
+CEF experiments are separate from this GTK repair and Tauri App integration.
 
 ## Whole App iOS Simulator SDK build
 

@@ -11,7 +11,7 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
-use webkit2gtk::{DownloadExt, WebContextExt, WebViewExt, WebsiteDataManagerExt};
+use webkit2gtk::{DownloadExt, URIRequestExt, WebContextExt, WebViewExt, WebsiteDataManagerExt};
 use wry::WebViewExtUnix;
 
 type ProbeResult<T> = std::result::Result<T, String>;
@@ -24,10 +24,17 @@ thread_local! {
 }
 
 fn observe_downloads(view: &webkit2gtk::WebView) {
+    let expected_view = view.downgrade();
     view.context()
         .expect("Owned native context")
-        .connect_download_started(|_, download| {
-            let receipt = Rc::new(RefCell::new(json!({"finished":false, "failed":false})));
+        .connect_download_started(move |_, download| {
+            let same_view = download
+                .web_view()
+                .zip(expected_view.upgrade())
+                .is_some_and(|(actual, expected)| actual == expected);
+            let source = download.request().and_then(|request| request.uri());
+            let receipt = Rc::new(RefCell::new(json!({"finished":false, "failed":false,
+                "workView":same_view, "source":source.map(|value|value.to_string())})));
             DOWNLOADS.with(|items| items.borrow_mut().push(receipt.clone()));
             let failed = receipt.clone();
             download.connect_failed(move |_, error| {
@@ -100,6 +107,20 @@ fn screen(profile: &str) -> ProbeResult<(Window, webkit2gtk::WebView)> {
 
 async fn pause() {
     glib::timeout_future(Duration::from_millis(100)).await;
+}
+
+async fn mark_export_document(
+    view: &webkit2gtk::WebView,
+    report: &mut Value,
+    nonce: &str,
+) -> ProbeResult<()> {
+    let key = serde_json::to_string(&format!("__sumi_export_document_{nonce}")).unwrap();
+    let value = serde_json::to_string(nonce).unwrap();
+    report["beforeDownloadUri"] = json!(view.uri().map(|value| value.to_string()));
+    report["beforeDownloadDocumentNonce"] = eval(view, &format!(
+        "(()=>{{const key={key};if(Object.prototype.hasOwnProperty.call(globalThis,key))throw Error('Document marker already exists');globalThis[key]={value};return globalThis[key]}})()"
+    )).await?;
+    Ok(())
 }
 
 async fn eval(view: &webkit2gtk::WebView, script: &str) -> ProbeResult<Value> {
@@ -467,6 +488,7 @@ async fn flow(app: &AppHandle, data: &Path, name: &str, observe: bool) -> ProbeR
                 12,
             )
             .await?;
+            mark_export_document(&work, &mut report, &nonce).await?;
             key(WORK, "ctrl+alt+shift+s").await?;
             ready(&work, "document.body.innerText.includes('Save for web')", 8).await?;
             snapshot(WORK, &data.join("export-dialog.png")).await?;
@@ -478,6 +500,7 @@ async fn flow(app: &AppHandle, data: &Path, name: &str, observe: bool) -> ProbeR
                 serde_json::to_string(&before).unwrap()), 12).await?;
             key(WORK, "ctrl+a").await?;
             key(WORK, "Right").await?;
+            mark_export_document(&work, &mut report, &nonce).await?;
             key(WORK, "ctrl+s").await?;
         }
         snapshot(WORK, &data.join("after-export.png")).await?;
@@ -518,6 +541,11 @@ async fn flow(app: &AppHandle, data: &Path, name: &str, observe: bool) -> ProbeR
             }
             pause().await;
         }
+    }
+    if !observe {
+        let marker = serde_json::to_string(&format!("__sumi_export_document_{nonce}")).unwrap();
+        report["afterDownloadContext"] = eval(&work, &format!("({{origin:location.origin,secure:isSecureContext,tauri:typeof window.__TAURI_INTERNALS__,ipc:typeof window.ipc,wryHandler:typeof window.webkit?.messageHandlers?.ipc,documentNonce:globalThis[{marker}]??null}})")).await?;
+        report["afterDownloadUri"] = json!(work.uri().map(|value| value.to_string()));
     }
     window.close().map_err(|e| e.to_string())?;
     let downloads = DOWNLOADS.with(|items| {

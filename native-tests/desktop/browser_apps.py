@@ -70,10 +70,28 @@ def validate_report(report, data, app, mode, nonce):
                 raise RuntimeError(f"The {name} {kind} path is not its original native profile")
     if mode == "observe":
         return None
+    after = report.get("afterDownloadContext", {})
+    if (after.get("origin") != ORIGINS[app] or after.get("secure") is not True
+            or any(after.get(key) != "undefined" for key in ("tauri", "ipc", "wryHandler"))):
+        raise RuntimeError("Download replaced the expected secure Web document or exposed messaging")
+    if report.get("beforeDownloadDocumentNonce") != nonce or after.get("documentNonce") != nonce:
+        raise RuntimeError("The original editor document did not survive its download")
+    before_uri, after_uri = report.get("beforeDownloadUri"), report.get("afterDownloadUri")
+    if not isinstance(before_uri, str) or not isinstance(after_uri, str) or before_uri != after_uri:
+        raise RuntimeError("Download changed the original native page URI")
+    native_uri = urlparse(after_uri)
+    if (native_uri.scheme + "://" + native_uri.netloc) != ORIGINS[app]:
+        raise RuntimeError("Native view did not retain the original HTTPS page after download")
     downloads = report.get("downloads")
     if not isinstance(downloads, list) or len(downloads) != 1:
         raise RuntimeError("Exactly one actual completed download receipt is required")
     download = downloads[0]
+    source = download.get("source")
+    if download.get("workView") is not True or not isinstance(source, str) or not source.startswith("blob:"):
+        raise RuntimeError("Download must originate from the actual Work view and a Blob URL")
+    source_uri = urlparse(source[5:])
+    if (source_uri.scheme + "://" + source_uri.netloc) != ORIGINS[app]:
+        raise RuntimeError("Download source is not the expected app's HTTPS Blob origin")
     if download.get("finished") is not True or download.get("failed") is not False:
         raise RuntimeError("The native download did not finish successfully")
     raw = download.get("destination")
