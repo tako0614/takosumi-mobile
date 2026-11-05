@@ -17,15 +17,19 @@ export async function inspectPermissions({pages,command,data,nonce,desktop,nativ
   const originalTitles=await Promise.all(pages.map(page=>page.evaluate('document.title')));
   async function request(page,label,choice) {
     const step={profile:page.native.profile};
+    // Window IDs are scoped to a browser process, not the desktop session.
+    const browserCommand=page.browserCommand??command;
+    const expectedPid=page.nativePid??nativePid;
+    assert(Number.isInteger(expectedPid)&&expectedPid>0,'An attested native browser PID is required');
     proof[label]=step;
     const title=`Sumi Permission ${label} ${nonce}`;
     await page.evaluate(`document.title=${JSON.stringify(title)}`);
     await page.send('Page.bringToFront');
-    step.initialWindow=await command('Browser.getWindowForTarget',{targetId:page.target.targetId});
+    step.initialWindow=await browserCommand('Browser.getWindowForTarget',{targetId:page.target.targetId});
     // Native roots cascade by 10px. Place each owned test window in the
     // inspected geometry before requesting permission, then verify readback.
-    await command('Browser.setWindowBounds',{windowId:step.initialWindow.windowId,bounds:{left:10,top:10,width:1050,height:1004,windowState:'normal'}});
-    step.window=await command('Browser.getWindowForTarget',{targetId:page.target.targetId});
+    await browserCommand('Browser.setWindowBounds',{windowId:step.initialWindow.windowId,bounds:{left:10,top:10,width:1050,height:1004,windowState:'normal'}});
+    step.window=await browserCommand('Browser.getWindowForTarget',{targetId:page.target.targetId});
     const end=Date.now()+5000;let ids=[];
     while(Date.now()<end&&!ids.length) {
       ids=(await desktop('xdotool',['search','--onlyvisible','--name',title],true)).split(/\s+/).filter(Boolean);
@@ -34,7 +38,7 @@ export async function inspectPermissions({pages,command,data,nonce,desktop,nativ
     assert.equal(ids.length,1,'Require a unique owned visible browser title');
     const id=ids[0];
     step.xWindow={id,title:await desktop('xdotool',['getwindowname',id]),pid:Number(await desktop('xdotool',['getwindowpid',id]))};
-    assert.equal(step.xWindow.pid,nativePid,'Refusing a window outside the owned native browser');
+    assert.equal(step.xWindow.pid,expectedPid,'Refusing a window outside the owned native browser');
     step.xWindow.geometry=await desktop('xdotool',['getwindowgeometry','--shell',id]);
     for(const expected of ['X=10','Y=10','WIDTH=1050','HEIGHT=1004'])assert(step.xWindow.geometry.split('\n').includes(expected),'Native window geometry must match the inspected layout');
     await desktop('xdotool',['windowfocus','--sync',id]);

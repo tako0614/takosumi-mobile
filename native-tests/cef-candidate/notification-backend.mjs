@@ -16,7 +16,7 @@ export async function startNotificationBackend({binary,data,nonce,env,desktop}) 
   const config=path.join(data,'notification-backend.conf');
   // Keep the daemon's normal tag/replacement handling. One visible item plus
   // FIFO waiting makes both profiles' notifications separately clickable.
-  await writeFile(config,`[global]\ntitle = ${title}\nwidth = 420\nheight = 120\norigin = top-right\noffset = 10x10\nnotification_limit = 1\nsort = false\nfont = DejaVu Sans 11\nformat = <b>%s</b>\\n%b\nmouse_left_click = do_action, close_current\n`);
+  await writeFile(config,`[global]\ntitle = ${title}\nwidth = 420\nheight = (0, 200)\norigin = top-right\noffset = (10, 10)\nnotification_limit = 1\nsort = false\nfont = DejaVu Sans 11\nformat = <b>%s</b>\\n%b\nmouse_left_click = do_action, close_current\n`);
   assert.equal(await desktop('gdbus',dbus('NameHasOwner',name)),'(false,)','Require a fresh notification bus');
   const logfile=await open(path.join(data,'notification-backend.log'),'wx',0o600);
   const daemon=spawn(binary,['-conf',config,'-verbosity','debug','-print'],{env,stdio:['ignore',logfile.fd,logfile.fd]});

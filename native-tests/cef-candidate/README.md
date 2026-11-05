@@ -112,9 +112,10 @@ or CDP grant is installed. Before every choice the request must still be
 pending without error at the original secure origin. All permission samples
 must retain that bound origin. Work's Allow must resolve to granted while
 Personal remains prompt; Personal's Block must resolve to denied while Work
-remains granted. The five replay controls reject wrong/insecure sites,
+remains granted. Seven replay controls reject wrong/insecure sites,
 redirected requests and pre-resolved or redirected pre-click snapshots before
-any native click; they are oracle tests, not native capability evidence.
+any native click, and check native PID binding and process-local command routing;
+they are oracle tests, not native capability evidence.
 
 On 2026-11-05 Excalidraw passed the choices, state separation and normal CEF
 shutdown. Photopea's initial probe showed its real prompt, and an earlier
@@ -162,9 +163,10 @@ the callback. After strengthening state capture and the focus precondition,
 Photopea failed before clicking: Personal's same-tag creation had already
 closed Work's JS notification object while its OS alert remained displayed.
 Both CEF guards and owned daemons shut down normally; these are functional
-failures, with `notificationUiPassed` and `execution.passed` false. Four replay
+failures, with `notificationUiPassed` and `execution.passed` false. Five replay
 controls reject wrong-profile callbacks, closed page objects, foreign X11
-owners and an already-focused target; they are not native evidence.
+owners, an already-focused target and an occluded input point; they are not
+native evidence.
 
 The matching Chromium source uses origin plus the non-persistent notification
 token as the ID; a nonempty tag becomes that token. Its process-wide listener
@@ -172,8 +174,49 @@ registry replaces entries by this ID. This is consistent with the observed
 collision across isolated contexts. A future adapter must preserve profile
 identity before this listener boundary, or evaluate separate browser processes
 per profile. Merely routing the OS action by profile cannot recreate an already
-replaced listener. No such fix, engine replacement or App integration is made
-by this fixture; the same-tag failure must remain a required regression.
+replaced listener. The default single-process mode applies no such fix; the
+same-tag failure remains a required regression. The explicitly selected
+process comparison below does not replace the installed App runtime.
+
+## Process-per-profile adapter comparison
+
+```bash
+python3 -B native-tests/cef-candidate/run.py --binary /absolute/owned/target/debug/takosumi-cef-candidate --data /absolute/new/process-case --app photopea --mode site-notifications --process-layout per-profile --notification-daemon /absolute/owned/dunst
+```
+
+This notification-only mode reuses the same executable, native request
+validator and UUID profile IDs in two separately guarded browser processes.
+Each has its own HOME/XDG/cache root, PID-owned CDP socket and native frame
+binding. Window IDs and browser commands remain scoped to the originating
+process. It does not add a native IPC bridge to either remote page, change
+website tags, migrate installed profiles or change the Tauri UI/mobile-kit.
+
+Excalidraw and Photopea both passed this local component on 2026-11-05: both
+same-tag notifications coexist, each native click reaches only its original
+profile as a trusted event, and the page's standard onclick `window.focus()`
+restores its exact native window from a verified other-window focus. The
+actual pointer target must equal the XRes-attested daemon XID before the single
+click; the fixture never raises the daemon or repairs focus afterward. In
+this WM-less session the restored browser can partially cover the next alert;
+the right title area remains visible and hit-tested. These screenshots do not
+qualify notification presentation under a real desktop window manager.
+
+After both clicks, exact native frame and once-only document nonce, synthetic
+localStorage and Secure/HttpOnly test cookies must remain. Work then closes
+through its native target and full normal guard before Personal's retained
+document/state is read once. Both guards, daemon stop and outer unchanged-hash
+checks must pass along with all three reference flags. Two initial Excalidraw
+cases remain failed: an occluded input point, then `mousemove --sync` waiting
+for motion at an already occupied coordinate. No timeout was increased; the
+driver now queries the actual pointer target instead.
+
+The current-source single-process negative comparison still fails before
+clicking with Work's page object closed. The process comparison demonstrates
+a viable isolation boundary for this component, without establishing unique
+causation for every earlier failure, a production adapter, runtime selection,
+real site-generated Push, Service Worker delivery, closed-App resume, durable
+profiles, performance or other OS support. The existing Dunst prerequisite
+remains test-only. No CEF/Chromium source or SDK patch is applied.
 
 On 2026-11-05 the basic same-origin profile test and the synthetic popup flow
 passed on native CEF, including normal closure. Earlier popup runs passed the

@@ -9,13 +9,15 @@ import { inspectPermissions } from './permissions.mjs';
 
 const origin='https://excalidraw.com';
 const bounds={left:10,top:10,width:1050,height:1004,windowState:'normal'};
-for(const fault of ['state-origin','state-insecure','request-origin','resolved-before-click','preclick-origin']) {
+for(const fault of ['state-origin','state-insecure','request-origin','resolved-before-click','preclick-origin','foreign-native-pid','process-local-command']) {
   test(`reject ${fault} before native click`,async()=>{
     const data=await mkdtemp(path.join(os.tmpdir(),'cef-permission-false-'));
     let clicks=0;
     const snapshot={started:true,result:null,error:null,origin,secure:true};
     const pages=['work','personal'].map(label=>({
       native:{profile:label},context:{origin},target:{targetId:label},
+      nativePid:fault==='foreign-native-pid'?456:undefined,
+      browserCommand:fault==='process-local-command'?async()=>{throw Error('Bound browser namespace reached');}:undefined,
       send:async method=>{assert.equal(method,'Page.bringToFront');return {};},
       evaluate:async expression=>{
         if(expression==='document.title')return 'Fixture';
@@ -47,7 +49,9 @@ for(const fault of ['state-origin','state-insecure','request-origin','resolved-b
         windowfocus:'',getwindowfocus:'42',getwindowgeometry:'X=10\nY=10\nWIDTH=1050\nHEIGHT=1004'};
       assert(Object.hasOwn(values,args[0]));return values[args[0]];
     };
-    const message=fault.startsWith('state-')?/Permission site must/:
+    const message=fault==='foreign-native-pid'?/Refusing a window outside the owned native browser/:
+      fault==='process-local-command'?/Bound browser namespace reached/:
+      fault.startsWith('state-')?/Permission site must/:
       fault==='request-origin'?/Permission request must use the bound origin/:/Permission request must still be pending/;
     await assert.rejects(inspectPermissions({pages,command,data,nonce:'11111111-1111-4111-8111-111111111111',desktop,nativePid:123,decide:true}),message);
     assert.equal(clicks,0,'Invalid permission evidence must not reach a native choice');

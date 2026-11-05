@@ -52,7 +52,8 @@ handler or CDP grant. They place a uniquely named, PID-verified owned window in
 the inspected English Linux geometry and click a single Allow/Block choice.
 The two known prompt layouts are test-fixture details. Actual pending request,
 secure origin, resolved permission and the other profile's state must agree;
-five replay controls reject false evidence before clicking. Excalidraw passed
+seven replay controls check false evidence, PID binding and process-local
+command routing before clicking. Excalidraw passed
 this notification-permission component; Photopea's full final flow remains
 unqualified. API notification events do not prove OS display or Push: the
 earlier owned D-Bus session lacked its notification service, and an unattributed
@@ -75,3 +76,17 @@ The matching Chromium 154.0.8037.98 source supports the collision hypothesis:
 These are source references for diagnosis, not copied product code or a
 qualified engine patch. Persistent Service Worker notifications use a different
 path and were not tested here.
+
+An explicit notification-only `--process-layout per-profile` comparison reuses
+the same CEF binary in two independently guarded runtimes. Process-local PID,
+debug socket, context/cache, frame, browser command and native window identity
+are all measured. It shares the real permission/notification probes and the
+existing pidfd guard/cleanup oracle; no page tag/API replacement or CEF patch
+is introduced. Excalidraw and Photopea passed native action/trusted callback/
+standard page focus, followed by Work's normal process closure and retained
+Personal document/state. The matched current-source single-process negative
+still fails with a closed Work notification object. The default mode and old
+failed evidence remain unchanged in meaning. This experimental process layout
+does not select an engine, integrate Tauri or qualify network Push, background
+restart, persistent profile migration, presentation with a desktop window
+manager, sandboxing, resource cost or distribution.

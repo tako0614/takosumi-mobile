@@ -56,7 +56,19 @@ export async function probeNotifications({pages,data,nonce,desktop,backend,windo
       const click={profile:page.native.profile,owner,window,geometry,before,expectedWindow,focusedBefore};
       proof.clicks.push(click);
       assert.equal(before[index].closed,0,'A pending native notification must still belong to its live page object');
-      await desktop('xdotool',['mousemove','--window',window,String(Math.floor(Number(sizes.WIDTH)/2)),String(Math.floor(Number(sizes.HEIGHT)/2)),'click','1']);
+      // Use the alert's title area, avoiding the site's hyperlink in its body.
+      // Restoring a browser can raise it over the left side of the next alert
+      // on this WM-less fixture. Require the actual pointer target, never
+      // raise the daemon artificially or click an occluding browser instead.
+      click.point={x:Number(sizes.WIDTH)-12,y:10};
+      // The next alert can occupy the same coordinates; --sync waits for a
+      // movement even when the pointer is already there. Query the actual
+      // server-side target below instead of waiting for another movement.
+      await desktop('xdotool',['mousemove','--window',window,String(click.point.x),String(click.point.y)]);
+      click.pointer=await desktop('xdotool',['getmouselocation','--shell']);
+      const pointerWindow=click.pointer.split('\n').find(line=>line.startsWith('WINDOW='))?.slice(7);
+      assert.equal(pointerWindow,window,'Native input point must actually target the owned notification window');
+      await desktop('xdotool',['click','1']);
       await settled(async()=>{
         const values=await Promise.all(pages.map(state));
         click.observed=values;

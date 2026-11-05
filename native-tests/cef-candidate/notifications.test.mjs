@@ -9,7 +9,7 @@ import { probeNotifications } from './notifications.mjs';
 
 const nonce='11111111-1111-4111-8111-111111111111';
 const origin='https://excalidraw.com';
-for(const fault of ['closed-page-object','wrong-profile-callback','foreign-window-owner','already-focused-target']) {
+for(const fault of ['closed-page-object','wrong-profile-callback','foreign-window-owner','already-focused-target','occluded-notification']) {
   test(`reject native notification evidence: ${fault}`,async()=>{
     const data=await mkdtemp(path.join(os.tmpdir(),'cef-notification-false-'));
     const instances=[];
@@ -47,7 +47,9 @@ for(const fault of ['closed-page-object','wrong-profile-callback','foreign-windo
       if(args[0]==='getwindowgeometry')return 'WIDTH=420\nHEIGHT=120';
       if(args[0]==='windowfocus'){focus=fault==='already-focused-target'?'101':args[2];return '';}
       if(args[0]==='getwindowfocus')return focus;
-      if(args[0]==='mousemove') {
+      if(args[0]==='mousemove')return '';
+      if(args[0]==='getmouselocation')return `WINDOW=${fault==='occluded-notification'?'202':'303'}`;
+      if(args[0]==='click') {
         clicks++;assert.equal(fault,'wrong-profile-callback');
         instances[1].onclick({isTrusted:true});return '';
       }
@@ -58,6 +60,7 @@ for(const fault of ['closed-page-object','wrong-profile-callback','foreign-windo
       'wrong-profile-callback':/Native click must not reach the other profile/,
       'foreign-window-owner':/Notification window must belong/,
       'already-focused-target':/Restoration requires a distinct owned browser/,
+      'occluded-notification':/Native input point must actually target/,
     };
     await assert.rejects(probeNotifications({pages,data,nonce,desktop,backend,windows}),messages[fault]);
     assert.equal(clicks,fault==='wrong-profile-callback'?1:0);

@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--app", choices=("photopea", "excalidraw"), required=True)
     parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications"), default="operate")
     parser.add_argument("--notification-daemon", type=Path, help="Already available Dunst 1.12.2 executable, used only inside the owned notification fixture")
+    parser.add_argument("--process-layout", choices=("single", "per-profile"), default="single",
+                        help="Experimental process-per-profile notification comparison; no App runtime change")
     parser.add_argument("--files", choices=("cdp", "native-picker"), default="cdp",
                         help="Native picker uses a visible browser in the owned Xvfb session")
     args = parser.parse_args()
@@ -53,6 +55,8 @@ def main():
                 parser.error(f"Required existing capability is missing: {tool}")
     if (args.mode == "site-notifications") != (args.notification_daemon is not None):
         parser.error("--notification-daemon is required only for site-notifications")
+    if args.process_layout == "per-profile" and args.mode != "site-notifications":
+        parser.error("The per-profile process comparison targets site-notifications only")
     daemon = args.notification_daemon.resolve(strict=True) if args.notification_daemon else None
     if daemon and (not daemon.is_file() or not os.access(daemon, os.X_OK)):
         parser.error("--notification-daemon must be an already available executable")
@@ -71,14 +75,15 @@ def main():
     data = data.parent.resolve(strict=True) / data.name
     # This pinned Linux Chromium creates its process-singleton socket below
     # TMPDIR. sockaddr_un reserves one byte for NUL in its 108-byte path.
-    socket_path = data / "tmp/org.chromium.Chromium.XXXXXX/SingletonSocket"
+    socket_root = data / "w" if args.process_layout == "per-profile" else data
+    socket_path = socket_root / "tmp/org.chromium.Chromium.XXXXXX/SingletonSocket"
     if len(os.fsencode(socket_path)) >= 108:
         parser.error("--data is too long for the Linux Chromium socket; choose a shorter owned case path")
     data.mkdir(mode=0o700)
     nonce = str(uuid.uuid4())
     (data / ".owned-browser-reference").write_text(nonce)
     fixture = create_input(data, args.app, nonce)
-    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "notification-backend.mjs", "notifications.mjs", "x11-owner.py", "run.py")]
+    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "operate-processes.mjs", "runtime.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "notification-backend.mjs", "notifications.mjs", "x11-owner.py", "run.py")]
     sources += [HERE.parent / name for name in (
         "desktop/browser_apps.py", "desktop/web_home.py", "browser/guard.py", "browser/lifecycle.ts",
     )]
@@ -94,7 +99,7 @@ def main():
     library = binary.parent / "libcef.so"
     library_hash = digest(library)
     source = {
-        "app": args.app, "mode": args.mode, "files": args.files, "binarySha256": digest(binary),
+        "app": args.app, "mode": args.mode, "files": args.files, "processLayout": args.process_layout, "binarySha256": digest(binary),
         "candidateMainSha256": digest(HERE / "src/main.rs"),
         "driverSha256": digest(HERE / "operate.mjs"),
         "runnerSha256": digest(Path(__file__).resolve()),
@@ -121,7 +126,7 @@ def main():
         with (data / "session.log").open("x") as output:
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "timeout", "150",
-                "node", str(HERE / "operate.mjs"), str(data), args.app, args.mode, str(binary), args.files,
+                "node", str(HERE / ("operate-processes.mjs" if args.process_layout == "per-profile" else "operate.mjs")), str(data), args.app, args.mode, str(binary), args.files,
                 *([str(daemon)] if daemon else []),
             ], env, timeout=170, stdout=output, stderr=subprocess.STDOUT)
         result["exitCode"] = 0
