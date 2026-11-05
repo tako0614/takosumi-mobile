@@ -126,6 +126,13 @@ async function attach(process) {
       // the hit target rather than requiring a unique DOM label.
       const button=await evaluate("(()=>{const nodes=[...document.querySelectorAll('button')].filter(e=>{const r=e.getBoundingClientRect();return e.innerText.trim()==='Start using Photopea'&&!e.disabled&&r.width>0&&r.top>=0&&r.bottom<=innerHeight});if(!nodes.length)throw Error('Visible Start button missing');const e=nodes[0],r=e.getBoundingClientRect(),point={x:r.x+r.width/2,y:r.y+r.height/2},hit=document.elementFromPoint(point.x,point.y);if(!hit||!(hit===e||e.contains(hit)))throw Error('Start button obscured');return{point,visibleMatches:nodes.length}})()");
       (proof.landingButtons??=[]).push({pid:native.nativePid,...button});
+      // Chrome treats a fully covered window as hidden and holds its input; an
+      // owned stacked-window control timed out CDP input exactly as ph17 did.
+      // Raise this exact window first, as a user clicking it would.
+      const visibleBefore=await evaluate("document.visibilityState");
+      desktop('xdotool',['windowraise',String(native.windowId)]);
+      await settled(()=>evaluate("document.visibilityState==='visible'"),'Raised Photopea window did not become visible');
+      (proof.landingRaise??=[]).push({pid:native.nativePid,window:native.windowId,visibleBefore});
       // Record what the page receives, to tell an input-routing drop from page behaviour (ph14/ph16).
       await evaluate("(()=>{window.__sumiInput=[];for(const t of ['pointermove','pointerdown','mousedown','pointerup','mouseup','click'])addEventListener(t,e=>{if(window.__sumiInput.length<64)window.__sumiInput.push({t,trusted:e.isTrusted,x:Math.round(e.clientX),y:Math.round(e.clientY),target:e.target?.tagName})},true);return true})()");
       // Move first, then press/release with button state, as a real pointer does.
