@@ -199,18 +199,12 @@ fn drain(backend: &Backend) -> Result<bool> {
     // transaction. Refuse before sending any close, rather than destroy one
     // profile before a later profile can cancel. Users can close native
     // browser windows individually; coordinated App quit remains unsupported.
-    let profiles = state.processes.keys().cloned().collect::<Vec<_>>();
-    for profile in profiles {
-        let process = state.processes.get_mut(&profile).unwrap();
-        if let Some(status) = process.child.try_wait().map_err(failure)? {
-            if !status.success() {
-                process.uncertain = true;
-                return Err(Error::InvalidRequest("Browser process ended abnormally."));
-            }
-            process.normal_guard()?;
-            state.processes.remove(&profile);
-        }
-    }
+    // A profile whose last window was just closed is still exiting for a
+    // moment; give exiting browsers a short bounded grace before counting.
+    settle_exiting(
+        &mut state,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )?;
     if state.processes.len() > 1 {
         return Err(Error::InvalidRequest(
             "Coordinated browser quit is unavailable; close browser windows individually first.",
@@ -231,6 +225,28 @@ fn drain(backend: &Backend) -> Result<bool> {
         }
     }
     Ok(true)
+}
+/// Remove every browser that has ended normally, rechecking until at most one
+/// remains or the deadline passes. An abnormal end keeps the profile and fails.
+fn settle_exiting(state: &mut State, deadline: std::time::Instant) -> Result<()> {
+    loop {
+        let profiles = state.processes.keys().cloned().collect::<Vec<_>>();
+        for profile in profiles {
+            let process = state.processes.get_mut(&profile).unwrap();
+            if let Some(status) = process.child.try_wait().map_err(failure)? {
+                if !status.success() {
+                    process.uncertain = true;
+                    return Err(Error::InvalidRequest("Browser process ended abnormally."));
+                }
+                process.normal_guard()?;
+                state.processes.remove(&profile);
+            }
+        }
+        if state.processes.len() <= 1 || std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 pub(super) fn shutdown(app: &AppHandle) -> Result<()> {
     let backend = app.state::<Backend>().inner().clone();
@@ -1020,6 +1036,67 @@ mod tests {
         assert!(!live.join("cef-profiles").exists());
         // Missing data is already clear.
         assert!(clear_site_data(&root, "44444444-4444-4444-8444-444444444444").is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn a_just_closed_profile_is_not_counted_as_still_open() {
+        // Two real Process::spawn children with stand-in guards: Work lingers;
+        // Personal's last window closed, so it writes a normal receipt and ends.
+        let root = std::env::temp_dir().join(format!("sumi-settle-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let lingering = root.join("lingering.py");
+        std::fs::write(&lingering, "import time\ntime.sleep(30)\n").unwrap();
+        let exiting = root.join("exiting.py");
+        std::fs::write(&exiting, "import json,sys,time\ntime.sleep(0.3)\nopen(sys.argv[1],'w').write(json.dumps({'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}))\n").unwrap();
+        let (work, personal) = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        let parent = spawner().unwrap();
+        let mut processes = BTreeMap::new();
+        for (index, (profile, guard)) in [(work, &lingering), (personal, &exiting)]
+            .into_iter()
+            .enumerate()
+        {
+            let payload = serde_json::from_value(serde_json::json!({
+                "key":format!("web-home:{profile}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+            }))
+            .unwrap();
+            let process = Process::spawn(
+                PathBuf::from("/bin/true"),
+                guard.clone(),
+                root.join(profile),
+                root.join(format!("r{index}")),
+                payload,
+                &parent,
+            )
+            .unwrap();
+            processes.insert(profile.to_owned(), process);
+        }
+        let mut state = State {
+            program: PathBuf::from("/bin/true"),
+            guard: lingering.clone(),
+            directory: root.clone(),
+            runtime_root: root.clone(),
+            processes,
+            spawner: parent.clone(),
+        };
+        let started = std::time::Instant::now();
+        settle_exiting(&mut state, started + Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            state
+                .processes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![work]
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "settled as soon as one remained"
+        );
+        drop(state); // Drop's SIGTERM path ends the lingering stand-in.
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
