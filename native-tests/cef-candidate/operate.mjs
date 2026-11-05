@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { waitForGtkConfirm } from './gtk-readiness.mjs';
 
 const repo=fileURLToPath(new URL('../../',import.meta.url));
 const data=process.argv[2], app=process.argv[3], mode=process.argv[4], binary=process.argv[5];
@@ -31,52 +32,66 @@ await mkdir(path.join(data,'Downloads'),{mode:0o700});
 const log=await open(path.join(data,'browser.log'),'wx',0o600);
 let browser,socket,exitPromise,sessionId,closed=false,error;
 const pending=new Map(), events=[], downloads=[];
+const navigation=[], documentRequests=new Set();
 let next=0;
-const receipt={engine:'standalone CEF154 candidate',app,mode,files,nonce,operationPassed:false,events:downloads};
-async function desktop(tool,args,allowMissing=false) {
+const receipt={engine:'standalone CEF154 candidate',app,mode,files,nonce,operationPassed:false,events:downloads,navigation};
+async function desktop(tool,args,allowMissing=false,raw=false) {
   const child=spawn(tool,args,{env,stdio:['ignore','pipe','pipe']});
-  let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);
+  const chunks=[];let err='';child.stdout.on('data',d=>chunks.push(d));child.stderr.on('data',d=>err+=d);
   const timer=setTimeout(()=>child.kill('SIGKILL'),4000);
   const status=await new Promise((resolve,reject)=>{child.once('exit',resolve);child.once('error',reject)}).finally(()=>clearTimeout(timer));
-  assert(status===0||(allowMissing&&status===1),`${tool} failed: ${err}`);return out.trim();
+  assert(status===0||(allowMissing&&status===1),`${tool} failed: ${err}`);
+  const out=Buffer.concat(chunks);return raw?out:out.toString('utf8').trim();
 }
 async function visibleWindows() {
   const ids=(await desktop('xdotool',['search','--onlyvisible','--name','.*'],true)).split(/\s+/).filter(Boolean);
   return Promise.all(ids.map(async id=>({id,title:await desktop('xdotool',['getwindowname',id])})));
 }
-async function openNativeInput() {
-  const before=await visibleWindows();
-  await key('o',2);
+async function nativeDialog(before,kind) {
   const deadline=Date.now()+8000;let added=[];
   while(Date.now()<deadline) {
     added=(await visibleWindows()).filter(w=>!before.some(old=>old.id===w.id));
     if(added.length)break;
     await delay(50);
   }
-  receipt.nativeChooser={before,added};
-  await desktop('import',['-window','root',path.join(data,'native-open-dialog.png')]);
-  const dialogs=added.filter(w=>['Open','Open File','Open Files','Select a file this site can read'].includes(w.title));
-  assert(dialogs.length===1,`No unique native open dialog: ${JSON.stringify(added)}`);
-  const id=dialogs[0].id;
-  // This DISPLAY comes exclusively from the runner's new Xvfb server.
-  // Target the observed dialog, never an inherited desktop or global focus.
+  const dialogs=added.filter(w=>kind==='open'
+    ?['Open','Open File','Open Files','Select a file this site can read'].includes(w.title)
+    :(/^Save(?: .+)?$/.test(w.title)||w.title==='Warning: this site can see edits you make'));
+  assert(dialogs.length===1,`No unique native ${kind} dialog: ${JSON.stringify(added)}`);
+  return {before,added,id:dialogs[0].id};
+}
+async function selectNativePath(dialog,selected,prefix) {
+  const id=dialog.id;
+  await desktop('import',['-window','root',path.join(data,`${prefix}-dialog.png`)]);
+  // DISPLAY belongs exclusively to the runner's new Xvfb server.
   await desktop('xdotool',['windowfocus','--sync',id]);
   assert(await desktop('xdotool',['getwindowfocus'])===id,'Native dialog must own focus');
   await desktop('xdotool',['key','--clearmodifiers','ctrl+l']);
-  await desktop('xdotool',['type','--clearmodifiers','--delay','1','--',input]);
+  // Save As initially selects only the stem, leaving its extension in the
+  // entry. Replace the whole value so the requested output stays exact.
+  await desktop('xdotool',['key','--clearmodifiers','ctrl+a']);
+  await desktop('xdotool',['type','--clearmodifiers','--delay','1','--',selected]);
+  await desktop('import',['-window','root',path.join(data,`${prefix}-selected.png`)]);
   const geometry=await desktop('xdotool',['getwindowgeometry','--shell',id]);
   const dimensions=Object.fromEntries(geometry.split('\n').filter(line=>/^(WIDTH|HEIGHT)=\d+$/.test(line)).map(line=>line.split('=')));
   assert(Number(dimensions.WIDTH)>=800&&Number(dimensions.HEIGHT)>=500,'Unexpected native dialog geometry');
-  // The inspected GTK portal dialog has its Select button at bottom right.
-  // Click that real button once; keyboard Return did not submit the dialog.
   const point={x:Number(dimensions.WIDTH)-52,y:Number(dimensions.HEIGHT)-23};
-  receipt.nativeChooser.confirm={geometry,point};
+  dialog.confirm={geometry,point};
+  dialog.confirm.readiness=await waitForGtkConfirm(
+    crop=>desktop('import',['-window',id,'-crop',crop,'-depth','8','RGB:-'],false,true),point,
+  );
+  // Click once after the inspected GTK confirm label becomes enabled.
   await desktop('xdotool',['mousemove','--window',id,String(point.x),String(point.y),'click','1']);
   const closeDeadline=Date.now()+8000;
   while(Date.now()<closeDeadline&&(await visibleWindows()).some(w=>w.id===id))await delay(50);
-  assert(!(await visibleWindows()).some(w=>w.id===id),'Native open dialog did not close');
-  await desktop('import',['-window','root',path.join(data,'after-native-open.png')]);
-  receipt.nativeChooser.closed=true;
+  assert(!(await visibleWindows()).some(w=>w.id===id),`Native ${prefix} dialog did not close`);
+  dialog.closed=true;
+  await desktop('import',['-window','root',path.join(data,`after-${prefix}.png`)]);
+}
+async function openNativeInput() {
+  const before=await visibleWindows();await key('o',2);
+  receipt.nativeChooser=await nativeDialog(before,'open');
+  await selectNativePath(receipt.nativeChooser,input,'native-open');
   receipt.inputMethod='Actual File System Access native open dialog in the owned Xvfb session';
 }
 async function stage(name) {
@@ -170,7 +185,21 @@ try {
   socket.onmessage=e=>{
     const m=JSON.parse(String(e.data));
     if(m.id){const p=pending.get(m.id);if(p){clearTimeout(p.timer);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}}
-    else {events.push(m);if(m.method?.startsWith('Browser.download'))downloads.push({method:m.method,params:m.params});}
+    else {
+      events.push(m);if(m.method?.startsWith('Browser.download'))downloads.push({method:m.method,params:m.params});
+      if(m.sessionId===sessionId&&navigation.length<32) {
+        const p=m.params;
+        if(m.method==='Network.requestWillBeSent'&&p.type==='Document') {
+          documentRequests.add(p.requestId);
+          const url=new URL(p.request.url);
+          navigation.push({kind:'request',requestId:p.requestId,frameId:p.frameId,url:url.origin+url.pathname});
+        }else if(m.method==='Network.responseReceived'&&documentRequests.has(p.requestId)) {
+          navigation.push({kind:'response',requestId:p.requestId,status:p.response.status});
+        }else if(m.method==='Network.loadingFailed'&&documentRequests.has(p.requestId)) {
+          navigation.push({kind:'failure',requestId:p.requestId,error:p.errorText,canceled:p.canceled});
+        }
+      }
+    }
   };
   receipt.version=await command('Browser.getVersion');
   const protocol=await (await fetch(`http://127.0.0.1:${port}/json/protocol`,{signal:AbortSignal.timeout(5000)})).json();
@@ -185,7 +214,7 @@ try {
   receipt.target=target;
   await command('Browser.setDownloadBehavior',{behavior:'allowAndName',downloadPath:path.join(data,'Downloads'),eventsEnabled:true,...(target.browserContextId?{browserContextId:target.browserContextId}:{})});
   sessionId=(await command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
-  await page('Page.enable');await page('Runtime.enable');await page('DOM.enable');
+  await page('Page.enable');await page('Runtime.enable');await page('DOM.enable');await page('Network.enable');
   await stage('await actual CEF editor');
   if(app==='photopea') {
     await ready("document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer')");
@@ -231,10 +260,29 @@ try {
       await key('s',11);await ready("document.body.innerText.includes('Save for web')",8);
       await screenshot('export-dialog.png');await key('Enter');
     }else {
-      await ready("document.title.includes('SumiProbeWork')",12);
-      await ready("document.querySelectorAll('.excalidraw canvas').length>0");
-      await key('a',2);await key('ArrowRight');await key('s',2);
+      // Excalidraw keeps a generic document title after native import. Observe
+      // the actual centered red fixture in its canvas before editing it.
+      await ready("[...document.querySelectorAll('.excalidraw canvas')].some(c=>{const context=c.getContext('2d');if(!context||!c.width||!c.height)return false;const p=context.getImageData(Math.floor(c.width/2),Math.floor(c.height/2),1,1).data;return p[0]>240&&p[1]<15&&p[2]<15&&p[3]>240})",12);
+      receipt.importedCanvas=await evaluate("[...document.querySelectorAll('.excalidraw canvas')].map(c=>({width:c.width,height:c.height,center:c.getContext('2d')?Array.from(c.getContext('2d').getImageData(Math.floor(c.width/2),Math.floor(c.height/2),1,1).data):null}))");
+      await stage(files==='native-picker'?'save selected file through File System Access':'export imported file');
+      await key('a',2);await key('ArrowRight');
+      if(files==='native-picker')receipt.beforeSaveWindows=await visibleWindows();
+      await key('s',2);
     }
+    let file;
+    if(app==='excalidraw'&&files==='native-picker') {
+      // The site's File System Access save opens a native Save As chooser;
+      // it does not emit Browser.download events. Choose a new owned output.
+      file=path.join(data,'Downloads','SumiProbeSaved.excalidraw');
+      await assert.rejects(lstat(file),{code:'ENOENT'});
+      receipt.nativeSaveChooser=await nativeDialog(receipt.beforeSaveWindows,'save');
+      await selectNativePath(receipt.nativeSaveChooser,file,'native-save');
+      // A site toast alone is insufficient; verify the saved nonce/geometry
+      // in the real file exactly once after the site's completion notice.
+      await ready("document.body.innerText.includes('File saved.')",8);
+      receipt.save={kind:'File System Access Save As',file,completion:'native chooser closed, site notice and actual file verification'};
+      await screenshot('saved.png');
+    }else {
     const downloadDeadline=Date.now()+15000;let finished;
     while(Date.now()<downloadDeadline && !finished) {
       assert(!downloads.some(e=>e.method==='Browser.downloadProgress'&&e.params.state==='canceled'),'Browser download canceled');
@@ -246,10 +294,11 @@ try {
     const guid=finished.params.guid;assert(/^[0-9a-f-]{36}$/.test(guid));
     const frame=(await page('Page.getFrameTree')).frameTree.frame;
     assert(began[0].params.frameId===frame.id,'Download must belong to the selected root page');
-    const file=path.join(data,'Downloads',guid);
+    file=path.join(data,'Downloads',guid);
     if(finished.params.filePath)assert(finished.params.filePath===file,'Unexpected browser destination');
-    const saved=await lstat(file);assert(saved.isFile()&&!saved.isSymbolicLink()&&saved.size>0&&saved.size<=1024*1024,'Missing or oversized actual export');
     receipt.download={began:began[0].params,finished:finished.params,file};
+    }
+    const saved=await lstat(file);assert(saved.isFile()&&!saved.isSymbolicLink()&&saved.size>0&&saved.size<=1024*1024,'Missing or oversized actual export');
     const proof=spawn('python3',['-B','-c',
       'import sys,json;from pathlib import Path;sys.path.insert(0,sys.argv[1]);from browser_apps import verify_export;print(json.dumps(verify_export(Path(sys.argv[2]),sys.argv[3],sys.argv[4])))',
       path.join(repo,'native-tests/desktop'),file,app,nonce],{env,stdio:['ignore','pipe','pipe']});
@@ -257,7 +306,19 @@ try {
     const status=await new Promise(resolve=>proof.once('exit',resolve));assert(status===0,err);
     receipt.export=JSON.parse(out);receipt.exportVerified=true;
   }
-}catch(e){error=e;receipt.error=String(e);try{await screenshot('failure.png')}catch{}if(files==='native-picker'){try{await desktop('import',['-window','root',path.join(data,'native-failure.png')])}catch{}}}
+}catch(e){
+  error=e;receipt.error=String(e);
+  try {receipt.failedFrame=(await page('Page.getFrameTree')).frameTree.frame;}catch{}
+  try {receipt.failedTargets=(await command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');}catch{}
+  if(receipt.nativePid) {
+    try {
+      const tasks=await readdir(`/proc/${receipt.nativePid}/task`);
+      receipt.nativeWaits=await Promise.all(tasks.slice(0,24).map(async tid=>({tid:Number(tid),name:(await readFile(`/proc/${receipt.nativePid}/task/${tid}/comm`,'utf8')).trim(),wait:(await readFile(`/proc/${receipt.nativePid}/task/${tid}/wchan`,'utf8')).trim()})));
+    }catch{}
+  }
+  try{await screenshot('failure.png')}catch{}
+  if(files==='native-picker'){try{await desktop('import',['-window','root',path.join(data,'native-failure.png')])}catch{}}
+}
 finally {
   try {
     if(socket?.readyState===WebSocket.OPEN)await command('Browser.close').catch(()=>{});

@@ -29,11 +29,18 @@ OS chooser and default Save UI unqualified.
 
 `--mode inspect` records observations and never qualifies an operation.
 `--app excalidraw --files native-picker` is a separate visible-browser probe of
-the actual File System Access chooser; it additionally needs existing `xdotool`
+the actual File System Access Open and Save As choosers; it additionally needs existing `xdotool`
 and ImageMagick `import`. Its experimental English GTK dialog driver must fail
 when the expected unique dialog/focus/closure is missing. It does not disable
 Web APIs or substitute another input route after a failed operation. Retain the
 failed case rather than inferring engine incapability from an automation error.
+The driver waits for the rendered confirm label in the inspected GTK theme
+before clicking once, and replaces the entire filename including its extension.
+This pixel heuristic is specific to that theme/geometry. A red canvas is only
+import readiness; success requires the exact new owned Save As output, the
+case-specific scene nonce and the actual keyboard edit. A toast or a file saved
+under an unexpected name cannot pass. This path does not require a download
+event because File System Access writes through the selected native file handle.
 
 `source.json` and `source-snapshot/` retain the runner, driver, export oracle and
 cleanup validators; `execution.json` also checks their hashes, the executable
@@ -43,10 +50,14 @@ accept an operation; API presence or an inspect receipt is insufficient.
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,
 saved and decoded a 138-byte 128×96 PNG and shut down normally. The original
-private driver and the public runner each passed separately. Excalidraw reached
-its real native chooser, but the public operation stopped because the dialog
-did not close; import/export remain unqualified. Earlier headless input-chooser
-and title-selector failures are retained as driver failures.
+private driver and the public runner each passed separately. Excalidraw also
+passed actual native Open, import, keyboard edit and native Save As to the exact
+new output, with the nonce and edited geometry verified in a 961-byte scene and
+normal shutdown. Earlier headless chooser, disabled-confirm, title-readiness
+and doubled-extension failures remain failures. Some cold starts stopped at
+about:blank with incomplete guard cleanup; kernel I/O waits were observed and
+the retained PIDs were later absent. Their unique cause remains unresolved.
+These successful file operations do not establish daily-use reliability.
 
 The native browser reports a non-global request context whose cache path equals
 the requested UUID directory. That single-context check does not establish

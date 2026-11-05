@@ -26,10 +26,14 @@ driver: `--files cdp` uses a headless browser, supplies actual existing file
 inputs through CDP and sets `Browser.setDownloadBehavior(allowAndName)` to an
 owned path. This is a File API / Blob-download component check. It does not
 qualify an OS chooser or the default Save UI. `--files native-picker` instead
-opens a visible browser in a fresh Xvfb session to inspect Excalidraw's actual
-File System Access chooser. It is a separate experiment, not a fallback that
+opens a visible browser in a fresh Xvfb session for Excalidraw's actual
+File System Access Open and Save As choosers, preserving the native site-write
+warning. It is a separate experiment, not a fallback that
 turns a failed CDP operation into success. Its download behavior is still the
-same explicit CDP setting.
+same explicit CDP setting, but the File System Access save does not use that
+download service. It selects a previously absent owned output and requires
+the exact file with the imported nonce and keyboard edit. The English GTK
+confirm-pixel heuristic is scoped to the inspected theme/geometry.
 
 Actual bytes and normal native shutdown are required for operation success.
 A verified single UUID context does not qualify two-profile data/session
