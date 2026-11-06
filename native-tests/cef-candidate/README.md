@@ -248,10 +248,17 @@ process group, a pidfd probe, the child subreaper, SIGTERM on parent death,
 pidfds retained only after a stable-ancestry re-check, the bounded drain
 (0.5 s natural, 0.5 s SIGTERM, 2 s SIGKILL) and ECHILD as the completion proof.
 It does not cap the browser's lifetime, and while the browser runs it blocks on
-a signalfd with a 250 ms observation tick instead of polling every 20 ms. The
-adapter runs a guard path ending in `.py` with `python3 -B` and executes any
-other guard directly; the fixture runner still passes `guard.py`, so the Rust
-guard is not yet qualified in the actual App run. Its self-tests use stand-in
+a signalfd with a 250 ms observation tick instead of polling every 20 ms. For
+a long-lived browser it holds pidfds only for processes that still exist
+(`observed` counts every distinct owned process), records observation failures
+while the browser runs in `nonFatalErrors` instead of stopping it, withholds
+descriptors leaked into it from the browser, resets inherited SIGTERM, SIGINT
+and SIGCHLD dispositions, starts the browser with no blocked signals and its
+own original descriptor limit, and starts nothing when a stop is already
+pending. The adapter arms the guard's parent-death signal between fork and
+exec, runs a guard path ending in `.py` with `python3 -B` and executes any
+other guard directly; `browser_process.py --guard` selects the Rust guard, which
+is not yet qualified in the actual App run. Its self-tests use stand-in
 children only and never start CEF:
 
 ```bash

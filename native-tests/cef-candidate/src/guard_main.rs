@@ -9,17 +9,21 @@
 //! `native-tests/browser/guard.py`, with two intended differences: the
 //! browser's lifetime is not capped, and while the browser runs the guard
 //! blocks on a signalfd (stop requests and child exits) with a 250 ms
-//! observation tick instead of polling every 20 ms. Smaller hardening details
-//! are noted where they occur (the startup probe, `__WALL`, restoring the
-//! browser's signal mask).
+//! observation tick instead of polling every 20 ms. Because it may run for
+//! days, it keeps descriptors only for processes that still exist, and an
+//! observation failure never ends a running browser. Smaller hardening
+//! details are noted where they occur.
 //!
 //! Receipt, written once after the drain:
 //! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
-//! error, cleanupErrors}`. The guard exits 0 only when the drain ended with
-//! the kernel's proof of no children, the browser exited 0 and nothing
-//! failed. As in guard.py, a forced cleanup alone does not change the exit
-//! status; the App separately requires `forcedCleanup == 0` for a normal end.
-//! A refusal before the receipt exists exits 2 and starts nothing.
+//! error, cleanupErrors, nonFatalErrors}`. The guard exits 0 only when the
+//! drain ended with the kernel's proof of no children, the browser exited 0
+//! and nothing failed. As in guard.py, a forced cleanup alone does not change
+//! the exit status; the App separately requires `forcedCleanup == 0` for a
+//! normal end. `nonFatalErrors` names observation failures while the browser
+//! ran; they did not stop it, and the drain's own observation and ECHILD still
+//! decide completeness. A refusal before the receipt exists exits 2 and starts
+//! nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -57,9 +61,7 @@ fn main() -> ExitCode {
     }
     let args: Vec<OsString> = std::env::args_os().collect();
     match prepare(&args) {
-        Ok((receipt, signals, stopping)) => {
-            supervise(receipt, &signals, stopping, &args[2], &args[3..])
-        }
+        Ok(prepared) => supervise(prepared, &args[2], &args[3..]),
         Err((code, message)) => {
             eprintln!("takosumi-browser-guard: {message}");
             ExitCode::from(code)
@@ -69,7 +71,10 @@ fn main() -> ExitCode {
 
 /// A short, stable error name for the receipt; never a path or argv.
 fn fault(error: &io::Error) -> String {
-    format!("{:?}", error.kind())
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (errno {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
 }
 
 /// The process ended (or was reaped) while it was being read.
@@ -210,10 +215,23 @@ fn is_owned(pid: i32, owner: i32, owner_start: u64) -> Result<bool, String> {
 #[derive(Default)]
 struct Tracker {
     handles: BTreeMap<i32, (u64, OwnedFd)>,
+    /// Distinct owned processes retained so far; it only grows.
+    observed: u64,
 }
 
 impl Tracker {
     fn observe(&mut self, owner: i32) -> Result<(), String> {
+        // Release the handles of processes that are gone (reaped, or the pid
+        // now names a later process). Only processes that still exist,
+        // zombies included, keep a pidfd, so the guard's descriptors follow
+        // the live process tree however many renderers come and go. A gone
+        // process never reappears in a snapshot, so it is never counted twice.
+        self.handles
+            .retain(|pid, (start, _)| match start_time(*pid) {
+                Ok(Some(now)) => now == *start,
+                Ok(None) => false,
+                Err(_) => true, // Unknown: keep it; `alive` reports it as remaining.
+            });
         let owner_start = start_time(owner)?.ok_or("IdentityUnavailable")?;
         for pid in descendants(owner)? {
             let Some(start) = start_time(pid)? else {
@@ -239,6 +257,7 @@ impl Tracker {
             // exact live guard. Otherwise, or on a read error, `fd` closes.
             if start_time(pid)? == Some(start) && is_owned(pid, owner, owner_start)? {
                 self.handles.insert(pid, (start, fd));
+                self.observed += 1;
             }
         }
         Ok(())
@@ -260,14 +279,8 @@ impl Tracker {
 }
 
 /// SIGTERM, SIGINT and SIGCHLD are blocked and read from a signalfd, so a stop
-/// request or a child exit wakes a blocking poll. A signal mask survives fork
-/// and exec, and std's `Command` leaves it as is (observed with Rust 1.97), so
-/// the browser is started with the mask the guard itself was given
-/// (`original`); the normal-exit self-test checks that from inside the child.
-struct Signals {
-    fd: OwnedFd,
-    original: libc::sigset_t,
-}
+/// request or a child exit wakes a blocking poll.
+struct Signals(OwnedFd);
 
 impl Signals {
     fn block() -> io::Result<Self> {
@@ -275,48 +288,36 @@ impl Signals {
         // is single-threaded, so the process mask is this thread's mask.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
-            let mut original: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
             for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
                 libc::sigaddset(&mut set, signal);
             }
-            if libc::sigprocmask(libc::SIG_BLOCK, &set, &mut original) != 0 {
+            if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // Ignored dispositions survive exec. An inherited SIG_IGN for
+            // SIGCHLD would make the kernel reap children itself, losing the
+            // browser's exit status and freeing its pid; guard.py's handlers
+            // also give the browser default SIGTERM and SIGINT. Blocked
+            // signals still reach the signalfd whatever the disposition.
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
+                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
             }
             let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self {
-                fd: OwnedFd::from_raw_fd(fd),
-                original,
-            })
+            Ok(Self(OwnedFd::from_raw_fd(fd)))
         }
-    }
-
-    /// A command that starts with the guard's original signal mask.
-    fn command(&self, program: &OsString, args: &[OsString]) -> Command {
-        let mut command = Command::new(program);
-        command.args(args);
-        let original = self.original;
-        // SAFETY: runs in the forked child before exec and only calls
-        // sigprocmask, which is async-signal-safe.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::sigprocmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
     }
 
     /// Wait up to `limit` for a signal, then consume every pending one.
     /// Returns whether a stop (SIGTERM or SIGINT) was among them.
     fn wait(&self, limit: Duration) -> io::Result<bool> {
         let mut ready = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
+            fd: self.0.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -337,7 +338,7 @@ impl Signals {
             let size = std::mem::size_of::<libc::signalfd_siginfo>();
             let read = unsafe {
                 libc::read(
-                    self.fd.as_raw_fd(),
+                    self.0.as_raw_fd(),
                     (&mut info as *mut libc::signalfd_siginfo).cast(),
                     size,
                 )
@@ -371,7 +372,111 @@ fn probe() -> io::Result<()> {
     Ok(())
 }
 
-type Prepared = (File, Signals, bool);
+/// The App may leak inheritable descriptors into the guard; the browser must
+/// not receive them (guard.py's Popen uses close_fds). Mark every descriptor
+/// above stderr close-on-exec in the guard itself before anything starts:
+/// the guard never uses inherited descriptors, and those it opens (receipt,
+/// signalfd, pidfds, std's spawn error pipe) are close-on-exec already.
+/// Marking instead of closing in the child keeps std's error pipe working.
+fn close_inherited_on_exec() -> io::Result<()> {
+    // SAFETY: integer-only syscall (Linux 5.11+ for the flag).
+    let marked = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if marked == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+        return Err(error);
+    }
+    // Older kernels: walk the descriptor table instead.
+    let listed: Vec<RawFd> = std::fs::read_dir("/proc/self/fd")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in listed.into_iter().filter(|fd| *fd > 2) {
+        // SAFETY: fcntl on a descriptor number; the listing's own descriptor
+        // is closed by now and simply reports EBADF.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Raise the guard's soft descriptor limit to its hard limit, as headroom for
+/// pidfds. Returns the original limit, which the browser gets back, or None
+/// when nothing changed. Best effort: a refusal keeps the original limit.
+fn raise_descriptor_limit() -> Option<libc::rlimit64> {
+    let mut original = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: valid rlimit pointers.
+    if unsafe { libc::getrlimit64(libc::RLIMIT_NOFILE, &mut original) } != 0
+        || original.rlim_cur >= original.rlim_max
+    {
+        return None;
+    }
+    let raised = libc::rlimit64 {
+        rlim_cur: original.rlim_max,
+        rlim_max: original.rlim_max,
+    };
+    (unsafe { libc::setrlimit64(libc::RLIMIT_NOFILE, &raised) } == 0).then_some(original)
+}
+
+/// The browser: the guard's stdio (the App's control pipe and log),
+/// environment and process group, no blocked signals, and the guard's
+/// original descriptor limit.
+fn browser_command(
+    program: &OsString,
+    args: &[OsString],
+    limit: Option<libc::rlimit64>,
+) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    // SAFETY: runs in the forked child before exec and makes only system
+    // calls (sigprocmask, prlimit64), which are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            // A signal mask survives fork and exec, and std's Command leaves
+            // it as is (observed with Rust 1.97). Start the browser with none
+            // blocked, whatever the guard or the App's thread had blocked.
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            if libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Some(limit) = limit {
+                let restored = libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::RLIMIT_NOFILE,
+                    &limit as *const libc::rlimit64,
+                    std::ptr::null_mut::<libc::rlimit64>(),
+                );
+                if restored != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+struct Prepared {
+    receipt: File,
+    signals: Signals,
+    stopping: bool,
+    limit: Option<libc::rlimit64>,
+}
 
 fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
     let refuse = |message: &str| Err((2, message.to_string()));
@@ -395,6 +500,12 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
             format!("pidfd or /proc children are unavailable: {error}"),
         ));
     }
+    if let Err(error) = close_inherited_on_exec() {
+        return Err((
+            2,
+            format!("Inherited descriptors cannot be withheld: {error}"),
+        ));
+    }
     // Reserve the receipt before any browser can exist. O_EXCL refuses a path
     // or link created meanwhile; the explicit mode survives any umask.
     let file = OpenOptions::new()
@@ -409,6 +520,7 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
     // Blocked before the parent-death signal is armed, so that signal and any
     // stop request are queued for the signalfd instead of ending the guard.
     let signals = Signals::block().map_err(fail)?;
+    let limit = raise_descriptor_limit();
     // SAFETY: getppid has no preconditions; prctl takes integer arguments only.
     let parent = unsafe { libc::getppid() };
     let one: libc::c_ulong = 1;
@@ -422,17 +534,26 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
     // The parent-death signal only covers deaths after it is armed. A parent
     // that ended between reading it and arming the signal has already
     // reparented this guard, so the pid differs: treat that as a stop now.
+    // (The App also arms it in the forked guard before exec.)
     let stopping = unsafe { libc::getppid() } != parent;
-    Ok((file, signals, stopping))
+    Ok(Prepared {
+        receipt: file,
+        signals,
+        stopping,
+        limit,
+    })
 }
 
 struct Run {
     me: i32,
     tracker: Tracker,
     child: Option<i32>,
+    /// Taken right after spawn; the direct child is signalled only through it.
+    child_fd: Option<OwnedFd>,
     root_exit: Option<i32>,
     forced: BTreeSet<i32>,
     cleanup_errors: BTreeSet<String>,
+    non_fatal: BTreeSet<String>,
 }
 
 fn exit_code(status: libc::c_int) -> i32 {
@@ -486,7 +607,7 @@ impl Run {
     }
 
     /// Signal every retained descendant through its pidfd, and the direct
-    /// child by pid while it is unreaped.
+    /// child through its own pidfd while it is unreaped.
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
         for (pid, (_, fd)) in &self.tracker.handles {
@@ -501,13 +622,11 @@ impl Run {
             }
         }
         // Covers an observation failure before the direct child was retained.
-        // Until this guard reaps it (root_exit unset) the kernel keeps its
-        // pid, even as a zombie, so the pid cannot name another process.
-        if let (Some(child), None) = (self.child, self.root_exit) {
-            // SAFETY: kill takes integers only.
-            if unsafe { libc::kill(child, signal) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
+        if let (Some(fd), None) = (&self.child_fd, self.root_exit) {
+            match pidfd_signal(fd, signal) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
                     self.cleanup_errors.insert(fault(&error));
                 }
             }
@@ -516,10 +635,19 @@ impl Run {
 
     /// Wait for the browser to exit or for a stop request, without a lifetime
     /// cap. Blocks on the signalfd between observations.
-    fn running(&mut self, signals: &Signals, mut stopping: bool) -> Result<(), String> {
+    fn running(&mut self, signals: &Signals) -> Result<(), String> {
+        let mut stopping = false;
         while self.root_exit.is_none() && !stopping {
-            self.tracker.observe(self.me)?;
-            self.reap()?;
+            // A failed observation must not end a healthy browser: the drain
+            // observes again and ECHILD decides completeness.
+            if let Err(error) = self.tracker.observe(self.me) {
+                self.non_fatal.insert(error);
+            }
+            if self.reap()? && self.root_exit.is_none() {
+                // No child left, yet this guard never reaped the browser:
+                // its exit status is unknown.
+                return Err("RootExitLost".to_string());
+            }
             if self.root_exit.is_none() {
                 stopping |= signals.wait(RUNNING_TICK).map_err(|error| fault(&error))?;
             }
@@ -527,8 +655,8 @@ impl Run {
         Ok(())
     }
 
-    /// The bounded drain every started run takes, however it ended. Returns
-    /// whether the kernel reported no children (ECHILD).
+    /// The bounded drain every run takes, however it ended. Returns whether
+    /// the kernel reported no children (ECHILD).
     fn drain(&mut self, signals: &Signals) -> bool {
         'phases: for (signal, budget) in DRAIN {
             if let Some(signal) = signal {
@@ -563,38 +691,53 @@ impl Run {
     }
 }
 
-fn supervise(
-    mut receipt: File,
-    signals: &Signals,
-    stopping: bool,
-    program: &OsString,
-    args: &[OsString],
-) -> ExitCode {
+fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitCode {
+    let Prepared {
+        mut receipt,
+        signals,
+        stopping,
+        limit,
+    } = prepared;
     let mut run = Run {
         // SAFETY: getpid has no preconditions.
         me: unsafe { libc::getpid() },
         tracker: Tracker::default(),
         child: None,
+        child_fd: None,
         root_exit: None,
         forced: BTreeSet::new(),
         cleanup_errors: BTreeSet::new(),
+        non_fatal: BTreeSet::new(),
     };
     let mut failure = None;
-    // The browser inherits stdin/stdout/stderr (the App's control pipe and
-    // log), the environment and this process group. The guard never writes
-    // to stdout.
-    match signals.command(program, args).spawn() {
-        Ok(child) => {
-            // Reaped only by `Run::reap`; std's Child neither waits nor kills
-            // on drop.
-            run.child = Some(child.id() as i32);
-            if let Err(error) = run.running(signals, stopping) {
-                failure = Some(error);
-            }
-        }
+    // A stop requested before the browser starts (a parent already gone, or a
+    // pending SIGTERM or SIGINT) starts nothing.
+    match signals.wait(Duration::ZERO) {
         Err(error) => failure = Some(fault(&error)),
+        Ok(pending) if pending || stopping => {
+            failure = Some("StopRequestedBeforeStart".to_string());
+        }
+        Ok(_) => match browser_command(program, args, limit).spawn() {
+            Ok(child) => {
+                // Reaped only by `Run::reap`; std's Child neither waits nor
+                // kills on drop. SIGCHLD has its default disposition, so the
+                // unreaped child keeps its pid and this pidfd names it.
+                let pid = child.id() as i32;
+                run.child = Some(pid);
+                match pidfd_open(pid) {
+                    Ok(fd) => {
+                        run.child_fd = Some(fd);
+                        if let Err(error) = run.running(&signals) {
+                            failure = Some(error);
+                        }
+                    }
+                    Err(error) => failure = Some(fault(&error)),
+                }
+            }
+            Err(error) => failure = Some(fault(&error)),
+        },
     }
-    let empty = run.drain(signals);
+    let empty = run.drain(&signals);
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     let normal =
         complete && run.root_exit == Some(0) && failure.is_none() && run.cleanup_errors.is_empty();
@@ -603,10 +746,11 @@ fn supervise(
         "complete": complete,
         "remaining": run.tracker.alive(),
         "kernelNoChildren": empty,
-        "observed": run.tracker.handles.len(),
+        "observed": run.tracker.observed,
         "forcedCleanup": run.forced.len(),
         "error": failure,
         "cleanupErrors": run.cleanup_errors,
+        "nonFatalErrors": run.non_fatal,
     });
     // One write of the whole document, so a reader never sees a partial one
     // from a successful write.
