@@ -257,6 +257,14 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
         working-directory: takosumi-mobile
+      # The per-profile CEF adapter also compiles on Windows (an unsandboxed
+      # test candidate there; the cef-windows job runs it).
+      - name: Compile desktop App with the per-profile CEF adapter
+        if: runner.os == 'Windows'
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features desktop-cef
+        working-directory: takosumi-mobile
       - name: Whole App iOS Simulator SDK build (unsigned)
         if: runner.os == 'macOS'
         timeout-minutes: 25
@@ -329,15 +337,18 @@ jobs:
           key: ${{ steps.desktop-cache.outputs.cache-primary-key }}
 
   # The per-profile CEF browser on Windows (first candidate): build
-  # takosumi-cef-browser-process from native-tests/cef-candidate with its
-  # locked crates and run it alone (no guard, no App) through windows_smoke.py.
-  # It runs without Chromium's sandbox on Windows, which the build must ask
-  # for by name (windows-unsandboxed-candidate); it is a test candidate, not
-  # a package. The guard and the standalone candidate are Linux only and are
-  # not built. Independent of the other jobs.
+  # takosumi-cef-browser-process and takosumi-browser-guard from
+  # native-tests/cef-candidate with their locked crates, run the browser alone
+  # through windows_smoke.py, run the guard's self-tests, then drive both
+  # through the App's adapter (its Process API, no App UI) in the app-screen
+  # plugin's Windows tests. The browser runs without Chromium's sandbox on
+  # Windows, which the build must ask for by name
+  # (windows-unsandboxed-candidate); it is a test candidate, not a package.
+  # The standalone candidate is Linux only and is not built. Independent of
+  # the other jobs.
   cef-windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}\target-cef
     steps:
@@ -388,11 +399,11 @@ jobs:
           rustc --version
           cargo --version
           python --version
-      - name: Build takosumi-cef-browser-process (product, unsandboxed candidate)
+      - name: Build takosumi-cef-browser-process (product, unsandboxed candidate) and takosumi-browser-guard
         id: build
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
@@ -437,6 +448,48 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP"
+      # The Windows guard (Job Objects) with stand-in browsers: the self-test
+      # binary re-executes itself as the guard and as the browser. A selection
+      # that runs fewer than all nine cases fails.
+      - name: Guard self-tests (Windows)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
+          cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 9 passed; 0 failed$' -Quiet)) { throw 'Not all nine guard self-tests ran' }
+      # The App's adapter on Windows with the product browser and the guard
+      # built above: the plugin's Windows unit tests, then the two ignored
+      # tests that start a profile through Process::spawn and the creation
+      # reply check, reopen it, shut it down through the adapter and require a
+      # normal guard receipt, and end the App's Job Object to require that the
+      # guard and every browser process end with it. Every one must have run.
+      - name: App adapter with the built guard and browser (Process API)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 40
+        run: |
+          $env:TAKOSUMI_WINDOWS_GUARD = "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe"
+          $env:TAKOSUMI_WINDOWS_BROWSER = "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe"
+          # The plugin has no lockfile of its own; the app's pins its versions.
+          Copy-Item src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
+          $log = Join-Path $env:RUNNER_TEMP 'adapter-tests.log'
+          cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-process-experiment --lib -- windows_tests --include-ignored --test-threads 1 --show-output | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "Adapter tests failed (exit $LASTEXITCODE)" }
+          $required = @(
+            'desktop::process_adapter::windows_tests::windows_adapter_opens_reuses_and_shuts_down_a_profile',
+            'desktop::process_adapter::windows_tests::windows_adapter_ending_the_app_job_ends_guard_and_browser',
+            'desktop::process_adapter::windows_tests::a_write_the_browser_does_not_read_times_out_and_holds_the_next',
+            'desktop::process_adapter::windows_tests::a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data',
+            'desktop::process_adapter::windows_tests::an_unresolvable_browser_leaves_the_app_running_with_its_reason',
+            'desktop::process_setup::windows::windows_tests::a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go'
+          )
+          foreach ($name in $required) {
+            if (-not (Select-String -Path $log -SimpleMatch "test $name ... ok" -Quiet)) { throw "$name did not pass" }
+          }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 10 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all ten Windows adapter tests ran' }
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the Win32
       # raise to make its top-level window the foreground window.
