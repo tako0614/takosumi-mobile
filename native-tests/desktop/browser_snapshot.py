@@ -48,7 +48,10 @@ def main():
     process = matches[0]
     native = process["opened"]["nativePid"]
     parent = process["pid"]
-    expected = Path(os.environ["TAKOSUMI_BROWSER_PROCESS_PROGRAM"]).resolve(strict=True)
+    # The runner names the executable separately for --packaged runs, where
+    # the App resolves its bundled browser and no override is set.
+    expected = Path(os.environ.get("TAKOSUMI_BROWSER_PROCESS_SNAPSHOT_PROGRAM")
+                    or os.environ["TAKOSUMI_BROWSER_PROCESS_PROGRAM"]).resolve(strict=True)
 
     def generation_live():
         return (guard.ancestry_identity(parent) or (None,))[0] == args.guard_start

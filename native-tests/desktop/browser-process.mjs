@@ -113,7 +113,10 @@ async function failureSnapshot(client) {
 async function attach(process) {
   // Set before any await, so an attach failure never inherits the previous page's stage.
   proof.stage={name:'attach',pid:process.opened.nativePid,profile:process.profile};
-  const native=process.opened, inspection=JSON.parse(await readFile(path.join(process.directory,'inspection.json'),'utf8'));
+  // Only a browser built with the cef-candidate `fixture-inspection` feature writes it.
+  const native=process.opened, inspection=JSON.parse(await readFile(path.join(process.directory,'inspection.json'),'utf8').catch(error=>{
+    throw new Error(`No inspection.json: build the browser with --features fixture-inspection (${error.code})`);
+  }));
   assert.equal(inspection.pid,native.nativePid);
   const rows=(await readFile('/proc/net/tcp','utf8')).split('\n').slice(1).map(line=>line.trim().split(/\s+/));
   const row=rows.find(r=>r[1]===`0100007F:${inspection.port.toString(16).toUpperCase().padStart(4,'0')}`&&r[3]==='0A');

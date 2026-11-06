@@ -23,6 +23,8 @@ use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest,
 mod gtk_navigation;
 #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
 mod process_adapter;
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+mod process_setup;
 mod profile_reset;
 mod resume_navigation;
 
@@ -110,11 +112,18 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
 }
 
 #[tauri::command]
-fn capabilities() -> CapabilitiesResponse {
+fn capabilities(app: AppHandle) -> CapabilitiesResponse {
+    capabilities_of(&app)
+}
+
+fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> CapabilitiesResponse {
     #[cfg(target_os = "macos")]
     let clear_profile = objc2::available!(macos = 14.0);
     #[cfg(not(target_os = "macos"))]
     let clear_profile = true;
+    // An unavailable browser refuses `clear_profile`, so the home must not offer it.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    let clear_profile = clear_profile && process_adapter::unavailable(_app).is_none();
     CapabilitiesResponse {
         pin_shortcut: false,
         clear_profile,
@@ -130,6 +139,11 @@ async fn clear_profile(
     #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::clear_profile(app, payload).await;
+    }
+    // An unavailable browser never falls back to the Wry profiles.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if let Some(reason) = process_adapter::unavailable(&app) {
+        return Err(Error::Desktop(reason));
     }
     let directory = app
         .path()
@@ -162,6 +176,11 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
     #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::open(app, payload).await;
+    }
+    // The home keeps running and shows why; never the Wry adapter instead.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if let Some(reason) = process_adapter::unavailable(&app) {
+        return Err(Error::Desktop(reason));
     }
     // Wry otherwise silently selects the default store on older macOS.
     #[cfg(target_os = "macos")]

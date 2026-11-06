@@ -1,0 +1,14 @@
+# Allows everything; it only names Takosumi's per-profile browser so that
+# hosts restricting unprivileged user namespaces through AppArmor (Ubuntu
+# 24.04 and later) still let its Chromium sandbox start, as the profiles
+# Ubuntu ships for Chrome and Chromium do.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile takosumi-cef-browser /usr/lib/Takosumi/cef/takosumi-cef-browser-process flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/takosumi-cef-browser>
+}

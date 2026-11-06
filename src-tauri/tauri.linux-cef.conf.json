@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "target/linux-cef/cef/": "cef/"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libasound2",
+          "libatk-bridge2.0-0",
+          "libatk1.0-0",
+          "libatspi2.0-0",
+          "libcairo2",
+          "libcups2",
+          "libdbus-1-3",
+          "libexpat1",
+          "libgbm1",
+          "libglib2.0-0",
+          "libnspr4",
+          "libnss3",
+          "libpango-1.0-0",
+          "libudev1",
+          "libx11-6",
+          "libxcb1",
+          "libxcomposite1",
+          "libxdamage1",
+          "libxext6",
+          "libxfixes3",
+          "libxkbcommon0",
+          "libxrandr2"
+        ],
+        "files": {
+          "/usr/share/takosumi/apparmor/takosumi-cef-browser": "linux/takosumi-cef-browser.apparmor"
+        },
+        "postInstallScript": "linux/postinst.sh",
+        "postRemoveScript": "linux/postrm.sh"
+      }
+    }
+  }
+}

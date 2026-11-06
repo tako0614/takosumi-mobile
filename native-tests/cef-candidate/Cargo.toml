@@ -4,6 +4,13 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[features]
+# The native fixture's observation seam in takosumi-cef-browser-process: a
+# loopback DevTools port and load markers when the App passes
+# TAKOSUMI_BROWSER_PROCESS_INSPECT=1. Build fixture browsers with it; a
+# browser staged for a package must be built without it.
+fixture-inspection = []
+
 [dependencies]
 cef = { version = "=154.5.0", default-features = false, features = ["linux-x11"] }
 libc = "0.2"

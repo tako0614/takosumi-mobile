@@ -234,12 +234,14 @@ added, and installed profiles are not migrated. This is an integration probe,
 not an engine decision or a distributable browser service.
 
 ```bash
-CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection --bin takosumi-cef-browser-process
 cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 python3 -B native-tests/desktop/browser_process.py --binary src-tauri/target/debug/takosumi-mobile --browser /absolute/owned/target/debug/takosumi-cef-browser-process --data /root/dev/tmp/new-short-app-case --app excalidraw
 ```
 
 Run `--app photopea` in another fresh case for the second anonymous origin.
+The fixture browser needs the cef-candidate feature `fixture-inspection` for
+its observation seam (see [Linux packaging](#linux-packaging-desktop-cef)).
 
 `takosumi-browser-guard` (`src/guard_main.rs`) is the product supervisor that
 replaces the fixture's Python guard for the Linux-first per-profile release. It
@@ -316,8 +318,10 @@ individually first; the fixture verifies both original documents survive the
 multi-profile refusal, closes Personal through Chrome's native shortcut, then
 tests Work's cancellable ordinary App exit. A production quit UX, cross-window
 beforeunload coordination, profile reset/migration, restart persistence, popup
-authentication, files/permissions/notifications in this new App path, sandbox,
-packaging/update and other OSes remain unfinished. The Python guard and the
+authentication, files/permissions/notifications in this new App path,
+sandbox qualification, update and other OSes remain unfinished. The sandbox
+decision and the local deb candidate are described under
+[Linux packaging](#linux-packaging-desktop-cef). The Python guard and the
 root-only unsandboxed setup are fixture prerequisites, not release design.
 
 The Excalidraw ex5 actual-App flow passed, including native cancellation,
@@ -335,6 +339,216 @@ not remove the observed failure. No unique cause, CEF-wide inability or
 Photopea compatibility is inferred. These failed App cases do not erase the
 earlier standalone component results or establish App-wide file/notification
 support. Retain each exact-source receipt when comparing later candidates.
+
+## Linux packaging (`desktop-cef`)
+
+The App feature `desktop-cef` enables this per-profile browser path in a normal
+App build, without the fixture driver; `native-browser-process-fixture` now
+implies it. It is Linux only, never enabled by default, and nothing here
+publishes or signs a package. The first local packaging default (chosen by the
+coordinator, not an approval to publish or distribute) is a deb plus an AppImage.
+
+**Locations** (`src-tauri/plugins/app-screen/src/desktop/process_setup.rs`).
+`TAKOSUMI_BROWSER_PROCESS_PROGRAM`, `TAKOSUMI_BROWSER_PROCESS_GUARD` and
+`TAKOSUMI_BROWSER_PROCESS_RUNTIME` stay explicit overrides, and the fixture
+sets all three. They are honoured only with the plugin feature
+`fixture-overrides` (enabled by `native-browser-process-fixture`); a
+`desktop-cef` product build ignores them, like the sandbox opt-out and the
+loopback inspection seam below. Unit tests cover both feature sets without
+changing the process environment. Without overrides, the browser and guard are
+`<resource_dir>/cef/takosumi-cef-browser-process` and
+`<resource_dir>/cef/takosumi-browser-guard`; both must canonicalize to
+existing files. On Linux, Tauri's resource directory is `<exe dir>/../lib/<productName>`
+when that exists, otherwise `$APPDIR/usr/lib/<productName>`, otherwise
+`/usr/lib/<productName>`; a binary in a Cargo `target/<profile>/` directory
+uses that directory. That gives `/usr/lib/Takosumi/cef/` for the installed
+deb, `<tree>/usr/lib/Takosumi/cef/` for an extracted deb, and
+`$APPDIR/usr/lib/Takosumi/cef/` (inside the AppImage mount) for the AppImage.
+For a `cargo` or `tauri dev` build, tauri-build copies the overlay's resources
+into `target/<profile>/cef/`.
+
+The runtime root holds each browser's sockets and `TMPDIR`. The App uses
+`$XDG_RUNTIME_DIR/takosumi-cef` only when `XDG_RUNTIME_DIR` is absolute and,
+per the XDG Base Directory rules, a directory owned by the effective user with
+mode 0700, and only when `takosumi-cef` there is missing (it is created 0700)
+or already a plain, private directory of that user. Otherwise it uses
+`<app cache>/cef` (normally `~/.cache/com.takosumi/cef`). That covers a
+root-owned `takosumi-cef` left by `sudo -E`, another user's runtime directory
+after `su`, a shared `XDG_RUNTIME_DIR=/tmp`, and a runtime path too long for
+the socket. A skipped directory is never chmod-ed or chown-ed. Every root,
+including the fixture's override (which is never created or replaced), must
+be a plain directory (not a link) owned by the effective user, with no group
+or other permission bits. It must also be short enough that
+`p-<pid>-999999/tmp/org.chromium.Chromium.XXXXXX/SingletonSocket` below it
+fits in 108 bytes.
+
+If no browser, guard or runtime root qualifies, or the App runs setuid or
+setgid (`getuid() != geteuid()`, or the same for the group), the plugin still
+starts. The backend is registered as unavailable with its reason, printed to
+stderr. The home keeps running, and `open` and `clear_profile` return that
+reason; nothing falls back to the Wry adapter. `capabilities` then reports
+`clearProfile: false`, so the home does not offer a deletion that would be
+refused.
+
+Each browser's `p-<App pid>-<n>` directory holds a `lock` file. The App keeps
+an exclusive `flock` on it for that browser's whole lifetime and releases it
+only after the directory is removed. Liveness is therefore decided by the lock,
+not by a pid, so another host sharing an NFS cache fallback, or another PID
+namespace sharing `/run/user/<uid>`, keeps its directories. A directory is
+removed once its guard has ended: callers drop a browser right after verifying
+its normal receipt, and any other ended browser is dropped at the App's end.
+
+At start, the App also sweeps its own verified root. It removes a plain
+directory of its user named `p-<pid>-<n>` only when a non-blocking `flock` on
+its lock file succeeds, and removes it while holding that lock. It leaves a
+held lock, a missing lock file (a directory being created, or one from an
+earlier build), a lock file that is a link, links and other entries. A new
+browser's name is used only when it is free or stale by the same test;
+otherwise the App takes the next name. No link is followed. A fixture build
+keeps ended directories, because the runner reads each guard's receipt there
+after the App exits; the sweep still applies.
+
+A browser that agreed to stop has 30 s (`STOP_FINISH`) to end normally. That
+covers an answered `stopped`, a control pipe or reply channel that closed after
+its last window, and a late `stopped` found while recovering. pk1 showed a
+browser still flushing its profile on a stalled disk past the earlier 2–5 s
+bounds. A shutdown request that could not be written within its 20 s write
+bound (the browser never read it, so it never agreed to stop) fails at once,
+leaving the browser in doubt; only a closed pipe waits `STOP_FINISH`. The
+runner waits `STOP_FINISH` plus 15 s for the App's exit, and correspondingly
+longer for the whole session, so it never kills an App that is still within
+that bound.
+
+**Sandbox.** The adapter adds `--no-sandbox` only when the App runs as root
+(Chromium refuses its sandbox to root; the fixture runs as root unless the
+runner's `--user` is given) or, in a fixture build only, when
+`TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` is set. The browser sets CEF's
+`no_sandbox` from the same switch, or when its own euid is 0. Otherwise
+Chromium uses its user-namespace sandbox. `chrome-sandbox` is not packaged:
+it works only as a setuid-root helper, which neither bundle installs. A host
+that blocks unprivileged user namespaces cannot start the sandboxed browser,
+and the App does not fall back to an unsandboxed one.
+
+Ubuntu 24.04 and later restrict user namespaces through AppArmor unless a
+profile allows the executable. The deb ships an allow-everything profile that
+only names the browser and grants `userns`, like the profiles Ubuntu ships for
+Chrome and Chromium (`src-tauri/linux/takosumi-cef-browser.apparmor`,
+installed as `/usr/share/takosumi/apparmor/takosumi-cef-browser`). The
+post-install script copies it into `/etc/apparmor.d` whenever
+`/etc/apparmor.d/abi/4.0` exists and `apparmor_parser -Q -T -K` accepts the
+shipped copy. That holds whatever the running kernel is, so an install in a
+chroot without securityfs, or before rebooting into a newer kernel, finds the
+profile at boot. It loads the profile now (`-r -W`) only when the running
+kernel mediates user namespaces
+(`/sys/kernel/security/apparmor/features/namespaces/userns_create`). AppArmor
+3.x (Debian 12, Ubuntu 22.04) cannot parse `abi <abi/4.0>` or `userns`, and an
+unparsable file in `/etc/apparmor.d` can make `apparmor.service` fail at boot,
+so it is skipped there. Tauri's deb bundler cannot declare a dpkg trigger, so
+after an upgrade from such a release the package must be reinstalled (for
+example `apt install --reinstall takosumi`) to install the profile. The
+post-remove script unloads and removes the installed copy on remove and purge.
+On purge it also removes the compiled cache entries named
+`takosumi-cef-browser`: in `apparmor_parser --print-cache-dir`, under each
+`/var/cache/apparmor/*/` and in the pre-3.0 `/etc/apparmor.d/cache`, never
+following links or touching other files. Both scripts pass `sh -n`, `dash -n`
+and shellcheck. The profile passes `apparmor_parser -Q -T -K` without being
+loaded; the scripts were not executed.
+
+**Known limits.** An AppImage cannot install a profile. On a host that restricts
+unprivileged user namespaces, its browser cannot start, and the App reports
+only the browser's generic start failure, not the cause. A person or
+administrator must allow unprivileged user namespaces for it. During a deb
+upgrade, dpkg replaces `/usr/lib/Takosumi/cef/` under a running App. Browsers
+started before the upgrade keep the old files, while later starts use the new
+browser and guard with the old App, so the App should be restarted after an
+upgrade. Neither case is handled in code yet.
+
+**Build and stage.** `build.rs` gives both browser executables a `$ORIGIN`
+run path, so they find the adjacent `libcef.so` without `LD_LIBRARY_PATH`;
+the adapter still sets it. The browser's DevTools inspection seam (a loopback
+port plus load markers for `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`) is compiled
+only with the cef-candidate feature `fixture-inspection`. Build fixture
+browsers with it, including the stage behind `browser_process.py --packaged`.
+Build a browser staged for a package without it, so the shipped executable
+cannot open a DevTools port even if its environment asks. The staging script
+refuses a browser containing the `TAKOSUMI_BROWSER_PROCESS_INSPECT` bytes
+unless `--fixture` is given. A fixture stage defaults to
+`src-tauri/target/linux-cef-fixture` (mapped by
+`src-tauri/tauri.linux-cef-fixture.conf.json`), is never written to the package
+stage path (even through a link), and is recorded as such in its manifest. It
+strips ELF files into the stage and symlinks the unchanged data files
+(`--copy` copies them instead). It stages the two executables, `libcef.so`,
+`icudtl.dat`, the V8 snapshot, the `.pak` files, all `locales/*.pak`,
+SwiftShader/Vulkan (and ANGLE when present) and `CREDITS.html`. It does not
+stage `chrome-sandbox` or SDK build inputs. A manifest with each file's size
+and SHA-256 is written beside the stage as a new file; an existing one is
+refused. `src-tauri/tauri.linux-cef.conf.json` maps
+`src-tauri/target/linux-cef/cef/` to the bundle's `cef/` and adds the deb
+dependencies of `libcef.so`, the AppArmor profile and the two scripts. The
+dependency names are the pre-t64 names, which the t64 packages provide.
+
+```bash
+# Product stage (no inspection seam):
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+bun scripts/stage-linux-cef.mjs --cef /absolute/owned/sdk/154.0.34/cef_linux_x86_64 --bin /absolute/owned/target/debug
+bunx tauri build --debug --bundles deb,appimage --features desktop-cef --config src-tauri/tauri.linux-cef.conf.json
+# Fixture browser (browser_process.py --browser, or a stage for --packaged):
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+bun scripts/stage-linux-cef.mjs --fixture --cef /absolute/owned/sdk/154.0.34/cef_linux_x86_64 --bin /absolute/owned/target/debug
+# tauri-build copies the fixture stage into target/debug/cef/ for --packaged:
+TAURI_CONFIG="$(cat src-tauri/tauri.linux-cef-fixture.conf.json)" cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+```
+
+The stage must not exist yet; the script never replaces or removes files. To
+keep it outside the checkout, make `src-tauri/target/linux-cef` a symlink to
+an owned directory before staging. Disk use per debug candidate is large. The
+App crate alone writes about 2.2 GB per feature set: a 1.2 GB staticlib, a
+357 MB cdylib, a 197 MB rlib and a 425 MB debug executable. tauri-build then
+copies 360 MB of resources into `target/debug/cef/`, and the deb directory
+holds an unpacked tree plus `data.tar.gz`.
+
+**Runner with `--user`.** `browser_process.py --user <account>` runs the
+session (Xvfb, D-Bus, App, observer) as that unprivileged account, so the
+browsers run with the Chromium sandbox. The case root stays root's (0711),
+with root's receipts, logs, hard-linked executables, source snapshot and the
+recording opener. Everything the session writes lives in one session
+directory, `<case>/<case name>/`: App, worker and observer artifacts, the
+opener log, profile data and runtime directories. Naming it like the case
+keeps the observer's synthetic nonce the case name, so the oracles are
+unchanged. Only that directory is handed over. Root creates its own files
+with `O_EXCL|O_NOFOLLOW` and reads session files as untrusted data: no link at
+any component, regular files only, with a size bound.
+
+**2026-11-06 local candidates.** The first stage was 232 files, 358 MiB,
+of which 268 MiB were written; the stripped `libcef.so` is 272 MB, down from
+1.46 GB. That deb, `Takosumi_0.1.0_amd64.deb`, was 261 MB (Installed-Size
+781,983 KiB). It contained `/usr/bin/takosumi-mobile` (the 425 MB debug
+executable) and `/usr/lib/Takosumi/cef/` with the two executables (0755),
+`libcef.so`, SwiftShader/Vulkan, the data files and 220 locales. The desktop
+entry and icons were in `/usr/share`. All 237 files in the extracted tree
+matched the deb's md5sums. The extracted App started in a private Xvfb with
+private HOME/XDG directories, created `$XDG_RUNTIME_DIR/takosumi-cef` (0700)
+and its profile root, so the packaged files resolved. That build predated the
+fallback, the unavailable state and the fixture-only gating: a 46-byte
+runtime root and a missing override executable then stopped it at start. A
+product build now ignores the override, and an unusable root falls back or
+leaves the App running with the reason.
+
+The packaged guard and browser also ran outside the App as `nobody` in a
+private Xvfb, booting to an unresolvable `.invalid` origin. Without
+`--no-sandbox`, zygote and renderer processes ran in nested user and PID
+namespaces. Eight of ten sandboxed runs and all three `--no-sandbox` runs shut
+down normally (`stopped`, guard exit 0, complete receipt). The first two
+sandboxed runs closed the window but never answered `stopped` within 30 s, and
+their guards force-drained and wrote incomplete receipts. They ran under high
+host I/O pressure; the cause is unknown and the failures stay recorded.
+
+Later the same day, the coordinator rebuilt the deb and an AppImage and
+launched both as an unprivileged user to the home. Packaged actual-App fixture
+runs passed: pk3 and pk4 as `nobody` with the sandbox, and pk5 as root. That is
+local evidence for this branch's earlier commits, not a qualification of later
+sources, of Tauri's AppImage dependency handling (linuxdeploy) on other hosts,
+or of a release.
 
 ## Observations and limits
 

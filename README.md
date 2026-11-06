@@ -69,7 +69,10 @@ trusted shell; macOS uses dedicated UUID data stores. Popups inherit their
 opener's native environment/store. The shell and mobile/desktop adapters share
 `WebHome`, connection persistence, profile identity and validated `OpenRequest`.
 CEF across every desktop OS would require a separate Tauri 3 alpha migration;
-this candidate keeps the existing Tauri 2 mobile plugins.
+this candidate keeps the existing Tauri 2 mobile plugins. On Linux, the
+explicit `desktop-cef` feature opens each connection in its own guarded CEF
+browser process packaged under the bundle's `cef/` resources; see
+[Linux packaging](native-tests/cef-candidate/README.md#linux-packaging-desktop-cef).
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
