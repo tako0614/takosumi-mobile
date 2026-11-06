@@ -2,33 +2,39 @@
 """Smoke test of takosumi-cef-browser-process on its own (no guard, no App).
 
 Written for Windows (the windows-latest CI job) and kept OS neutral, so it also
-runs against the Linux browser. Python 3 standard library only; no OS tools
-except `tasklist`/`taskkill` on Windows.
+runs against the Linux browser. Python 3 standard library only (ctypes for the
+Windows Job Object and window checks); no OS tools.
 
 It creates a new owned case directory and lays it out as the App's adapter
 (src-tauri/plugins/app-screen/src/desktop/process_adapter.rs) lays out a
 browser's profile directory: `boot.json` holding the first Open request,
 `Downloads/`, and on Linux private HOME/XDG/TMPDIR directories. It starts the
 browser directly with `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` and the App's
-switches, then requires, each within a bound:
+switches: on Windows suspended, inside a kill-on-close Job Object, resumed
+once assigned, so every process it starts is accounted; on Linux in its own
+session and process group. It then requires, each within a bound:
 
 1. an `opened` reply for the boot request's key and profile, whose cache path
    is `<case>/cef-profiles/<profile>` and whose native pid is the started one;
 2. with `--expect-load` (a `fixture-inspection` browser only), the browser's
    main-frame load marker, which shows a renderer process ran;
 3. with `--reuse`, an `opened` reply for a second Open of the same key that
-   reuses the same native browser and window (on Windows this exercises the
-   Win32 raise; a refused foreground change is reported, not failed);
+   reuses the same native browser and window, and that the raise succeeded:
+   no refusal in the browser's stderr and, on Windows, the reported top-level
+   window is the foreground window;
 4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
-   a `stopped` reply for N and process exit code 0.
+   a `stopped` reply for N and process exit code 0;
+5. no process left: none still in the Job Object (Windows) or the process
+   group (Linux) within 10 s of the exit.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
-exits 1 on any failure, printing the tails of the browser's logs. The case
-directory is never removed. Remaining processes after the exit are reported
-but do not fail the run.
+exits 1 on any failure, printing the tails of the browser's logs. Leftover
+processes are ended (closing the Job Object, or SIGKILL to the group). The
+case directory is never removed.
 """
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -55,6 +61,7 @@ APP_SWITCHES = ["--no-first-run", "--no-default-browser-check", "--disable-backg
 OPENED_FIELDS = {"event", "id", "key", "profile", "browser_id", "cache_path", "window_id", "native_pid"}
 URL_SHAPE = re.compile(r"https://(?:[a-z0-9-]+\.)*[a-z0-9-]+(?::[0-9]{1,5})?/")
 RAISE_REFUSED = "Reused browser window was not raised:"
+LEFTOVER_WAIT = 10
 
 
 class Failure(Exception):
@@ -64,6 +71,158 @@ class Failure(Exception):
 def require(condition, message):
     if not condition:
         raise Failure(message)
+
+
+# Win32 structures with explicit field widths (DWORD = 32 bits, SIZE_T and
+# ULONG_PTR = pointer width), so their x64 sizes can be checked anywhere.
+class BasicLimit(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+
+class IoCounters(ctypes.Structure):  # IO_COUNTERS
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class ExtendedLimit(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    _fields_ = [("BasicLimitInformation", BasicLimit), ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+class Accounting(ctypes.Structure):  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", ctypes.c_uint32), ("TotalProcesses", ctypes.c_uint32),
+                ("ActiveProcesses", ctypes.c_uint32), ("TotalTerminatedProcesses", ctypes.c_uint32)]
+
+
+class ThreadEntry(ctypes.Structure):  # THREADENTRY32
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ThreadID", ctypes.c_uint32),
+                ("th32OwnerProcessID", ctypes.c_uint32), ("tpBasePri", ctypes.c_int32),
+                ("tpDeltaPri", ctypes.c_int32), ("dwFlags", ctypes.c_uint32)]
+
+
+X64_SIZES = {BasicLimit: 64, IoCounters: 48, ExtendedLimit: 144, Accounting: 48, ThreadEntry: 28}
+
+CREATE_SUSPENDED = 0x4
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+PROCESS_TERMINATE = 0x1
+PROCESS_SET_QUOTA = 0x100
+THREAD_SUSPEND_RESUME = 0x2
+TH32CS_SNAPTHREAD = 0x4
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+GA_ROOT = 2
+
+
+def win32():
+    """kernel32 and user32 with the prototypes used here (Windows only)."""
+    handle, boolean, dword = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    for library, name, restype, argtypes in (
+        (kernel32, "CreateJobObjectW", handle, [ctypes.c_void_p, ctypes.c_wchar_p]),
+        (kernel32, "SetInformationJobObject", boolean, [handle, ctypes.c_int, ctypes.c_void_p, dword]),
+        (kernel32, "QueryInformationJobObject", boolean,
+         [handle, ctypes.c_int, ctypes.c_void_p, dword, ctypes.c_void_p]),
+        (kernel32, "AssignProcessToJobObject", boolean, [handle, handle]),
+        (kernel32, "TerminateJobObject", boolean, [handle, ctypes.c_uint]),
+        (kernel32, "OpenProcess", handle, [dword, boolean, dword]),
+        (kernel32, "OpenThread", handle, [dword, boolean, dword]),
+        (kernel32, "ResumeThread", dword, [handle]),
+        (kernel32, "CreateToolhelp32Snapshot", handle, [dword, dword]),
+        (kernel32, "Thread32First", boolean, [handle, ctypes.POINTER(ThreadEntry)]),
+        (kernel32, "Thread32Next", boolean, [handle, ctypes.POINTER(ThreadEntry)]),
+        (kernel32, "CloseHandle", boolean, [handle]),
+        (user32, "GetForegroundWindow", handle, []),
+        (user32, "GetAncestor", handle, [handle, ctypes.c_uint]),
+    ):
+        function = getattr(library, name)
+        function.restype, function.argtypes = restype, argtypes
+    return kernel32, user32
+
+
+def last_error(what):
+    code = ctypes.get_last_error()
+    return OSError(f"{what} failed (Windows error {code})")
+
+
+class WindowsJob:
+    """A kill-on-close Job Object that owns the browser and every process it starts."""
+
+    def __init__(self):
+        for structure, size in X64_SIZES.items():
+            require(ctypes.sizeof(structure) == size, f"Unexpected {structure.__name__} layout")
+        self.kernel32, self.user32 = win32()
+        self.handle = self.kernel32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise last_error("CreateJobObjectW")
+        limits = ExtendedLimit()
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.kernel32.SetInformationJobObject(self.handle, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                                                     ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = last_error("SetInformationJobObject")
+            self.close()
+            raise error
+
+    def adopt(self, pid):
+        """Assign a process started suspended, then resume its thread."""
+        process = self.kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not process:
+            raise last_error("OpenProcess")
+        try:
+            if not self.kernel32.AssignProcessToJobObject(self.handle, process):
+                raise last_error("AssignProcessToJobObject")
+        finally:
+            self.kernel32.CloseHandle(process)
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if snapshot in (None, INVALID_HANDLE_VALUE):
+            raise last_error("CreateToolhelp32Snapshot")
+        resumed = 0
+        try:
+            entry = ThreadEntry(dwSize=ctypes.sizeof(ThreadEntry))
+            found = self.kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while found:
+                if entry.th32OwnerProcessID == pid:
+                    thread = self.kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if not thread:
+                        raise last_error("OpenThread")
+                    try:
+                        if self.kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise last_error("ResumeThread")
+                    finally:
+                        self.kernel32.CloseHandle(thread)
+                    resumed += 1
+                entry.dwSize = ctypes.sizeof(ThreadEntry)
+                found = self.kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+        require(resumed >= 1, "The suspended browser had no thread to resume")
+
+    def processes(self):
+        """(processes ever in the job, processes still in it)."""
+        info = Accounting()
+        if not self.kernel32.QueryInformationJobObject(self.handle, JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                                                       ctypes.byref(info), ctypes.sizeof(info), None):
+            raise last_error("QueryInformationJobObject")
+        return info.TotalProcesses, info.ActiveProcesses
+
+    def terminate(self):
+        if self.handle and not self.kernel32.TerminateJobObject(self.handle, 1):
+            raise last_error("TerminateJobObject")
+
+    def close(self):
+        """Closing the last handle kills whatever is still in the job."""
+        if self.handle:
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 def sha256(path):
@@ -112,9 +271,27 @@ class Browser:
         self.case = case
         self.log = open(case / "browser.log", "xb")
         self.protocol = open(case / "protocol.jsonl", "xb")
-        extra = {} if WINDOWS else {"start_new_session": True}
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=self.log, cwd=case, env=env, **extra)
+        self.job = None
+        if WINDOWS:
+            self.job = WindowsJob()
+            extra = {"creationflags": CREATE_SUSPENDED}
+        else:
+            extra = {"start_new_session": True}
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=self.log, cwd=case, env=env, **extra)
+        except BaseException:
+            if self.job is not None:
+                self.job.close()
+            raise
+        if self.job is not None:
+            try:
+                self.job.adopt(self.process.pid)
+            except BaseException:
+                self.process.kill()
+                self.process.wait()
+                self.job.close()
+                raise
         self.lines = queue.Queue()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -185,13 +362,32 @@ class Browser:
             if event is not None:
                 self.unsolicited(event)
 
-    def stop_tree(self):
-        """Failure cleanup: end the browser and the processes it started."""
+    def leftovers(self):
+        """Processes still owned after the browser exited, waiting up to
+        LEFTOVER_WAIT for them to end: ({"total", "active"} on Windows, the
+        Job Object's counts; {"groupAlive"} on Linux)."""
+        deadline = time.monotonic() + LEFTOVER_WAIT
+        while True:
+            if self.job is not None:
+                total, active = self.job.processes()
+                result = {"total": total, "active": active}
+                done = active == 0
+            else:
+                try:
+                    os.killpg(self.process.pid, 0)
+                    done = False
+                except ProcessLookupError:
+                    done = True
+                result = {"groupAlive": not done}
+            if done or time.monotonic() >= deadline:
+                return result, done
+            time.sleep(0.5)
+
+    def end_all(self):
+        """Ends the browser and every process it started; never raises."""
         try:
-            if WINDOWS:
-                if self.process.poll() is None:
-                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.process.pid)],
-                                   capture_output=True, timeout=30)
+            if self.job is not None:
+                self.job.terminate()
             else:
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
@@ -200,29 +396,6 @@ class Browser:
             self.process.wait(timeout=30)
         except (OSError, subprocess.SubprocessError) as error:
             print(f"windows_smoke: cleanup failed: {error}", file=sys.stderr)
-
-    def remaining(self, name):
-        """Processes left after the browser exited (informational)."""
-        deadline = time.monotonic() + 10
-        while True:
-            if WINDOWS:
-                try:
-                    listing = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
-                                             capture_output=True, text=True, timeout=30).stdout
-                except (OSError, subprocess.SubprocessError):
-                    return None  # unknown
-                count = sum(1 for row in listing.splitlines() if row.lower().startswith(f'"{name.lower()}"'))
-            else:
-                try:
-                    os.killpg(self.process.pid, 0)
-                    count = 1  # at least one member of the browser's session remains
-                except ProcessLookupError:
-                    count = 0
-                except OSError:
-                    return None  # unknown
-            if count == 0 or time.monotonic() >= deadline:
-                return count
-            time.sleep(0.5)
 
 
 def check_opened(event, request_id, key, profile, case, pid):
@@ -236,6 +409,19 @@ def check_opened(event, request_id, key, profile, case, pid):
             "The opened reply has no native browser window")
 
 
+def check_foreground(user32, window):
+    """The reported window is top level and became the foreground window."""
+    require(user32.GetAncestor(window, GA_ROOT) == window, "The reported window_id is not a top-level window")
+    deadline = time.monotonic() + 2
+    while True:
+        foreground = user32.GetForegroundWindow()
+        if foreground == window:
+            return
+        require(time.monotonic() < deadline,
+                f"The reused window {window} is not the foreground window ({foreground})")
+        time.sleep(0.1)
+
+
 def load_marker(case, browser_id, pid):
     path = case / f"load-ready-{browser_id}.json"
     try:
@@ -245,6 +431,11 @@ def load_marker(case, browser_id, pid):
     require(marker == {"pid": pid, "browserId": browser_id, "mainFrame": True},
             f"Unexpected load marker {marker!r}")
     return marker
+
+
+def raise_refusal(case):
+    refused = [line for line in tail(case / "browser.log").splitlines() if RAISE_REFUSED in line]
+    return refused[-1][:300] if refused else None
 
 
 def main():
@@ -258,7 +449,8 @@ def main():
     parser.add_argument("--stop-timeout", type=float, default=60)
     parser.add_argument("--expect-load", action="store_true",
                         help="require the main-frame load marker (fixture-inspection browsers only)")
-    parser.add_argument("--reuse", action="store_true", help="reopen the same screen before shutting down")
+    parser.add_argument("--reuse", action="store_true",
+                        help="reopen the same screen and require the raise before shutting down")
     args = parser.parse_args()
     if not (WINDOWS or LINUX):
         parser.error("Only Windows and Linux browsers are supported")
@@ -340,6 +532,10 @@ def main():
             require(reused["browser_id"] == opened["browser_id"] and reused["window_id"] == opened["window_id"],
                     "The reopened screen did not reuse its native browser window")
             summary["reused"] = reused
+            if session.job is not None:
+                # The browser raised the window before it replied.
+                check_foreground(session.job.user32, reused["window_id"])
+                summary["foreground"] = True
             next_id += 1
 
         stop_deadline = time.monotonic() + args.stop_timeout
@@ -360,19 +556,27 @@ def main():
         require(code == 0, f"The browser exited with {code}")
         session.reader.join(timeout=5)
         summary["stdoutClosed"] = not session.reader.is_alive()
+        summary["leftovers"], done = session.leftovers()
+        require(done, f"Processes remained {LEFTOVER_WAIT} s after the browser exited: {summary['leftovers']}")
+        summary["raiseRefused"] = raise_refusal(case)
+        require(not args.reuse or summary["raiseRefused"] is None,
+                f"The reused window was not raised: {summary['raiseRefused']}")
         summary["passed"] = True
-    except Failure as failure:
-        summary["error"] = str(failure)
     except Exception as error:  # every failure ends in the summary and exit 1
-        summary["error"] = f"{type(error).__name__}: {error}"
+        summary["error"] = str(error) if isinstance(error, Failure) else f"{type(error).__name__}: {error}"
     finally:
         if session is not None:
             if not summary["passed"]:
-                session.stop_tree()
+                if "leftovers" not in summary and session.process.poll() is not None:
+                    try:
+                        summary["leftovers"], _ = session.leftovers()
+                    except OSError as error:
+                        summary["leftovers"] = f"unknown: {error}"
+                session.end_all()
                 summary.setdefault("exitCode", session.process.poll())
-            summary["remainingProcesses"] = session.remaining(browser.name)
-            if not WINDOWS and summary["remainingProcesses"]:
-                session.stop_tree()
+                summary.setdefault("raiseRefused", raise_refusal(case))
+            if session.job is not None:
+                session.job.close()
             try:
                 session.process.stdin.close()
             except OSError:
@@ -380,8 +584,6 @@ def main():
             summary["events"] = session.events
             session.log.close()
             session.protocol.close()
-            refused = [line for line in tail(case / "browser.log").splitlines() if RAISE_REFUSED in line]
-            summary["raiseRefused"] = refused[-1][:300] if refused else None
     text = json.dumps(summary, indent=2)
     print(text)
     if case is not None:
