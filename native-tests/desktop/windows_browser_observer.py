@@ -15,7 +15,8 @@ State is synthetic (a nonce in localStorage and a script cookie, and the
 site's HttpOnly session cookie set by the sign-in stand-in); no real login.
 
 Window switching uses SetForegroundWindow (then, if Windows refuses, the
-task switchers' AttachThreadInput route). It never sends keyboard or mouse
+task switchers' AttachThreadInput route), and Work is minimized before the
+home reopens it with ShowWindowAsync. It never sends keyboard or mouse
 input. Beforeunload dialogs are cancelled through DevTools
 (Page.handleJavaScriptDialog), not with a native key as on Linux; native
 window closes are WM_CLOSE, as a click on the title bar's close button.
@@ -50,6 +51,9 @@ LOAD_WAIT = 25
 END_WAIT = 20
 RAISE_REFUSED = "Reused browser window was not raised:"
 GA_ROOT = 2
+# ShowWindow: minimized without activating another window (the home stays in
+# front for the reopen).
+SW_SHOWMINNOACTIVE = 7
 GW_HWNDNEXT = 2
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x8
@@ -93,6 +97,7 @@ class Win32:
             (self.user32, "IsWindow", boolean, [handle]),
             (self.user32, "IsWindowVisible", boolean, [handle]),
             (self.user32, "IsIconic", boolean, [handle]),
+            (self.user32, "ShowWindowAsync", boolean, [handle, ctypes.c_int]),
             (self.user32, "GetAncestor", handle, [handle, ctypes.c_uint]),
             (self.user32, "GetForegroundWindow", handle, []),
             (self.user32, "SetForegroundWindow", boolean, [handle]),
@@ -224,6 +229,15 @@ class Win32:
             return {"route": "AttachThreadInput", "before": before}
         raise Failure(f"{what} did not come to the front (foreground {self.foreground()}, "
                       f"foreground lock timeout {self.lock_timeout()} ms)")
+
+    def minimize(self, window):
+        """Minimize another process's top-level window without activating
+        another one (ShowWindowAsync, so a busy owner cannot block this
+        process). No input event is sent."""
+        self.user32.ShowWindowAsync(window, SW_SHOWMINNOACTIVE)
+
+    def iconic(self, window):
+        return bool(self.user32.IsIconic(window))
 
     def close(self, window):
         """A native close request (WM_CLOSE), as the title bar's close button."""
@@ -714,11 +728,9 @@ class Observer:
         # The home comes back through the OS's window switching (the owner's
         # decision: no in-browser home button). A browser window is in front
         # first, so the switch is real; Work must not be in front, so the
-        # reopen below has to raise it.
+        # reopen below has to raise it (and, minimized, restore it).
         self.step("home through OS window switching")
         switch = {"precondition": win.switch_to(personal.window, "Personal's window", change=False)}
-        # With Personal in front, whether this desktop reports a front CEF
-        # window as visible at all (Chromium's native occlusion tracking).
         self.visibility(personal, "personal-in-front")
         switch["home"] = win.switch_to(home, "The home window")
         require(win.foreground() == home and win.visible(home), "The home window must be in front and visible")
@@ -726,6 +738,22 @@ class Observer:
         switch["lock"] = win.foreground_lock()
         switch["homeWindow"] = win.window_state(home)
         self.case("home-by-window-switch", switch)
+        # The Windows browser runs without Chromium's native occlusion
+        # tracking (process_main.rs), so a covered window stays visible; a
+        # minimized one is still hidden. Minimize Work from here (no input),
+        # so the reopen below must restore it and make its page visible
+        # again. A desktop where that does not hide the page fails here, with
+        # its evidence.
+        self.step("Work minimized before the reopen", work)
+        win.minimize(work.window)
+        self.settled(lambda: win.iconic(work.window), "Work's window did not minimize")
+        try:
+            self.settled(lambda: work.evaluate("document.visibilityState") == "hidden", "not hidden")
+        except Failure:
+            self.visibility(work, "minimized")
+            raise Failure("Minimizing Work's window did not make its page hidden on this desktop, so the reopen "
+                          "cannot show it visible again") from None
+        require(win.foreground() == home, f"The home must stay in front while Work is minimized ({win.foreground()})")
         self.visibility(work, "before-reuse")
         named = {"home": home, "work": work.window, "personal": personal.window}
         self.proof.setdefault("zOrder", {})["before-reuse"] = win.z_order(named)
@@ -739,6 +767,7 @@ class Observer:
                 == sorted(page.native["nativePid"] for page in pages) and len(resumed["after"]) == 2,
                 "Reopening must not start another browser process")
         require(win.wait_foreground(work.window), f"Reopened Work's window is not in front ({win.foreground()})")
+        require(not win.iconic(work.window), "Reopened Work's window is still minimized")
         require(work.pages() == [work.target["targetId"]], "Reopening must not open another window")
         refusals = self.raise_refusals(work)
         require(refusals == [], f"Work's browser refused the raise: {refusals}")
@@ -751,29 +780,19 @@ class Observer:
                 f"Windows' foreground lock is not active here ({lock}), so the raise cannot show the App's "
                 "foreground grant at work")
         evidence = {"window": work.window, "foreground": win.foreground(), "homeRoute": switch["home"]["route"],
-                    "lock": lock}
-        # Visibility decides only where this desktop reports a front CEF
-        # window as visible: a CI desktop may never report one (Chromium's
-        # native occlusion), which is environmental, not the raise.
-        reported = any(entry.get("visibility") == "visible"
-                       for when in ("attach", "personal-in-front", "before-reuse")
-                       for entry in self.proof["visibility"].get(when, []))
+                    "lock": lock, "minimizedBefore": True}
+        # The page was hidden while minimized; the raise restored the window,
+        # so the page must report visible again.
         try:
-            self.settled(lambda: work.evaluate("document.visibilityState") == "visible", "not visible",
-                         SETTLE_WAIT if reported else 3)
+            self.settled(lambda: work.evaluate("document.visibilityState") == "visible", "not visible")
             evidence["visibility"] = "visible"
         except Failure:
             evidence["visibility"] = "hidden"
         self.visibility(work, "after-reuse")
-        # Personal still visible here means Work, though in front, was not
-        # reordered above it; Personal hidden with Work hidden means the
-        # reorder happened but occlusion was not recomputed.
         self.visibility(personal, "after-reuse")
         self.proof["zOrder"]["after-reuse"] = win.z_order(named)
-        evidence["desktopReportsVisible"] = reported
-        require(evidence["visibility"] == "visible" or not reported,
-                "Reopened Work's document stayed hidden although this desktop reported a front CEF window "
-                "as visible: the raise did not make the browser visible again")
+        require(evidence["visibility"] == "visible",
+                "Reopened Work's page stayed hidden after the raise restored its minimized window")
         self.case("reuse-raises-window", evidence)
 
         # Chrome's real beforeunload path needs sticky user activation. CDP's
