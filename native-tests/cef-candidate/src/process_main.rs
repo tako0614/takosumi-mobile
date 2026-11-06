@@ -9,10 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Mutex, PoisonError},
 };
 use tauri_plugin_app_screen::{
     browser_process::{decode, external_link, link_host, read_packet, Reply, Request},
@@ -51,6 +48,13 @@ struct State {
     unload_dialogs: BTreeSet<i32>,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
+/// Whether the control pipe's reader may still post a request to the UI
+/// thread. Closed before the message loop is asked to quit, under the same
+/// lock the reader holds while it posts, so nothing is posted afterwards.
+static CONTROL_OPEN: Mutex<bool> = Mutex::new(true);
+fn close_control() {
+    *CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner) = false;
+}
 
 fn with_state<T>(run: impl FnOnce(&mut State) -> T) -> T {
     assert_ne!(currently_on(ThreadId::UI), 0);
@@ -82,6 +86,9 @@ fn maybe_quit() {
         }
     });
     if done {
+        // The parent closes its end of the pipe once it reads `stopped`; the
+        // end of input must not reach the UI thread after the loop ends.
+        close_control();
         quit_message_loop();
     }
 }
@@ -668,6 +675,16 @@ fn open(id: u64, payload: OpenRequest) {
     }
 }
 fn dispatch(bytes: Option<&[u8]>) {
+    // A request the reader posted just before the control pipe closed can
+    // still run while CEF shuts down, after the browser state is gone (on
+    // Windows the parent's end of input arrived while the closing window
+    // handed over the foreground). Nothing is left to do then. A panic here
+    // would abort the browser: CEF task callbacks cannot unwind, and the
+    // process ends with 0xC0000409 instead of exit 0.
+    if STATE.with(|state| state.borrow().is_none()) {
+        eprintln!("A control request arrived after the browser stopped; ignored.");
+        return;
+    }
     let Some(bytes) = bytes else {
         if with_state(|state| state.shutdown.is_none()) {
             close_all(None, true);
@@ -930,15 +947,13 @@ fn main() {
         ),
         1
     );
-    let active = Arc::new((Mutex::new(()), AtomicBool::new(true)));
-    let gate = active.clone();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(io::stdin());
         loop {
             let bytes = read_packet(&mut reader).ok().flatten();
             let stop = bytes.is_none();
-            let _guard = gate.0.lock().unwrap();
-            if !gate.1.load(Ordering::Acquire) {
+            let open = CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*open {
                 break;
             }
             let mut task = PipeTask::new(bytes);
@@ -948,10 +963,7 @@ fn main() {
         }
     });
     run_message_loop();
-    {
-        let _guard = active.0.lock().unwrap();
-        active.1.store(false, Ordering::Release);
-    }
+    close_control();
     let failed = STATE.with(|state| {
         let mut state = state.borrow_mut().take().unwrap();
         assert!(state.screens.is_empty() && state.live == 0 && state.pending == 0);
