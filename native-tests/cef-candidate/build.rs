@@ -7,7 +7,8 @@
 // directory first, where cef-dll-sys copies `libcef.dll` and its resources.
 // The browser instead embeds the application manifest CEF requires (Windows
 // 10/11 compatibility, so Chromium sees the real OS version; Common Controls
-// 6; asInvoker).
+// 6; asInvoker). Only the MSVC linker flags below embed it, so any other
+// Windows target is refused rather than built without it.
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -15,7 +16,12 @@ fn main() {
         for bin in ["takosumi-cef-browser-process", "takosumi-cef-candidate"] {
             println!("cargo:rustc-link-arg-bin={bin}=-Wl,-rpath,$ORIGIN");
         }
-    } else if target_os == "windows" && target_env == "msvc" {
+    } else if target_os == "windows" {
+        assert!(
+            target_env == "msvc",
+            "Windows builds need the MSVC target: the browser's application manifest is embedded \
+             with MSVC linker flags, and target_env {target_env:?} would build it without one"
+        );
         let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("windows")
             .join("takosumi-cef-browser-process.exe.manifest");

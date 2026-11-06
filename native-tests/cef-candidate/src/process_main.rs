@@ -377,14 +377,16 @@ mod x11_front {
     }
 }
 
-/// Bring a reused Windows browser window to the front when the home returns
-/// to it: restore it when minimized, show it and ask for the foreground.
-/// Windows hands the foreground only to a process allowed to take it (for
-/// example one the foreground App passed that right with
-/// `AllowSetForegroundWindow`); otherwise it flashes the taskbar button, and
-/// the refusal is reported like an X11 one. A stale handle makes the calls
-/// fail, never crash. user32 is already linked by the CEF wrapper; the
-/// candidate gains no crate dependency.
+/// Windows browser windows. The browser's native handle may be a child of
+/// its frame; both the raise and the `window_id` reported to the App use the
+/// frame, the top-level window (`GA_ROOT`) the person sees and switches to.
+/// Bringing a reused window to the front restores it when minimized, shows it
+/// and asks for the foreground. Windows hands the foreground only to a
+/// process allowed to take it (for example one the foreground App passed that
+/// right with `AllowSetForegroundWindow`); otherwise it flashes the taskbar
+/// button, and the refusal is reported like an X11 one. A stale handle makes
+/// the calls fail, never crash. user32 is already linked by the CEF wrapper;
+/// the candidate gains no crate dependency.
 #[cfg(windows)]
 mod win32_front {
     use std::ffi::{c_int, c_uint, c_void};
@@ -401,19 +403,30 @@ mod win32_front {
     const SW_SHOW: c_int = 5;
     const SW_RESTORE: c_int = 9;
 
-    pub fn raise(window: Hwnd) -> Result<(), &'static str> {
+    /// The top-level window of a browser handle (itself when it has none).
+    pub fn top_level(window: Hwnd) -> Hwnd {
         if window.is_null() {
+            return window;
+        }
+        // SAFETY: documented user32 signature; a stale handle yields null.
+        let root = unsafe { GetAncestor(window, GA_ROOT) };
+        if root.is_null() {
+            window
+        } else {
+            root
+        }
+    }
+
+    pub fn raise(top: Hwnd) -> Result<(), &'static str> {
+        if top.is_null() {
             return Err("no native window");
         }
         // SAFETY: documented user32 signatures; every call accepts any
         // handle value and reports a stale one through its result.
         unsafe {
-            if IsWindow(window) == 0 {
+            if IsWindow(top) == 0 {
                 return Err("stale native window");
             }
-            // The Chrome-style browser's handle may be a child of its frame.
-            let root = GetAncestor(window, GA_ROOT);
-            let top = if root.is_null() { window } else { root };
             // The return value is the previous visibility, not a failure.
             ShowWindow(
                 top,
@@ -437,18 +450,18 @@ fn raise(host: &BrowserHost) -> Result<(), &'static str> {
 }
 #[cfg(windows)]
 fn raise(host: &BrowserHost) -> Result<(), &'static str> {
-    win32_front::raise(host.window_handle().0.cast())
+    win32_front::raise(win32_front::top_level(host.window_handle().0.cast()))
 }
 
-/// The native window id reported to the App: the X11 window on Linux, the
-/// HWND's value on Windows.
+/// The native window id reported to the App: the X11 window CEF reports on
+/// Linux; on Windows the value of the top-level HWND the raise brings forward.
 #[cfg(target_os = "linux")]
 fn window_id(host: &BrowserHost) -> u64 {
     host.window_handle()
 }
 #[cfg(windows)]
 fn window_id(host: &BrowserHost) -> u64 {
-    host.window_handle().0 as usize as u64
+    win32_front::top_level(host.window_handle().0.cast()) as usize as u64
 }
 
 fn opened(id: u64, key: String, browser: &Browser) {
@@ -461,7 +474,11 @@ fn opened(id: u64, key: String, browser: &Browser) {
         )
     });
     assert_eq!(context.is_global(), 0);
+    #[cfg(target_os = "linux")]
     assert_eq!(actual, expected);
+    // Exactly the requested spelling, not merely the same components.
+    #[cfg(windows)]
+    assert_eq!(actual.as_os_str(), expected.as_os_str());
     reply(Reply::Opened {
         id,
         key,
@@ -804,39 +821,49 @@ fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// browser built as a DLL that CEF's `bootstrap.exe`, renamed to the browser,
 /// loads, with sandbox information passed to `execute_process` and
 /// `initialize`. This build links none of that and passes no sandbox
-/// information, so CEF is told so explicitly.
+/// information, so CEF is told so explicitly. Such a build must be asked for
+/// by name (the feature `windows-unsandboxed-candidate`), so an unsandboxed
+/// browser is never built, and staged, by accident.
 /// TODO(TASK-0119 Windows): qualify the bootstrap/cef_sandbox layout and
 /// enable the sandbox before any Windows package.
 #[cfg(windows)]
 fn without_sandbox(_args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     true
 }
+#[cfg(all(windows, not(feature = "windows-unsandboxed-candidate")))]
+compile_error!(
+    "The Windows browser runs without Chromium's sandbox. Build it only as a test candidate, \
+     with the feature windows-unsandboxed-candidate; it is not for packages."
+);
 
 /// The parent passes the directory in its final form, so the cache path CEF
 /// reports back compares exactly with the one requested.
 #[cfg(target_os = "linux")]
-fn canonical(directory: &Path) -> PathBuf {
-    directory.canonicalize().unwrap()
+fn is_final(directory: &Path) -> bool {
+    directory.canonicalize().unwrap() == directory
 }
 /// On Windows `canonicalize` spells the final path in its verbatim form
 /// (`\\?\C:\…` or `\\?\UNC\server\share\…`); the parent and CEF use the
-/// ordinary spelling of the same path (`C:\…`, `\\server\share\…`). Short
-/// (8.3) names, links and letter case are still resolved by `canonicalize`,
-/// so the parent must pass the long, final spelling.
+/// ordinary spelling of the same path (`C:\…`, `\\server\share\…`). After
+/// that prefix the spelling must match exactly: `Path` equality would accept
+/// another drive-letter case, `/` separators, repeated or trailing
+/// separators. Short (8.3) names, links and letter case are resolved by
+/// `canonicalize`, so the parent passes the long, final spelling.
 #[cfg(windows)]
-fn canonical(directory: &Path) -> PathBuf {
+fn is_final(directory: &Path) -> bool {
     let verbatim = directory.canonicalize().unwrap();
     let text = verbatim.to_str().expect("UTF-8 browser directory");
-    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{share}"))
+    let ordinary = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{share}")
     } else if let Some(disk) = text
         .strip_prefix(r"\\?\")
         .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
     {
-        PathBuf::from(disk)
+        disk.to_string()
     } else {
-        verbatim
-    }
+        text.to_string()
+    };
+    std::ffi::OsStr::new(&ordinary) == directory.as_os_str()
 }
 
 fn main() {
@@ -852,7 +879,7 @@ fn main() {
     let directory = PathBuf::from(
         std::env::var_os("TAKOSUMI_BROWSER_PROCESS_DIRECTORY").expect("Owned parent directory"),
     );
-    assert!(directory.is_absolute() && canonical(&directory) == directory);
+    assert!(directory.is_absolute() && is_final(&directory));
     let mut boot = Vec::new();
     std::fs::File::open(directory.join("boot.json"))
         .unwrap()

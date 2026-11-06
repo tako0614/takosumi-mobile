@@ -10,6 +10,12 @@ publish = false
 # TAKOSUMI_BROWSER_PROCESS_INSPECT=1. Build fixture browsers with it; a
 # browser staged for a package must be built without it.
 fixture-inspection = []
+# Windows only: the browser runs without Chromium's sandbox there (see
+# `without_sandbox` in src/process_main.rs). A Windows build without this
+# feature stops with a compile error, so an unsandboxed browser is built only
+# when asked for by name: test candidates and CI, never a package. No effect
+# on Linux.
+windows-unsandboxed-candidate = []
 
 [dependencies]
 cef = { version = "=154.5.0", default-features = false, features = ["linux-x11"] }
@@ -21,9 +27,10 @@ tauri-plugin-app-screen = { path = "../../src-tauri/plugins/app-screen", default
 libc = "0.2"
 
 # Linux and Windows (first candidate). On Windows build this bin alone with
-# `--bin takosumi-cef-browser-process`: the guard below and the standalone
-# `takosumi-cef-candidate` (src/main.rs) are Linux only and refuse to compile
-# elsewhere, so no inert supervisor can be staged by mistake.
+# `--bin takosumi-cef-browser-process --features windows-unsandboxed-candidate`:
+# the guard below and the standalone `takosumi-cef-candidate` (src/main.rs)
+# are Linux only and refuse to compile elsewhere, so no inert supervisor can
+# be staged by mistake.
 [[bin]]
 name = "takosumi-cef-browser-process"
 path = "src/process_main.rs"
