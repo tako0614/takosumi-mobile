@@ -231,6 +231,8 @@ not establish that all retained SDK references or cold-start issues are solved.
 
 An explicit Linux fixture now connects the existing bundled WebHome and its
 shell-only `app-screen.open` command to a separate CEF process per UUID profile.
+The same driver runs on Windows against a local fixture site; see
+[Windows actual App (W3)](#windows-actual-app-w3).
 Normal builds keep their existing runtime. No shared-kit or remote page IPC is
 added, and installed profiles are not migrated. This is an integration probe,
 not an engine decision or a distributable browser service.
@@ -630,7 +632,8 @@ effect there. On Windows:
   and calls `SetForegroundWindow` through minimal `extern "system"` user32
   declarations (the CEF wrapper already links user32). Windows hands the
   foreground only to a process allowed to take it, so an App should call
-  `AllowSetForegroundWindow` with the browser's pid before sending the Open.
+  `AllowSetForegroundWindow` with the browser's pid before sending the Open
+  (the App's adapter does since W3).
   Otherwise Windows flashes the taskbar button and the browser prints
   `Reused browser window was not raised: Windows refused the foreground change`
   to stderr, as it does for an X11 refusal.
@@ -698,8 +701,9 @@ on Windows at the adapter level: `takosumi-browser-guard` for Windows, and the
 app-screen plugin's `desktop-process-experiment` (and so the App's
 `desktop-cef`) compiled for Windows, where it starts the guard and the browser
 through the same `Process` code as on Linux. macOS and other OSes still refuse
-both with a single compile error. There is no App UI or fixture on Windows
-yet (that is W3), and the browser stays the unsandboxed candidate.
+both with a single compile error. W2 had no App UI or fixture on Windows
+(that came with [W3](#windows-actual-app-w3)), and the browser stays the
+unsandboxed candidate.
 
 **Guard** (`src/guard_windows.rs`, chosen by `src/guard_entry.rs`; the Linux
 `src/guard_main.rs` is unchanged). Same command line
@@ -823,7 +827,8 @@ no receipt. The spawner thread drops the job when every requester is gone
   free; any other failure counts as live.
 - An external link the person chose opens with the shell's `open`
   (`ShellExecuteW`) on its own thread, within the same budget of openers.
-  This path is compiled but not exercised by a test.
+  This path is compiled into product builds but not exercised by a test; a
+  fixture build records the link instead (W3).
 - No setuid/setgid identity check exists on Windows; an elevated App is not
   refused.
 
@@ -915,7 +920,7 @@ check waits a short, stated bound and names what is left.
 - The guard's job check proves that it runs in some Job Object, not that it
   is the App's: Windows 11 and CI runners may place every process in a job.
 - The `ShellExecuteW` path for external links is compiled but not exercised
-  by a test.
+  by a test (fixture builds do not contain it since W3).
 - A pending control-pipe write is cancelled when the App's end closes, for
   at most 2 s; a writer thread that does not get to run in that time can
   keep its write blocked until the browser reads or ends (the guard's stop
@@ -924,6 +929,200 @@ check waits a short, stated bound and names what is left.
   earlier write settled close to its own deadline.
 - `observed` includes the browser's console host, so it is one higher than
   on Linux for the same browser.
+
+## Windows actual App (W3)
+
+The third Windows step (W3) runs the real App on Windows: its home in
+WebView2 drives the per-profile CEF path through the App's own adapter, as
+the Linux actual-App fixture does, in CI on `windows-latest`. The user flow is
+a connection chosen in the home, the site's sign-in stand-in, its app home, an
+app opened in that connection's own CEF window, a return to the home through
+the OS's window switching (the owner's decision: no in-browser home button),
+a reopen that reuses the window, and the App's quit. Nothing is packaged or
+signed; the browser stays the unsandboxed candidate.
+
+**Driver** (`src-tauri/tests/desktop/browser_process.rs`, feature
+`native-browser-process-fixture`, never enabled by normal builds or
+releases). The flow is shared by Linux and Windows and reaches the home
+through a small `Shell` (evaluate a script, pause):
+
+- Linux keeps the GTK WebKit view on the GLib main loop
+  (`browser_process_linux.rs`); its behaviour is unchanged. gtk, webkit2gtk
+  and javascriptcore-rs now come through the feature `native-fixture-gtk`,
+  which both actual-App fixtures enable; they are Linux-only optional
+  dependencies, so nothing of them is resolved or built for Windows.
+- Windows (`browser_process_windows.rs`) uses Tauri's
+  `WebviewWindow::eval_with_callback`: WebView2's `ExecuteScript` runs on the
+  UI thread and its JSON result comes back. `ExecuteScript` reports no
+  exception (a throwing script yields `null`), so each script is wrapped to
+  return its value or its error; an error, or a result without a value, fails
+  as on Linux. The flow runs on a thread of its own and waits there (30 s per
+  script), so the UI thread keeps pumping and the backend's mutex may be taken
+  from the flow. No WebView2 COM object is touched directly and no crate is
+  added.
+- The 90 s watchdog, every checkpoint bound and the markers are Linux's. Only
+  on Windows: the first open marker adds the home's top-level HWND
+  (`homeWindow`); the reset phase identifies Personal's CEF root by its
+  creation time (Linux: its inode) and records whether Chromium holds its
+  `lockfile` (`personalLockHeld`; Linux records the `SingletonLock` target),
+  and the refused clear must leave that lock held; after the home clears
+  Work, the App requires Work's `cef-profiles` to be gone and Personal's to
+  remain; the phases are `restart` and `reset` (notifications and the native
+  file chooser stay Linux-only).
+- The connection origin is the runner's local site
+  (`TAKOSUMI_BROWSER_PROCESS_APP=local` with
+  `TAKOSUMI_BROWSER_PROCESS_SITE=https://127.0.0.1:<port>`, checked exactly).
+- Tauri resolves the App's data directories on Windows from known folders,
+  not the environment, so the App's identifier is
+  `com.takosumi.fixture.browserprocess.<case name>`: each case has its own
+  App data, home WebView2 profile and browser profiles under
+  `%LOCALAPPDATA%` (and `%APPDATA%`), shared by its launches. The runner
+  refuses a case name whose data already exists and never removes it.
+
+**External links.** A Windows build with `fixture-overrides` (which the
+fixture feature enables) does not contain `ShellExecuteW`: the opener appends
+`{"argv":[url],"pid":<App pid>}` to the file named by
+`TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG` (an absolute path; without it the
+link is dropped). No W3 case chooses to open a link outside, and the runner
+requires that log to stay empty. The product opener remains untested.
+
+**Foreground.** Before it sends a reopen, the adapter now calls
+`AllowSetForegroundWindow` with the browser's native pid, so the browser may
+raise its window while the person uses the home (a refusal is harmless). The
+CI runner has no user input, so Windows' foreground lock does not engage
+there, and CI cannot tell whether this call was needed.
+
+**Runner** (`native-tests/desktop/windows_browser_process.py`, Python
+standard library only; `git` reads the revision). It refuses to run on other
+OSes. `--data` names a new case directory inside the user's profile (the
+App's runtime root must lie there, so `RUNNER_TEMP` on another drive does not
+qualify), named with at most 24 lowercase letters, digits and hyphens: the
+name also names the App's data, and Chromium's files under the browser
+profiles in `%LOCALAPPDATA%` come close to Windows' 260-character paths.
+The layout follows `browser_process.py`: the case holds
+`.owned-browser-reference`, `source-snapshot/`, `execution[-phase].json` and
+`summary.json`; the session
+directory `<case>/<case name>` holds the runtime root `r/`, the App's `tmp/`
+(its `TEMP`), `app[-phase].log`, `observer[-phase].log`, the App's markers
+and checkpoints, `browser-observation[-phase].json`,
+`app-execution[-phase].json` and `external-open.log`. Per launch it:
+
+- serves the fixture site from a thread at `https://127.0.0.1:<ephemeral>`
+  for the whole run: `/` is the sign-in stand-in (a name, `work` or
+  `personal`, posted to `/session` sets an HttpOnly, Secure, SameSite=Lax
+  session cookie; no credential) or, signed in, the app home linking to the
+  app page `/app/`. Each page names its role and user in
+  `<main data-page data-user>`. Before the first launch it requires the site
+  to verify with Python's default context (the Windows ROOT store) and with
+  the fixture CA alone;
+- starts the App with a filtered environment (no inherited `TAKOSUMI_*` or
+  `WEBVIEW2_*`), the fixture overrides for the browser, guard and runtime
+  root, the inspection seam and the recording log; created suspended and
+  detached from any console, put into a kill-on-close Job Object, then
+  resumed, so the App, its WebView2 processes, guards and browsers are all
+  in the job;
+- runs `windows_browser_observer.py` (85 s), then requires the App's exit 0
+  (45 s, as on Linux), the App flow's and the observation's pass, every
+  opened browser's normal guard receipt, and the session's counterpart of the
+  Linux outer guard receipt: the job empty within 10 s of the App's exit,
+  with no forced cleanup. On failure it ends the App, terminates what is left
+  in the job (counted as forced), and prints the tails of the App, observer
+  and browser logs;
+- hashes the executables, `libcef.dll` and the selected sources before and
+  after every launch; any change fails the run.
+
+**Observer** (`native-tests/desktop/windows_browser_observer.py`, standard
+library only: ctypes for Win32 and a minimal RFC 6455 client for DevTools).
+For each profile it requires `inspection.json` to name the attested native
+pid, that pid alone to listen on `127.0.0.1:<port>` (`GetExtendedTcpTable`),
+the DevTools endpoint on that port, exactly one page target, the fixture page
+loaded in a secure context with no App bridge (`__TAURI_INTERNALS__`,
+`window.ipc`, WebKit's or WebView2's message handlers), and the reported
+`window_id` to be a visible top-level window of that pid. It switches windows
+with `SetForegroundWindow` (if Windows refuses, the task switchers'
+`AttachThreadInput` route) and never sends keyboard or mouse input. It
+cancels a beforeunload dialog through DevTools (`Page.handleJavaScriptDialog`),
+where Linux presses Escape, and closes a window with `WM_CLOSE`, where Linux
+presses Ctrl+Shift+W. Waiting for a profile to end after its last window
+closed (Work before Personal is asked, Personal after its native close)
+allows 20 s where Linux allows 10 s; a navigation within the fixture site
+may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
+
+**Cases.** The runner prints `PASS case <name>` for each, in this order:
+
+| Case | What it requires |
+| --- | --- |
+| `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
+| `home-by-window-switch` | with Personal's window in front, an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
+| `reuse-raises-window` | the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal |
+| `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
+| `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
+| `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
+| `restart-keeps-separation` | a relaunch on the same data reopens both from the saved home; each keeps its own storage, script cookie and session |
+| `clear-only-one-profile` | a relaunch clears Work from the home: only Work's CEF root is removed and Work is signed out with no storage; clearing the running Personal is refused with its data and `lockfile` kept; after Personal's native close the in-session clear removes it |
+| `no-process-left` | every launch ended with its job empty, no forced cleanup and normal guard receipts |
+| `no-external-open` | nothing reached the opener over all launches |
+
+**CI.** The job `cef-windows-app` (`windows-latest`, 120 minutes) checks out
+the App with mobile-kit and the takosumi contract, builds the home
+(`bun run build`) and runs the runner's unit tests
+(`native-tests/desktop/test_windows_browser_process.py`: the WebSocket
+client, the DevTools bookkeeping, the TCP table parser, the fixture site, the
+receipt check and the case list). It names the installed WebView2 Runtime or
+stops, builds the `fixture-inspection,windows-unsandboxed-candidate` browser
+with the guard and the App with `native-browser-process-fixture` (line
+tables only), creates the TLS files and trusts their CA
+(`native-tests/desktop/windows_fixture_tls.ps1`), runs one case with
+`--restart --reset` (20 minutes), and requires each of the ten case names and
+exactly ten `PASS case` lines, and a passed `summary.json`. It removes the CA
+afterwards whatever happened and keeps the case and the profiles' browser
+logs as the artifact `cef-windows-app-case` (14 days). It shares the CEF
+distribution cache with `cef-windows`, which it does not change.
+
+**Running it** on a disposable Windows machine, in an elevated PowerShell 7
+(the CA goes into `LocalMachine\Root`):
+
+```powershell
+$env:CEF_PATH = "C:\absolute\owned\cef"
+cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+bun run build
+cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls
+python -B native-tests/desktop/windows_browser_process.py --binary <target>\debug\takosumi-mobile.exe --browser <target>\debug\takosumi-cef-browser-process.exe --guard <target>\debug\takosumi-browser-guard.exe --data "$env:TEMP\sumi-w3-local" --tls-cert C:\absolute\owned\w3-tls\cert.pem --tls-key C:\absolute\owned\w3-tls\key.pem --tls-ca C:\absolute\owned\w3-tls\ca.pem --restart --reset
+pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls -Remove
+```
+
+The case directory and `%LOCALAPPDATA%\com.takosumi.fixture.browserprocess.<case name>`
+(and the same under `%APPDATA%` if the App created it) stay behind.
+
+**Not proven by W3:** Chromium's sandbox on Windows; packaging (no staged
+`cef\`, no MSI/NSIS), Authenticode signing and updates; real devices (only
+the CI virtual machine); real sites, a real IdP or popups (the real-site
+browser-compatibility runs, downloads, popups, the open-outside choice, the
+long alert, notifications and the native file chooser stay Linux-only);
+the `ShellExecuteW` opener; native keyboard and mouse input in the browser's
+dialogs and windows (the cancel goes through DevTools, the switch through
+`SetForegroundWindow`, the close through `WM_CLOSE`); Windows' foreground
+lock after real input; occlusion-driven page visibility; and other DPI or
+multi-monitor layouts.
+
+**2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
+the Linux host. For `x86_64-pc-windows-msvc`, the App type-checks and passes
+clippy with `native-browser-process-fixture` (C, archive and resource tools
+replaced by stand-ins that write empty outputs, since `cargo check` links
+nothing), and the plugin with `desktop-process-experiment` and with
+`fixture-overrides` (library and tests) adds no clippy warning to the three
+the current toolchain already reports in unchanged code; `cargo tree`
+resolves no gtk for that target, and the cef-candidate bins still pass
+clippy. On Linux the App checks and passes clippy with
+`native-browser-process-fixture`, `native-web-home-fixture` and
+`desktop-cef`; the plugin tests pass (66 with each experiment feature set,
+and the `desktop` library and capability tests); rustfmt and the source
+format check pass for the changed files; and the runner's 17 unit tests
+pass. The observer's DevTools client and flows (sign-in stand-in, samples, a
+beforeunload cancelled through `Page.handleJavaScriptDialog`) also ran once
+against a private headless Chrome and the runner's TLS site on Linux.
+Windows evidence comes only from the CI job.
 
 ## Observations and limits
 
