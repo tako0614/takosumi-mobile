@@ -6,13 +6,20 @@
 // are symbolic links to their sources unless `--copy` is given. Tauri follows
 // the links when it copies resources into the build and the bundles.
 //
-//   bun scripts/stage-linux-cef.mjs --cef <dir with libcef.so> --bin <dir with the two binaries> [--out <dir>] [--copy]
+//   bun scripts/stage-linux-cef.mjs --cef <dir with libcef.so> --bin <dir with the two binaries> [--out <dir>] [--copy] [--fixture]
 //
 // `--out` defaults to src-tauri/target/linux-cef, the path that
 // src-tauri/tauri.linux-cef.conf.json maps to the bundle's `cef/`. The stage
 // is `<out>/cef`; it must not exist yet (nothing is replaced or removed). A
 // manifest with each staged file's size and SHA-256 is written beside it as
 // `<out>/stage.json`, outside the bundled directory.
+//
+// A browser built with the cef-candidate feature `fixture-inspection` (it
+// contains the TAKOSUMI_BROWSER_PROCESS_INSPECT seam) is refused unless
+// `--fixture` is given. A fixture stage defaults to
+// src-tauri/target/linux-cef-fixture (mapped by
+// src-tauri/tauri.linux-cef-fixture.conf.json) and is never written to the
+// package stage path, so a package cannot silently pick up a fixture browser.
 //
 // Node or Bun, Linux x86-64, and binutils `strip` are required.
 
@@ -41,6 +48,9 @@ import { fileURLToPath } from "node:url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_OUT = path.join(REPO, "src-tauri", "target", "linux-cef");
+const FIXTURE_OUT = path.join(REPO, "src-tauri", "target", "linux-cef-fixture");
+/** Present only in a browser built with the fixture-inspection feature. */
+const INSPECTION_SEAM = Buffer.from("TAKOSUMI_BROWSER_PROCESS_INSPECT");
 
 /** Built by native-tests/cef-candidate; both are stripped into the stage. */
 const BINARIES = ["takosumi-cef-browser-process", "takosumi-browser-guard"];
@@ -79,17 +89,19 @@ function usage(message) {
   if (message) console.error(`stage-linux-cef: ${message}`);
   console.error(
     "usage: stage-linux-cef.mjs --cef <dir with libcef.so> --bin <dir with " +
-      `${BINARIES.join(" and ")}> [--out <dir>] [--copy]`,
+      `${BINARIES.join(" and ")}> [--out <dir>] [--copy] [--fixture]`,
   );
   process.exit(2);
 }
 
 function parse(argv) {
-  const options = { out: DEFAULT_OUT, copy: false };
+  const options = { out: undefined, copy: false, fixture: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--copy") {
       options.copy = true;
+    } else if (flag === "--fixture") {
+      options.fixture = true;
     } else if (flag === "--cef" || flag === "--bin" || flag === "--out") {
       const value = argv[index + 1];
       if (!value) usage(`${flag} needs a directory`);
@@ -100,6 +112,7 @@ function parse(argv) {
     }
   }
   if (!options.cef || !options.bin) usage("--cef and --bin are required");
+  options.out ??= options.fixture ? FIXTURE_OUT : DEFAULT_OUT;
   return options;
 }
 
@@ -129,6 +142,16 @@ function sha256(file) {
   return hash.digest("hex");
 }
 
+/** The same location, also through links when both exist. */
+function samePath(left, right) {
+  if (path.resolve(left) === path.resolve(right)) return true;
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
+  }
+}
+
 function requireFile(file, what) {
   if (!existsSync(file) || !statSync(file).isFile()) usage(`${what} not found: ${file}`);
   return realpathSync(file);
@@ -142,6 +165,9 @@ function main() {
   const cef = realpathSync(options.cef);
   const bin = realpathSync(options.bin);
   const stage = path.join(options.out, "cef");
+  if (options.fixture && samePath(options.out, DEFAULT_OUT)) {
+    usage(`a fixture stage is never written to the package stage path ${DEFAULT_OUT}`);
+  }
   for (const existing of [stage, path.join(options.out, "stage.json")]) {
     if (existsSync(existing) || isLink(existing)) {
       usage(`${existing} already exists; remove it yourself or choose another --out`);
@@ -157,6 +183,17 @@ function main() {
     const source = requireFile(path.join(bin, name), `built ${name}`);
     if (!isElf(source)) usage(`${source} is not an ELF executable`);
     plan.push([name, source, "strip"]);
+  }
+  const browser = plan.find(([name]) => name === "takosumi-cef-browser-process")[1];
+  const inspectionSeam = readFileSync(browser).includes(INSPECTION_SEAM);
+  if (inspectionSeam && !options.fixture) {
+    usage(
+      `${browser} contains the fixture inspection seam (built with --features fixture-inspection); ` +
+        "a package stage refuses it. Rebuild without the feature, or pass --fixture for a fixture stage",
+    );
+  }
+  if (options.fixture && !inspectionSeam) {
+    console.log("note: this browser has no inspection seam; the fixture observer cannot attach to it");
   }
   for (const name of RUNTIME.strip) plan.push([name, requireFile(path.join(cef, name), "CEF runtime file"), "strip"]);
   for (const name of [...RUNTIME.data, ...RUNTIME.notices]) {
@@ -208,6 +245,8 @@ function main() {
   const archive = path.join(cef, "archive.json");
   const manifest = {
     kind: "takosumi.linux-cef-stage@v1",
+    fixture: options.fixture,
+    inspectionSeam,
     cef: { directory: cef, archive: existsSync(archive) ? JSON.parse(readFileSync(archive, "utf8")) : null },
     bin,
     stage,
@@ -225,9 +264,12 @@ function main() {
   console.log(`staged ${files.length} files (${mib(total)} MiB, ${mib(written)} MiB written) in ${stage}`);
   for (const line of skipped) console.log(`not staged: ${line}`);
   console.log(`manifest: ${path.join(options.out, "stage.json")}`);
-  if (path.resolve(options.out) !== DEFAULT_OUT) {
+  const [overlay, mapped] = options.fixture
+    ? ["tauri.linux-cef-fixture.conf.json", FIXTURE_OUT]
+    : ["tauri.linux-cef.conf.json", DEFAULT_OUT];
+  if (!samePath(options.out, mapped)) {
     console.log(
-      `note: src-tauri/tauri.linux-cef.conf.json maps ${path.relative(REPO, DEFAULT_OUT)}/cef/; ` +
+      `note: src-tauri/${overlay} maps ${path.relative(REPO, mapped)}/cef/; ` +
         "link that path to this stage or pass an overlay that maps it",
     );
   }
