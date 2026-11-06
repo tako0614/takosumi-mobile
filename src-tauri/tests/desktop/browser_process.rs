@@ -188,7 +188,7 @@ async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
     Ok(())
 }
 /// An identity of a profile's CEF cache root that a detach-and-recreate
-/// changes: its inode on Linux, its creation time on Windows.
+/// changes: its inode on Linux, its file ID on Windows.
 #[cfg(target_os = "linux")]
 fn root_identity(root: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -196,12 +196,55 @@ fn root_identity(root: &Path) -> Result<u64> {
         .map_err(|error| error.to_string())?
         .ino())
 }
+/// Windows: the volume serial number and 128-bit file ID
+/// (`GetFileInformationByHandleEx`, `FileIdInfo`) of the directory itself,
+/// opened without following a link and sharing everything, so a rename by
+/// the clear is never blocked.
 #[cfg(windows)]
-fn root_identity(root: &Path) -> Result<u64> {
-    use std::os::windows::fs::MetadataExt;
-    Ok(std::fs::symlink_metadata(root)
-        .map_err(|error| error.to_string())?
-        .creation_time())
+fn root_identity(root: &Path) -> Result<(u64, [u8; 16])> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    #[repr(C)]
+    struct FileIdInfo {
+        volume: u64,
+        file: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const FILE_ID_INFO: i32 = 18;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root)
+        .map_err(|error| error.to_string())?;
+    let mut info = FileIdInfo {
+        volume: 0,
+        file: [0; 16],
+    };
+    // SAFETY: a live handle and a FILE_ID_INFO-sized buffer for that class.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle().cast(),
+            FILE_ID_INFO,
+            (&mut info as *mut FileIdInfo).cast(),
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok((info.volume, info.file))
 }
 /// CEF's own liveness mark on a running profile's cache root, recorded for
 /// the observer: the `SingletonLock` link target on Linux (it names the
@@ -403,8 +446,12 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         println!("{kind}: shell ready");
         return relaunch_flow(app, view, case, &kind).await;
     }
+    // Progress lines survive an outer timeout that kills the App mid-wait.
+    println!("first: shell ready");
     add(view, "Work", 1).await?;
+    println!("first: Work added and opened");
     add(view, "Personal", 2).await?;
+    println!("first: Personal added and opened");
     let connections = eval(
         view,
         "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
@@ -440,7 +487,9 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&open).unwrap(),
     )
     .map_err(|error| error.to_string())?;
+    println!("first: both browsers recorded; waiting for the observer");
     checkpoint(view, case, "inspect-ready").await?;
+    println!("first: observer ready; reopening Work from the home");
     resume_work(view).await?;
     let after = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
@@ -468,9 +517,11 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // Resume, download, the popup (load up to 25 s) and the external link
     // (15 s) run before the observer asks to quit. The App watchdog (90 s)
     // remains the overall bound; the observer's stage names a slow step.
+    println!("first: Work reused; waiting for the quit request");
     checkpoint_within(view, case, "request-exit", Duration::from_secs(60)).await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
+    println!("first: quitting (Work's beforeunload expected)");
     app.exit(0);
     checkpoint(view, case, "cancel-inspected").await?;
     let stopped = exit_cancelled(view, app, 0).await?;
@@ -491,6 +542,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&stopped).unwrap(),
     )
     .map_err(|e| e.to_string())?;
+    println!("first: the cancelled quit kept both browsers");
     resume_work(view).await?;
     let retained = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
@@ -511,6 +563,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     checkpoint(view, case, "request-partial-exit").await?;
     // Work now agrees to leave and closes first; Personal cancels, so the quit
     // stops with only Personal kept (the accepted sequential trade-off).
+    println!("first: quitting again (Work closes, Personal cancels)");
     app.exit(0);
     checkpoint(view, case, "partial-inspected").await?;
     let partial = exit_cancelled(view, app, 1).await?;
@@ -537,6 +590,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&partial).unwrap(),
     )
     .map_err(|error| error.to_string())?;
+    println!("first: Work closed and Personal kept; waiting for the final quit");
     // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
     checkpoint_within(view, case, "request-final-exit", Duration::from_secs(60)).await?;
     std::fs::write(
