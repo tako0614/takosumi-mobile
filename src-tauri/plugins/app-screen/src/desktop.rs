@@ -133,6 +133,11 @@ async fn clear_profile(
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::clear_profile(app, payload).await;
     }
+    // An unavailable browser never falls back to the Wry profiles.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if let Some(reason) = process_adapter::unavailable(&app) {
+        return Err(Error::Desktop(reason));
+    }
     let directory = app
         .path()
         .app_local_data_dir()
@@ -164,6 +169,11 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
     #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::open(app, payload).await;
+    }
+    // The home keeps running and shows why; never the Wry adapter instead.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    if let Some(reason) = process_adapter::unavailable(&app) {
+        return Err(Error::Desktop(reason));
     }
     // Wry otherwise silently selects the default store on older macOS.
     #[cfg(target_os = "macos")]

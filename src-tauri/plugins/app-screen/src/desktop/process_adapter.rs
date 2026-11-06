@@ -97,11 +97,19 @@ struct Process {
     opening: Option<String>,
     opened: serde_json::Value,
     guard_receipt: PathBuf,
+    /// This browser's `p-<pid>-<n>` directory; removed once its guard ended
+    /// (kept in fixture builds, see `setup::KEEP_ENDED_RUNTIME`).
+    runtime: PathBuf,
     program: PathBuf,
     /// Opening order: an App quit closes the oldest profile first.
     order: u64,
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
+/// How long a browser that agreed to stop (it answered Stopped, or its pipe
+/// closed after its last window) may take to end normally. It may still be
+/// flushing its profile; on a stalled disk that exceeded a few seconds (pk1),
+/// and an App that cannot finish quitting is worse than waiting longer.
+const STOP_FINISH: Duration = Duration::from_secs(30);
 /// Openers started and not yet ended; a burst beyond this is dropped.
 #[cfg(not(test))]
 static OPENERS: AtomicU64 = AtomicU64::new(0);
@@ -149,32 +157,67 @@ fn open_externally(url: &str) {
     OPENED.lock().unwrap().push(url.to_owned());
 }
 
+/// Why this App's desktop browser cannot open connections. The home and the
+/// rest of the App keep running; `open` and `clear_profile` return the reason.
+pub(super) struct Unavailable(String);
+pub(super) fn unavailable<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
+    app.try_state::<Unavailable>()
+        .map(|reason| reason.inner().0.clone())
+}
+
 /// Find the browser, its guard and the runtime root: the fixture's explicit
 /// environment overrides, otherwise the App's packaged `cef/` resources and
-/// the per-user runtime directory (see `process_setup`).
-pub(super) fn install(app: &AppHandle) -> Result<()> {
+/// the per-user runtime directory (see `process_setup`). A failure never stops
+/// the App: the backend is registered as unavailable with its reason.
+pub(super) fn install<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<()> {
+    match prepare(app) {
+        Ok(state) => {
+            app.manage(Backend(
+                Arc::new(Mutex::new(state)),
+                Arc::new(ExitPhase::default()),
+            ));
+        }
+        Err(error) => {
+            let reason = format!("The desktop browser is unavailable: {error}");
+            eprintln!("{reason}");
+            app.manage(Unavailable(reason));
+        }
+    }
+    Ok(())
+}
+
+fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
+    // SAFETY: these identity calls have no preconditions and cannot fail.
+    let (uid, euid, gid, egid) = unsafe {
+        (
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getgid(),
+            libc::getegid(),
+        )
+    };
+    setup::plain_identity(uid, euid, gid, egid)?;
     let paths = app.path();
     let plan = setup::plan(
-        &setup::Overrides::from_env(),
+        &setup::Overrides::from_lookup(&setup::environment),
         paths.resource_dir().ok().as_deref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
         paths.app_cache_dir().ok().as_deref(),
     )?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
     let setup::Located {
         program,
         guard,
         runtime: runtime_root,
     } = setup::locate(plan, euid)?;
+    // Runtime directories of ended App instances (tmpfs keeps them until
+    // logout; the cache fallback keeps them across reboots).
+    for problem in setup::sweep_runtime(&runtime_root, std::process::id(), setup::pid_alive) {
+        eprintln!("A stale browser runtime directory was not removed: {problem}");
+    }
     // The sandbox opt-out is a fixture seam only; a product build runs
     // sandboxed unless it runs as root (which Chromium refuses to sandbox).
-    let no_sandbox = setup::without_sandbox(
-        euid,
-        std::env::var_os("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX")
-            .filter(|_| cfg!(feature = "fixture-overrides"))
-            .as_deref(),
-    );
+    let no_sandbox =
+        setup::without_sandbox(euid, setup::sandbox_opt_out(&setup::environment).as_deref());
     let directory = app
         .path()
         .app_local_data_dir()
@@ -182,19 +225,15 @@ pub(super) fn install(app: &AppHandle) -> Result<()> {
         .join("browser-process-experiment");
     private_directory(&directory)?;
     let directory = directory.canonicalize().map_err(failure)?;
-    app.manage(Backend(
-        Arc::new(Mutex::new(State {
-            program,
-            guard,
-            directory,
-            runtime_root,
-            no_sandbox,
-            processes: BTreeMap::new(),
-            spawner: spawner()?,
-        })),
-        Arc::new(ExitPhase::default()),
-    ));
-    Ok(())
+    Ok(State {
+        program,
+        guard,
+        directory,
+        runtime_root,
+        no_sandbox,
+        processes: BTreeMap::new(),
+        spawner: spawner()?,
+    })
 }
 
 pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
@@ -242,10 +281,9 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 return Err(Error::InvalidRequest("Browser profile limit reached."));
             }
             let key = payload.key.clone();
-            let runtime = state.runtime_root.join(format!(
-                "p-{}-{}",
+            let runtime = state.runtime_root.join(setup::runtime_name(
                 std::process::id(),
-                NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst)
+                NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst),
             ));
             let mut process = Process::spawn(
                 state.program.clone(),
@@ -328,7 +366,11 @@ fn settle_exiting(state: &mut State, deadline: std::time::Instant) -> Result<()>
     }
 }
 pub(super) fn shutdown(app: &AppHandle) -> Result<()> {
-    let backend = app.state::<Backend>().inner().clone();
+    // An unavailable browser has nothing to close.
+    let Some(backend) = app.try_state::<Backend>() else {
+        return Ok(());
+    };
+    let backend = backend.inner().clone();
     match backend
         .1
         .state
@@ -537,7 +579,9 @@ fn clear_site_data(directory: &std::path::Path, profile: &str) -> Result<()> {
 }
 
 pub(super) fn status(app: &AppHandle) -> Result<serde_json::Value> {
-    let backend = app.state::<Backend>();
+    let Some(backend) = app.try_state::<Backend>() else {
+        return Err(failure(unavailable(app).unwrap_or_default()));
+    };
     let state = backend.0.lock().map_err(failure)?;
     Ok(serde_json::Value::Array(state.processes.values().map(|process|serde_json::json!({
         "pid":process.child.id(),"profile":process.profile,"directory":process.directory,"guardReceipt":process.guard_receipt,
@@ -578,11 +622,16 @@ impl Process {
                 "Browser runtime socket path is too long.",
             ));
         }
+        // Names are unique within this App instance, so an existing one was left
+        // by an earlier instance that had the same pid: remove it first.
+        setup::remove_runtime(&runtime)?;
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&runtime)
             .map_err(failure)?;
+        // Removed again if no guard starts; a started guard's Process owns it.
+        let mut unowned = Unowned(Some(runtime.clone()));
         let boot = Request::Open { id: 1, payload };
         boot.validate(&profile)?;
         let bytes = serde_json::to_vec(&boot).map_err(failure)?;
@@ -625,10 +674,7 @@ impl Process {
         command.env_clear();
         // Optional observation seam for the disposable native fixture only.
         // It is never a page IPC command or enabled in a normal App build.
-        if cfg!(feature = "fixture-overrides")
-            && std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
-        {
+        if setup::inspection(&setup::environment) {
             command.env("TAKOSUMI_BROWSER_PROCESS_INSPECT", "1");
         }
         for key in [
@@ -699,6 +745,7 @@ impl Process {
             opening: None,
             opened: serde_json::Value::Null,
             guard_receipt,
+            runtime: unowned.0.take().expect("Owned runtime directory"),
             program,
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
         };
@@ -919,7 +966,7 @@ impl Process {
         // protocol fault stays an error.
         if let Err(error) = self.send(Request::Shutdown { id }, now + Duration::from_secs(20)) {
             return self
-                .ended_within(Duration::from_secs(2))
+                .ended_within(STOP_FINISH)
                 .map(|()| true)
                 .map_err(|_| error);
         }
@@ -928,7 +975,7 @@ impl Process {
             Ok(reply) => reply,
             Err(Wait::Closed) => {
                 return self
-                    .ended_within(Duration::from_secs(2))
+                    .ended_within(STOP_FINISH)
                     .map(|()| true)
                     .map_err(|_| Wait::Closed.into());
             }
@@ -950,11 +997,8 @@ impl Process {
             }
         }
         self.input.take();
-        // The person already agreed to leave and every window has closed; the
-        // browser may still flush its profile. On a slow disk that can exceed a
-        // few seconds (pk1), and an App that cannot finish quitting is worse
-        // than waiting a little longer for a clean, normal end.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // The person already agreed to leave and every window has closed.
+        let deadline = std::time::Instant::now() + STOP_FINISH;
         while std::time::Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().map_err(failure)? {
                 return if status.success() {
@@ -1002,7 +1046,7 @@ impl Process {
                 }
                 Reply::Stopped { id } if id == self.next => {
                     self.input.take();
-                    return self.ended_within(Duration::from_secs(5)).map(|()| true);
+                    return self.ended_within(STOP_FINISH).map(|()| true);
                 }
                 Reply::Opened { id, .. } if id == self.next => {
                     if let Some(key) = self.opening.clone() {
@@ -1072,6 +1116,23 @@ fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
+        // The test executable has no packaged `cef/` resources beside it, so
+        // locating the browser fails; installing must not.
+        let app = tauri::test::mock_app();
+        install(app.handle()).unwrap();
+        assert!(app.try_state::<Backend>().is_none());
+        let reason = unavailable(app.handle()).expect("an unavailable reason");
+        assert!(
+            reason.starts_with("The desktop browser is unavailable: "),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Browser process executable is unavailable"),
+            "{reason}"
+        );
+    }
     #[test]
     fn a_zero_exit_never_substitutes_for_complete_normal_descendant_proof() {
         let valid = serde_json::json!({"rootExit":0,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":0,"error":null,"cleanupErrors":[]});
@@ -1320,6 +1381,92 @@ sys.stdin.read()' "$1"
             lines.iter().any(|line| line == "--no-first-run"),
             "{lines:?}"
         );
+    }
+    /// A stand-in guard that writes a normal receipt and ends at once.
+    fn ending_guard(root: &std::path::Path) -> PathBuf {
+        let guard = root.join("guard.py");
+        std::fs::write(
+            &guard,
+            format!("import json,sys\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n"),
+        )
+        .unwrap();
+        guard
+    }
+    fn work_payload() -> OpenRequest {
+        serde_json::from_value(serde_json::json!({
+            "key":"web-home:11111111-1111-4111-8111-111111111111:https://excalidraw.com",
+            "url":"https://excalidraw.com/","title":"Work","profile":"11111111-1111-4111-8111-111111111111","webHome":true
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn an_ended_browsers_runtime_directory_goes_with_it_and_a_stale_one_is_replaced() {
+        let root = std::env::temp_dir().join(format!("sumi-rt-{}", std::process::id()));
+        private_directory(&root.join("outside")).unwrap();
+        let guard = ending_guard(&root);
+        let runtime = root.join("r");
+        // Left by an earlier App instance with the same pid: junk, a socket
+        // directory and a link to outside, which must not be followed.
+        private_directory(&runtime.join("tmp").join("org.chromium.Chromium.x")).unwrap();
+        std::fs::write(runtime.join("guard.json"), b"stale").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), runtime.join("tmp").join("out")).unwrap();
+        let parent = spawner().unwrap();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("profile"),
+            runtime.clone(),
+            work_payload(),
+            &parent,
+            true,
+        )
+        .expect("a stale runtime directory never makes the start fail");
+        // The start recreates `tmp/`; nothing stale remains in it.
+        let stale_gone = !runtime.join("tmp/org.chromium.Chromium.x").exists()
+            && runtime.join("tmp/out").symlink_metadata().is_err();
+        let status = exit_within(&mut process.child, Duration::from_secs(10));
+        let verified = process.normal_guard();
+        drop(process);
+        let kept = runtime.exists();
+        let outside = root.join("outside").is_dir();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(stale_gone, "the stale directory was removed first");
+        assert!(status.is_some_and(|status| status.success()));
+        verified.unwrap();
+        assert_eq!(
+            kept,
+            setup::KEEP_ENDED_RUNTIME,
+            "removed with its browser, kept only for the fixture runner"
+        );
+        assert!(
+            outside,
+            "links inside a runtime directory are never followed"
+        );
+        drop(parent);
+    }
+    #[test]
+    fn a_browser_that_never_starts_leaves_no_runtime_directory() {
+        let root = std::env::temp_dir().join(format!("sumi-rt-none-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let runtime = root.join("r");
+        let parent = spawner().unwrap();
+        let started = Process::spawn(
+            PathBuf::from("/bin/true"),
+            root.join("no-such-guard"),
+            root.join("profile"),
+            runtime.clone(),
+            work_payload(),
+            &parent,
+            true,
+        );
+        let left = runtime.exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(started.is_err());
+        assert!(
+            !left,
+            "a guard that never started owns no runtime directory"
+        );
+        drop(parent);
     }
     #[test]
     fn clearing_site_data_removes_only_that_profiles_cache_and_never_follows_links() {
@@ -2028,6 +2175,18 @@ fn native_parent(pid: u32) -> Option<u32> {
         .parse()
         .ok()
 }
+/// A runtime directory created for a guard that has not started yet; removed
+/// if spawning fails before a `Process` owns it.
+struct Unowned(Option<PathBuf>);
+impl Drop for Unowned {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            if let Err(problem) = setup::remove_runtime(&runtime) {
+                eprintln!("A browser runtime directory was not removed: {problem}");
+            }
+        }
+    }
+}
 impl Drop for Process {
     fn drop(&mut self) {
         self.input.take();
@@ -2044,6 +2203,14 @@ impl Drop for Process {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Every caller drops a browser right after verifying its guard's
+        // normal receipt; any other ended guard is dropped only at the App's
+        // end. A guard still running keeps its sockets and receipt.
+        if !setup::KEEP_ENDED_RUNTIME && matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Err(problem) = setup::remove_runtime(&self.runtime) {
+                eprintln!("A browser runtime directory was not removed: {problem}");
             }
         }
     }

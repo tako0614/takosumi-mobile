@@ -18,12 +18,25 @@ pub(super) const BROWSER: &str = "takosumi-cef-browser-process";
 pub(super) const GUARD: &str = "takosumi-browser-guard";
 /// This App's entry in `$XDG_RUNTIME_DIR`.
 const RUNTIME: &str = "takosumi-cef";
-/// Its entry in the App's cache directory when no runtime directory is set.
+/// Its entry in the App's cache directory when no usable runtime directory exists.
 const CACHE_RUNTIME: &str = "cef";
+/// Only the native fixture's build honours the environment seams below.
+const FIXTURE: bool = cfg!(feature = "fixture-overrides");
+/// A fixture build keeps an ended browser's runtime directory: its runner
+/// reads each guard's receipt there after the App exits. A product build
+/// removes it; both sweep directories of ended App instances at start.
+pub(super) const KEEP_ENDED_RUNTIME: bool = FIXTURE;
+
+/// Reads one environment variable. The App passes `environment`; tests pass
+/// their own table, so they never change the process environment.
+pub(super) type Lookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+pub(super) fn environment(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
 
 /// Explicit overrides, read once from the App's environment. The native
 /// fixture sets all three; a packaged App sets none.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Overrides {
     pub program: Option<OsString>,
     pub guard: Option<OsString>,
@@ -32,24 +45,59 @@ pub(super) struct Overrides {
 impl Overrides {
     /// Only a fixture build honours these; a product build always resolves
     /// its own bundled files.
-    pub(super) fn from_env() -> Self {
-        if !cfg!(feature = "fixture-overrides") {
+    pub(super) fn from_lookup(lookup: Lookup) -> Self {
+        if !FIXTURE {
             return Self::default();
         }
         Self {
-            program: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PROGRAM"),
-            guard: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_GUARD"),
-            runtime: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_RUNTIME"),
+            program: lookup("TAKOSUMI_BROWSER_PROCESS_PROGRAM"),
+            guard: lookup("TAKOSUMI_BROWSER_PROCESS_GUARD"),
+            runtime: lookup("TAKOSUMI_BROWSER_PROCESS_RUNTIME"),
         }
     }
+}
+
+/// The fixture's sandbox opt-out (`TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX`); a
+/// product build never reads it.
+pub(super) fn sandbox_opt_out(lookup: Lookup) -> Option<OsString> {
+    FIXTURE
+        .then(|| lookup("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX"))
+        .flatten()
+}
+
+/// Whether the fixture asked for its loopback inspection seam; never in a
+/// product build.
+pub(super) fn inspection(lookup: Lookup) -> bool {
+    FIXTURE && lookup("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref() == Some(OsStr::new("1"))
+}
+
+/// A setuid or setgid App would start browsers with an identity the person
+/// did not choose; the browser path refuses to run that way.
+pub(super) fn plain_identity(uid: u32, euid: u32, gid: u32, egid: u32) -> Result<()> {
+    if uid != euid || gid != egid {
+        return Err(Error::InvalidRequest(
+            "The desktop browser does not run from a setuid or setgid App.",
+        ));
+    }
+    Ok(())
+}
+
+/// A place the App may keep its browser runtime root, tried in order.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Candidate {
+    /// `$XDG_RUNTIME_DIR/takosumi-cef`, only when the runtime directory itself
+    /// follows the XDG rules (owned by this user, mode 0700).
+    Xdg(PathBuf),
+    /// `<app cache>/cef`, created when missing.
+    Cache(PathBuf),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Runtime {
     /// The fixture's own directory: it must already exist.
     Given(PathBuf),
-    /// A per-user directory the App creates (0700) when it is missing.
-    Owned(PathBuf),
+    /// The first candidate that is (or can be made) this user's private root.
+    Search(Vec<Candidate>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,11 +109,10 @@ pub(super) struct Plan {
 
 /// Decide where the browser, its guard and the runtime root are, without
 /// touching the filesystem. Each explicit override wins; otherwise the browser
-/// and guard come from `<resources>/cef/` and the runtime root is
-/// `$XDG_RUNTIME_DIR/takosumi-cef`, or `<app cache>/cef` only when
-/// `XDG_RUNTIME_DIR` is unset (an empty value counts as unset). A relative
-/// runtime or cache directory is refused rather than resolved against the
-/// working directory.
+/// and guard come from `<resources>/cef/`, and the runtime root is searched in
+/// `$XDG_RUNTIME_DIR` (when set, non-empty and absolute) and then in the App's
+/// cache directory (when absolute). Relative directories are never resolved
+/// against the working directory.
 pub(super) fn plan(
     overrides: &Overrides,
     resources: Option<&Path>,
@@ -87,27 +134,19 @@ pub(super) fn plan(
         Some(path) => PathBuf::from(path),
         None => packaged(GUARD)?,
     };
-    let runtime = match (
-        &overrides.runtime,
-        xdg_runtime.filter(|dir| !dir.is_empty()),
-    ) {
-        (Some(path), _) => Runtime::Given(PathBuf::from(path)),
-        (None, Some(dir)) if Path::new(dir).is_absolute() => {
-            Runtime::Owned(Path::new(dir).join(RUNTIME))
+    let runtime = match &overrides.runtime {
+        Some(path) => Runtime::Given(PathBuf::from(path)),
+        None => {
+            let xdg = xdg_runtime
+                .filter(|dir| !dir.is_empty())
+                .map(Path::new)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| Candidate::Xdg(dir.to_path_buf()));
+            let cache = cache
+                .filter(|cache| cache.is_absolute())
+                .map(|cache| Candidate::Cache(cache.to_path_buf()));
+            Runtime::Search(xdg.into_iter().chain(cache).collect())
         }
-        (None, Some(_)) => {
-            return Err(Error::InvalidRequest(
-                "XDG_RUNTIME_DIR must be an absolute path.",
-            ))
-        }
-        (None, None) => match cache {
-            Some(cache) if cache.is_absolute() => Runtime::Owned(cache.join(CACHE_RUNTIME)),
-            _ => {
-                return Err(Error::InvalidRequest(
-                    "No private runtime directory is available for the browser.",
-                ))
-            }
-        },
     };
     Ok(Plan {
         program,
@@ -124,17 +163,15 @@ pub(super) struct Located {
 }
 
 /// Check the planned files and directories: both executables must resolve to
-/// existing files, and the runtime root must be private to `euid` (an owned
-/// one is created first). Every returned path is canonical.
+/// existing files, and the runtime root must be private to `euid`. A fixture's
+/// root must already be so; otherwise the first usable candidate wins. Every
+/// returned path is canonical.
 pub(super) fn locate(plan: Plan, euid: u32) -> Result<Located> {
     let program = existing_file(&plan.program, "Browser process executable is unavailable.")?;
     let guard = existing_file(&plan.guard, "Browser guard is unavailable.")?;
     let runtime = match plan.runtime {
         Runtime::Given(path) => private_runtime(&path, euid)?,
-        Runtime::Owned(path) => {
-            private_directory(&path)?;
-            private_runtime(&path, euid)?
-        }
+        Runtime::Search(candidates) => search(&candidates, euid)?,
     };
     Ok(Located {
         program,
@@ -151,6 +188,85 @@ fn existing_file(path: &Path, missing: &'static str) -> Result<PathBuf> {
         return Err(Error::InvalidRequest(missing));
     }
     Ok(canonical)
+}
+
+/// What `lstat` showed about one path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Seen {
+    pub dir: bool,
+    pub uid: u32,
+    pub mode: u32,
+}
+fn seen(path: &Path) -> Result<Option<Seen>> {
+    match path.symlink_metadata() {
+        Ok(metadata) => Ok(Some(Seen {
+            dir: metadata.file_type().is_dir(),
+            uid: metadata.uid(),
+            mode: metadata.mode() & 0o7777,
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(failure(error)),
+    }
+}
+
+/// The XDG Base Directory rules for `$XDG_RUNTIME_DIR`: a directory owned by
+/// the user with mode 0700. Another user's directory (after `su`) or a shared
+/// `/tmp` (1777) does not qualify.
+pub(super) fn xdg_usable(seen: Option<Seen>, euid: u32) -> bool {
+    matches!(seen, Some(seen) if seen.dir && seen.uid == euid && seen.mode & 0o777 == 0o700)
+}
+
+/// An existing runtime root this App may use: a plain directory (not a link)
+/// of this user, closed to group and others. Another owner's (one left by
+/// `sudo -E`) or a looser one is skipped, never chmod-ed or chown-ed.
+pub(super) fn root_usable(seen: Option<Seen>, euid: u32) -> bool {
+    matches!(seen, Some(seen) if seen.dir && seen.uid == euid && seen.mode & 0o077 == 0)
+}
+
+fn search(candidates: &[Candidate], euid: u32) -> Result<PathBuf> {
+    let mut reasons = Vec::new();
+    for candidate in candidates {
+        match usable_candidate(candidate, euid) {
+            Ok(root) => return Ok(root),
+            Err(error) => {
+                let (Candidate::Xdg(place) | Candidate::Cache(place)) = candidate;
+                reasons.push(format!("{}: {error}", place.display()));
+            }
+        }
+    }
+    Err(failure(format!(
+        "No private runtime directory is available for the browser{}",
+        if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reasons.join("; "))
+        }
+    )))
+}
+
+fn usable_candidate(candidate: &Candidate, euid: u32) -> Result<PathBuf> {
+    let root = match candidate {
+        Candidate::Xdg(dir) => {
+            if !xdg_usable(seen(dir)?, euid) {
+                return Err(Error::InvalidRequest(
+                    "XDG_RUNTIME_DIR is not this user's private (0700) runtime directory.",
+                ));
+            }
+            dir.join(RUNTIME)
+        }
+        Candidate::Cache(cache) => cache.join(CACHE_RUNTIME),
+    };
+    match seen(&root)? {
+        None => private_directory(&root)?,
+        found if !root_usable(found, euid) => {
+            return Err(Error::InvalidRequest(
+                "The browser runtime directory there is not this user's private directory.",
+            ))
+        }
+        Some(_) => {}
+    }
+    // Checked again after any creation: another process may have raced it.
+    private_runtime(&root, euid)
 }
 
 /// The runtime root holds each browser's sockets and temporary files: a plain
@@ -175,7 +291,7 @@ fn private_runtime(path: &Path, euid: u32) -> Result<PathBuf> {
         ));
     }
     let canonical = path.canonicalize().map_err(failure)?;
-    if !socket_path_fits(&canonical.join(format!("p-{}-999999", std::process::id()))) {
+    if !socket_path_fits(&canonical.join(runtime_name(std::process::id(), 999_999))) {
         return Err(Error::InvalidRequest(
             "Browser runtime directory path is too long.",
         ));
@@ -193,10 +309,77 @@ pub(super) fn socket_path_fits(runtime: &Path) -> bool {
         < 108
 }
 
+/// One browser's runtime directory inside the root: `p-<App pid>-<n>`.
+pub(super) fn runtime_name(pid: u32, n: u64) -> String {
+    format!("p-{pid}-{n}")
+}
+/// The App pid a runtime directory name was made for.
+fn runtime_owner(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix("p-")?.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Remove one browser runtime directory. Only a plain directory is removed;
+/// a link or file in its place is refused, and std's `remove_dir_all` never
+/// follows links inside it.
+pub(super) fn remove_runtime(path: &Path) -> Result<()> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            std::fs::remove_dir_all(path).map_err(failure)
+        }
+        Ok(_) => Err(Error::InvalidRequest(
+            "Browser runtime entry is not a plain directory.",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failure(error)),
+    }
+}
+
+/// Inside the verified runtime root, remove browser runtime directories left
+/// by App instances that have ended (their pid is gone) or by an earlier
+/// instance that had this App's pid (none of this instance's exist yet).
+/// Another live instance's directories, links and other entries stay. Returns
+/// the failures; none stops the App.
+pub(super) fn sweep_runtime(root: &Path, own_pid: u32, alive: impl Fn(u32) -> bool) -> Vec<String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => return vec![error.to_string()],
+    };
+    let mut problems = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                problems.push(error.to_string());
+                continue;
+            }
+        };
+        let Some(pid) = entry.file_name().to_str().and_then(runtime_owner) else {
+            continue;
+        };
+        let is_dir = entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink());
+        if is_dir && (pid == own_pid || !alive(pid)) {
+            if let Err(error) = remove_runtime(&entry.path()) {
+                problems.push(format!("{}: {error}", entry.path().display()));
+            }
+        }
+    }
+    problems
+}
+
+/// Whether a process with this pid exists now.
+pub(super) fn pid_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 /// Chromium refuses its sandbox to root, so a root App (the native fixture
 /// runs as root) starts browsers with `--no-sandbox`. Otherwise only an
-/// explicit `TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` opts out. The browser
-/// reads the same decision from its arguments.
+/// explicit `TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` (fixture builds only, see
+/// `sandbox_opt_out`) opts out. The browser reads the same decision from its
+/// arguments.
 pub(super) fn without_sandbox(euid: u32, opt_out: Option<&OsStr>) -> bool {
     euid == 0 || opt_out == Some(OsStr::new("1"))
 }
@@ -225,9 +408,26 @@ mod tests {
         private_directory(&root).unwrap();
         root
     }
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    /// Every fixture variable set, as a hostile or leftover environment would.
+    fn everything(key: &str) -> Option<OsString> {
+        Some(OsString::from(match key {
+            "TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX" | "TAKOSUMI_BROWSER_PROCESS_INSPECT" => "1",
+            _ => "/elsewhere",
+        }))
+    }
 
     #[test]
-    fn a_packaged_app_finds_its_browser_in_resources_and_sockets_in_the_runtime_dir() {
+    fn a_packaged_app_finds_its_browser_in_resources_and_searches_runtime_then_cache() {
         let packaged = plan(
             &Overrides::default(),
             Some(Path::new("/usr/lib/Takosumi")),
@@ -240,7 +440,10 @@ mod tests {
             Plan {
                 program: "/usr/lib/Takosumi/cef/takosumi-cef-browser-process".into(),
                 guard: "/usr/lib/Takosumi/cef/takosumi-browser-guard".into(),
-                runtime: Runtime::Owned("/run/user/1000/takosumi-cef".into()),
+                runtime: Runtime::Search(vec![
+                    Candidate::Xdg("/run/user/1000".into()),
+                    Candidate::Cache("/home/a/.cache/com.takosumi".into()),
+                ]),
             }
         );
     }
@@ -281,30 +484,40 @@ mod tests {
         assert_eq!(mixed.guard, PathBuf::from("/case/guard.py"));
         assert_eq!(
             mixed.runtime,
-            Runtime::Owned("/run/user/7/takosumi-cef".into())
+            Runtime::Search(vec![Candidate::Xdg("/run/user/7".into())])
         );
     }
 
     #[test]
-    fn the_cache_runtime_is_used_only_without_xdg_runtime_dir() {
+    fn unset_empty_or_relative_directories_are_never_candidates() {
         let cache = Some(Path::new("/home/a/.cache/com.takosumi"));
-        for unset in [None, Some(OsStr::new(""))] {
-            let chosen = plan(&Overrides::default(), Some(Path::new("/r")), unset, cache).unwrap();
-            assert_eq!(
-                chosen.runtime,
-                Runtime::Owned("/home/a/.cache/com.takosumi/cef".into())
-            );
+        let only_cache =
+            Runtime::Search(vec![Candidate::Cache("/home/a/.cache/com.takosumi".into())]);
+        for xdg in [None, Some(OsStr::new("")), Some(OsStr::new("relative/run"))] {
+            let chosen = plan(&Overrides::default(), Some(Path::new("/r")), xdg, cache).unwrap();
+            assert_eq!(chosen.runtime, only_cache, "{xdg:?}");
         }
-        assert!(plan(
+        let relative_cache = plan(
             &Overrides::default(),
             Some(Path::new("/r")),
-            Some(OsStr::new("relative/run")),
-            cache
+            None,
+            Some(Path::new("relative/cache")),
         )
-        .is_err());
-        for cache in [None, Some(Path::new("relative/cache"))] {
-            assert!(plan(&Overrides::default(), Some(Path::new("/r")), None, cache).is_err());
-        }
+        .unwrap();
+        assert_eq!(relative_cache.runtime, Runtime::Search(Vec::new()));
+        // With no candidate at all, locating reports that nothing is available.
+        let root = scratch("n");
+        std::fs::write(root.join("b"), b"").unwrap();
+        let located = locate(
+            Plan {
+                program: root.join("b"),
+                guard: root.join("b"),
+                runtime: Runtime::Search(Vec::new()),
+            },
+            euid(),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(located.is_err());
     }
 
     #[test]
@@ -313,6 +526,110 @@ mod tests {
         assert!(plan(&Overrides::default(), None, run, None).is_err());
         assert!(plan(&overrides(Some("/b"), None, None), None, run, None).is_err());
         assert!(plan(&overrides(None, Some("/g"), None), None, run, None).is_err());
+    }
+
+    #[test]
+    fn xdg_runtime_dirs_follow_the_xdg_rules_and_existing_roots_must_be_ours() {
+        let me = 1000;
+        let at = |dir, uid, mode| Some(Seen { dir, uid, mode });
+        assert!(xdg_usable(at(true, me, 0o700), me));
+        for (case, seen) in [
+            ("missing", None),
+            ("another user's, after su", at(true, 1001, 0o700)),
+            ("root's, left by sudo -E", at(true, 0, 0o700)),
+            ("a shared /tmp", at(true, 0, 0o1777)),
+            ("group readable", at(true, me, 0o750)),
+            ("not a directory", at(false, me, 0o700)),
+        ] {
+            assert!(!xdg_usable(seen, me), "{case}");
+        }
+        assert!(root_usable(at(true, me, 0o700), me));
+        for (case, seen) in [
+            ("missing", None),
+            ("root-owned, left by sudo -E", at(true, 0, 0o700)),
+            ("another user's", at(true, 1001, 0o700)),
+            ("open to others", at(true, me, 0o755)),
+            ("a link or file", at(false, me, 0o700)),
+        ] {
+            assert!(!root_usable(seen, me), "{case}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_runtime_dir_falls_back_to_the_cache_and_is_left_untouched() {
+        let root = scratch("f");
+        std::fs::write(root.join("b"), b"").unwrap();
+        let locate_with = |xdg: &Path, cache: &Path| {
+            locate(
+                Plan {
+                    program: root.join("b"),
+                    guard: root.join("b"),
+                    runtime: Runtime::Search(vec![
+                        Candidate::Xdg(xdg.to_owned()),
+                        Candidate::Cache(cache.to_owned()),
+                    ]),
+                },
+                euid(),
+            )
+        };
+        let cache_root = root.join("c").join(CACHE_RUNTIME);
+        // The runtime directory itself is not 0700 (a shared or loose one).
+        private_directory(&root.join("loose")).unwrap();
+        chmod(&root.join("loose"), 0o755);
+        let loose = locate_with(&root.join("loose"), &root.join("c"));
+        let loose_child = root.join("loose").join(RUNTIME).exists();
+        // A usable runtime directory whose takosumi-cef is not private: skipped,
+        // never repaired.
+        private_directory(&root.join("x")).unwrap();
+        private_directory(&root.join("x").join(RUNTIME)).unwrap();
+        chmod(&root.join("x").join(RUNTIME), 0o755);
+        let foreign = locate_with(&root.join("x"), &root.join("c"));
+        let foreign_mode = mode(&root.join("x").join(RUNTIME));
+        // A usable runtime directory too long for the socket path.
+        let long = root.join("l".repeat(60));
+        private_directory(&long).unwrap();
+        let too_long = locate_with(&long, &root.join("c"));
+        // A missing runtime directory is not created on its behalf.
+        let missing = locate_with(&root.join("absent"), &root.join("c"));
+        let absent_created = root.join("absent").exists();
+        let canonical = cache_root.canonicalize().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        for (case, result) in [
+            ("loose", loose),
+            ("foreign root", foreign),
+            ("too long", too_long),
+            ("missing", missing),
+        ] {
+            assert_eq!(result.unwrap().runtime, canonical, "{case}");
+        }
+        assert!(!loose_child, "nothing is created in a loose runtime dir");
+        assert_eq!(foreign_mode, 0o755, "a skipped root keeps its mode");
+        assert!(!absent_created);
+    }
+
+    #[test]
+    fn when_every_candidate_fails_locating_names_each_reason() {
+        let root = scratch("e");
+        std::fs::write(root.join("b"), b"").unwrap();
+        private_directory(&root.join("loose")).unwrap();
+        chmod(&root.join("loose"), 0o755);
+        // The cache fallback is too long for the socket path.
+        let cache = root.join("c".repeat(60));
+        let located = locate(
+            Plan {
+                program: root.join("b"),
+                guard: root.join("b"),
+                runtime: Runtime::Search(vec![
+                    Candidate::Xdg(root.join("loose")),
+                    Candidate::Cache(cache.clone()),
+                ]),
+            },
+            euid(),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let message = located.unwrap_err().to_string();
+        assert!(message.contains("XDG_RUNTIME_DIR"), "{message}");
+        assert!(message.contains("too long"), "{message}");
     }
 
     #[test]
@@ -333,10 +650,7 @@ mod tests {
         .unwrap();
         let located = locate(planned, euid()).unwrap();
         let canonical = root.canonicalize().unwrap();
-        let mode = std::fs::metadata(root.join("x").join(RUNTIME))
-            .unwrap()
-            .permissions()
-            .mode();
+        let created = mode(&root.join("x").join(RUNTIME));
         // Locating again accepts the directory it created.
         let again = locate(
             plan(
@@ -357,7 +671,7 @@ mod tests {
                 runtime: canonical.join("x").join(RUNTIME),
             }
         );
-        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(created, 0o700);
         assert_eq!(again.unwrap(), located);
     }
 
@@ -397,6 +711,7 @@ mod tests {
                 euid,
             )
         };
+        let cache = |base: &str| Runtime::Search(vec![Candidate::Cache(root.join(base))]);
         private_directory(&root.join("ok")).unwrap();
         let canonical = root.join("ok").canonicalize().unwrap();
         let ok = attempt(Runtime::Given(root.join("ok")), euid());
@@ -404,15 +719,15 @@ mod tests {
         let foreign = attempt(Runtime::Given(root.join("ok")), euid().wrapping_add(1));
         // A fixture runtime is never created on its behalf.
         let absent = attempt(Runtime::Given(root.join("absent")), euid());
-        private_directory(&root.join("open")).unwrap();
-        std::fs::set_permissions(root.join("open"), std::fs::Permissions::from_mode(0o750))
-            .unwrap();
-        let open = attempt(Runtime::Owned(root.join("open")), euid());
-        std::os::unix::fs::symlink(root.join("ok"), root.join("link")).unwrap();
-        let link = attempt(Runtime::Owned(root.join("link")), euid());
-        let long = root.join("l".repeat(60));
-        let too_long = attempt(Runtime::Owned(long.clone()), euid());
-        let long_created = long.is_dir();
+        private_directory(&root.join("open").join(CACHE_RUNTIME)).unwrap();
+        chmod(&root.join("open").join(CACHE_RUNTIME), 0o750);
+        let open = attempt(cache("open"), euid());
+        private_directory(&root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("ok"), root.join("link").join(CACHE_RUNTIME)).unwrap();
+        let link = attempt(cache("link"), euid());
+        let long = "l".repeat(60);
+        let too_long = attempt(cache(&long), euid());
+        let long_created = root.join(&long).join(CACHE_RUNTIME).is_dir();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(ok.unwrap().runtime, canonical);
         assert!(foreign.is_err());
@@ -420,10 +735,7 @@ mod tests {
         assert!(open.is_err());
         assert!(link.is_err());
         assert!(too_long.is_err());
-        assert!(
-            long_created,
-            "the owned directory is created before its checks"
-        );
+        assert!(long_created, "the cache root is created before its checks");
     }
 
     #[test]
@@ -445,5 +757,94 @@ mod tests {
         for other in ["", "0", "true", "yes", " 1"] {
             assert!(!without_sandbox(1000, Some(OsStr::new(other))), "{other:?}");
         }
+    }
+
+    #[cfg(not(feature = "fixture-overrides"))]
+    #[test]
+    fn a_product_build_ignores_every_fixture_variable() {
+        assert_eq!(Overrides::from_lookup(&everything), Overrides::default());
+        assert_eq!(sandbox_opt_out(&everything), None);
+        assert!(!inspection(&everything));
+        // So a non-root product App always runs sandboxed.
+        assert!(!without_sandbox(
+            1000,
+            sandbox_opt_out(&everything).as_deref()
+        ));
+    }
+
+    #[cfg(feature = "fixture-overrides")]
+    #[test]
+    fn a_fixture_build_reads_its_variables() {
+        assert_eq!(
+            Overrides::from_lookup(&everything),
+            overrides(Some("/elsewhere"), Some("/elsewhere"), Some("/elsewhere"))
+        );
+        assert_eq!(sandbox_opt_out(&everything), Some(OsString::from("1")));
+        assert!(inspection(&everything));
+        assert!(without_sandbox(
+            1000,
+            sandbox_opt_out(&everything).as_deref()
+        ));
+        let nothing = |_: &str| None;
+        assert_eq!(Overrides::from_lookup(&nothing), Overrides::default());
+        assert!(!inspection(&nothing));
+        let other = |_: &str| Some(OsString::from("0"));
+        assert!(!inspection(&other));
+    }
+
+    #[test]
+    fn a_setuid_or_setgid_app_does_not_start_browsers() {
+        assert!(plain_identity(1000, 1000, 1000, 1000).is_ok());
+        assert!(plain_identity(0, 0, 0, 0).is_ok());
+        assert!(plain_identity(1000, 0, 1000, 1000).is_err(), "setuid root");
+        assert!(plain_identity(0, 1000, 0, 0).is_err());
+        assert!(plain_identity(1000, 1000, 1000, 0).is_err(), "setgid");
+    }
+
+    #[test]
+    fn the_sweep_removes_only_ended_or_own_runtime_dirs_and_never_follows_links() {
+        let root = scratch("s");
+        let (own, live, dead) = (std::process::id(), 4_000_001, 4_000_002);
+        let outside = root.join("outside");
+        private_directory(&outside.join("kept")).unwrap();
+        let runtime = root.join("rt");
+        private_directory(&runtime).unwrap();
+        for name in [
+            runtime_name(dead, 1),
+            runtime_name(own, 3),
+            runtime_name(live, 2),
+            "keep".into(),
+            "p-x-1".into(),
+        ] {
+            private_directory(&runtime.join(&name).join("tmp")).unwrap();
+            std::fs::write(runtime.join(&name).join("guard.json"), b"{}").unwrap();
+        }
+        // A stale-looking link and file are never removed or followed.
+        std::os::unix::fs::symlink(&outside, runtime.join(runtime_name(dead, 9))).unwrap();
+        std::fs::write(runtime.join(runtime_name(dead, 8)), b"").unwrap();
+        // Inside a stale directory, a link to outside is removed, not followed.
+        std::os::unix::fs::symlink(&outside, runtime.join(runtime_name(dead, 1)).join("out"))
+            .unwrap();
+        let problems = sweep_runtime(&runtime, own, |pid| pid == live);
+        let mut left = std::fs::read_dir(&runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        left.sort();
+        let outside_kept = outside.join("kept").is_dir();
+        let refused = remove_runtime(&runtime.join(runtime_name(dead, 9)));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut expected = vec![
+            runtime_name(live, 2),
+            runtime_name(dead, 8),
+            runtime_name(dead, 9),
+            "keep".into(),
+            "p-x-1".into(),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert!(outside_kept, "links are never followed");
+        assert!(refused.is_err(), "a link is not a runtime directory");
     }
 }
