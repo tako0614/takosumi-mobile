@@ -37,9 +37,6 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("takosumi-browser-guard needs Linux pidfds, signalfd and the child subreaper.");
-
 /// While the browser runs, observe descendants on every signal and at least
 /// this often. Ownership is proven by ECHILD at the end, not by this tick.
 const RUNNING_TICK: Duration = Duration::from_millis(250);
@@ -57,7 +54,8 @@ const MAX_ANCESTRY: usize = 128;
 /// recorded in `nonFatalErrors` and the browser keeps running.
 const MAX_RUNNING_FAULTS: u32 = 8;
 
-fn main() -> ExitCode {
+/// Called by `guard_entry.rs`, which compiles this supervisor only for Linux.
+pub(super) fn main() -> ExitCode {
     // The self-test build runs its tests unless it is asked to act as the
     // guard; the release binary has no such switch.
     #[cfg(test)]

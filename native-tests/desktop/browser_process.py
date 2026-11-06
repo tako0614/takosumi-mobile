@@ -39,6 +39,7 @@ LINUX_SOURCES = (
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/guard_main.rs",
+    "native-tests/cef-candidate/src/guard_entry.rs",
     "native-tests/cef-candidate/x11-owner.py",
     "native-tests/cef-candidate/permissions.mjs", "native-tests/cef-candidate/notifications.mjs",
     "native-tests/cef-candidate/notification-backend.mjs", "native-tests/cef-candidate/gtk-readiness.mjs",

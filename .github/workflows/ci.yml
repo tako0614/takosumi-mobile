@@ -327,3 +327,126 @@ jobs:
             ~/.cargo/git/db
             takosumi-mobile/src-tauri/target
           key: ${{ steps.desktop-cache.outputs.cache-primary-key }}
+
+  # The per-profile CEF browser on Windows (first candidate): build
+  # takosumi-cef-browser-process from native-tests/cef-candidate with its
+  # locked crates and run it alone (no guard, no App) through windows_smoke.py.
+  # It runs without Chromium's sandbox on Windows, which the build must ask
+  # for by name (windows-unsandboxed-candidate); it is a test candidate, not
+  # a package. The guard and the standalone candidate are Linux only and are
+  # not built. Independent of the other jobs.
+  cef-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target-cef
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Locked CEF version
+        id: cef
+        shell: pwsh
+        run: |
+          $lock = Get-Content native-tests/cef-candidate/Cargo.lock
+          $index = [array]::IndexOf($lock, 'name = "cef-dll-sys"')
+          if ($index -lt 0 -or $lock[$index + 1] -notmatch '^version = "(.+)"$') { throw 'cef-dll-sys is not locked' }
+          "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+      # cef-dll-sys downloads the CEF distribution into CEF_PATH on its first
+      # build. Cache the extracted distribution, not the archive beside it.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cef-sdk
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: cef-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.cef.outputs.version }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cef-cargo
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-cef
+          key: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
+          restore-keys: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: CMake and Ninja for the CEF wrapper
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            # Visual Studio ships Ninja with its CMake tools.
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+            if (-not (Test-Path (Join-Path $ninja 'ninja.exe'))) { throw 'Ninja is not available' }
+            Add-Content -Path $env:GITHUB_PATH -Value $ninja
+            & (Join-Path $ninja 'ninja.exe') --version
+          } else {
+            ninja --version
+          }
+          rustc --version
+          cargo --version
+          python --version
+      - name: Build takosumi-cef-browser-process (product, unsandboxed candidate)
+        id: build
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+      # Keep the SDK and the compiler work even when a smoke run below fails.
+      - name: Preserve CEF distribution
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: ${{ steps.cef-sdk.outputs.cache-primary-key }}
+      - name: Preserve CEF compiler cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-cargo.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-cef
+          key: ${{ steps.cef-cargo.outputs.cache-primary-key }}
+      # build.rs embeds the application manifest with MSVC linker flags; read
+      # the RT_MANIFEST resource back from the executable with the SDK's mt.exe.
+      - name: Embedded application manifest
+        shell: pwsh
+        run: |
+          $exe = "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe"
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw 'mt.exe from the Windows SDK is not available' }
+          $out = Join-Path $env:RUNNER_TEMP 'takosumi-cef-browser-process.manifest'
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:$out"
+          if ($LASTEXITCODE -ne 0) { throw "No embedded manifest (mt.exe exit $LASTEXITCODE)" }
+          Get-Content -Raw $out
+          [xml]$manifest = Get-Content -Raw $out
+          $os = @($manifest.SelectNodes("//*[local-name()='supportedOS']") | ForEach-Object { $_.GetAttribute('Id') })
+          if (($os -join ',') -ne '{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}') { throw "Unexpected supportedOS: $($os -join ',')" }
+          $controls = @($manifest.SelectNodes("//*[local-name()='assemblyIdentity' and @name='Microsoft.Windows.Common-Controls' and @version='6.0.0.0']"))
+          if ($controls.Count -ne 1) { throw 'No Common Controls 6 dependency' }
+          $levels = @($manifest.SelectNodes("//*[local-name()='requestedExecutionLevel']") | ForEach-Object { $_.GetAttribute('level') })
+          if (($levels -join ',') -ne 'asInvoker') { throw "Unexpected requestedExecutionLevel: $($levels -join ',')" }
+      # cef-dll-sys copies libcef.dll and the CEF resources beside the
+      # executable, where Windows looks first.
+      - name: Browser smoke (product build)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP"
+      # The fixture-inspection build adds the main-frame load marker, which
+      # shows a renderer ran; --reuse reopens the screen and requires the Win32
+      # raise to make its top-level window the foreground window.
+      - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate)
+        id: fixture-build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+      - name: Browser smoke (page load and window reuse)
+        if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" --expect-load --reuse
