@@ -512,8 +512,13 @@ async function openExternalProbe(work,personal,expected,sample) {
   const geometry=Object.fromEntries(desktop('xdotool',['getwindowgeometry','--shell',String(work.native.windowId)]).split('\n').map(line=>line.split('=')));
   const toolbar=await work.evaluate("window.outerHeight-window.innerHeight");
   state.click={x:Math.round(Number(geometry.X)+point.x),y:Math.round(Number(geometry.Y)+toolbar+point.y),toolbar};
+  // No window manager here: give Work the X input focus first, as the
+  // beforeunload steps do; Chrome closes a menu whose window is not active.
+  const viewableBefore=new Set([...before].filter(id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}}));
+  desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
   desktop('xdotool',['mousemove','--sync',String(state.click.x),String(state.click.y)]);
   desktop('xdotool',['click','3']);
+  desktop('import',['-window','root',path.join(data,'open-external-after-click.png')]);
   // The menu is a new viewable top-level window of Work's own browser.
   const viewable=id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}};
   const ownerOf=id=>{try{return JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),id])).pid;}catch{return null;}};
@@ -521,6 +526,7 @@ async function openExternalProbe(work,personal,expected,sample) {
   await settled(async()=>{menu=tops().filter(id=>!before.has(id)).find(id=>viewable(id)&&ownerOf(id)===work.native.nativePid);return Boolean(menu);},'The link context menu did not open in Work\'s browser').catch(error=>{
     // What appeared instead, for the failure record.
     state.newWindows=tops().filter(id=>!before.has(id)).map(id=>({window:Number(id),viewable:viewable(id),owner:ownerOf(id)}));
+    state.becameViewable=[...before].filter(id=>!viewableBefore.has(id)&&viewable(id)).map(id=>({window:Number(id),owner:ownerOf(id)}));
     proof.openExternal=state;throw error;
   });
   state.menu={window:Number(menu),owner:work.native.nativePid};
