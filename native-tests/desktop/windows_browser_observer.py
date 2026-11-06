@@ -58,6 +58,21 @@ MIB_TCP_STATE_LISTEN = 2
 ERROR_INSUFFICIENT_BUFFER = 122
 
 
+class Rect(ctypes.Structure):  # RECT
+    _fields_ = [("left", ctypes.c_int32), ("top", ctypes.c_int32), ("right", ctypes.c_int32),
+                ("bottom", ctypes.c_int32)]
+
+
+class Placement(ctypes.Structure):  # WINDOWPLACEMENT
+    _fields_ = [("length", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("showCmd", ctypes.c_uint32),
+                ("minX", ctypes.c_int32), ("minY", ctypes.c_int32), ("maxX", ctypes.c_int32),
+                ("maxY", ctypes.c_int32), ("normal", Rect)]
+
+
+class LastInput(ctypes.Structure):  # LASTINPUTINFO
+    _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
+
+
 # --- Win32 -----------------------------------------------------------------
 
 class Win32:
@@ -81,6 +96,10 @@ class Win32:
             (self.user32, "PostMessageW", boolean, [handle, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]),
             (self.user32, "SystemParametersInfoW", boolean, [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
                                                              ctypes.c_uint]),
+            (self.user32, "GetWindowPlacement", boolean, [handle, ctypes.POINTER(Placement)]),
+            (self.user32, "GetWindowRect", boolean, [handle, ctypes.POINTER(Rect)]),
+            (self.user32, "GetLastInputInfo", boolean, [ctypes.POINTER(LastInput)]),
+            (self.kernel32, "GetTickCount", dword, []),
             (self.kernel32, "GetCurrentThreadId", dword, []),
             (self.iphlpapi, "GetExtendedTcpTable", dword, [ctypes.c_void_p, ctypes.POINTER(dword), boolean,
                                                            ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]),
@@ -109,6 +128,33 @@ class Win32:
         if not self.user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(value), 0):
             return None
         return value.value
+
+    def window_state(self, window):
+        """What Windows reports about a top-level window: shown, minimized,
+        its placement (showCmd and normal rectangle) and its rectangle."""
+        placement = Placement(length=ctypes.sizeof(Placement))
+        rect = Rect()
+        state = {"visible": bool(self.user32.IsWindowVisible(window)), "iconic": bool(self.user32.IsIconic(window))}
+        if self.user32.GetWindowPlacement(window, ctypes.byref(placement)):
+            normal = placement.normal
+            state["placement"] = {"showCmd": placement.showCmd,
+                                  "normal": [normal.left, normal.top, normal.right, normal.bottom]}
+        if self.user32.GetWindowRect(window, ctypes.byref(rect)):
+            state["rect"] = [rect.left, rect.top, rect.right, rect.bottom]
+        return state
+
+    def foreground_lock(self):
+        """Windows' foreground lock: its timeout and the time since the last
+        input. While the time since input is below the timeout, a process
+        that is not in front may not take the foreground unless it was
+        given the right (AllowSetForegroundWindow)."""
+        timeout = self.lock_timeout()
+        last = LastInput(cbSize=ctypes.sizeof(LastInput))
+        idle = None
+        if self.user32.GetLastInputInfo(ctypes.byref(last)):
+            idle = (self.kernel32.GetTickCount() - last.dwTime) & 0xFFFFFFFF
+        return {"timeout": timeout, "idleMs": idle,
+                "active": bool(timeout and idle is not None and idle < timeout)}
 
     def wait_foreground(self, window, bound=2.0):
         deadline = time.monotonic() + bound
@@ -546,6 +592,7 @@ class Observer:
         for field in ("tauri", "ipc", "wry", "webview2"):
             require(context[field] == "undefined", f"A CEF page must not see the App's {field} bridge")
         page.context = context
+        self.visibility(page, "attach")
         return page
 
     def sign_in(self, page, user):
@@ -568,6 +615,17 @@ class Observer:
             f"&& document.querySelector('main')?.dataset.user==={signed}"),
             f"The {user} app did not open", LOAD_WAIT, tolerate=True)
         require(page.pages() == [page.target["targetId"]], f"The {user} app must stay in its one window")
+
+    def visibility(self, page, when):
+        """The page's own visibility and focus and Windows' view of its
+        window, recorded under `when` (evidence for reuse-raises-window)."""
+        try:
+            document = page.evaluate("({visibility:document.visibilityState,focus:document.hasFocus()})")
+        except Failure as error:
+            document = {"error": str(error)}
+        entry = dict(document, profile=page.process["profile"], window=self.win.window_state(page.window))
+        self.proof.setdefault("visibility", {}).setdefault(when, []).append(entry)
+        return entry
 
     def raise_refusals(self, page):
         try:
@@ -627,10 +685,16 @@ class Observer:
         # reopen below has to raise it.
         self.step("home through OS window switching")
         switch = {"precondition": win.switch_to(personal.window, "Personal's window", change=False)}
+        # With Personal in front, whether this desktop reports a front CEF
+        # window as visible at all (Chromium's native occlusion tracking).
+        self.visibility(personal, "personal-in-front")
         switch["home"] = win.switch_to(home, "The home window")
         require(win.foreground() == home and win.visible(home), "The home window must be in front and visible")
         switch["lockTimeout"] = win.lock_timeout()
+        switch["lock"] = win.foreground_lock()
+        switch["homeWindow"] = win.window_state(home)
         self.case("home-by-window-switch", switch)
+        self.visibility(work, "before-reuse")
         self.checkpoint("inspect-ready")
 
         self.step("home reopens Work")
@@ -641,12 +705,37 @@ class Observer:
                 == sorted(page.native["nativePid"] for page in pages) and len(resumed["after"]) == 2,
                 "Reopening must not start another browser process")
         require(win.wait_foreground(work.window), f"Reopened Work's window is not in front ({win.foreground()})")
-        self.settled(lambda: work.evaluate("document.visibilityState") == "visible",
-                     "Reopened Work's document is not visible")
         require(work.pages() == [work.target["targetId"]], "Reopening must not open another window")
         refusals = self.raise_refusals(work)
         require(refusals == [], f"Work's browser refused the raise: {refusals}")
-        self.case("reuse-raises-window", {"window": work.window, "foreground": win.foreground()})
+        # The raise came from a browser that was not in front while the home
+        # was. With Windows' foreground lock active, that needs the right the
+        # App passed on (AllowSetForegroundWindow); without the lock it would
+        # prove nothing about it.
+        lock = switch["lock"]
+        require(lock["active"],
+                f"Windows' foreground lock is not active here ({lock}), so the raise cannot show the App's "
+                "foreground grant at work")
+        evidence = {"window": work.window, "foreground": win.foreground(), "homeRoute": switch["home"]["route"],
+                    "lock": lock}
+        # Visibility decides only where this desktop reports a front CEF
+        # window as visible: a CI desktop may never report one (Chromium's
+        # native occlusion), which is environmental, not the raise.
+        reported = any(entry.get("visibility") == "visible"
+                       for when in ("attach", "personal-in-front", "before-reuse")
+                       for entry in self.proof["visibility"].get(when, []))
+        try:
+            self.settled(lambda: work.evaluate("document.visibilityState") == "visible", "not visible",
+                         SETTLE_WAIT if reported else 3)
+            evidence["visibility"] = "visible"
+        except Failure:
+            evidence["visibility"] = "hidden"
+        self.visibility(work, "after-reuse")
+        evidence["desktopReportsVisible"] = reported
+        require(evidence["visibility"] == "visible" or not reported,
+                "Reopened Work's document stayed hidden although this desktop reported a front CEF window "
+                "as visible: the raise did not make the browser visible again")
+        self.case("reuse-raises-window", evidence)
 
         # Chrome's real beforeunload path needs sticky user activation. CDP's
         # userGesture is synthetic and is reported as such, not a real click.
