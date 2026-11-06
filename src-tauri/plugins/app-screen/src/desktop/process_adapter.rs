@@ -2675,6 +2675,12 @@ mod windows_tests {
                 .join(&process.profile)
         );
         eprintln!("receipt: {}", tail(&process.guard_receipt));
+        logs(process);
+    }
+
+    /// The browser's stderr (where a Rust panic message lands before an
+    /// abort) and the tail of CEF's own log.
+    fn logs(process: &Process) {
         for name in ["browser.log", "cef-native.log"] {
             eprintln!(
                 "----- {name} -----\n{}",
@@ -2840,9 +2846,11 @@ mod windows_tests {
             listing(&root)
         );
         // Reopening the same screen reuses its native browser and window.
-        process
-            .open(payload(profile, true))
-            .expect("the same screen reopens");
+        let reopened = process.open(payload(profile, true));
+        if reopened.is_err() {
+            logs(&process);
+        }
+        reopened.expect("the same screen reopens");
         for field in ["browserId", "windowId", "nativePid", "nativeCache"] {
             assert_eq!(process.opened[field], first[field], "{field}");
         }
@@ -2862,6 +2870,13 @@ mod windows_tests {
                 "receipt": receipt,
             })
         );
+        if !stopped.as_ref().is_ok_and(|stopped| *stopped)
+            || receipt
+                .as_ref()
+                .is_none_or(|receipt| require_normal_guard(receipt).is_err())
+        {
+            logs(&process);
+        }
         assert!(
             stopped.expect("the profile shuts down"),
             "no page cancelled"
