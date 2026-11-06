@@ -1,13 +1,21 @@
 use tauri::Manager;
 
-#[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+// The browser-process fixture drives the same flow on Linux (GTK WebKit home)
+// and Windows (WebView2 home); see tests/desktop/browser_process.rs.
+#[cfg(all(
+    feature = "native-browser-process-fixture",
+    any(target_os = "linux", windows)
+))]
 #[path = "../tests/desktop/browser_process.rs"]
 mod browser_process_fixture;
 #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
 #[path = "../tests/desktop/web_home.rs"]
 mod web_home_fixture;
-#[cfg(all(feature = "native-browser-process-fixture", not(target_os = "linux")))]
-compile_error!("The browser-process App fixture requires Linux.");
+#[cfg(all(
+    feature = "native-browser-process-fixture",
+    not(any(target_os = "linux", windows))
+))]
+compile_error!("The browser-process App fixture requires Linux or Windows.");
 #[cfg(all(
     feature = "native-browser-process-fixture",
     feature = "native-web-home-fixture"
@@ -53,13 +61,19 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_takosumi_push::init())?;
             #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
             web_home_fixture::start(app.handle().clone());
-            #[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-browser-process-fixture",
+                any(target_os = "linux", windows)
+            ))]
             browser_process_fixture::start(app.handle().clone());
             Ok(())
         });
     #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
     web_home_fixture::run(builder, tauri::generate_context!());
-    #[cfg(all(feature = "native-browser-process-fixture", target_os = "linux"))]
+    #[cfg(all(
+        feature = "native-browser-process-fixture",
+        any(target_os = "linux", windows)
+    ))]
     browser_process_fixture::run(builder, tauri::generate_context!());
     #[cfg(not(any(
         feature = "native-web-home-fixture",

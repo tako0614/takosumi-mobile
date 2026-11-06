@@ -22,8 +22,10 @@ tauri-build = { version = "2", features = [] }
 # ("Windows browser process"); nothing is packaged for Windows yet.
 desktop-cef = ["tauri-plugin-app-screen/desktop-process-experiment"]
 # Explicit actual-App fixture: the real home drives the per-profile CEF
-# browser (tests/desktop/browser_process.rs); never enabled by normal builds
-# or releases.
+# browser (tests/desktop/browser_process.rs) on Linux and Windows; never
+# enabled by normal builds or releases. Only Linux takes the GTK/WebKit
+# driver pieces; the Windows driver uses Tauri's own API (WebView2 through
+# eval_with_callback) and no further dependency.
 native-browser-process-fixture = ["desktop-cef", "tauri-plugin-app-screen/fixture-overrides", "tauri/custom-protocol", "native-fixture-gtk"]
 # The actual-App fixtures' GTK/WebKit driver pieces. They are Linux-only
 # optional dependencies (see the Linux target section), so nothing is

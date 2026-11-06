@@ -1,8 +1,9 @@
 //! Actual bundled WebHome -> existing shell IPC -> owned CEF browser processes.
-//! Only the explicit Linux fixture feature includes this driver. The flow
-//! below reaches the home through `Shell`, whose backend finds the home view
-//! and evaluates scripts in it: the GTK WebKit view on the GTK main loop
-//! (`browser_process_linux.rs`).
+//! Only the explicit fixture feature includes this driver. The flow below is
+//! the same on Linux and Windows; it reaches the home through `Shell`, whose
+//! backend finds the home view and evaluates scripts in it: the GTK WebKit
+//! view on the GTK main loop (`browser_process_linux.rs`) or the main window's
+//! WebView2 from a thread of its own (`browser_process_windows.rs`).
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -14,13 +15,20 @@ use tauri::{AppHandle, Manager};
 #[cfg(target_os = "linux")]
 #[path = "browser_process_linux.rs"]
 mod shell;
+#[cfg(windows)]
+#[path = "browser_process_windows.rs"]
+mod shell;
 pub use shell::{run, start};
 
 static EXIT: AtomicI32 = AtomicI32::new(1);
 type Result<T> = std::result::Result<T, String>;
 
-/// Later launches on the same App data.
+/// Later launches on the same App data. Notifications and the native file
+/// chooser are inspected on Linux only.
+#[cfg(target_os = "linux")]
 const PHASES: &[&str] = &["restart", "reset", "notify", "files"];
+#[cfg(windows)]
+const PHASES: &[&str] = &["restart", "reset"];
 
 /// The home view the flow drives. `eval` returns the script's value as JSON
 /// and fails when the script throws or has no JSON value; `pause` waits
@@ -67,13 +75,32 @@ async fn ready(view: &impl Shell, condition: &str) -> Result<()> {
     ))
 }
 /// The connection origin the runner chose: one of the Linux runner's
-/// anonymous app sites.
+/// anonymous app sites, or on Windows the runner's own local fixture site.
 fn app_origin() -> Result<String> {
     match std::env::var("TAKOSUMI_BROWSER_PROCESS_APP").as_deref() {
         Ok("excalidraw") => Ok("https://excalidraw.com".into()),
         Ok("photopea") => Ok("https://www.photopea.com".into()),
+        #[cfg(windows)]
+        Ok("local") => local_site(),
         _ => Err("Anonymous app fixture choice missing".into()),
     }
+}
+/// The Windows runner's fixture site: exactly `https://127.0.0.1:<port>`.
+#[cfg(windows)]
+fn local_site() -> Result<String> {
+    let site = std::env::var("TAKOSUMI_BROWSER_PROCESS_SITE")
+        .map_err(|_| "Local fixture site missing".to_string())?;
+    let port = site
+        .strip_prefix("https://127.0.0.1:")
+        .filter(|port| {
+            !port.is_empty()
+                && port.len() <= 5
+                && !port.starts_with('0')
+                && port.bytes().all(|digit| digit.is_ascii_digit())
+                && port.parse::<u32>().is_ok_and(|port| port <= 65535)
+        })
+        .ok_or("Local fixture site must be https://127.0.0.1:<port>")?;
+    Ok(format!("https://127.0.0.1:{port}"))
 }
 async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
     let label = serde_json::to_string(label).unwrap();
@@ -161,7 +188,7 @@ async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
     Ok(())
 }
 /// An identity of a profile's CEF cache root that a detach-and-recreate
-/// changes: its inode on Linux.
+/// changes: its inode on Linux, its creation time on Windows.
 #[cfg(target_os = "linux")]
 fn root_identity(root: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -169,20 +196,70 @@ fn root_identity(root: &Path) -> Result<u64> {
         .map_err(|error| error.to_string())?
         .ino())
 }
+#[cfg(windows)]
+fn root_identity(root: &Path) -> Result<u64> {
+    use std::os::windows::fs::MetadataExt;
+    Ok(std::fs::symlink_metadata(root)
+        .map_err(|error| error.to_string())?
+        .creation_time())
+}
 /// CEF's own liveness mark on a running profile's cache root, recorded for
 /// the observer: the `SingletonLock` link target on Linux (it names the
-/// browser's pid).
+/// browser's pid); on Windows whether Chromium holds its `lockfile` (an
+/// exclusive open fails with a sharing violation).
 #[cfg(target_os = "linux")]
 fn profile_lock(root: &Path) -> Value {
     std::fs::read_link(root.join("SingletonLock"))
         .map(|target| Value::String(target.to_string_lossy().into_owned()))
         .unwrap_or(Value::Null)
 }
-/// Whether the refused clear left the running profile's liveness mark. Linux
-/// records the `SingletonLock` target and the observer checks it.
+#[cfg(windows)]
+fn profile_lock(root: &Path) -> Value {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    Value::Bool(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("lockfile"))
+            .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)),
+    )
+}
+/// Whether the refused clear left the running profile's liveness mark: on
+/// Windows Chromium must still hold its `lockfile`. (Linux records the
+/// `SingletonLock` target and the observer checks it.)
 #[cfg(target_os = "linux")]
 fn still_marked_live(_root: &Path) -> bool {
     true
+}
+#[cfg(windows)]
+fn still_marked_live(root: &Path) -> bool {
+    profile_lock(root) == Value::Bool(true)
+}
+/// Windows: the home's clear removed only Work's CEF cache root; Personal's
+/// stays. Both browsers are closed at this point of the relaunch.
+#[cfg(windows)]
+fn only_work_cleared(app: &AppHandle, connections: &Value) -> Result<()> {
+    let data = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("browser-process-experiment");
+    let root = |name: &str| {
+        connections
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == name))
+            .and_then(|item| item["profile"].as_str())
+            .map(|profile| data.join(profile).join("cef-profiles"))
+            .ok_or_else(|| format!("Missing saved {name}"))
+    };
+    if root("Work")?.symlink_metadata().is_ok() {
+        return Err("The home's clear left Work's CEF profile".into());
+    }
+    if !root("Personal")?.is_dir() {
+        return Err("The home's clear of Work removed Personal's CEF profile".into());
+    }
+    Ok(())
 }
 /// A later launch on the same App data (`kind` is restart or reset). The saved
 /// home reopens each profile; for reset, Work's site data is first cleared
@@ -211,6 +288,11 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         tap_in_row(view, "Work", "保存データを消去").await?;
         ready(view,"document.body.innerText.includes('Workのサイトデータを消去しました。') && !document.querySelector('.web-error') && !document.querySelector('.web-clear')").await?;
         println!("reset: Work site data cleared through the home");
+        #[cfg(windows)]
+        {
+            only_work_cleared(app, &connections)?;
+            println!("reset: only Work's CEF profile was removed");
+        }
     }
     open_saved(view, app, "Work", 1).await?;
     println!("{kind}: Work reopened");
@@ -260,6 +342,8 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
     }
     #[cfg(target_os = "linux")]
     let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalSingleton":personal_lock});
+    #[cfg(windows)]
+    let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalLockHeld":personal_lock});
     std::fs::write(
         case.join(format!("app-browser-process-{kind}-open.json")),
         serde_json::to_vec_pretty(&marker).unwrap(),
@@ -343,7 +427,14 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         .iter()
         .find(|process| process["profile"] == profile)
         .ok_or("No Work process")?;
-    let open = serde_json::json!({"connections":connections,"processes":before});
+    #[allow(unused_mut)]
+    let mut open = serde_json::json!({"connections":connections,"processes":before});
+    // Windows: the home's own top-level window, which the runner switches
+    // back to through the OS (the owner's decision: no in-browser home button).
+    #[cfg(windows)]
+    {
+        open["homeWindow"] = shell::home_window(app)?;
+    }
     std::fs::write(
         case.join("app-browser-process-open.json"),
         serde_json::to_vec_pretty(&open).unwrap(),
