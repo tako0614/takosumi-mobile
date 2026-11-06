@@ -96,10 +96,29 @@ jobs:
         run: |
           swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests 2>&1 | tee "$RUNNER_TEMP/app-screen-swift-test.log"
           grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/app-screen-swift-test.log"
+      # The image's mirror has crawled for most of the job's budget; bound one
+      # attempt, then retry once against archive.ubuntu.com (sources rewritten
+      # only for the retry). The package list is unchanged.
       - name: System libraries for Tauri on Linux
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+          packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev"
+          attempt() {
+            # update and install within $1 seconds, apt retrying each download
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends $packages"
+          }
+          if ! attempt 200; then
+            echo "::warning::apt-get through the image's mirror failed or took over 200 s; retrying once against archive.ubuntu.com"
+            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [[ -f "$sources" ]]; then
+                sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+              fi
+            done
+            # An attempt ended during unpacking leaves dpkg to finish first.
+            sudo dpkg --configure -a
+            attempt 200
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -227,11 +246,30 @@ jobs:
         working-directory: takosumi-mobile
       - run: bun run build
         working-directory: takosumi-mobile
+      # The image's mirror has crawled for most of the job's budget; bound one
+      # attempt, then retry once against archive.ubuntu.com (sources rewritten
+      # only for the retry). The package list is unchanged.
       - name: Linux desktop SDK and isolated test tools
         if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11
+          packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11"
+          attempt() {
+            # update and install within $1 seconds, apt retrying each download
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends $packages"
+          }
+          if ! attempt 200; then
+            echo "::warning::apt-get through the image's mirror failed or took over 200 s; retrying once against archive.ubuntu.com"
+            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [[ -f "$sources" ]]; then
+                sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+              fi
+            done
+            # An attempt ended during unpacking leaves dpkg to finish first.
+            sudo dpkg --configure -a
+            attempt 200
+          fi
       - name: Shared Web-home confirmation in isolated Chromium
         if: runner.os == 'Linux'
         timeout-minutes: 2
