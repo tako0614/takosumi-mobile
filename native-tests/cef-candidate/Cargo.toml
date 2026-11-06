@@ -13,20 +13,28 @@ fixture-inspection = []
 
 [dependencies]
 cef = { version = "=154.5.0", default-features = false, features = ["linux-x11"] }
-libc = "0.2"
 serde_json = "1"
 tauri = { version = "=2.11.5", default-features = false }
 tauri-plugin-app-screen = { path = "../../src-tauri/plugins/app-screen", default-features = false, features = ["browser-process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Linux and Windows (first candidate). On Windows build this bin alone with
+# `--bin takosumi-cef-browser-process`: the guard below and the standalone
+# `takosumi-cef-candidate` (src/main.rs) are Linux only and refuse to compile
+# elsewhere, so no inert supervisor can be staged by mistake.
 [[bin]]
 name = "takosumi-cef-browser-process"
 path = "src/process_main.rs"
 
-# Product supervisor for one browser process. Its self-tests must run the
-# guard as a separate single-threaded process, so libtest is not used.
+# Product supervisor for one browser process (src/guard_main.rs). It needs
+# Linux pidfds, signalfd and the child subreaper; src/guard_entry.rs compiles
+# it only for Linux. Its self-tests must run the guard as a separate
+# single-threaded process, so libtest is not used.
 [[bin]]
 name = "takosumi-browser-guard"
-path = "src/guard_main.rs"
+path = "src/guard_entry.rs"
 harness = false
 
 [profile.dev]
