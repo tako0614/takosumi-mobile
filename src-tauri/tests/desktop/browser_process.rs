@@ -447,7 +447,8 @@ async fn flow(app: &AppHandle) -> Result<()> {
         serde_json::to_vec_pretty(&partial).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(&case, "request-final-exit").await?;
+    // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
+    checkpoint_within(&case, "request-final-exit", Duration::from_secs(60)).await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
         b"{\"passed\":true}\n",

@@ -348,14 +348,16 @@ async function filesProbe(pages) {
     fileURLToPath(new URL('.',import.meta.url)),output,'excalidraw',filesNonce]));
   assert.deepEqual(await listing(),proof.files.personalDownloadsBefore,"Personal's Downloads must not change");
   // Not a separated surface: the portal backend keeps one recent-files list
-  // for the desktop session, not per connection. Record it; Personal's own
-  // data must still hold no trace of Work's files.
-  const recent=async file=>{try{return await readFile(file,'utf8');}catch(e){if(e.code==='ENOENT')return '';throw e;}};
+  // for the desktop session, not per connection (Personal's chooser would see
+  // it). Record that list; the only per-profile claim checked is that nothing
+  // wrote Work's files into Personal's own profile data.
+  const recent=async file=>{try{return {file,exists:true,text:await readFile(file,'utf8')};}catch(e){if(e.code==='ENOENT')return {file,exists:false,text:''};throw e;}};
   const names=[path.basename(input),path.basename(output)];
-  const sessionRecent=process.env.XDG_DATA_HOME?await recent(path.join(process.env.XDG_DATA_HOME,'recently-used.xbel')):'';
-  proof.files.sessionRecentHasWorkFiles=names.map(name=>sessionRecent.includes(name));
-  const personalRecent=await recent(path.join(personal.process.directory,'data','recently-used.xbel'));
-  assert(!names.some(name=>personalRecent.includes(name)),"Personal's own data must not list Work's files");
+  const shared=process.env.XDG_DATA_HOME?await recent(path.join(process.env.XDG_DATA_HOME,'recently-used.xbel')):{file:null,exists:false,text:''};
+  const own=await recent(path.join(personal.process.directory,'data','recently-used.xbel'));
+  proof.files.sessionRecent={file:shared.file,exists:shared.exists,workFiles:names.map(name=>shared.text.includes(name))};
+  proof.files.personalRecent={file:own.file,exists:own.exists,workFiles:names.map(name=>own.text.includes(name))};
+  assert(!proof.files.personalRecent.workFiles.some(Boolean),"Nothing may write Work's files into Personal's profile data");
   proof.files.savedMs=Date.now()-proof.files.started;
   await closePersonalAfterRelaunch(personal,'files');
   proof.passed=true;
@@ -427,11 +429,13 @@ async function openPopupForQuit(page) {
   let target;
   await settled(async()=>{target=(await page.c.command('Target.getTargets')).targetInfos.find(t=>t.type==='page'&&t.openerId===page.target.targetId);return Boolean(target);},'Popup did not appear before the final quit');
   const session=(await page.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
-  await popupLoaded(async expression=>{
+  const evaluate=async expression=>{
     const value=await page.c.command('Runtime.evaluate',{expression,returnByValue:true},session);
     assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
-  },url);
-  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,loaded:url};
+  };
+  await popupLoaded(evaluate,url);
+  const observed=await evaluate("({navigation:performance.getEntriesByType('navigation')[0]?.name??null,href:location.href,ready:document.readyState})");
+  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,requested:url,observed};
 }
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
