@@ -628,8 +628,9 @@ effect there. On Windows:
   top-level (`GA_ROOT`) HWND of that frame, the window a person sees and
   switches to and the one an App would focus or pass to Win32 in the next
   step; on Linux it stays the X11 window CEF reports. Reopening a live screen
-  raises that same top-level window: it restores it when minimized, shows it
-  and calls `SetForegroundWindow` through minimal `extern "system"` user32
+  raises that same top-level window: it restores it when minimized, shows it,
+  moves it to the top of the Z-order (`SetWindowPos` with `HWND_TOP`, since
+  W3) and calls `SetForegroundWindow` through minimal `extern "system"` user32
   declarations (the CEF wrapper already links user32). Windows hands the
   foreground only to a process allowed to take it, so an App should call
   `AllowSetForegroundWindow` with the browser's pid before sending the Open
@@ -1091,7 +1092,7 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
 | `home-by-window-switch` | with Personal's window in front, an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
-| `reuse-raises-window` | with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal. Visibility decides only where the desktop reported some front CEF window as visible before the reuse: then Work's document must become visible (a product defect otherwise); a desktop that never reports one (Chromium's native occlusion on a CI desktop) leaves it as evidence |
+| `reuse-raises-window` | with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal. Visibility decides only where the desktop reported some front CEF window as visible before the reuse: then Work's document must become visible (a product defect otherwise); a desktop that never reports one (Chromium's native occlusion on a CI desktop) leaves it as evidence. The Z-order of the home, Work and Personal before and after the reuse, and Personal's visibility after it, are recorded |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
 | `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
@@ -1157,6 +1158,23 @@ reused and in front with its owner Work's browser), then failed
 desktop ever reports a CEF page as visible was not recorded then. In the
 same run `cef-windows` failed the W2 reuse test as described under
 "Browser stop race".
+
+**Second CI run (W3).** Run 42298520970 (head `1b21f63`): `cef-windows`
+passed again (the stop-race fix: the W2 reuse ended with a normal receipt)
+and the Linux GTK fixture passed; `cef-windows-app` failed
+`reuse-raises-window` under the visibility rule. Both browser windows opened
+at the same rectangle `[10,10,1014,710]`, so Personal (opened second) covered
+Work: at attach Work was `hidden` and Personal `visible`, so this desktop does
+report visibility (Chromium's native occlusion works there). After the
+reuse, Work's window was the foreground window, focused and not
+always-on-top, yet its page stayed `hidden`. The raise had only shown the
+window and called `SetForegroundWindow`; it now also moves the window to the
+top of the Z-order (`SetWindowPos`, `HWND_TOP`, no move or size) before
+asking for the foreground, a real reorder that Chromium's occlusion tracker
+recomputes on. A refused move is reported like a refused foreground
+change. The observer now records the Z-order and Personal's visibility
+after the reuse, so a further failure shows whether Work was not reordered
+or the reorder was not recomputed.
 
 **2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
 the Linux host. For `x86_64-pc-windows-msvc`, the App type-checks and passes
