@@ -26,6 +26,7 @@ import {
   mkdirSync,
   openSync,
   closeSync,
+  constants,
   readFileSync,
   readSync,
   readdirSync,
@@ -141,8 +142,10 @@ function main() {
   const cef = realpathSync(options.cef);
   const bin = realpathSync(options.bin);
   const stage = path.join(options.out, "cef");
-  if (existsSync(stage) || isLink(stage)) {
-    usage(`${stage} already exists; remove it yourself or choose another --out`);
+  for (const existing of [stage, path.join(options.out, "stage.json")]) {
+    if (existsSync(existing) || isLink(existing)) {
+      usage(`${existing} already exists; remove it yourself or choose another --out`);
+    }
   }
   if (spawnSync("strip", ["--version"], { stdio: "ignore" }).status !== 0) {
     usage("binutils strip is required");
@@ -191,7 +194,7 @@ function main() {
       }
       chmodSync(target, 0o755);
     } else if (options.copy) {
-      copyFileSync(source, target);
+      copyFileSync(source, target, constants.COPYFILE_EXCL);
       chmodSync(target, 0o644);
       method = "copy";
     } else {
@@ -211,7 +214,11 @@ function main() {
     notStaged: skipped,
     files,
   };
-  writeFileSync(path.join(options.out, "stage.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  // A new file only: never an existing manifest or a link planted in its place.
+  writeFileSync(path.join(options.out, "stage.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o644,
+  });
 
   const total = files.reduce((sum, file) => sum + file.size, 0);
   const written = files.filter((file) => file.method !== "link").reduce((sum, file) => sum + file.size, 0);

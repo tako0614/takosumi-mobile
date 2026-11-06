@@ -31,9 +31,10 @@
           "libxrandr2"
         ],
         "files": {
-          "/etc/apparmor.d/takosumi-cef-browser": "linux/takosumi-cef-browser.apparmor"
+          "/usr/share/takosumi/apparmor/takosumi-cef-browser": "linux/takosumi-cef-browser.apparmor"
         },
-        "postInstallScript": "linux/postinst.sh"
+        "postInstallScript": "linux/postinst.sh",
+        "postRemoveScript": "linux/postrm.sh"
       }
     }
   }
