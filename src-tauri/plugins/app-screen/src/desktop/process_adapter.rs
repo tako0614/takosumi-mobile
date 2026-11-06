@@ -2875,14 +2875,18 @@ mod windows_tests {
         // App process's end does.
         drop(parent);
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut outlived = Vec::new();
         for (pid, handle) in &handles {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let ended = crate::windows_job::wait_any(&[handle.as_raw_handle()], Some(remaining));
-            assert!(
-                matches!(ended, Ok(Some(0))),
-                "process {pid} outlived the App's job: {ended:?}"
-            );
+            if !matches!(ended, Ok(Some(0))) {
+                outlived.push(format!("{pid} {:?} {ended:?}", windows::image_of(*pid)));
+            }
         }
+        assert!(
+            outlived.is_empty(),
+            "processes outlived the App's job: {outlived:?}"
+        );
         assert!(process.child.try_wait().unwrap().is_some());
         assert!(
             process.normal_guard().is_err(),
