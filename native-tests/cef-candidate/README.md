@@ -240,6 +240,25 @@ python3 -B native-tests/desktop/browser_process.py --binary src-tauri/target/deb
 ```
 
 Run `--app photopea` in another fresh case for the second anonymous origin.
+
+`takosumi-browser-guard` (`src/guard_main.rs`) is the product supervisor that
+replaces the fixture's Python guard for the Linux-first per-profile release. It
+keeps `guard.py`'s arguments and receipt: an exclusive 0600 receipt, its own
+process group, a pidfd probe, the child subreaper, SIGTERM on parent death,
+pidfds retained only after a stable-ancestry re-check, the bounded drain
+(0.5 s natural, 0.5 s SIGTERM, 2 s SIGKILL) and ECHILD as the completion proof.
+It does not cap the browser's lifetime, and while the browser runs it blocks on
+a signalfd with a 250 ms observation tick instead of polling every 20 ms. The
+adapter runs a guard path ending in `.py` with `python3 -B` and executes any
+other guard directly; the fixture runner still passes `guard.py`, so the Rust
+guard is not yet qualified in the actual App run. Its self-tests use stand-in
+children only and never start CEF:
+
+```bash
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
+```
+
 The runner needs the existing Python pidfd/subreaper guard, Node, Xvfb, D-Bus,
 XRes, xdotool and ImageMagick; it installs nothing. It supplies fresh HOME/XDG
 directories and explicitly enables PID-attested loopback inspection ports.
