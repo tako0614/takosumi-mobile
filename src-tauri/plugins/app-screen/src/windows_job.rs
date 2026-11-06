@@ -28,8 +28,15 @@ use std::{
 /// The environment variable that names a guard's stop event. The App sets
 /// it for the guard; the guard removes it from the browser's environment.
 pub const STOP_EVENT_ENV: &str = "TAKOSUMI_BROWSER_GUARD_STOP_EVENT";
-/// `CreateProcess` flag: a console program gets a console without a window.
+/// `CreateProcess` flag: a console program gets a console without a window
+/// (and so a windowless console host, `conhost.exe`, as its child). The guard
+/// starts the browser this way: CEF's helper processes, console programs
+/// too, then share that one hidden console instead of each getting a new one.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// `CreateProcess` flag: a console program gets no console at all, and so no
+/// console host. The App starts the guard this way; its standard handles
+/// are the pipes and log file passed explicitly.
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;

@@ -13,7 +13,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdin},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread::JoinHandle,
     time::Instant,
 };
@@ -175,8 +178,14 @@ fn query(pid: u32) -> Option<OwnedHandle> {
 }
 
 /// The full Win32 path of a process's executable image.
+#[cfg(test)]
 pub(super) fn image_of(pid: u32) -> Option<PathBuf> {
-    let process = query(pid)?;
+    image(&query(pid)?)
+}
+
+/// The full Win32 path of the executable image of the process `process`
+/// holds open.
+fn image(process: &OwnedHandle) -> Option<PathBuf> {
     let mut buffer = vec![0u16; 32_768];
     let mut size = buffer.len() as u32;
     // SAFETY: a live handle and a buffer of `size` UTF-16 units.
@@ -205,14 +214,18 @@ fn created(process: Handle) -> Option<u64> {
 /// running exactly `program`: Windows records the guard as its parent, it
 /// was created after the guard (so the record is not one left by an ended
 /// process whose id the guard reused), and its image path is `program`,
-/// compared exactly. The guard is unreaped, so its id names it.
+/// compared exactly. The native process is opened first and held: while
+/// this handle is open its id cannot name another process, so the parent
+/// snapshot taken after opening, the creation time and the image all
+/// concern that same process (an ended one is not in the snapshot). The
+/// guard is unreaped, so its id and handle name it.
 pub(super) fn native_owned(native_pid: u32, guard: &Child, program: &Path) -> bool {
-    if parent_of(native_pid) != Some(guard.id()) {
-        return false;
-    }
     let Some(native) = query(native_pid) else {
         return false;
     };
+    if parent_of(native_pid) != Some(guard.id()) {
+        return false;
+    }
     let (Some(born), Some(guard_born)) = (
         created(native.as_raw_handle().cast()),
         created(guard.as_raw_handle().cast()),
@@ -220,7 +233,7 @@ pub(super) fn native_owned(native_pid: u32, guard: &Child, program: &Path) -> bo
         return false;
     };
     born >= guard_born
-        && image_of(native_pid).as_deref().map(Path::as_os_str) == Some(program.as_os_str())
+        && image(&native).as_deref().map(Path::as_os_str) == Some(program.as_os_str())
 }
 
 /// The cache path the browser reported, compared exactly with the one the
@@ -306,6 +319,9 @@ pub(super) struct Input {
     pending: bool,
     /// Keeps the pipe handle valid for cancelling while the thread writes.
     pipe: Arc<ChildStdin>,
+    /// Set before a pending write is cancelled, so the thread does not go
+    /// on with the rest of a partly written request.
+    closing: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -313,15 +329,15 @@ impl Input {
     pub(super) fn new(stdin: ChildStdin) -> io::Result<Self> {
         let pipe = Arc::new(stdin);
         let writer = pipe.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let stop = closing.clone();
         let (requests, received) = mpsc::channel::<Vec<u8>>();
         let (report, done) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("browser-process-writer".into())
             .spawn(move || {
                 for bytes in received {
-                    let result = (&*writer)
-                        .write_all(&bytes)
-                        .and_then(|()| (&*writer).flush());
+                    let result = write_all_unless(&writer, &bytes, &stop);
                     let failed = result.is_err();
                     if report.send(result).is_err() || failed {
                         break;
@@ -333,6 +349,7 @@ impl Input {
             done,
             pending: false,
             pipe,
+            closing,
             thread: Some(thread),
         })
     }
@@ -371,6 +388,28 @@ impl Input {
     }
 }
 
+/// Write all of `bytes` unless the App's end is closing.
+fn write_all_unless(writer: &ChildStdin, mut bytes: &[u8], closing: &AtomicBool) -> io::Result<()> {
+    let mut writer = writer;
+    while !bytes.is_empty() {
+        if closing.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "Browser pipe closed",
+                ))
+            }
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "Browser pipe write timed out")
 }
@@ -383,6 +422,7 @@ impl Drop for Input {
         // The thread ends once its channel closes and any write returns.
         self.requests.take();
         if self.pending {
+            self.closing.store(true, Ordering::Release);
             // SAFETY: `pipe` keeps the handle open for this call; cancelling
             // only ends the write in progress on it (if any) with an error.
             unsafe {

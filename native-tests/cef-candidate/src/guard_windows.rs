@@ -11,9 +11,14 @@
 //!
 //! The guard creates a kill-on-close Job Object of its own (no breakaway) and
 //! starts the browser in it before it runs any code (created suspended with
-//! no console window, assigned, resumed), passing its own standard input,
-//! output and error: the App's control pipe, reply pipe and log. Every
-//! process the browser starts is then in the guard's job. It waits for the
+//! a console that has no window, assigned, resumed), passing its own standard
+//! input, output and error: the App's control pipe, reply pipe and log. Every
+//! process the browser starts is then in the guard's job, and so is the
+//! windowless console host (`conhost.exe`) Windows starts for the browser's
+//! console: CEF's helpers are console programs too and share that console
+//! rather than each getting a new one. `observed` counts that host, and the
+//! drain waits for it like any other process in the job. The App starts the
+//! guard itself detached from any console, so it has no console host. It waits for the
 //! browser to exit or for a stop request: the App sets a named event it
 //! created and passed in `TAKOSUMI_BROWSER_GUARD_STOP_EVENT` (removed from
 //! the browser's environment). There is no lifetime cap and no polling while
@@ -86,6 +91,19 @@ pub(super) fn main() -> ExitCode {
             ExitCode::from(code)
         }
     }
+}
+
+/// Self-test fault injection (`TAKOSUMI_GUARD_FAULT_<POINT>` set in the guard
+/// under test), compiled into the self-test binary only; in a release build
+/// every call is a constant `false`.
+#[cfg(test)]
+fn injected(point: &str) -> bool {
+    std::env::var_os(format!("TAKOSUMI_GUARD_FAULT_{point}")).is_some()
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn injected(_point: &str) -> bool {
+    false
 }
 
 /// A short, stable error name for the receipt; never a path or argv.
@@ -243,18 +261,37 @@ impl Run {
     /// The bounded drain every run takes, however it ended. Returns whether
     /// the job was proven empty after the browser exited.
     fn drain(&mut self) -> bool {
-        if self.settle_within(NATURAL) {
+        if self.natural() {
             return true;
         }
-        // Count what is about to be terminated before terminating it.
-        let active = self.active().unwrap_or(0);
+        // Count what is about to be terminated before terminating it. A job
+        // that emptied just as the natural budget ran out has nothing left
+        // to end: no termination, and no forced cleanup is recorded.
+        let active = self.active();
+        if active == Some(0) {
+            return self.settled() || self.settle_within(FORCED);
+        }
         match self.job.terminate(FORCED_EXIT) {
-            Ok(()) => self.forced += active.max(1),
+            Ok(()) => self.forced += active.unwrap_or(0).max(1),
             Err(error) => {
                 self.cleanup_errors.insert(fault(&error));
             }
         }
         self.settle_within(FORCED)
+    }
+
+    /// The natural part of the drain. The self-test build can instead let
+    /// the budget run out exactly as the job empties (`LATE_EMPTY`), which
+    /// timing alone cannot produce on demand.
+    fn natural(&mut self) -> bool {
+        if injected("LATE_EMPTY") {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.active() != Some(0) && Instant::now() < deadline {
+                std::thread::sleep(DRAIN_TICK);
+            }
+            return false;
+        }
+        self.settle_within(NATURAL)
     }
 }
 

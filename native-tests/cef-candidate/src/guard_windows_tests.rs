@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::mpsc;
+use tauri_plugin_app_screen::windows_job::DETACHED_PROCESS;
 
 pub(crate) const AS_GUARD: &str = "TAKOSUMI_BROWSER_GUARD_SELF_TEST_AS_GUARD";
 const STANDIN: &str = "--standin";
@@ -87,6 +88,7 @@ const TESTS: &[Test] = tests![
     a_non_zero_browser_exit_is_reported_and_fails,
     the_browser_keeps_the_pipes_but_not_the_stop_event,
     a_lingering_descendant_is_terminated_with_the_job,
+    a_job_that_empties_as_the_natural_budget_ends_is_not_forced,
     a_stop_request_drains_a_running_browser,
     ending_the_apps_job_ends_the_guard_and_the_browser,
     a_pending_stop_starts_no_browser,
@@ -178,18 +180,77 @@ impl Case {
         command
     }
 
-    /// Started inside the case's job, as the App starts it.
+    /// Started inside the case's job and detached from any console, as the
+    /// App starts it.
     fn start(&self, mut command: Command) -> Child {
-        spawn_in(self.job.as_ref().unwrap(), &mut command, CREATE_NO_WINDOW).unwrap()
+        spawn_in(self.job.as_ref().unwrap(), &mut command, DETACHED_PROCESS).unwrap()
     }
 
     fn receipt(&self) -> Value {
         serde_json::from_slice(&std::fs::read(&self.receipt).unwrap()).unwrap()
     }
 
-    /// Processes still in the App's job (the guard and everything below it).
-    fn active(&self) -> u32 {
-        self.job.as_ref().unwrap().processes().unwrap().1
+    /// Nothing of the case is left in the App's job (the guard and everything
+    /// below it). Called after the guard's exit was observed and its receipt
+    /// proved its own job empty, so a process still counted can only be one
+    /// whose teardown is finishing. That takes milliseconds; 3 s allows for a
+    /// loaded runner yet stays far below any stand-in's own lifetime (a
+    /// sleeping stand-in runs 60 s), so no real survivor passes. A failure
+    /// names every process still in the job with its image.
+    fn assert_nothing_left(&self) {
+        let job = self.job.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let active = job.processes().unwrap().1;
+            if active == 0 {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let left: Vec<String> = job
+                    .process_ids()
+                    .unwrap()
+                    .into_iter()
+                    .map(|pid| format!("{pid} {:?}", image_of(pid)))
+                    .collect();
+                panic!("{active} processes are left in the App's job: {left:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// The executable image of a process, for failure messages.
+fn image_of(pid: u32) -> Option<String> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn QueryFullProcessImageNameW(
+            process: *mut c_void,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let mut buffer = vec![0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    // SAFETY: plain calls; the handle is checked, used for one query with a
+    // buffer of `size` units, and closed.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let queried = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size);
+        CloseHandle(process);
+        (queried != 0).then(|| {
+            std::ffi::OsString::from_wide(&buffer[..size as usize])
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 }
 
@@ -269,7 +330,7 @@ fn normal_exit_writes_a_complete_normal_receipt() {
             "nonFatalErrors",
         ])
     );
-    assert_eq!(case.active(), 0);
+    case.assert_nothing_left();
 }
 
 fn a_non_zero_browser_exit_is_reported_and_fails() {
@@ -323,7 +384,25 @@ fn a_lingering_descendant_is_terminated_with_the_job() {
     assert!(proof["forcedCleanup"].as_u64().unwrap() >= 1, "{proof}");
     assert!(proof["observed"].as_u64().unwrap() >= 2, "{proof}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
-    assert_eq!(case.active(), 0, "the descendant is gone");
+    // The descendant sleeps 60 s unless the job ended it.
+    case.assert_nothing_left();
+}
+
+fn a_job_that_empties_as_the_natural_budget_ends_is_not_forced() {
+    // The guard under test lets its natural budget run out only once the job
+    // is empty: the drain must then find nothing to terminate.
+    let case = Case::new("late");
+    let mut command = case.guard(&["exit", "0"]);
+    command.env("TAKOSUMI_GUARD_FAULT_LATE_EMPTY", "1");
+    let mut guard = case.start(command);
+    let status = finish(&mut guard, Duration::from_secs(20));
+    let proof = case.receipt();
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(clean(&proof), "{proof}");
+    assert_eq!(proof["rootExit"], 0);
+    assert_eq!(proof["complete"], true);
+    assert_eq!(proof["forcedCleanup"], 0, "nothing was terminated");
+    case.assert_nothing_left();
 }
 
 fn a_stop_request_drains_a_running_browser() {
@@ -343,7 +422,7 @@ fn a_stop_request_drains_a_running_browser() {
     assert_eq!(proof["rootExit"], FORCED_EXIT);
     assert!(proof["forcedCleanup"].as_u64().unwrap() >= 1, "{proof}");
     assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
-    assert_eq!(case.active(), 0);
+    case.assert_nothing_left();
 }
 
 fn ending_the_apps_job_ends_the_guard_and_the_browser() {

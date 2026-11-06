@@ -84,21 +84,23 @@ fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
 }
 /// Windows has no parent-death signal. Every guard starts inside one Job
 /// Object this thread owns: created suspended, assigned, then resumed, so it
-/// runs no code outside the job, and with no console window. The job ends
+/// runs no code outside the job, and detached from any console (no console
+/// window and no console host process; its standard handles are the pipes
+/// and log passed explicitly). The job ends
 /// every guard and browser in it when its last handle closes: when the App
 /// process ends, however it ends, or when every requester is gone (the App
 /// state was dropped, or a test ended). Spawning from one thread also keeps
 /// one guard's pipe ends out of another's inherited handles.
 #[cfg(windows)]
 fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
-    use crate::windows_job::{spawn_in, Job, CREATE_NO_WINDOW};
+    use crate::windows_job::{spawn_in, Job, DETACHED_PROCESS};
     let job = Job::kill_on_close().map_err(failure)?;
     let (send, requests) = mpsc::channel::<SpawnRequest>();
     std::thread::Builder::new()
         .name("browser-process-parent".into())
         .spawn(move || {
             for (mut command, reply) in requests {
-                let _ = reply.send(spawn_in(&job, &mut command, CREATE_NO_WINDOW));
+                let _ = reply.send(spawn_in(&job, &mut command, DETACHED_PROCESS));
             }
             drop(job);
         })
@@ -2493,6 +2495,52 @@ mod windows_tests {
     }
 
     #[test]
+    fn dropping_the_writer_during_a_blocked_write_closes_the_pipe() {
+        // The reader sleeps without reading, then reads its input to the end
+        // and prints how much arrived. A write that was cancelled when the
+        // App's end was dropped leaves part of the 4 MiB, and the end of
+        // input follows; a write that went on would deliver all of it.
+        let mut child = Command::new("python")
+            .args([
+                "-I",
+                "-c",
+                "import sys,time\ntime.sleep(3)\nprint(len(sys.stdin.buffer.read()),flush=True)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = windows::Input::new(child.stdin.take().unwrap()).unwrap();
+        let size = 4 << 20;
+        let blocked = input.write_until(
+            &vec![b'x'; size],
+            Instant::now() + Duration::from_millis(300),
+        );
+        drop(input);
+        let mut stdout = child.stdout.take().unwrap();
+        let (send, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = send.send(text);
+        });
+        let text = received.recv_timeout(Duration::from_secs(30));
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(blocked.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let delivered: usize = text
+            .expect("the reader saw the end of its input in time")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            delivered < size,
+            "the blocked write was not cancelled: {delivered}"
+        );
+    }
+
+    #[test]
     fn a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data() {
         use std::os::windows::fs::OpenOptionsExt;
         let root = std::env::temp_dir().join(format!("sumi-clear-{}", std::process::id()));
@@ -2656,6 +2704,42 @@ mod windows_tests {
         process
     }
 
+    /// CEF helper processes of the browser: its children running the
+    /// browser's own executable. The browser's console host (`conhost.exe`,
+    /// a child of every console program started with a hidden console) is
+    /// not one. Waits up to 30 s for the first (the renderer of the page, if
+    /// not already the GPU or a utility process).
+    fn cef_helpers(native_pid: u32, program: &Path) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let helpers = windows::tree_of(native_pid)
+                .into_iter()
+                .filter(|pid| {
+                    *pid != native_pid
+                        && windows::parent_of(*pid) == Some(native_pid)
+                        && windows::image_of(*pid).as_deref() == Some(program)
+                })
+                .collect::<Vec<_>>();
+            if !helpers.is_empty() || Instant::now() >= deadline {
+                return helpers;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The entries of a directory, for a failure message.
+    fn listing(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| {
+                        Some(entry.ok()?.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     #[ignore = "needs the built Windows guard and browser (see the module comment)"]
     fn windows_adapter_opens_reuses_and_shuts_down_a_profile() {
@@ -2682,7 +2766,20 @@ mod windows_tests {
                 .to_str()
         );
         let tree = windows::tree_of(process.child.id());
-        println!("guard tree while open: {tree:?}");
+        let helpers = cef_helpers(native_pid, &located.program);
+        println!("guard tree while open: {tree:?}; CEF helpers: {helpers:?}");
+        assert!(
+            !helpers.is_empty(),
+            "no CEF helper below the browser: {tree:?}"
+        );
+        // CEF's process singleton holds the profile's lockfile while the
+        // browser runs: what clear_profile's refusal relies on.
+        let root = process.directory.join("cef-profiles");
+        assert!(
+            windows::singleton_live(&root),
+            "the live profile's lockfile is not held: {:?}",
+            listing(&root)
+        );
         // Reopening the same screen reuses its native browser and window.
         process
             .open(payload(profile, true))
@@ -2716,8 +2813,10 @@ mod windows_tests {
             receipt["kernelNoChildren"], true,
             "the guard's job is empty"
         );
+        // The helpers are the browser's children and cannot break away from
+        // its job, so the job counted them besides the browser.
         assert!(
-            receipt["observed"].as_u64().unwrap() >= 2,
+            receipt["observed"].as_u64().unwrap() > helpers.len() as u64,
             "CEF's helper processes were in the guard's job"
         );
         assert!(process
@@ -2725,6 +2824,11 @@ mod windows_tests {
             .try_wait()
             .unwrap()
             .is_some_and(|status| status.success()));
+        assert!(
+            !windows::singleton_live(&root),
+            "the ended profile's lockfile is released: {:?}",
+            listing(&root)
+        );
         let runtime = process.runtime.clone();
         drop(process);
         assert!(
@@ -2743,12 +2847,16 @@ mod windows_tests {
         let profile = "22222222-2222-4222-8222-222222222222";
         let mut process = opened(&case, &located, &parent, profile);
         let native_pid = process.opened["nativePid"].as_u64().unwrap() as u32;
+        let helpers = cef_helpers(native_pid, &located.program);
         let tree = windows::tree_of(process.child.id());
-        println!("guard tree before the App's job ends: {tree:?}");
+        println!("guard tree before the App's job ends: {tree:?}; CEF helpers: {helpers:?}");
         assert!(tree.contains(&native_pid), "{tree:?}");
-        assert!(tree.len() >= 3, "guard, browser and a CEF helper: {tree:?}");
-        // A short-lived CEF helper may already have ended by now; the guard
-        // and the browser itself must still be there.
+        assert!(
+            !helpers.is_empty(),
+            "no CEF helper below the browser: {tree:?}"
+        );
+        // A short-lived CEF helper may already have ended by now; the guard,
+        // the browser itself and at least one helper must still be there.
         let handles = tree
             .iter()
             .filter_map(|pid| windows::waitable(*pid).map(|handle| (*pid, handle)))
@@ -2759,6 +2867,10 @@ mod windows_tests {
                 "process {pid} is not open"
             );
         }
+        assert!(
+            handles.iter().any(|(held, _)| helpers.contains(held)),
+            "no CEF helper is open: {helpers:?}"
+        );
         // The App side ends: its spawner closes the App's Job Object, as the
         // App process's end does.
         drop(parent);

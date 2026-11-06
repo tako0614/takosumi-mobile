@@ -450,7 +450,7 @@ jobs:
         run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP"
       # The Windows guard (Job Objects) with stand-in browsers: the self-test
       # binary re-executes itself as the guard and as the browser. A selection
-      # that runs fewer than all nine cases fails.
+      # that runs fewer than all ten cases fails.
       - name: Guard self-tests (Windows)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
@@ -460,7 +460,7 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
           cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 9 passed; 0 failed$' -Quiet)) { throw 'Not all nine guard self-tests ran' }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 10 passed; 0 failed$' -Quiet)) { throw 'Not all ten guard self-tests ran' }
       # The App's adapter on Windows with the product browser and the guard
       # built above: the plugin's Windows unit tests, then the two ignored
       # tests that start a profile through Process::spawn and the creation
@@ -506,14 +506,16 @@ jobs:
             'desktop::process_adapter::windows_tests::windows_adapter_opens_reuses_and_shuts_down_a_profile',
             'desktop::process_adapter::windows_tests::windows_adapter_ending_the_app_job_ends_guard_and_browser',
             'desktop::process_adapter::windows_tests::a_write_the_browser_does_not_read_times_out_and_holds_the_next',
+            'desktop::process_adapter::windows_tests::dropping_the_writer_during_a_blocked_write_closes_the_pipe',
             'desktop::process_adapter::windows_tests::a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data',
             'desktop::process_adapter::windows_tests::an_unresolvable_browser_leaves_the_app_running_with_its_reason',
-            'desktop::process_setup::windows::windows_tests::a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go'
+            'desktop::process_setup::windows::windows_tests::a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go',
+            'desktop::process_setup::windows::windows_tests::a_missing_cache_runtime_root_is_created_and_located'
           )
           foreach ($name in $required) {
             if (-not (Select-String -Path $log -SimpleMatch "test $name ... ok" -Quiet)) { throw "$name did not pass" }
           }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 10 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all ten Windows adapter tests ran' }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 12 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all twelve Windows adapter tests ran' }
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the Win32
       # raise to make its top-level window the foreground window.

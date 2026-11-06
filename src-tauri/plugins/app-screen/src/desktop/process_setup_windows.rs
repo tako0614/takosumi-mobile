@@ -284,6 +284,43 @@ mod windows_tests {
     }
 
     #[test]
+    fn a_missing_cache_runtime_root_is_created_and_located() {
+        let root = scratch("cache");
+        let identity = Identity {
+            profile: root.clone(),
+        };
+        let cache = root.join("app-cache");
+        private_directory(&cache).unwrap();
+        std::fs::write(root.join("program.exe"), b"").unwrap();
+        let absent = !cache.join(CACHE_RUNTIME).exists();
+        let located = locate(
+            Plan {
+                program: root.join("program.exe"),
+                guard: root.join("program.exe"),
+                runtime: Runtime::Search(vec![
+                    Candidate::Xdg(root.join("never-used")),
+                    Candidate::Cache(cache.clone()),
+                ]),
+            },
+            &identity,
+        );
+        let created = cache.join(CACHE_RUNTIME).is_dir();
+        // Outside the profile, the created root is refused with the reason.
+        let elsewhere = Identity {
+            profile: root.join("other-profile"),
+        };
+        let refused = search(&[Candidate::Cache(root.join("other-cache"))], &elsewhere);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(absent, "the root did not exist before");
+        let located = located.unwrap();
+        assert_eq!(located.runtime, cache.join(CACHE_RUNTIME));
+        assert_eq!(located.program, root.join("program.exe"));
+        assert!(created);
+        let reason = refused.unwrap_err().to_string();
+        assert!(reason.contains("inside this user's profile"), "{reason}");
+    }
+
+    #[test]
     fn a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go() {
         let root = scratch("lock");
         let held_dir = root.join(runtime_name(4_000_001, 1));
