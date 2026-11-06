@@ -22,6 +22,15 @@ from web_home import enable_child_subreaper, process_identity, wait_engine_child
 REPO = Path(__file__).resolve().parents[2]
 GUARD = REPO / "native-tests/browser/guard.py"
 SCRATCH_ROOT = Path("/root/dev/tmp")
+# The App gives a browser that agreed to stop up to STOP_FINISH (30 s,
+# src-tauri/plugins/app-screen/src/desktop/process_adapter.rs) to end normally.
+# The runner waits that long plus a margin before calling an App exit
+# abnormal, so it never kills an App that is still within its own bound.
+APP_STOP_FINISH = 30
+APP_EXIT_WAIT = APP_STOP_FINISH + 15
+OBSERVER_WAIT = 85
+# The whole session: the observer, the App's exit and the cleanup waits.
+SESSION_WAIT = OBSERVER_WAIT + APP_EXIT_WAIT + 20
 LINUX_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/browser/guard.py", "native-tests/desktop/web_home.py",
@@ -142,9 +151,9 @@ def worker(args):
         try:
             with (args.data / f"observer{suffix}.log").open("x") as observer:
                 subprocess.run(["node", str(REPO / "native-tests/desktop/browser-process.mjs"),
-                                str(args.data)], check=True, timeout=85,
+                                str(args.data)], check=True, timeout=OBSERVER_WAIT,
                                stdout=observer, stderr=subprocess.STDOUT)
-            result["appExit"] = app.wait(timeout=15)
+            result["appExit"] = app.wait(timeout=APP_EXIT_WAIT)
             require(result["appExit"] == 0, "The App must exit normally")
             require(json.loads((args.data / f"app-browser-process{suffix}-complete.json").read_text())["passed"] is True,
                     "The actual App flow must pass")
@@ -211,7 +220,7 @@ def run_session(args, env, files, before, head, suffix):
         identity = process_identity(process.pid)
         proof["sessionStart"] = identity[0] if identity else None
         try:
-            proof["sessionExit"] = process.wait(timeout=110)
+            proof["sessionExit"] = process.wait(timeout=SESSION_WAIT)
             proof["sessionGuard"] = json.loads(receipt.read_text())
             normal(proof["sessionGuard"])
             require(proof["sessionExit"] == 0, "The owned session must exit normally")
