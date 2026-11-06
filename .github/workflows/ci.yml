@@ -475,6 +475,30 @@ jobs:
           $env:TAKOSUMI_WINDOWS_BROWSER = "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe"
           # The plugin has no lockfile of its own; the app's pins its versions.
           Copy-Item src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
+          # The copied lock also lists crates the plugin's graph does not use,
+          # and --locked refuses to prune them: one unlocked resolve does.
+          cargo metadata --format-version 1 --manifest-path src-tauri/plugins/app-screen/Cargo.toml > $null
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed (exit $LASTEXITCODE)" }
+          # It may only prune: every [[package]] name and version left in the
+          # plugin lock must be one the app's lock pins.
+          function Get-LockedPackages([string]$path) {
+            $found = [System.Collections.Generic.HashSet[string]]::new()
+            $package = $false
+            $name = $null
+            foreach ($line in Get-Content -LiteralPath $path) {
+              if ($line.StartsWith('[')) { $package = ($line -eq '[[package]]'); $name = $null; continue }
+              if (-not $package) { continue }
+              if ($line -match '^name = "(.+)"$') { $name = $Matches[1] }
+              elseif ($null -ne $name -and $line -match '^version = "(.+)"$') { [void]$found.Add("$name $($Matches[1])"); $name = $null }
+            }
+            return ,$found
+          }
+          $app = Get-LockedPackages src-tauri/Cargo.lock
+          $plugin = Get-LockedPackages src-tauri/plugins/app-screen/Cargo.lock
+          if ($plugin.Count -eq 0) { throw 'The plugin lock lists no packages' }
+          $added = @($plugin | Where-Object { -not $app.Contains($_) } | Sort-Object)
+          if ($added.Count -gt 0) { throw "The plugin lock pins versions the app's lock does not: $($added -join ', ')" }
+          Write-Output "Plugin lock: $($plugin.Count) of the app's $($app.Count) pinned packages"
           $log = Join-Path $env:RUNNER_TEMP 'adapter-tests.log'
           cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-process-experiment --lib -- windows_tests --include-ignored --test-threads 1 --show-output | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Adapter tests failed (exit $LASTEXITCODE)" }
