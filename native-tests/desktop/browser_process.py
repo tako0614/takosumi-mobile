@@ -246,6 +246,17 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
+    # A recording stand-in for the desktop's opener, first on PATH: the App hands
+    # links the person chose to open outside to xdg-open. Nothing real opens.
+    opener = args.data / "opener"
+    opener.mkdir(mode=0o700)
+    stub = opener / "xdg-open"
+    stub.write_text("#!/usr/bin/python3 -I\nimport json, os, sys\n"
+                    "with open(os.environ['TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG'], 'a') as log:\n"
+                    "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+    stub.chmod(0o700)
+    env["PATH"] = f"{opener}{os.pathsep}{env.get('PATH', '')}"
+    env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(args.data / "external-open.log")
     file_input = file_nonce = None
     if args.files:
         # The owned input is hashed with the sources: Save As must not overwrite it.

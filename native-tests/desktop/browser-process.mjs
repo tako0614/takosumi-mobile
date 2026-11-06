@@ -482,6 +482,47 @@ async function externalLinkProbe(work,personal,expected,sample) {
   assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
   state.passed=true;return state;
 }
+// The person may instead choose to open a link outside the App (policy): the
+// link's native context menu offers it, and the App hands the link to the
+// desktop's opener (the runner's recording stand-in; nothing real opens).
+// Nothing opens inside the App and Personal is unchanged.
+async function openExternalProbe(work,personal,expected,sample) {
+  const log=process.env.TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG;
+  assert(log&&path.isAbsolute(log),'The recording opener is required');
+  const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
+  const url=`${other}/?sumi_open_external_${nonce.replaceAll('-','')}`;
+  const state={method:'Native context menu on a test-inserted link: CDP right click, X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
+  const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+  const opened=async()=>{try{return (await readFile(log,'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+  assert.deepEqual(await opened(),[],'Nothing may reach the opener before the choice');
+  const workPages=(await pages(work)).map(t=>t.targetId);
+  const point=await work.evaluate(`(()=>{const a=document.createElement('a');a.id='sumi-open-external';a.href=${JSON.stringify(url)};a.textContent='external';Object.assign(a.style,{position:'fixed',left:'40px',top:'40px',width:'240px',height:'48px',display:'block',zIndex:'2147483647',background:'#fff',color:'#00e',font:'20px sans-serif'});document.body.append(a);const r=a.getBoundingClientRect(),p={x:r.x+r.width/2,y:r.y+r.height/2},hit=document.elementFromPoint(p.x,p.y);if(!(hit===a||a.contains(hit)))throw Error('Link obscured');return p})()`);
+  desktop('xdotool',['windowraise',String(work.native.windowId)]);
+  await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible before the right click');
+  const tops=()=>desktop('xwininfo',['-root','-children','-int']).split('\n').map(line=>line.match(/^\s+(\d+) /)?.[1]).filter(Boolean);
+  const before=new Set(tops());
+  await work.send('Input.dispatchMouseEvent',{type:'mouseMoved',button:'none',buttons:0,...point});
+  await work.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'right',buttons:2,clickCount:1,...point});
+  await work.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'right',buttons:0,clickCount:1,...point});
+  // The menu is a new viewable top-level window of Work's own browser.
+  const viewable=id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}};
+  const ownerOf=id=>{try{return JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),id])).pid;}catch{return null;}};
+  let menu;
+  await settled(async()=>{menu=tops().filter(id=>!before.has(id)).find(id=>viewable(id)&&ownerOf(id)===work.native.nativePid);return Boolean(menu);},'The link context menu did not open in Work\'s browser');
+  state.menu={window:Number(menu),owner:work.native.nativePid};
+  desktop('import',['-window','root',path.join(data,'open-external-menu.png')]);
+  desktop('xdotool',['key','--clearmodifiers','Down']);
+  desktop('xdotool',['key','--clearmodifiers','Return']);
+  await settled(async()=>(await opened()).length>0,'The App did not hand the chosen link to the desktop opener');
+  state.opened=await opened();
+  assert.deepEqual(state.opened,[[url]],'Exactly the chosen link must reach the opener');
+  await settled(async()=>!viewable(menu),'The context menu did not close');
+  assert.deepEqual((await pages(work)).map(t=>t.targetId),workPages,'Nothing may open inside the App');
+  assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'Personal must not change');
+  await work.evaluate("(()=>{document.getElementById('sumi-open-external').remove();return true})()");
+  assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
+  state.passed=true;return state;
+}
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -545,6 +586,8 @@ async function firstLaunch() {
   proof.popup=await popupProbe(work,personal,key,expected,sample);
   step('Work external link',work);
   proof.externalLink=await externalLinkProbe(work,personal,expected,sample);
+  step('Work link opened outside by choice',work);
+  proof.openExternal=await openExternalProbe(work,personal,expected,sample);
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
