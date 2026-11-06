@@ -963,12 +963,16 @@ through a small `Shell` (evaluate a script, pause):
 - The 90 s watchdog, every checkpoint bound and the markers are Linux's. Only
   on Windows: the first open marker adds the home's top-level HWND
   (`homeWindow`); the reset phase identifies Personal's CEF root by its
-  creation time (Linux: its inode) and records whether Chromium holds its
+  volume serial number and 128-bit file ID (`FileIdInfo`; Linux: its inode)
+  and records whether Chromium holds its
   `lockfile` (`personalLockHeld`; Linux records the `SingletonLock` target),
   and the refused clear must leave that lock held; after the home clears
   Work, the App requires Work's `cef-profiles` to be gone and Personal's to
   remain; the phases are `restart` and `reset` (notifications and the native
   file chooser stay Linux-only).
+- The first launch prints a progress line per step (as the relaunch phases
+  already did), so a launch the runner ends still leaves its last step in
+  `app.log`.
 - The connection origin is the runner's local site
   (`TAKOSUMI_BROWSER_PROCESS_APP=local` with
   `TAKOSUMI_BROWSER_PROCESS_SITE=https://127.0.0.1:<port>`, checked exactly).
@@ -983,14 +987,43 @@ through a small `Shell` (evaluate a script, pause):
 fixture feature enables) does not contain `ShellExecuteW`: the opener appends
 `{"argv":[url],"pid":<App pid>}` to the file named by
 `TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG` (an absolute path; without it the
-link is dropped). No W3 case chooses to open a link outside, and the runner
-requires that log to stay empty. The product opener remains untested.
+link is dropped). The line and the path rule are pure functions in
+`process_setup.rs` (`opener_record`, `opener_log`) with Linux unit tests. No
+W3 flow chooses to open a link outside (that needs the native context menu,
+inspected on Linux only), so the run's case `no-opener-request` shows only
+that nothing in these flows handed a link to the opener; the recorder itself
+never runs in CI. The product opener remains untested.
 
 **Foreground.** Before it sends a reopen, the adapter now calls
 `AllowSetForegroundWindow` with the browser's native pid, so the browser may
-raise its window while the person uses the home (a refusal is harmless). The
-CI runner has no user input, so Windows' foreground lock does not engage
-there, and CI cannot tell whether this call was needed.
+raise its window while the person uses the home (a refusal is harmless).
+The `windows-latest` runner keeps Windows' foreground lock active: run
+42292805130 read a lock timeout of 2147483647 ms, and the observer reached
+the home only through `AttachThreadInput` after a plain `SetForegroundWindow`
+was refused. A browser that is not in front cannot take the foreground there
+without being given the right, so `reuse-raises-window` records the lock
+(timeout and time since the last input) and the home's route and requires
+the lock to be active: Work's window coming to the front from the home then
+shows the grant at work.
+
+**Browser stop race (fixed in W3).** In run 42292805130 the W2 test
+`windows_adapter_opens_reuses_and_shuts_down_a_profile` got `stopped` after a
+reuse and then the browser exited with `0xC0000409`, the code of a Rust
+abort on Windows; the same test had passed on `13b4e3a`, and the run did not
+keep the browser's stderr. The best-supported cause, from the code: the
+stdin reader posted requests to the UI thread until the message loop had
+returned, while the parent closes its end of the pipe as soon as it reads
+`stopped`. Once the raise succeeds (the App now passes the foreground right),
+the closing window holds the foreground and Windows hands the activation
+over, so the loop returns later and the end of input could be posted in
+between. That task then ran during CEF's shutdown, after the browser state
+was taken, and `with_state`'s `expect` panicked in a CEF task callback,
+which cannot unwind. The reader's gate is now closed before the loop is
+asked to quit, and a request that still runs after the state is gone is
+ignored with a note on stderr. The test now prints `browser.log` (the
+browser's stderr, where a panic message lands) and the tail of
+`cef-native.log` when the reopen or shutdown fails or the receipt is
+abnormal, so a recurrence names its cause.
 
 **Runner** (`native-tests/desktop/windows_browser_process.py`, Python
 standard library only; `git` reads the revision). It refuses to run on other
@@ -1043,7 +1076,11 @@ with `SetForegroundWindow` (if Windows refuses, the task switchers'
 `AttachThreadInput` route) and never sends keyboard or mouse input. It
 cancels a beforeunload dialog through DevTools (`Page.handleJavaScriptDialog`),
 where Linux presses Escape, and closes a window with `WM_CLOSE`, where Linux
-presses Ctrl+Shift+W. Waiting for a profile to end after its last window
+presses Ctrl+Shift+W. It records each page's visibility and focus with
+Windows' view of its window (`IsWindowVisible`, `IsIconic`, placement,
+rectangle) when it attaches, with Personal brought to the front, before the
+reuse and after it, and the runner prints this evidence after each launch
+(and before the log tails of a failed one). Waiting for a profile to end after its last window
 closed (Work before Personal is asked, Personal after its native close)
 allows 20 s where Linux allows 10 s; a navigation within the fixture site
 may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
@@ -1054,14 +1091,14 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
 | `home-by-window-switch` | with Personal's window in front, an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
-| `reuse-raises-window` | the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal |
+| `reuse-raises-window` | with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal. Visibility decides only where the desktop reported some front CEF window as visible before the reuse: then Work's document must become visible (a product defect otherwise); a desktop that never reports one (Chromium's native occlusion on a CI desktop) leaves it as evidence |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
 | `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
 | `restart-keeps-separation` | a relaunch on the same data reopens both from the saved home; each keeps its own storage, script cookie and session |
 | `clear-only-one-profile` | a relaunch clears Work from the home: only Work's CEF root is removed and Work is signed out with no storage; clearing the running Personal is refused with its data and `lockfile` kept; after Personal's native close the in-session clear removes it |
 | `no-process-left` | every launch ended with its job empty, no forced cleanup and normal guard receipts |
-| `no-external-open` | nothing reached the opener over all launches |
+| `no-opener-request` | no link was handed to the App's opener over all launches (the recording log stayed empty) |
 
 **CI.** The job `cef-windows-app` (`windows-latest`, 120 minutes) checks out
 the App with mobile-kit and the takosumi contract, builds the home
@@ -1077,7 +1114,13 @@ tables only), creates the TLS files and trusts their CA
 exactly ten `PASS case` lines, and a passed `summary.json`. It removes the CA
 afterwards whatever happened and keeps the case and the profiles' browser
 logs as the artifact `cef-windows-app-case` (14 days). It shares the CEF
-distribution cache with `cef-windows`, which it does not change.
+distribution cache with `cef-windows`, which it does not change. The fixture
+CA is name-constrained to `127.0.0.1/32`, and its thumbprint is recorded
+before it enters `LocalMachine\Root`, so the removal always finds it. The
+`desktop` job's Linux leg compiles the App with
+`native-browser-process-fixture`, so the shared flow and its GTK driver are
+built in CI too (the Linux actual-App run itself is local, against real
+sites).
 
 **Running it** on a disposable Windows machine, in an elevated PowerShell 7
 (the CA goes into `LocalMachine\Root`):
@@ -1102,27 +1145,37 @@ browser-compatibility runs, downloads, popups, the open-outside choice, the
 long alert, notifications and the native file chooser stay Linux-only);
 the `ShellExecuteW` opener; native keyboard and mouse input in the browser's
 dialogs and windows (the cancel goes through DevTools, the switch through
-`SetForegroundWindow`, the close through `WM_CLOSE`); Windows' foreground
-lock after real input; occlusion-driven page visibility; and other DPI or
+`SetForegroundWindow`, the close through `WM_CLOSE`); occlusion-driven page
+visibility on a desktop that never reports it; and other DPI or
 multi-monitor layouts.
+
+**First CI run (W3).** Run 42292805130 (head `0b533a8`): `cef-windows-app`
+built and passed the first launch up to the reuse (separate profiles signed
+in, the home reached by `AttachThreadInput` with the lock active, Work
+reused and in front with its owner Work's browser), then failed
+`reuse-raises-window` because Work's document reported `hidden`; whether this
+desktop ever reports a CEF page as visible was not recorded then. In the
+same run `cef-windows` failed the W2 reuse test as described under
+"Browser stop race".
 
 **2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
 the Linux host. For `x86_64-pc-windows-msvc`, the App type-checks and passes
 clippy with `native-browser-process-fixture` (C, archive and resource tools
 replaced by stand-ins that write empty outputs, since `cargo check` links
-nothing), and the plugin with `desktop-process-experiment` and with
-`fixture-overrides` (library and tests) adds no clippy warning to the three
-the current toolchain already reports in unchanged code; `cargo tree`
-resolves no gtk for that target, and the cef-candidate bins still pass
-clippy. On Linux the App checks and passes clippy with
+nothing), the browser and guard pass clippy (`cef/dox`), and the plugin with
+`desktop-process-experiment` and with `fixture-overrides` (library and
+tests) adds no clippy warning to the three the current toolchain already
+reports in unchanged code; `cargo tree` resolves no gtk for that target. On
+Linux the App checks and passes clippy with
 `native-browser-process-fixture`, `native-web-home-fixture` and
-`desktop-cef`; the plugin tests pass (66 with each experiment feature set,
-and the `desktop` library and capability tests); rustfmt and the source
-format check pass for the changed files; and the runner's 17 unit tests
-pass. The observer's DevTools client and flows (sign-in stand-in, samples, a
-beforeunload cancelled through `Page.handleJavaScriptDialog`) also ran once
-against a private headless Chrome and the runner's TLS site on Linux.
-Windows evidence comes only from the CI job.
+`desktop-cef`, the browser passes clippy (one existing warning); the plugin
+tests pass (68 with each experiment feature set, and the `desktop` library
+and capability tests); rustfmt and the source format check pass for the
+changed files; and the runner's 17 unit tests pass. The observer's DevTools
+client and flows (sign-in stand-in, samples, a beforeunload cancelled
+through `Page.handleJavaScriptDialog`) also ran once against a private
+headless Chrome and the runner's TLS site on Linux. Windows evidence comes
+only from the CI job.
 
 ## Observations and limits
 
