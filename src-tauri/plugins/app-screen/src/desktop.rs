@@ -21,10 +21,18 @@ use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
 #[cfg(target_os = "linux")]
 mod gtk_navigation;
-#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+#[cfg(all(
+    any(target_os = "linux", windows),
+    feature = "desktop-process-experiment"
+))]
 mod process_adapter;
-#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+#[cfg(all(
+    any(target_os = "linux", windows),
+    feature = "desktop-process-experiment"
+))]
 mod process_setup;
+#[cfg(all(windows, feature = "desktop-process-experiment"))]
+mod process_windows;
 mod profile_reset;
 mod resume_navigation;
 
@@ -66,14 +74,20 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
         open,
         clear_profile
     ]);
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     let builder = builder.setup(|app, _api| {
         process_adapter::install(app)?;
         Ok(())
     });
     builder
         .on_event(|_app, event| {
-            #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+            #[cfg(all(
+                any(target_os = "linux", windows),
+                feature = "desktop-process-experiment"
+            ))]
             match event {
                 tauri::RunEvent::WindowEvent {
                     label,
@@ -96,7 +110,10 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
                 install_shell_message_cleanup(_app);
             }
             if matches!(event, tauri::RunEvent::Exit) {
-                #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+                #[cfg(all(
+                    any(target_os = "linux", windows),
+                    feature = "desktop-process-experiment"
+                ))]
                 process_adapter::terminal(_app);
                 // Raw views do not belong to Tauri's managed-view registry.
                 // Clear remaining owned resources as a terminal fallback.
@@ -122,7 +139,10 @@ fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Capabilitie
     #[cfg(not(target_os = "macos"))]
     let clear_profile = true;
     // An unavailable browser refuses `clear_profile`, so the home must not offer it.
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     let clear_profile = clear_profile && process_adapter::unavailable(_app).is_none();
     CapabilitiesResponse {
         pin_shortcut: false,
@@ -136,12 +156,18 @@ async fn clear_profile(
     payload: crate::ClearProfileRequest,
 ) -> Result<crate::ClearProfileResponse> {
     payload.validate()?;
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::clear_profile(app, payload).await;
     }
     // An unavailable browser never falls back to the Wry profiles.
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     if let Some(reason) = process_adapter::unavailable(&app) {
         return Err(Error::Desktop(reason));
     }
@@ -173,12 +199,18 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             "Desktop app screens currently require Web-home mode.",
         ));
     }
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     if app.try_state::<process_adapter::Backend>().is_some() {
         return process_adapter::open(app, payload).await;
     }
     // The home keeps running and shows why; never the Wry adapter instead.
-    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
     if let Some(reason) = process_adapter::unavailable(&app) {
         return Err(Error::Desktop(reason));
     }
@@ -207,12 +239,18 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
         .map_err(failure)?
 }
 
-#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+#[cfg(all(
+    any(target_os = "linux", windows),
+    feature = "desktop-process-experiment"
+))]
 pub fn shutdown_browser_process_experiment(app: &AppHandle) -> Result<()> {
     process_adapter::shutdown(app)
 }
 
-#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+#[cfg(all(
+    any(target_os = "linux", windows),
+    feature = "desktop-process-experiment"
+))]
 pub fn browser_process_experiment_status(app: &AppHandle) -> Result<serde_json::Value> {
     process_adapter::status(app)
 }

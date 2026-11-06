@@ -1,0 +1,340 @@
+//! Product supervisor for one per-profile CEF browser process (Windows).
+//!
+//! `takosumi-browser-guard <absolute new receipt> <program> [args...]`
+//!
+//! The same command line, receipt and exit codes as the Linux guard
+//! (`guard_main.rs`), built on a Job Object instead of pidfds and the child
+//! subreaper. The App starts this guard inside its own kill-on-close Job
+//! Object (see `tauri_plugin_app_screen::windows_job`), so when the App ends,
+//! however it ends, its job ends this guard and the browser: Windows has no
+//! parent-death signal. The guard refuses to run outside any job.
+//!
+//! The guard creates a kill-on-close Job Object of its own (no breakaway) and
+//! starts the browser in it before it runs any code (created suspended with
+//! no console window, assigned, resumed), passing its own standard input,
+//! output and error: the App's control pipe, reply pipe and log. Every
+//! process the browser starts is then in the guard's job. It waits for the
+//! browser to exit or for a stop request: the App sets a named event it
+//! created and passed in `TAKOSUMI_BROWSER_GUARD_STOP_EVENT` (removed from
+//! the browser's environment). There is no lifetime cap and no polling while
+//! it waits.
+//!
+//! The drain then always runs: up to 0.5 s for the browser and every process
+//! in the job to end by themselves, then `TerminateJobObject` (each process
+//! still in the job ends with exit code 1, and they count as forced cleanup),
+//! then up to 2 s for the job to empty. The completion proof is the job's
+//! `ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
+//! browser exited.
+//!
+//! Receipt, written once after the drain, with the Linux guard's fields:
+//! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
+//! error, cleanupErrors, nonFatalErrors}`. Here `kernelNoChildren` keeps its
+//! key with the meaning "the kernel reports the job empty", `remaining` lists
+//! the process ids still in the job (`JobObjectBasicProcessIdList`) and
+//! `observed` counts every process ever in it (`TotalProcesses`, the browser
+//! included). `rootExit` is the browser's exit code (NTSTATUS crash codes are
+//! negative). The guard exits 0 only when the drain proved the job empty,
+//! the browser exited 0 and nothing failed; as on Linux a forced cleanup
+//! alone does not change the exit status, and the App separately requires
+//! `forcedCleanup == 0`. A refusal before the receipt exists exits 2 and
+//! starts nothing.
+//!
+//! Not covered: a process that the browser has created outside its tree
+//! through a system service (COM, WMI, the task scheduler) is not in the job,
+//! as on Linux a process started by a session manager is not a descendant.
+
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::Path;
+use std::process::{Child, Command, ExitCode};
+use std::time::{Duration, Instant};
+use tauri_plugin_app_screen::windows_job::{
+    in_job, spawn_in, wait_any, Event, Job, CREATE_NO_WINDOW, STOP_EVENT_ENV,
+};
+
+/// Natural end, then the job is terminated and may take this long to empty.
+const NATURAL: Duration = Duration::from_millis(500);
+const FORCED: Duration = Duration::from_secs(2);
+/// While draining, re-check the job at least this often.
+const DRAIN_TICK: Duration = Duration::from_millis(20);
+/// After a failed wait, retry after this pause; this many consecutive
+/// failures (about 2 s) make the guard give up waiting and drain.
+const FAULT_PAUSE: Duration = Duration::from_millis(250);
+const MAX_RUNNING_FAULTS: u32 = 8;
+/// The exit code of processes the drain terminates.
+const FORCED_EXIT: u32 = 1;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Called by `guard_entry.rs` on Windows.
+pub(super) fn main() -> ExitCode {
+    // The self-test build runs its tests, or acts as a stand-in browser,
+    // unless it is asked to act as the guard; the release binary has no such
+    // switch.
+    #[cfg(test)]
+    if let Some(code) = tests::dispatch() {
+        return code;
+    }
+    let args: Vec<OsString> = std::env::args_os().collect();
+    match prepare(&args) {
+        Ok(prepared) => supervise(prepared, &args[2], &args[3..]),
+        Err((code, message)) => {
+            eprintln!("takosumi-browser-guard: {message}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// A short, stable error name for the receipt; never a path or argv.
+fn fault(error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (Windows error {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
+}
+
+struct Prepared {
+    receipt: File,
+    stop: Event,
+    job: Job,
+}
+
+fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
+    let refuse = |message: &str| Err((2, message.to_string()));
+    if args.len() < 3 {
+        return refuse("usage: takosumi-browser-guard <absolute new receipt> <program> [args...]");
+    }
+    let receipt = Path::new(&args[1]);
+    // Nothing may exist at the path, not even a dangling link.
+    let vacant =
+        matches!(receipt.symlink_metadata(), Err(error) if error.kind() == io::ErrorKind::NotFound);
+    if !receipt.is_absolute() || !vacant {
+        return refuse("The receipt path must be absolute and must not exist.");
+    }
+    // The App's job is this guard's only link to the App's lifetime.
+    match in_job() {
+        Ok(true) => {}
+        Ok(false) => return refuse("The browser guard must run inside its App's Job Object."),
+        Err(error) => return Err((2, format!("Job membership is unknown: {error}"))),
+    }
+    let Some(name) = std::env::var_os(STOP_EVENT_ENV) else {
+        return refuse("The App's stop event is not named.");
+    };
+    let stop = Event::open(&name)
+        .map_err(|error| (2, format!("The App's stop event cannot be opened: {error}")))?;
+    let job = Job::kill_on_close()
+        .map_err(|error| (2, format!("A Job Object cannot be created: {error}")))?;
+    // Reserve the receipt before any browser can exist. CREATE_NEW refuses
+    // a path created meanwhile, and a link there is opened as itself, never
+    // followed. It inherits the runtime directory's access control.
+    let receipt = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(receipt)
+        .map_err(|error| (2, format!("The receipt cannot be created: {error}")))?;
+    Ok(Prepared { receipt, stop, job })
+}
+
+struct Run {
+    job: Job,
+    child: Option<Child>,
+    root_exit: Option<i32>,
+    forced: u32,
+    cleanup_errors: BTreeSet<String>,
+    non_fatal: BTreeSet<String>,
+}
+
+impl Run {
+    /// Record the browser's exit code once it has exited.
+    fn reap(&mut self) {
+        if self.root_exit.is_some() {
+            return;
+        }
+        if let Some(child) = &mut self.child {
+            match child.try_wait() {
+                // Windows always has an exit code; NTSTATUS values wrap negative.
+                Ok(Some(status)) => self.root_exit = status.code(),
+                Ok(None) => {}
+                Err(error) => {
+                    self.cleanup_errors.insert(fault(&error));
+                }
+            }
+        }
+    }
+
+    fn active(&mut self) -> Option<u32> {
+        match self.job.processes() {
+            Ok((_, active)) => Some(active),
+            Err(error) => {
+                self.cleanup_errors.insert(fault(&error));
+                None
+            }
+        }
+    }
+
+    /// Whether the browser has exited and the job is empty.
+    fn settled(&mut self) -> bool {
+        self.reap();
+        let browser_done = self.child.is_none() || self.root_exit.is_some();
+        browser_done && self.active() == Some(0)
+    }
+
+    /// Wait for the browser to exit or for a stop request, without a
+    /// lifetime cap. A failed wait is retried; one that keeps failing makes
+    /// the guard drain.
+    fn running(&mut self, stop: &Event) -> Result<(), String> {
+        let Some(child) = &self.child else {
+            return Ok(());
+        };
+        let handles = [child.as_raw_handle(), stop.as_raw_handle()];
+        let mut faults = 0;
+        loop {
+            match wait_any(&handles, None) {
+                // The browser exited, or the App asked the guard to stop.
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    let error = fault(&error);
+                    self.non_fatal.insert(error.clone());
+                    faults += 1;
+                    if faults >= MAX_RUNNING_FAULTS {
+                        return Err(error);
+                    }
+                    std::thread::sleep(FAULT_PAUSE);
+                }
+            }
+        }
+        self.reap();
+        Ok(())
+    }
+
+    /// Wait up to `budget` for the browser to exit and the job to empty.
+    fn settle_within(&mut self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.settled() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let pause = DRAIN_TICK.min(deadline - now);
+            // The browser's exit wakes this early.
+            let woke = match &self.child {
+                Some(child) if self.root_exit.is_none() => {
+                    wait_any(&[child.as_raw_handle()], Some(pause)).map(|_| ())
+                }
+                _ => {
+                    std::thread::sleep(pause);
+                    Ok(())
+                }
+            };
+            if woke.is_err() {
+                std::thread::sleep(pause);
+            }
+        }
+    }
+
+    /// The bounded drain every run takes, however it ended. Returns whether
+    /// the job was proven empty after the browser exited.
+    fn drain(&mut self) -> bool {
+        if self.settle_within(NATURAL) {
+            return true;
+        }
+        // Count what is about to be terminated before terminating it.
+        let active = self.active().unwrap_or(0);
+        match self.job.terminate(FORCED_EXIT) {
+            Ok(()) => self.forced += active.max(1),
+            Err(error) => {
+                self.cleanup_errors.insert(fault(&error));
+            }
+        }
+        self.settle_within(FORCED)
+    }
+}
+
+fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitCode {
+    let Prepared {
+        mut receipt,
+        stop,
+        job,
+    } = prepared;
+    let mut run = Run {
+        job,
+        child: None,
+        root_exit: None,
+        forced: 0,
+        cleanup_errors: BTreeSet::new(),
+        non_fatal: BTreeSet::new(),
+    };
+    let mut failure = None;
+    // A stop requested before the browser starts starts nothing.
+    match stop.is_set() {
+        Err(error) => failure = Some(fault(&error)),
+        Ok(true) => failure = Some("StopRequestedBeforeStart".to_string()),
+        Ok(false) => {
+            let mut command = Command::new(program);
+            command.args(args).env_remove(STOP_EVENT_ENV);
+            match spawn_in(&run.job, &mut command, CREATE_NO_WINDOW) {
+                Ok(child) => {
+                    run.child = Some(child);
+                    if let Err(error) = run.running(&stop) {
+                        failure = Some(error);
+                    }
+                }
+                Err(error) => failure = Some(fault(&error)),
+            }
+        }
+    }
+    let empty = run.drain();
+    let complete = run.child.is_some() && run.root_exit.is_some() && empty;
+    let normal =
+        complete && run.root_exit == Some(0) && failure.is_none() && run.cleanup_errors.is_empty();
+    let remaining = run.job.process_ids().unwrap_or_else(|error| {
+        run.cleanup_errors.insert(fault(&error));
+        Vec::new()
+    });
+    let observed = match run.job.processes() {
+        Ok((total, _)) => total,
+        Err(error) => {
+            run.cleanup_errors.insert(fault(&error));
+            0
+        }
+    };
+    let normal = normal && run.cleanup_errors.is_empty();
+    let proof = serde_json::json!({
+        "rootExit": run.root_exit,
+        "complete": complete,
+        "remaining": remaining,
+        "kernelNoChildren": empty,
+        "observed": observed,
+        "forcedCleanup": run.forced,
+        "error": failure,
+        "cleanupErrors": run.cleanup_errors,
+        "nonFatalErrors": run.non_fatal,
+    });
+    // One write of the whole document, so a reader never sees a partial one
+    // from a successful write.
+    let written = serde_json::to_vec(&proof)
+        .map_err(io::Error::from)
+        .and_then(|bytes| receipt.write_all(&bytes))
+        .and_then(|()| receipt.flush());
+    if let Err(error) = written {
+        eprintln!("takosumi-browser-guard: the receipt could not be written: {error}");
+        return ExitCode::from(1);
+    }
+    if normal {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+#[cfg(test)]
+#[path = "guard_windows_tests.rs"]
+mod tests;

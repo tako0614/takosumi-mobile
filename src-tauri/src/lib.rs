@@ -16,8 +16,10 @@ compile_error!("Select one actual-App fixture at a time.");
 
 #[cfg(all(feature = "native-web-home-fixture", not(target_os = "linux")))]
 compile_error!("The native Web-home fixture requires Linux; it does not qualify other OSes.");
-#[cfg(all(feature = "desktop-cef", not(target_os = "linux")))]
-compile_error!("The per-profile CEF desktop browser is Linux only.");
+// Windows builds it as an unsandboxed test candidate (the browser itself
+// must be built with the cef-candidate feature windows-unsandboxed-candidate).
+#[cfg(all(feature = "desktop-cef", not(any(target_os = "linux", windows))))]
+compile_error!("The per-profile CEF desktop browser is available on Linux and Windows only.");
 #[cfg(all(feature = "desktop-cef", feature = "native-web-home-fixture"))]
 compile_error!("The native Web-home fixture drives the Wry adapter; build it without desktop-cef.");
 
