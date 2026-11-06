@@ -711,7 +711,14 @@ breakaway, reserves the receipt (`CREATE_NEW`, never through a link), and
 starts the browser in the job before it runs any code: created
 `CREATE_SUSPENDED | CREATE_NO_WINDOW` with the guard's own stdin, stdout and
 stderr (the App's control pipe, reply pipe and log), assigned, then resumed.
-It then waits, without polling or a lifetime cap, for the browser's exit or a
+`CREATE_NO_WINDOW` gives the browser a console without a window, and with it
+a windowless console host (`conhost.exe`) child in the guard's job. CEF's
+helper processes run the same console program and share that one hidden
+console. Started detached (`DETACHED_PROCESS`, no console), each helper would
+instead get a new console of its own, possibly a visible one, and a console
+host each, so the browser keeps its hidden console. `observed` therefore also
+counts that console host, and the drain waits for it like any other process
+in the job. It then waits, without polling or a lifetime cap, for the browser's exit or a
 stop request. A stop request is the App setting a manual-reset named event
 (`Local\takosumi-browser-guard-stop-<App pid>-<runtime>-<nanos>`) that the App
 created (an existing name is refused) and named in
@@ -720,7 +727,9 @@ the variable from the browser's environment. Like a signal on Linux, any
 process of the same user could set it. The drain always runs: up to 0.5 s for
 the browser and every process in the job to end, then `TerminateJobObject`
 (the processes still in the job end with exit code 1 and count as
-`forcedCleanup`), then up to 2 s for the job to empty. The completion proof is
+`forcedCleanup`), then up to 2 s for the job to empty. A job that is found
+empty just after the 0.5 s is not terminated, and nothing is counted as
+forced. The completion proof is
 `ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
 browser exited, recorded under the Linux key `kernelNoChildren`; `remaining`
 lists the process ids still in the job (`JobObjectBasicProcessIdList`) and
@@ -730,7 +739,9 @@ system service (COM, WMI, the task scheduler) is not in the job.
 
 **Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
 thread owns one kill-on-close Job Object for the App and starts every guard
-inside it (suspended, assigned, resumed, `CREATE_NO_WINDOW`). Jobs nest, so a
+inside it (suspended, assigned, resumed). The guard is started
+`DETACHED_PROCESS`: it needs no console, so it has no console host either;
+its standard handles are the pipes and log passed explicitly. Jobs nest, so a
 browser is in its guard's job and, through it, in the App's. When the App
 process ends, however it ends, the system closes the App's job and ends every
 guard and browser with it: the profiles are retained, but such guards write
@@ -778,12 +789,15 @@ no receipt. The spawner thread drops the job when every requester is gone
   browser has a writer thread that performs the blocking write while the
   caller waits for it with the same 20 s bound; a write the browser does not
   read in time times out and the next one first waits for it. Closing the
-  App's end ends the thread after any write in progress, which is cancelled.
-- The `opened` check: Windows records the guard as the native process's
-  parent (a process snapshot), the native process was created no earlier than
-  the guard (so the record is not one left by an ended process whose id the
-  guard reused), its image path (`QueryFullProcessImageNameW`) equals the
-  browser path exactly, and the reported cache path equals the requested one
+  App's end ends the thread after any write in progress, which is cancelled
+  (`CancelIoEx`); the thread then writes nothing more of that request.
+- The `opened` check: the native process is opened first and its handle held,
+  so its id cannot name another process during the check. Then Windows must
+  record the guard as its parent (a process snapshot taken after opening),
+  it must have been created no earlier than the guard (so the record is not
+  one left by an ended process whose id the guard reused), its image path
+  (`QueryFullProcessImageNameW` on the held handle) must equal the browser
+  path exactly, and the reported cache path must equal the requested one
   exactly.
 - Stopping a guard that is still running when its `Process` is dropped sets
   the stop event (never terminates the guard, whose job would end the browser
@@ -802,30 +816,42 @@ no receipt. The spawner thread drops the job when every requester is gone
 **CI.** The `cef-windows` job builds the product browser and the guard
 together, keeps the W1 manifest check and both smoke runs, and adds two steps.
 `Guard self-tests (Windows)` runs `cargo test --bin takosumi-browser-guard`
-(nine cases in `src/guard_windows_tests.rs`; the self-test binary is its own
-stand-in browser, and each case starts the guard inside a fresh kill-on-close
-job as the App does): a normal end, a non-zero exit, the pipes reaching the
-browser without the stop event, a lingering descendant terminated with the
-job, a stop request, the App's job ending guard and browser, a pending stop,
-the refusals and a browser that cannot start. `App adapter with the built
+(ten cases in `src/guard_windows_tests.rs`; the self-test binary is its own
+stand-in browser, and each case starts the guard detached inside a fresh
+kill-on-close job as the App does): a normal end, a non-zero exit, the pipes
+reaching the browser without the stop event, a lingering descendant
+terminated with the job, a job that empties just as the natural budget ends
+(a self-test-only injection, `TAKOSUMI_GUARD_FAULT_LATE_EMPTY`, lets the
+budget run out exactly then; timing alone cannot produce it on demand), a
+stop request, the App's job ending guard and browser, a pending stop, the
+refusals and a browser that cannot start. Cases that require the App's job
+to be empty afterwards wait at most 3 s for processes whose exit is already
+under way (the stand-ins that must be ended sleep 60 s) and name every
+process still there with its image. `App adapter with the built
 guard and browser (Process API)` runs the plugin's Windows tests with
 `TAKOSUMI_WINDOWS_GUARD` and `TAKOSUMI_WINDOWS_BROWSER` pointing at the
-product build: unit tests of the pipe writer, the lockfile check with
-`clear_profile`'s data handling, the runtime locks and root rules, and the
-unavailable state; and two `#[ignore]`d tests run with `--include-ignored`.
+product build: unit tests of the pipe writer (a write the reader does not
+take times out; dropping the App's end during such a write cancels it, so the
+reader sees the end of its input before all the data), the lockfile check
+with `clear_profile`'s data handling, the runtime locks and root rules
+(including `<app cache>\cef` created when missing), and the unavailable
+state; and two `#[ignore]`d tests run with `--include-ignored`.
 `windows_adapter_opens_reuses_and_shuts_down_a_profile` starts a profile
 through `Process::spawn`, waits for the creation reply through
 `expect_open_until` (`expect_open` with a 120 s cold-start bound instead of
 20 s; the time is printed), restates the parent, image and cache checks
-against Windows' records, reopens the same key and requires the same native
-browser and window, shuts down through `Process::shutdown` and requires a
-normal receipt (complete, `rootExit` 0, no forced cleanup, the job empty,
-`observed` at least 2) and the runtime directory's removal.
-`windows_adapter_ending_the_app_job_ends_guard_and_browser` starts a profile,
-records the guard's process tree, drops the App's spawner (closing the App's
-job) and requires every process of that tree to end within 15 s and no
-normal receipt. The step fails unless each named test passed and exactly ten
-ran. The `desktop` job also checks the App with `--features desktop-cef` on
+against Windows' records, requires at least one CEF helper (a child of the
+browser running the browser's own executable, so its console host does not
+count) and Chromium's `lockfile` in the profile's cache root held, reopens
+the same key and requires the same native browser and window, shuts down
+through `Process::shutdown` and requires a normal receipt (complete,
+`rootExit` 0, no forced cleanup, the job empty, `observed` above the number
+of helpers seen), the `lockfile` released and the runtime directory's
+removal. `windows_adapter_ending_the_app_job_ends_guard_and_browser` starts a
+profile, requires a CEF helper, records the guard's process tree, drops the
+App's spawner (closing the App's job) and requires every process of that
+tree to end within 15 s and no normal receipt. The step fails unless each
+named test passed and exactly twelve ran. The `desktop` job also checks the App with `--features desktop-cef` on
 Windows.
 
 **2026-11-06 local checks (W2).** On the Linux host the plugin type-checks for
@@ -837,6 +863,37 @@ the CI job. On Linux the plugin tests (66 with each experiment feature set),
 the 30 guard self-tests, the `fixture-inspection` browser and guard build, a
 check of all three cef-candidate bins and a check of the App with
 `desktop-cef` passed, with Linux behaviour unchanged.
+
+**First CI runs (W2).** Run 42264960643 (head `5e2250f`) passed the adapter
+tests (ten then) but failed the guard self-test
+`normal_exit_writes_a_complete_normal_receipt` once: after the guard had
+ended, the App's job still counted one process, while the same test had
+passed on the run before. The guard was then started with `CREATE_NO_WINDOW`,
+so its windowless console host, a child in the App's job, could outlive it
+for a moment. The guard is now started detached (no console host), and the
+check waits a short, stated bound and names what is left.
+
+**Known W2 limits** (documented, not implemented):
+
+- Between `CreateProcess(CREATE_SUSPENDED)` and `AssignProcessToJobObject`
+  the new guard or browser exists outside the intended job. It runs no code
+  then, but if its parent dies in that window it stays suspended and
+  unowned. `PROC_THREAD_ATTRIBUTE_JOB_LIST` (Windows 10) would create it in
+  the job directly; std's `Command` has no stable way to pass it.
+- Inheritable handles are not limited to the three standard handles
+  (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` would do that). The App spawns guards
+  from one thread, and std serializes its own spawns, but a handle another
+  part of the App made inheritable could reach a guard and its browser.
+- A browser ended by the drain has `rootExit` 1, the same as one that called
+  `exit(1)` itself; `forcedCleanup` tells them apart, and the App only
+  accepts `rootExit` 0 with no forced cleanup.
+- The guard's job check proves that it runs in some Job Object, not that it
+  is the App's: Windows 11 and CI runners may place every process in a job.
+- The `ShellExecuteW` path for external links is compiled but not exercised
+  by a test.
+- A writer-thread write handed over and cancelled within microseconds of
+  being issued can miss the cancellation and stay blocked until the browser
+  reads or ends; the App only drops a pending write after its 20 s bound.
 
 ## Observations and limits
 
