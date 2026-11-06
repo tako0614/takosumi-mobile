@@ -68,6 +68,8 @@ static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
 enum Wait {
     TimedOut,
     Closed,
+    /// The browser answered this request with an error: nothing is pending.
+    Rejected(String),
     Fault(Error),
 }
 impl From<Wait> for Error {
@@ -75,6 +77,7 @@ impl From<Wait> for Error {
         match wait {
             Wait::TimedOut => Error::InvalidRequest("Browser response timed out."),
             Wait::Closed => Error::InvalidRequest("Browser replies closed."),
+            Wait::Rejected(message) => failure(message),
             Wait::Fault(error) => error,
         }
     }
@@ -210,7 +213,6 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             )?;
             // Retain ownership before waiting for the native creation reply.
             let result = process.expect_open(1, &key);
-            process.uncertain = result.is_err();
             state.processes.insert(profile, process);
             result
         }
@@ -253,10 +255,7 @@ fn drain(backend: &Backend) -> Result<bool> {
                 state.processes.remove(&profile);
             }
             Ok(false) => return Ok(false), // Native beforeunload cancellation.
-            Err(error) => {
-                process.uncertain = true;
-                return Err(error);
-            }
+            Err(error) => return Err(error), // Marks the browser in doubt unless it answered.
         }
     }
     Ok(true)
@@ -722,7 +721,7 @@ impl Process {
                 )));
             }
             if let Reply::Error { message, .. } = reply {
-                return Err(Wait::Fault(failure(message)));
+                return Err(Wait::Rejected(message));
             }
             return Ok(reply);
         }
@@ -737,8 +736,17 @@ impl Process {
         deadline: std::time::Instant,
     ) -> Result<()> {
         self.opening = Some(key.to_owned());
-        let reply = self.receive(id, deadline)?;
-        self.confirm_opened(reply, key)
+        let result = match self.receive(id, deadline) {
+            Ok(reply) => self.confirm_opened(reply, key),
+            // The browser refused this creation outright: nothing is pending.
+            Err(Wait::Rejected(message)) => {
+                self.opening = None;
+                return Err(failure(message));
+            }
+            Err(wait) => Err(wait.into()),
+        };
+        self.uncertain = result.is_err();
+        result
     }
     /// Record a creation reply for this browser's own native child, profile
     /// cache and key; anything else is unconfirmed.
@@ -785,18 +793,31 @@ impl Process {
             .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
         let id = self.next;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let result = self
-            .send(Request::Open { id, payload }, deadline)
-            .and_then(|()| self.expect_open_until(id, &key, deadline));
-        self.uncertain = result.is_err();
-        result
+        if let Err(error) = self.send(Request::Open { id, payload }, deadline) {
+            self.uncertain = true;
+            return Err(error);
+        }
+        self.expect_open_until(id, &key, deadline)
     }
     fn shutdown(&mut self) -> Result<bool> {
         // A person answers each window's beforeunload in turn: the reply bound
         // is interactive, unlike the write bound.
         self.shutdown_until(std::time::Instant::now() + Duration::from_secs(300))
     }
+    /// Any failure leaves the browser in doubt, except an error it answered.
     fn shutdown_until(&mut self, reply_deadline: std::time::Instant) -> Result<bool> {
+        let mut rejected = false;
+        let result = self.shutdown_attempt(reply_deadline, &mut rejected);
+        if result.is_err() && !rejected {
+            self.uncertain = true;
+        }
+        result
+    }
+    fn shutdown_attempt(
+        &mut self,
+        reply_deadline: std::time::Instant,
+        rejected: &mut bool,
+    ) -> Result<bool> {
         if let Some(status) = self.child.try_wait().map_err(failure)? {
             return if status.success() {
                 self.normal_guard().map(|()| true)
@@ -828,6 +849,10 @@ impl Process {
                     .ended_within(Duration::from_secs(2))
                     .map(|()| true)
                     .map_err(|_| Wait::Closed.into());
+            }
+            Err(Wait::Rejected(message)) => {
+                *rejected = true;
+                return Err(failure(message));
             }
             Err(wait) => return Err(wait.into()),
         };
@@ -1219,7 +1244,7 @@ mod tests {
         let lingering = root.join("lingering.py");
         std::fs::write(&lingering, "import time\ntime.sleep(30)\n").unwrap();
         let exiting = root.join("exiting.py");
-        std::fs::write(&exiting, "import json,sys,time\ntime.sleep(0.3)\nopen(sys.argv[1],'w').write(json.dumps({'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}))\n").unwrap();
+        std::fs::write(&exiting, "import json,pathlib,sys,time\npathlib.Path(sys.argv[1]).with_name('started').write_text('1')\ntime.sleep(0.3)\nopen(sys.argv[1],'w').write(json.dumps({'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}))\n").unwrap();
         let (work, personal) = (
             "11111111-1111-4111-8111-111111111111",
             "22222222-2222-4222-8222-222222222222",
@@ -1254,6 +1279,8 @@ mod tests {
             processes,
             spawner: parent.clone(),
         };
+        // Python start-up under host I/O load must not eat the bound under test.
+        marker(&root.join("r1").join("started"));
         let started = std::time::Instant::now();
         settle_exiting(&mut state, started + Duration::from_secs(2)).unwrap();
         assert_eq!(
@@ -1301,7 +1328,7 @@ mod tests {
     /// input closes. SIGTERM (Drop) also ends both children.
     fn recovering_guard(root: &std::path::Path) -> PathBuf {
         let guard = root.join("guard.py");
-        std::fs::write(&guard, format!("import json,pathlib,signal,subprocess,sys\nhere=pathlib.Path(sys.argv[1])\nnative=subprocess.Popen([sys.argv[2],'30'])\nother=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\ndef end():\n    native.kill();other.kill();native.wait();other.wait()\ndef stop(*_):\n    end();sys.exit(0)\nsignal.signal(signal.SIGTERM,stop)\nhere.with_name('other').write_text(str(other.pid))\nhere.with_name('native').write_text(str(native.pid))\nsys.stdin.read()\nend()\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        std::fs::write(&guard, format!("import json,pathlib,signal,subprocess,sys\nhere=pathlib.Path(sys.argv[1])\nnative=subprocess.Popen([sys.argv[2],'30'])\nother=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\ndef end():\n    native.kill();other.kill();native.wait();other.wait()\ndef stop(*_):\n    end();sys.exit(0)\nsignal.signal(signal.SIGTERM,stop)\nhere.with_name('other').write_text(str(other.pid))\nhere.with_name('native').write_text(str(native.pid))\nsys.stdin.read()\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nend()\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
         guard
     }
     /// A live stand-in browser for `profile` with injected replies, as after a
@@ -1532,12 +1559,71 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        process.uncertain = true; // As `drain` marks a failed shutdown.
+        assert!(process.uncertain, "a timed-out shutdown leaves it in doubt");
         assert!(
             !process.recover().unwrap(),
             "the late cancel keeps the browser"
         );
         assert!(!process.uncertain, "and makes it usable again");
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn an_answered_error_settles_the_request_but_a_timeout_does_not() {
+        // The browser refused a creation (e.g. its window limit) or a close
+        // it could not observe: it holds nothing pending and stays usable.
+        let root = std::env::temp_dir().join(format!("sumi-answered-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let work = "11111111-1111-4111-8111-111111111111";
+        let guard = recovering_guard(&root);
+        let program = std::fs::canonicalize("/bin/sleep").unwrap();
+        let parent = spawner().unwrap();
+        let payload = || {
+            serde_json::from_value::<OpenRequest>(serde_json::json!({
+                "key":format!("web-home:{work}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":work,"webHome":true
+            }))
+            .unwrap()
+        };
+        let (mut process, send) = in_doubt(&root, &guard, &program, &parent, 1, work);
+        process.next = 1;
+        process.uncertain = false;
+        send.send(Ok(Reply::Error {
+            id: 2,
+            message: "Native browser window limit reached".into(),
+        }))
+        .unwrap();
+        match process.open(payload()) {
+            Err(Error::Desktop(message)) => {
+                assert_eq!(message, "Native browser window limit reached")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!process.uncertain, "a refused creation leaves it usable");
+        assert_eq!(process.opening, None);
+        send.send(Ok(Reply::Error {
+            id: 3,
+            message: "Native close observation is unavailable; browser retained".into(),
+        }))
+        .unwrap();
+        assert!(process.shutdown().is_err());
+        assert!(!process.uncertain, "a refused close leaves it usable");
+        // A creation that times out stays in doubt for recovery.
+        let passed = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let key = format!("web-home:{work}:https://excalidraw.com");
+        assert!(process.expect_open_until(4, &key, passed).is_err());
+        assert!(process.uncertain, "a timed-out creation leaves it in doubt");
+        assert_eq!(process.opening.as_deref(), Some(key.as_str()));
+        // A request that cannot be written leaves it in doubt too.
+        process.uncertain = false;
+        process.input.take();
+        assert!(process.open(payload()).is_err());
+        assert!(
+            process.uncertain,
+            "an unwritten creation leaves it in doubt"
+        );
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();
     }
