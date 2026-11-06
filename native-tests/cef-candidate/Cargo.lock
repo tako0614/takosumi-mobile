@@ -2827,6 +2827,7 @@ name = "takosumi-cef-candidate"
 version = "0.0.0"
 dependencies = [
  "cef",
+ "libc",
  "serde_json",
  "tauri",
  "tauri-plugin-app-screen",
