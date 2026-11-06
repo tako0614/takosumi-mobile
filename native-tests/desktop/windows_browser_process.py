@@ -24,8 +24,9 @@ an app page); its certificate comes from windows_fixture_tls.ps1, whose CA
 the machine must trust. Real sites, notifications, the native file chooser,
 popups and the open-outside choice are inspected by the Linux runner only.
 External links are never opened: the fixture build records them to the
-session's external-open.log instead of calling ShellExecuteW, and the run
-requires that log to stay empty.
+session's external-open.log instead of calling ShellExecuteW (the record's
+shape is unit-tested in the plugin). No case chooses to open a link outside,
+and the run requires that log to stay empty (no-opener-request).
 
 It prints `PASS case <name>` for each verified case and writes summary.json
 into the case directory, which it never removes.
@@ -77,9 +78,13 @@ OBSERVED_CASES = {
     "reset": ("clear-only-one-profile",),
 }
 # Verified by the runner: the first launch's final quit closed every
-# connection normally, and after all launches nothing was left or opened.
+# connection normally; after all launches nothing was left in a job and no
+# link was handed to the App's opener.
 QUIT_CASE = "quit-completes"
-FINAL_CASES = ("no-process-left", "no-external-open")
+FINAL_CASES = ("no-process-left", "no-opener-request")
+# The observer's evidence printed to the CI log (bindings and samples stay in
+# browser-observation.json).
+EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility")
 WINDOWS_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
@@ -298,8 +303,24 @@ def session_receipt(job, app_exit):
             "error": None, "observed": total}
 
 
+def evidence(session, suffix):
+    """The observation's decisive evidence as one compact JSON line: the
+    stage, any error, the window and visibility records and each case's
+    evidence except the per-profile bindings."""
+    try:
+        observation = read_json(session / f"browser-observation{suffix}.json")
+    except (OSError, ValueError, Failure) as error:
+        return json.dumps({"observation": f"unreadable: {error}"})
+    digest = {key: observation[key] for key in EVIDENCE_KEYS if key in observation}
+    digest["cases"] = {name: value for name, value in observation.get("evidence", {}).items()
+                       if name != "separate-profiles"}
+    return json.dumps(digest, separators=(",", ":"))
+
+
 def tails(session, suffix):
     """Logs of a failed phase, for the CI log."""
+    print(f"----- evidence{suffix} -----", file=sys.stderr)
+    print(evidence(session, suffix), file=sys.stderr)
     names = [f"app{suffix}.log", f"observer{suffix}.log", f"browser-observation{suffix}.json"]
     for name in names:
         print(f"----- tail of {session / name} -----", file=sys.stderr)
@@ -503,6 +524,7 @@ def run(args, summary):
                     f"The {proof['phase']} launch verified {proof['cases']}, not {expected}")
             # The first launch's final quit: the App exited 0 after closing
             # Personal (and Work before it) with normal guard receipts.
+            print(f"evidence{suffix or '-first'} {evidence(args.session, suffix)}", flush=True)
             for name in expected + ([QUIT_CASE] if not suffix else []):
                 print(f"PASS case {name}", flush=True)
                 summary["cases"].append(name)
@@ -510,10 +532,12 @@ def run(args, summary):
         # browser guard's normal receipt (checked per phase above).
         print(f"PASS case {FINAL_CASES[0]}", flush=True)
         summary["cases"].append(FINAL_CASES[0])
-        # Nothing reached the opener: no case chooses to open a link outside.
+        # No link was handed to the App's opener over all launches: none of
+        # these flows chooses to open one outside (that needs the native
+        # context menu, inspected on Linux only).
         opened = read_session(log, 1024 * 1024).decode().splitlines() if os.path.lexists(log) else []
         summary["externalOpens"] = len(opened)
-        require(opened == [], f"Expected no external open, saw {len(opened)}")
+        require(opened == [], f"Expected no request to the opener, saw {len(opened)}")
         print(f"PASS case {FINAL_CASES[1]}", flush=True)
         summary["cases"].append(FINAL_CASES[1])
     finally:

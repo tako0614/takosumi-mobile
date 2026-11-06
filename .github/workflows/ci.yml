@@ -699,7 +699,7 @@ jobs:
             'restart-keeps-separation',
             'clear-only-one-profile',
             'no-process-left',
-            'no-external-open'
+            'no-opener-request'
           )
           foreach ($case_name in $w3Cases) {
             if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "W3 case $case_name did not pass" }
