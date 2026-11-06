@@ -995,6 +995,22 @@ inspected on Linux only), so the run's case `no-opener-request` shows only
 that nothing in these flows handed a link to the opener; the recorder itself
 never runs in CI. The product opener remains untested.
 
+**Native occlusion is off on Windows.** The Windows browser adds
+`CalculateNativeWinOcclusion` to `--disable-features` (merged with any value
+already given) in CEF's `on_before_command_line_processing`, as Electron
+does; Linux is unchanged. In run 42306043123 Chromium's native occlusion
+tracker marked a browser window covered by the other profile's window
+(both at the same rectangle) as hidden, but after the home's reopen had moved
+that window to the top of the Z-order (position 10, above Personal at 18 and
+the home at 15) and made it the foreground window, neither browser process
+recomputed: the reused page stayed `hidden` and the window now below stayed
+`visible`. A reused window could therefore stay hidden. The cause inside
+Chromium is unknown (it may be specific to the runner's session), and so is
+whether the tracker would follow on a real desktop. The trade-off: a covered
+window that is not minimized keeps rendering at the normal rate; a minimized
+window is still hidden. The reopen's move to the top of the Z-order stays,
+since it is right for the real stacking.
+
 **Foreground.** Before it sends a reopen, the adapter now calls
 `AllowSetForegroundWindow` with the browser's native pid, so the browser may
 raise its window while the person uses the home (a refusal is harmless).
@@ -1077,11 +1093,14 @@ with `SetForegroundWindow` (if Windows refuses, the task switchers'
 `AttachThreadInput` route) and never sends keyboard or mouse input. It
 cancels a beforeunload dialog through DevTools (`Page.handleJavaScriptDialog`),
 where Linux presses Escape, and closes a window with `WM_CLOSE`, where Linux
-presses Ctrl+Shift+W. It records each page's visibility and focus with
-Windows' view of its window (`IsWindowVisible`, `IsIconic`, placement,
-rectangle) when it attaches, with Personal brought to the front, before the
-reuse and after it, and the runner prints this evidence after each launch
-(and before the log tails of a failed one). Waiting for a profile to end after its last window
+presses Ctrl+Shift+W. Before the home reopens Work it minimizes Work's
+window (`ShowWindowAsync` with `SW_SHOWMINNOACTIVE`, so the home stays in
+front). It records each page's visibility and focus with Windows' view of
+its window (`IsWindowVisible`, `IsIconic`, placement, rectangle) when it
+attaches, with Personal brought to the front, before the reuse and after it,
+and the top-level Z-order of the home, Work and Personal around the reuse;
+the runner prints this evidence after each launch (and before the log tails
+of a failed one). Waiting for a profile to end after its last window
 closed (Work before Personal is asked, Personal after its native close)
 allows 20 s where Linux allows 10 s; a navigation within the fixture site
 may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
@@ -1092,7 +1111,7 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
 | `home-by-window-switch` | with Personal's window in front, an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
-| `reuse-raises-window` | with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), Work's window comes to the front within 2 s, and the browser logged no raise refusal. Visibility decides only where the desktop reported some front CEF window as visible before the reuse: then Work's document must become visible (a product defect otherwise); a desktop that never reports one (Chromium's native occlusion on a CI desktop) leaves it as evidence. The Z-order of the home, Work and Personal before and after the reuse, and Personal's visibility after it, are recorded |
+| `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` within 10 s, and the browser logged no raise refusal. The Z-order around the reuse and both pages' visibility are recorded |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
 | `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
@@ -1146,9 +1165,10 @@ browser-compatibility runs, downloads, popups, the open-outside choice, the
 long alert, notifications and the native file chooser stay Linux-only);
 the `ShellExecuteW` opener; native keyboard and mouse input in the browser's
 dialogs and windows (the cancel goes through DevTools, the switch through
-`SetForegroundWindow`, the close through `WM_CLOSE`); occlusion-driven page
-visibility on a desktop that never reports it; and other DPI or
-multi-monitor layouts.
+`SetForegroundWindow`, the minimize through `ShowWindowAsync`, the close
+through `WM_CLOSE`); Chromium's native occlusion tracking (off on Windows;
+whether it would follow reorders on a real desktop is unknown); and other
+DPI or multi-monitor layouts.
 
 **First CI run (W3).** Run 42292805130 (head `0b533a8`): `cef-windows-app`
 built and passed the first launch up to the reuse (separate profiles signed
@@ -1175,6 +1195,14 @@ recomputes on. A refused move is reported like a refused foreground
 change. The observer now records the Z-order and Personal's visibility
 after the reuse, so a further failure shows whether Work was not reordered
 or the reorder was not recomputed.
+
+**Third CI run (W3).** Run 42306043123 (head `bf9a482`): the reorder
+happened (Work at Z-order position 10, above Personal at 18 and the home at
+15; Work in front; nothing always-on-top), yet Work's page stayed `hidden`
+and Personal's `visible`: the occlusion tracker recomputed in neither
+process. Native occlusion is now off on Windows (see above), and
+`reuse-raises-window` minimizes Work before the reopen and requires the
+raise to restore it and make its page visible again.
 
 **2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
 the Linux host. For `x86_64-pc-windows-msvc`, the App type-checks and passes
