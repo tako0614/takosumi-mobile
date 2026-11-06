@@ -3,6 +3,8 @@
 Experimental Linux CEF 154 process using the App's production `OpenRequest`
 validator and UUID profile IDs. It does not replace the Tauri runtime or change
 installed App profiles. See [upstream attribution and scope](UPSTREAM.md).
+The per-profile browser process also has a first Windows candidate; see
+[Windows browser process](#windows-browser-process-first-candidate).
 
 Build with an owned SDK/target directory and the committed candidate lockfile:
 
@@ -243,7 +245,8 @@ Run `--app photopea` in another fresh case for the second anonymous origin.
 The fixture browser needs the cef-candidate feature `fixture-inspection` for
 its observation seam (see [Linux packaging](#linux-packaging-desktop-cef)).
 
-`takosumi-browser-guard` (`src/guard_main.rs`) is the product supervisor that
+`takosumi-browser-guard` (`src/guard_main.rs`, compiled only for Linux through
+`src/guard_entry.rs`) is the product supervisor that
 replaces the fixture's Python guard for the Linux-first per-profile release. It
 keeps `guard.py`'s arguments and receipt: an exclusive 0600 receipt, its own
 process group, a pidfd probe, the child subreaper, SIGTERM on parent death,
@@ -463,8 +466,8 @@ started before the upgrade keep the old files, while later starts use the new
 browser and guard with the old App, so the App should be restarted after an
 upgrade. Neither case is handled in code yet.
 
-**Build and stage.** `build.rs` gives both browser executables a `$ORIGIN`
-run path, so they find the adjacent `libcef.so` without `LD_LIBRARY_PATH`;
+**Build and stage.** On Linux `build.rs` gives both browser executables a
+`$ORIGIN` run path, so they find the adjacent `libcef.so` without `LD_LIBRARY_PATH`;
 the adapter still sets it. The browser's DevTools inspection seam (a loopback
 port plus load markers for `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`) is compiled
 only with the cef-candidate feature `fixture-inspection`. Build fixture
@@ -549,6 +552,106 @@ runs passed: pk3 and pk4 as `nobody` with the sandbox, and pk5 as root. That is
 local evidence for this branch's earlier commits, not a qualification of later
 sources, of Tauri's AppImage dependency handling (linuxdeploy) on other hosts,
 or of a release.
+
+## Windows browser process (first candidate)
+
+`takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`. This
+first Windows step runs the browser on its own, started by `windows_smoke.py`
+or the CI job; the App does not start it on Windows yet (`desktop-process-experiment`
+and `desktop-cef` stay Linux only), and nothing is staged or packaged.
+
+```powershell
+$env:CEF_PATH = "C:\absolute\owned\cef"   # the first build downloads the Windows distribution here
+cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process
+python -B native-tests/cef-candidate/windows_smoke.py --browser <target>\debug\takosumi-cef-browser-process.exe --work C:\absolute\owned\cases
+```
+
+Build only that bin on Windows. The guard needs Linux pidfds, signalfd and the
+child subreaper, and the standalone `takosumi-cef-candidate` is a Linux
+experiment. Both refuse to compile on other OSes with a single error instead
+of building an inert stub that a stage could pick up by mistake. A Windows
+supervisor (for example a Job Object owning the browser's processes) is not
+written. The build needs the MSVC toolchain, CMake and Ninja for cef-dll-sys's
+`libcef_dll_wrapper`, as `windows-latest` provides.
+
+The X11 raise (`x11_front`), the euid sandbox decision (`libc` is now a
+Linux-only dependency) and the `$ORIGIN` run path are compiled only for Linux,
+where the browser's behaviour and output are unchanged. On Windows:
+
+- **DLLs and resources.** cef-dll-sys copies the distribution's files
+  (`libcef.dll`, `chrome_elf.dll`, the `.pak`, `icudtl.dat` and V8 snapshot
+  files) and `locales/` into the Cargo profile directory beside the executable.
+  The Windows loader searches the executable's directory first, and CEF finds
+  its resources and locales in that same directory, so no `PATH` or run path is
+  needed. A browser started elsewhere needs those files beside it. The
+  harness's `--runtime` puts another runtime directory on `PATH` for
+  `libcef.dll`; that layout is not exercised on Windows.
+- **Manifest.** `build.rs` embeds
+  `windows/takosumi-cef-browser-process.exe.manifest` with the MSVC linker
+  (`/MANIFEST:EMBED`, `/MANIFESTINPUT`, `/MANIFESTUAC:NO`): the Windows 10/11
+  compatibility entry of CEF's cefsimple manifest, without which Windows
+  reports an older version to Chromium, plus Common Controls 6 and `asInvoker`.
+- **Profile directory.** `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` must be absolute
+  and in its final form, as on Linux. On Windows the check drops the `\\?\`
+  (or `\\?\UNC\`) prefix that `canonicalize` adds; short (8.3) names, links
+  and letter case are still resolved, so the parent passes the long final
+  spelling (the harness uses `os.path.realpath`). `boot.json`, `Downloads/`,
+  `cef-profiles/<profile>/`, `cef-native.log` and the stdin/stdout protocol are
+  unchanged. The Linux HOME/XDG/TMPDIR directories have no counterpart; the
+  harness points `TEMP` and `TMP` into its case.
+- **Window reuse.** Reopening a live screen restores a minimized window, shows
+  it and calls `SetForegroundWindow` through minimal `extern "system"` user32
+  declarations (the CEF wrapper already links user32). Windows hands the
+  foreground only to a process allowed to take it, so an App should call
+  `AllowSetForegroundWindow` with the browser's pid before sending the Open.
+  Otherwise Windows flashes the taskbar button and the browser prints
+  `Reused browser window was not raised: Windows refused the foreground change`
+  to stderr, as it does for an X11 refusal.
+- **Sandbox.** Off on Windows in this candidate, whatever the switches. CEF's
+  Windows sandbox needs cef-dll-sys's `sandbox` feature (`cef_sandbox`) and the
+  bootstrap layout: the browser built as a DLL that CEF's `bootstrap.exe`,
+  renamed to the browser, loads, with sandbox information passed to
+  `execute_process` and `initialize`. This build links none of that, so it sets
+  CEF's `no_sandbox` itself. It must be qualified before any Windows package
+  (the TODO in `without_sandbox`).
+- **Console.** The executable keeps the console subsystem. An App starting it
+  from a GUI process must pass `CREATE_NO_WINDOW` (or the browser must move to
+  the Windows subsystem) to avoid a console window. Not handled yet.
+
+**Smoke harness.** `windows_smoke.py` uses only the Python 3 standard library
+(plus `tasklist`/`taskkill` on Windows) and runs on both OSes. It creates a new
+case directory under `--work` (`tempfile.mkdtemp`), lays it out like the App's
+adapter and writes the boot Open for `https://example.com/` with a new UUID
+profile (key `web-home:<profile>:https://example.com`). It starts the browser
+directly with `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` and the App's switches (on
+Linux also private HOME/XDG/TMPDIR, `LD_LIBRARY_PATH` and `--no-sandbox` as
+root). It requires an `opened` reply for that key and profile, with the
+expected cache path and native pid, within 120 s. It then sends
+`{"operation":"shutdown","id":2}` and requires a `closed` reply for that
+browser, `stopped` for id 2 and exit code 0 within 60 s. `--expect-load` (a
+`fixture-inspection` browser) also requires the main-frame load marker, which
+shows a renderer ran. `--reuse` sends a second Open of the screen (id 2,
+`resume`) and requires the same native browser and window before shutting down
+with id 3. The harness prints a JSON summary and keeps it with
+`protocol.jsonl`, `browser.log` and `cef-native.log` in the case, which it never
+removes. On failure it prints the log tails and ends the process tree
+(`taskkill /T` on Windows, the process group on Linux). Processes left after
+the exit are counted (by image name on Windows, by process group on Linux) but
+do not fail the run.
+
+The CI job `cef-windows` on `windows-latest` builds the product browser with
+`--locked` (`CEF_PATH` is `${{ runner.temp }}\cef`, cached by the locked
+cef-dll-sys version), runs the harness, then builds the `fixture-inspection`
+browser and runs it with `--expect-load --reuse`.
+
+**2026-11-06 local checks (Linux host).** The browser type-checks for
+`x86_64-pc-windows-msvc` with `cargo check --features cef/dox`; `dox` skips
+cef-dll-sys's build script, which needs the Windows SDK, so nothing was linked
+or run for Windows here. On that target the guard stops at its single error.
+The Linux build, the guard self-tests and the plugin tests passed, and the
+harness passed once against the Linux `fixture-inspection` browser in a private
+`xvfb-run` display with `--expect-load --reuse`. Windows evidence comes only
+from the CI job.
 
 ## Observations and limits
 
