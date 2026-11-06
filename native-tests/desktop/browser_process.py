@@ -251,12 +251,19 @@ def main():
     opener = args.data / "opener"
     opener.mkdir(mode=0o700)
     stub = opener / "xdg-open"
-    stub.write_text("#!/usr/bin/python3 -I\nimport json, os, sys\n"
+    stub.write_text(f"#!{sys.executable} -I\nimport json, os, sys\n"
                     "with open(os.environ['TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG'], 'a') as log:\n"
-                    "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+                    "    log.write(json.dumps({'argv': sys.argv[1:], 'ppid': os.getppid()}) + '\\n')\n")
     stub.chmod(0o700)
     env["PATH"] = f"{opener}{os.pathsep}{env.get('PATH', '')}"
     env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(args.data / "external-open.log")
+    # The stand-in must be what the App resolves, and it must actually run:
+    # a failing exec would make PATH lookup fall through to the real opener.
+    require(shutil.which("xdg-open", path=env["PATH"]) == str(stub), "The recording opener is not first on PATH")
+    selftest = opener / "selftest.log"
+    subprocess.run([str(stub), "selftest"], env=dict(env, TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(selftest)),
+                   check=True, timeout=30)
+    require(json.loads(selftest.read_text())["argv"] == ["selftest"], "The recording opener did not record")
     file_input = file_nonce = None
     if args.files:
         # The owned input is hashed with the sources: Save As must not overwrite it.
@@ -305,6 +312,9 @@ def main():
                                            TAKOSUMI_BROWSER_PROCESS_FILES_NONCE=file_nonce),
                                 files, before, head, "-files")
         require(files_run["passed"] is True, "The native file chooser execution did not pass")
+    # Over all phases, only the first launch's chosen link reached the opener.
+    opened = (args.data / "external-open.log").read_text().splitlines()
+    require(len(opened) == 1, f"Expected exactly one external open, saw {len(opened)}")
 
 
 if __name__ == "__main__":

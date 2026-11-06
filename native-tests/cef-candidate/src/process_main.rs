@@ -13,7 +13,7 @@ use std::{
     },
 };
 use tauri_plugin_app_screen::{
-    browser_process::{decode, external_link, read_packet, Reply, Request},
+    browser_process::{decode, external_link, link_host, read_packet, Reply, Request},
     OpenRequest,
 };
 
@@ -482,8 +482,11 @@ wrap_context_menu_handler! {
     impl ContextMenuHandler {
         fn on_before_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
             let (Some(params),Some(model))=(params,model) else {return;};
-            if external_link(&CefString::from(&params.link_url()).to_string()) {
-                model.insert_item_at(0,OPEN_EXTERNALLY,Some(&CefString::from("既定のブラウザで開く")));
+            // Name the destination host (ASCII/punycode): a page can cover the
+            // screen with a link or change it at the last moment.
+            let url=CefString::from(&params.link_url()).to_string();
+            if let Some(host)=link_host(&url) {
+                model.insert_item_at(0,OPEN_EXTERNALLY,Some(&CefString::from(format!("既定のブラウザで開く: {host}").as_str())));
                 model.insert_separator_at(1);
             }
         }

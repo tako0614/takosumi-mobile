@@ -100,24 +100,42 @@ struct Process {
     order: u64,
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
-/// Hand a validated link to the desktop's opener without waiting for it.
+/// Openers started and not yet ended; a burst beyond this is dropped.
+#[cfg(not(test))]
+static OPENERS: AtomicU64 = AtomicU64::new(0);
+/// Hand a validated link to the desktop's opener without waiting for it. Its
+/// own process group keeps the desktop browser it may start out of the App's
+/// terminal signals.
 #[cfg(not(test))]
 fn open_externally(url: &str) {
-    match Command::new("xdg-open")
+    if OPENERS.fetch_add(1, Ordering::SeqCst) >= 8 {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("Too many external links are opening; this one was dropped.");
+        return;
+    }
+    let mut command = Command::new("xdg-open");
+    command
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-    {
+        .process_group(0);
+    match command.spawn() {
         Ok(mut child) => {
-            let _ = std::thread::Builder::new()
+            let reaper = std::thread::Builder::new()
                 .name("external-open".into())
                 .spawn(move || {
                     let _ = child.wait();
+                    OPENERS.fetch_sub(1, Ordering::SeqCst);
                 });
+            if let Err(error) = reaper {
+                eprintln!("The external link opener is not watched: {error}");
+            }
         }
-        Err(error) => eprintln!("The external link could not be opened: {error}"),
+        Err(error) => {
+            OPENERS.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("The external link could not be opened: {error}");
+        }
     }
 }
 /// Tests never start the desktop's opener: they record what would be opened.
@@ -688,14 +706,21 @@ impl Process {
                     // The person chose to open a link outside the App. The browser
                     // runs with its profile's HOME and XDG directories, so the App
                     // opens it with the person's own desktop; never a command reply.
-                    if let Ok(Reply::OpenExternal { profile, url }) = &reply {
-                        if *profile == owner && external_link(url) {
-                            open_externally(url);
-                        } else {
-                            eprintln!("An invalid external link request was ignored.");
+                    // Another profile's request is a protocol fault, as for closes.
+                    let reply = match reply {
+                        Ok(Reply::OpenExternal { profile, .. }) if profile != owner => {
+                            Err("Foreign external link request".to_string())
                         }
-                        continue;
-                    }
+                        Ok(Reply::OpenExternal { url, .. }) => {
+                            if external_link(&url) {
+                                open_externally(&url);
+                            } else {
+                                eprintln!("An invalid external link request was ignored.");
+                            }
+                            continue;
+                        }
+                        other => other,
+                    };
                     let failed = reply.is_err();
                     if send.send(reply).is_err() || failed {
                         break;
@@ -1674,17 +1699,17 @@ mod tests {
     }
     #[test]
     fn external_link_requests_never_reach_command_replies() {
-        // The stand-in browser asks to open a link from another profile, a
-        // non-web link and one valid link of its own, then answers the
-        // shutdown. The reader consumes all three, hands only the valid one to
-        // the recording opener (tests never start the desktop's), and never
-        // forwards them as replies.
+        // The stand-in browser asks to open a non-web link and one valid link
+        // of its own, then answers the shutdown: the reader consumes both,
+        // hands only the valid one to the recording opener (tests never start
+        // the desktop's) and forwards neither. Another profile's request is a
+        // protocol fault.
         let root = std::env::temp_dir().join(format!("sumi-external-{}", std::process::id()));
         private_directory(&root).unwrap();
         let profile = "11111111-1111-4111-8111-111111111111";
         let marker = format!("own-{}", std::process::id());
         let guard = root.join("guard.py");
-        std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'openExternal','profile':'22222222-2222-4222-8222-222222222222','url':'https://example.com/'}}),flush=True)\nprint(json.dumps({{'event':'openExternal','profile':'{profile}','url':'file:///etc/passwd'}}),flush=True)\nprint(json.dumps({{'event':'openExternal','profile':'{profile}','url':'https://example.com/{marker}'}}),flush=True)\nsys.stdin.readline()\nprint(json.dumps({{'event':'cancelled','id':2,'profile':'{profile}'}}),flush=True)\nsys.stdin.read()\n")).unwrap();
+        std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'openExternal','profile':'{profile}','url':'file:///etc/passwd'}}),flush=True)\nprint(json.dumps({{'event':'openExternal','profile':'{profile}','url':'https://example.com/{marker}'}}),flush=True)\nsys.stdin.readline()\nprint(json.dumps({{'event':'cancelled','id':2,'profile':'{profile}'}}),flush=True)\nsys.stdin.read()\n")).unwrap();
         let parent = spawner().unwrap();
         let payload = serde_json::from_value(serde_json::json!({
             "key":format!("web-home:{profile}:https://excalidraw.com"),
@@ -1713,6 +1738,40 @@ mod tests {
             opened,
             vec![expected],
             "only the valid link of the owning profile is opened"
+        );
+        drop(process);
+        let foreign = root.join("foreign.py");
+        std::fs::write(&foreign, "import json,sys\nprint(json.dumps({'event':'openExternal','profile':'22222222-2222-4222-8222-222222222222','url':'https://example.com/foreign'}),flush=True)\nsys.stdin.read()\n").unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            foreign,
+            root.join("q").join(profile),
+            root.join("s"),
+            payload,
+            &parent,
+        )
+        .unwrap();
+        process.next = 1;
+        match process.shutdown() {
+            Err(Error::Desktop(message)) => assert_eq!(message, "Foreign external link request"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            process.uncertain,
+            "a foreign request leaves the browser in doubt"
+        );
+        assert!(
+            !OPENED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| url.ends_with("/foreign")),
+            "another profile's link is never opened"
         );
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();

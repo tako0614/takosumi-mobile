@@ -494,6 +494,8 @@ async function openExternalProbe(work,personal,expected,sample) {
   const state={method:'Native context menu on a test-inserted link in a srcdoc frame: X11 right click (xdotool), X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
   const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   const opened=async()=>{try{return (await readFile(log,'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+  // The click point below assumes CSS pixels equal X pixels.
+  assert.equal(await work.evaluate('devicePixelRatio'),1,'The click mapping assumes devicePixelRatio 1');
   assert.deepEqual(await opened(),[],'Nothing may reach the opener before the choice');
   const workPages=(await pages(work)).map(t=>t.targetId);
   // Editor pages may cancel contextmenu for their own menus (ex35: no native
@@ -535,7 +537,10 @@ async function openExternalProbe(work,personal,expected,sample) {
   desktop('xdotool',['key','--clearmodifiers','Return']);
   await settled(async()=>(await opened()).length>0,'The App did not hand the chosen link to the desktop opener');
   state.opened=await opened();
-  assert.deepEqual(state.opened,[[url]],'Exactly the chosen link must reach the opener');
+  assert.deepEqual(state.opened.map(entry=>entry.argv),[[url]],'Exactly the chosen link must reach the opener');
+  // From the App itself (the opener's parent), not from a profile browser.
+  state.openerParent=await readlink(`/proc/${state.opened[0].ppid}/exe`).catch(e=>`unreadable: ${e.code}`);
+  assert.equal(path.basename(state.openerParent),'takosumi-mobile','The App must start the opener');
   await settled(async()=>!viewable(menu),'The context menu did not close');
   assert.deepEqual((await pages(work)).map(t=>t.targetId),workPages,'Nothing may open inside the App');
   assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'Personal must not change');

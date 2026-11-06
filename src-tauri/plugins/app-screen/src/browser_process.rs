@@ -133,24 +133,47 @@ pub enum Reply {
     },
 }
 
-/// A link the person may open outside the App: an absolute http(s) URL with
-/// a host and no credentials, without whitespace or control characters, and
-/// bounded. Anything else (file:, javascript:, custom schemes) stays inside.
+/// A link the person may open outside the App: an absolute http(s) URL in
+/// its ASCII (punycode) form with a host and no credentials, without
+/// whitespace, control characters or backslashes, and bounded. Anything else
+/// (file:, javascript:, custom schemes) stays inside.
 pub fn external_link(url: &str) -> bool {
+    link_host(url).is_some()
+}
+
+/// The host (with any port) of an `external_link`, shown to the person.
+pub fn link_host(url: &str) -> Option<&str> {
     if url.is_empty()
         || url.len() > 4096
+        || !url.is_ascii()
+        || url.contains('\\')
         || url.chars().any(|c| c.is_control() || c.is_whitespace())
     {
-        return false;
+        return None;
     }
-    let Some(rest) = url
+    let rest = url
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
-        return false;
-    };
+        .or_else(|| url.strip_prefix("http://"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@')
+    // host[:port], where an IPv6 host is bracketed.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(inside) => {
+            let (address, after) = inside.split_once(']')?;
+            if address.is_empty() {
+                return None;
+            }
+            (&authority[..address.len() + 2], after)
+        }
+        None => match authority.find(':') {
+            Some(colon) => (&authority[..colon], &authority[colon..]),
+            None => (authority, ""),
+        },
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()));
+    (!host.is_empty() && port_ok && !authority.contains('@')).then_some(authority)
 }
 
 /// Only complete bounded packets cross the pipe; no arbitrary eval or path command.
@@ -179,12 +202,19 @@ mod tests {
 
     #[test]
     fn only_bounded_web_links_without_credentials_may_open_outside() {
-        for url in [
-            "https://excalidraw.com/",
-            "http://example.com/a?b=c#d",
-            "https://www.photopea.com/?x=1",
+        for (url, host) in [
+            ("https://excalidraw.com/", "excalidraw.com"),
+            ("http://example.com/a?b=c#d", "example.com"),
+            ("https://www.photopea.com/?x=1", "www.photopea.com"),
+            (
+                "https://xn--bcher-kva.example:8443/x",
+                "xn--bcher-kva.example:8443",
+            ),
+            ("https://[::1]:8443/", "[::1]:8443"),
+            ("https://[::1]/", "[::1]"),
         ] {
             assert!(external_link(url), "{url}");
+            assert_eq!(link_host(url), Some(host));
         }
         let long = format!("https://example.com/{}", "a".repeat(4096));
         for url in [
@@ -198,6 +228,14 @@ mod tests {
             "https://example.com/a b",
             "https://example.com/\n",
             "https://exa\u{7f}mple.com/",
+            "https://exa\u{202e}mple.com/",
+            "https://bücher.example/",
+            "https://\\evil.com/",
+            "https://:443/",
+            "https://example.com:x/",
+            "https://::1/",
+            "https://[]/",
+            "https://example.com:/",
             "ftp://example.com/",
             long.as_str(),
         ] {
