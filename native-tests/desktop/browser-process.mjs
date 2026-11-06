@@ -491,12 +491,17 @@ async function openExternalProbe(work,personal,expected,sample) {
   assert(log&&path.isAbsolute(log),'The recording opener is required');
   const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
   const url=`${other}/?sumi_open_external_${nonce.replaceAll('-','')}`;
-  const state={method:'Native context menu on a test-inserted link: CDP right click, X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
+  const state={method:'Native context menu on a test-inserted link in a srcdoc frame: CDP right click, X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
   const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   const opened=async()=>{try{return (await readFile(log,'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if(e.code==='ENOENT')return [];throw e;}};
   assert.deepEqual(await opened(),[],'Nothing may reach the opener before the choice');
   const workPages=(await pages(work)).map(t=>t.targetId);
-  const point=await work.evaluate(`(()=>{const a=document.createElement('a');a.id='sumi-open-external';a.href=${JSON.stringify(url)};a.textContent='external';Object.assign(a.style,{position:'fixed',left:'40px',top:'40px',width:'240px',height:'48px',display:'block',zIndex:'2147483647',background:'#fff',color:'#00e',font:'20px sans-serif'});document.body.append(a);const r=a.getBoundingClientRect(),p={x:r.x+r.width/2,y:r.y+r.height/2},hit=document.elementFromPoint(p.x,p.y);if(!(hit===a||a.contains(hit)))throw Error('Link obscured');return p})()`);
+  // Editor pages may cancel contextmenu for their own menus (ex35: no native
+  // menu opened on a top-level link in Excalidraw). Record that, and put the
+  // link in a srcdoc frame, whose events never reach the page's listeners.
+  state.pageCancelsContextMenu=await work.evaluate("(()=>{const e=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:60,clientY:60});document.body.dispatchEvent(e);return e.defaultPrevented})()");
+  const frameDoc=`<!doctype html><body style="margin:0;background:#fff"><a id="l" href="${url}" style="display:inline-block;padding:16px;font:24px sans-serif">external</a></body>`;
+  const point=await work.evaluate(`new Promise((resolve,reject)=>{const f=document.createElement('iframe');f.id='sumi-open-external';Object.assign(f.style,{position:'fixed',left:'40px',top:'40px',width:'320px',height:'90px',border:'0',zIndex:'2147483647',background:'#fff'});f.onload=()=>{const a=f.contentDocument.getElementById('l'),fr=f.getBoundingClientRect(),r=a.getBoundingClientRect(),p={x:fr.x+r.x+r.width/2,y:fr.y+r.y+r.height/2};if(document.elementFromPoint(p.x,p.y)!==f||f.contentDocument.elementFromPoint(r.x+r.width/2,r.y+r.height/2)!==a){reject(Error('Link obscured'));return;}resolve(p)};f.srcdoc=${JSON.stringify(frameDoc)};document.body.append(f);})`);
   desktop('xdotool',['windowraise',String(work.native.windowId)]);
   await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible before the right click');
   const tops=()=>desktop('xwininfo',['-root','-children','-int']).split('\n').map(line=>line.match(/^\s+(\d+) /)?.[1]).filter(Boolean);
@@ -508,7 +513,11 @@ async function openExternalProbe(work,personal,expected,sample) {
   const viewable=id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}};
   const ownerOf=id=>{try{return JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),id])).pid;}catch{return null;}};
   let menu;
-  await settled(async()=>{menu=tops().filter(id=>!before.has(id)).find(id=>viewable(id)&&ownerOf(id)===work.native.nativePid);return Boolean(menu);},'The link context menu did not open in Work\'s browser');
+  await settled(async()=>{menu=tops().filter(id=>!before.has(id)).find(id=>viewable(id)&&ownerOf(id)===work.native.nativePid);return Boolean(menu);},'The link context menu did not open in Work\'s browser').catch(error=>{
+    // What appeared instead, for the failure record.
+    state.newWindows=tops().filter(id=>!before.has(id)).map(id=>({window:Number(id),viewable:viewable(id),owner:ownerOf(id)}));
+    proof.openExternal=state;throw error;
+  });
   state.menu={window:Number(menu),owner:work.native.nativePid};
   desktop('import',['-window','root',path.join(data,'open-external-menu.png')]);
   desktop('xdotool',['key','--clearmodifiers','Down']);
