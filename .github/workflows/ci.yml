@@ -295,6 +295,15 @@ jobs:
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled"
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --cancelled-spa --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled-spa"
           python3 native-tests/desktop/run.py --spa-resume --pending-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-pending"
+      # The browser-process actual-App fixture's GTK driver (shared with the
+      # Windows one) is run locally against real sites, not here; compile it
+      # so a change to the shared flow cannot break the Linux build unseen.
+      - name: Compile the browser-process App fixture (Linux GTK driver)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+        working-directory: takosumi-mobile
       - name: Build bundled App and verify the fixture observer
         id: linux-app-fixture-build
         if: ${{ !cancelled() && runner.os == 'Linux' }}
