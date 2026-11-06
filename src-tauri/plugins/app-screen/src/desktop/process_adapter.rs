@@ -604,15 +604,29 @@ impl Process {
         file.write_all(&bytes).map_err(failure)?;
         file.flush().map_err(failure)?;
         let guard_receipt = runtime.join("guard.json");
-        let mut command = Command::new("python3");
-        command
-            .args(["-B"])
-            .arg(guard)
-            .arg(&guard_receipt)
-            .arg(&program);
-        // The fixture guard owns this process group and its exact descendants.
-        // Do not put it in the App's or another runner's process group.
+        let mut command = guard_command(&guard);
+        command.arg(&guard_receipt).arg(&program);
+        // The guard owns this process group and its exact descendants. Do not
+        // put it in the App's or another runner's process group.
         command.process_group(0);
+        // Tie the guard to the App from the moment it forks: if the App died
+        // before this point, the guard would otherwise arm its parent-death
+        // signal against its new parent and outlive the App.
+        let app = std::process::id();
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                // prctl is variadic and reads unsigned longs.
+                let (term, zero) = (libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong);
+                if libc::prctl(libc::PR_SET_PDEATHSIG, term, zero, zero, zero) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() as u32 != app {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
         command.env_clear();
         // Optional observation seam for the disposable native fixture only.
         // It is never a page IPC command or enabled in a normal App build.
@@ -1191,6 +1205,92 @@ mod tests {
             status, None,
             "the actual open path must not tie guards to a retiring thread"
         );
+        drop(parent);
+    }
+    #[test]
+    fn only_a_py_guard_runs_under_python() {
+        let fixture = guard_command(std::path::Path::new("/opt/fixture/guard.py"));
+        assert_eq!(fixture.get_program(), "python3");
+        assert_eq!(
+            fixture.get_args().collect::<Vec<_>>(),
+            ["-B", "/opt/fixture/guard.py"]
+        );
+        let product = guard_command(std::path::Path::new("/opt/app/takosumi-browser-guard"));
+        assert_eq!(product.get_program(), "/opt/app/takosumi-browser-guard");
+        assert_eq!(product.get_args().count(), 0);
+    }
+    /// A stand-in product guard that is not Python: run under python3 it would
+    /// fail to parse and never record how it was started. It records its argv
+    /// beside the receipt position, then execs a reader of its parent-death
+    /// signal (kept across exec; neither sh nor python sets one), which waits
+    /// for the control pipe to close.
+    const DIRECT_GUARD: &str = r#"#!/bin/sh
+printf '%s\n' "$0" "$@" > "${1%/*}/argv"
+exec python3 -I -B -c 'import ctypes,os,sys
+d=os.path.dirname(sys.argv[1])
+s=ctypes.c_int(-1)
+ctypes.CDLL(None).prctl(2,ctypes.byref(s),0,0,0)
+open(d+"/pdeathsig","w").write(str(s.value))
+open(d+"/ready","w").close()
+sys.stdin.read()' "$1"
+"#;
+    #[test]
+    fn open_requests_execute_a_guard_binary_directly() {
+        let root = std::env::temp_dir().join(format!("sumi-pa-direct-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let guard = root.join("takosumi-browser-guard");
+        // Written and made executable by a process that has exited, so no
+        // sibling test's fork can still hold it open for writing (ETXTBSY).
+        let written = Command::new("python3")
+            .args([
+                "-I",
+                "-B",
+                "-c",
+                "import os,sys\nopen(sys.argv[1],'w').write(sys.argv[2])\nos.chmod(sys.argv[1],0o700)",
+            ])
+            .arg(&guard)
+            .arg(DIRECT_GUARD)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let runtime = root.join("r");
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":"web-home:11111111-1111-4111-8111-111111111111:https://excalidraw.com",
+            "url":"https://excalidraw.com/","title":"Work","profile":"11111111-1111-4111-8111-111111111111","webHome":true
+        }))
+        .unwrap();
+        let parent = spawner().unwrap();
+        let process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard.clone(),
+            root.join("profile"),
+            runtime.clone(),
+            payload,
+            &parent,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !runtime.join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let recorded = std::fs::read_to_string(runtime.join("argv"));
+        let pdeathsig = std::fs::read_to_string(runtime.join("pdeathsig"));
+        drop(process); // Closing the control pipe ends the stand-in.
+        std::fs::remove_dir_all(&root).unwrap();
+        let recorded = recorded.expect("the guard binary was not executed directly");
+        // Armed by the adapter between fork and exec, before the guard runs.
+        assert_eq!(pdeathsig.unwrap(), libc::SIGTERM.to_string());
+        let lines = recorded.lines().collect::<Vec<_>>();
+        let receipt = runtime.join("guard.json");
+        assert_eq!(
+            lines[..3],
+            [
+                guard.to_str().unwrap(),
+                receipt.to_str().unwrap(),
+                "/bin/true"
+            ]
+        );
+        assert!(lines.contains(&"--no-sandbox"), "{lines:?}");
         drop(parent);
     }
     #[test]
@@ -1853,6 +1953,18 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+/// The fixture guard (`guard.py`) runs under python3; the product guard
+/// (`takosumi-browser-guard`) is executed directly. Both take the same
+/// arguments and write the same receipt.
+fn guard_command(guard: &std::path::Path) -> Command {
+    if guard.extension() == Some(std::ffi::OsStr::new("py")) {
+        let mut command = Command::new("python3");
+        command.arg("-B").arg(guard);
+        command
+    } else {
+        Command::new(guard)
     }
 }
 fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> Result<Child> {

@@ -240,6 +240,35 @@ python3 -B native-tests/desktop/browser_process.py --binary src-tauri/target/deb
 ```
 
 Run `--app photopea` in another fresh case for the second anonymous origin.
+
+`takosumi-browser-guard` (`src/guard_main.rs`) is the product supervisor that
+replaces the fixture's Python guard for the Linux-first per-profile release. It
+keeps `guard.py`'s arguments and receipt: an exclusive 0600 receipt, its own
+process group, a pidfd probe, the child subreaper, SIGTERM on parent death,
+pidfds retained only after a stable-ancestry re-check, the bounded drain
+(0.5 s natural, 0.5 s SIGTERM, 2 s SIGKILL) and ECHILD as the completion proof.
+It does not cap the browser's lifetime, and while the browser runs it blocks on
+a signalfd with a 250 ms observation tick instead of polling every 20 ms. For
+a long-lived browser it holds pidfds only for processes that still exist,
+checked through the pidfd itself (`observed` counts every distinct owned
+process), records observation failures, a missing browser pidfd and reap or
+wait failures that recover within eight ticks in `nonFatalErrors` instead of
+stopping the browser, signals the unreaped browser by pid if it has no pidfd,
+withholds
+descriptors leaked into it from the browser, resets inherited SIGTERM, SIGINT
+and SIGCHLD dispositions, starts the browser with no blocked signals and its
+own original descriptor limit, and starts nothing when a stop is already
+pending. The adapter arms the guard's parent-death signal between fork and
+exec, runs a guard path ending in `.py` with `python3 -B` and executes any
+other guard directly; `browser_process.py --guard` selects the Rust guard, which
+is not yet qualified in the actual App run. Its self-tests use stand-in
+children only and never start CEF:
+
+```bash
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
+```
+
 The runner needs the existing Python pidfd/subreaper guard, Node, Xvfb, D-Bus,
 XRes, xdotool and ImageMagick; it installs nothing. It supplies fresh HOME/XDG
 directories and explicitly enables PID-attested loopback inspection ports.
