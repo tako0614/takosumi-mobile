@@ -22,6 +22,22 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub(crate) const AS_GUARD: &str = "TAKOSUMI_BROWSER_GUARD_SELF_TEST_AS_GUARD";
 
+/// Fault injection for the guard under test: `TAKOSUMI_GUARD_FAULT_<POINT>`
+/// set to a number fails that many calls at the point, `always` every call.
+pub(crate) fn inject(point: &str) -> bool {
+    static USED: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
+    let Ok(value) = std::env::var(format!("TAKOSUMI_GUARD_FAULT_{point}")) else {
+        return false;
+    };
+    if value == "always" {
+        return true;
+    }
+    let mut used = USED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = used.entry(point.to_string()).or_insert(0);
+    *count += 1;
+    *count <= value.parse().unwrap_or(0)
+}
+
 /// The stand-in browser: `python3 -c STANDIN <case directory> <mode> [...]`.
 const STANDIN: &str = r#"
 import json,os,resource,select,signal,sys,time
@@ -70,6 +86,7 @@ if mode=='stop': helper('default'); time.sleep(30); os._exit(0)
 if mode=='stubborn':
     signal.signal(signal.SIGTERM,signal.SIG_IGN); helper('ignore'); time.sleep(30); os._exit(0)
 if mode=='long': time.sleep(3.5); os._exit(0)
+if mode=='sleep': time.sleep(30); os._exit(0)
 if mode=='fds':
     def is_open(fd):
         try: os.fstat(fd); return True
@@ -90,6 +107,7 @@ if mode=='churn':
             if not done: break
             alive.discard(done)
     for pid in alive: os.waitpid(pid,0)
+    if len(sys.argv)>6: record('held'); released()
     os._exit(0)
 os._exit(93)
 "#;
@@ -134,6 +152,11 @@ const TESTS: &[Test] = tests![
     no_lifetime_cap_and_no_busy_polling_while_the_browser_runs,
     many_short_lived_descendants_do_not_exhaust_descriptors,
     an_observation_failure_while_running_does_not_stop_the_browser,
+    pruning_needs_no_free_descriptor,
+    transient_reap_and_wait_failures_do_not_stop_the_browser,
+    persistent_wait_failures_drain_after_the_bound,
+    a_missing_browser_pidfd_does_not_stop_the_browser,
+    without_any_pidfd_the_drain_still_signals_the_browser,
     an_inherited_sigchld_ignore_keeps_the_browser_exit_status,
     the_browser_gets_only_stdio_and_the_original_descriptor_limit,
     the_browser_keeps_the_control_pipe_on_stdin_and_stdout,
@@ -796,7 +819,8 @@ fn many_short_lived_descendants_do_not_exhaust_descriptors() {
     // Far more owned processes came and went than the 64 descriptors allow
     // at once; only the existing ones held a pidfd.
     assert!(proof["observed"].as_u64().unwrap() >= 150, "{proof}");
-    assert!(peak < 64, "the guard held {peak} descriptors");
+    // About 25 children are alive at once, plus the guard's own 7 or so.
+    assert!(peak < 48, "the guard held {peak} descriptors");
 }
 
 fn an_observation_failure_while_running_does_not_stop_the_browser() {
@@ -813,6 +837,136 @@ fn an_observation_failure_while_running_does_not_stop_the_browser() {
     // The browser still ran to its own normal end, and the drain completed.
     assert_eq!(status.code(), Some(0), "{proof}");
     assert!(normal(&proof), "{proof}");
+}
+
+fn errno_12(proof: &Value, field: &str) -> bool {
+    proof[field]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name.as_str().unwrap().ends_with("(errno 12)"))
+}
+
+fn pruning_needs_no_free_descriptor() {
+    let case = Case::new("prune");
+    let mut command = case.command(case.receipt(), "churn");
+    command.args(["150", "0.3", "0.012", "hold"]);
+    at_start(&mut command, descriptor_limit(64, 64));
+    let mut guard = case.spawn(command);
+    guard.records.wait("root");
+    // Once the guard holds many pidfds, take away every free descriptor.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while descriptor_count(guard.pid()) < 15 {
+        assert!(
+            Instant::now() < deadline,
+            "the guard never held 15 descriptors"
+        );
+        pause(10);
+    }
+    let set_soft = |soft: u64| {
+        let limit = libc::rlimit64 {
+            rlim_cur: soft,
+            rlim_max: 64,
+        };
+        // SAFETY: valid rlimit pointer; this test owns the guard process.
+        let result = unsafe {
+            libc::prlimit64(
+                guard.pid(),
+                libc::RLIMIT_NOFILE,
+                &limit,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    };
+    set_soft(3);
+    guard.records.wait("held");
+    // Every child has been reaped: only the guard's own descriptors, the
+    // browser's pidfd and its retained handle may stay open.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut held = descriptor_count(guard.pid());
+    while held > 7 && Instant::now() < deadline {
+        pause(50);
+        held = descriptor_count(guard.pid());
+    }
+    set_soft(64);
+    std::fs::write(case.path("release"), "").unwrap();
+    let status = guard.wait(Duration::from_secs(20));
+    let proof = case.proof();
+    assert!(
+        held <= 7,
+        "{held} descriptors stayed open without a free one"
+    );
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(normal(&proof), "{proof}");
+}
+
+fn transient_reap_and_wait_failures_do_not_stop_the_browser() {
+    let case = Case::new("transient");
+    let mut command = case.command(case.receipt(), "long");
+    command
+        .env("TAKOSUMI_GUARD_FAULT_REAP", "3")
+        .env("TAKOSUMI_GUARD_FAULT_WAIT", "3");
+    let status = case.spawn(command).wait(Duration::from_secs(20));
+    let proof = case.proof();
+    // The stand-in ran its full 3.5 s and ended on its own.
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(normal(&proof), "{proof}");
+    assert!(errno_12(&proof, "nonFatalErrors"), "{proof}");
+}
+
+fn persistent_wait_failures_drain_after_the_bound() {
+    let case = Case::new("persistent");
+    let mut command = case.command(case.receipt(), "sleep");
+    command.env("TAKOSUMI_GUARD_FAULT_WAIT", "always");
+    let started = Instant::now();
+    let mut guard = case.spawn(command);
+    guard.records.wait("root");
+    let status = guard.wait(Duration::from_secs(20));
+    let elapsed = started.elapsed();
+    let proof = case.proof();
+    assert_eq!(status.code(), Some(1), "{proof}");
+    assert!(
+        proof["error"].as_str().unwrap().ends_with("(errno 12)"),
+        "{proof}"
+    );
+    assert_eq!(proof["rootExit"], -libc::SIGTERM, "{proof}");
+    assert_eq!(proof["complete"], true);
+    // Eight failed ticks of 250 ms, then the 0.5 s natural phase.
+    assert!(elapsed >= Duration::from_millis(1900), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+}
+
+fn a_missing_browser_pidfd_does_not_stop_the_browser() {
+    let case = Case::new("nopidfd");
+    let mut command = case.command(case.receipt(), "normal");
+    command.env("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD", "always");
+    let status = case.spawn(command).wait(Duration::from_secs(20));
+    let proof = case.proof();
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(normal(&proof), "{proof}");
+    assert!(errno_12(&proof, "nonFatalErrors"), "{proof}");
+}
+
+fn without_any_pidfd_the_drain_still_signals_the_browser() {
+    // Neither the browser's own pidfd nor any observation: only its pid,
+    // still unreaped, is left to signal.
+    let case = Case::new("bypid");
+    let mut command = case.command(case.receipt(), "sleep");
+    command
+        .env("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD", "always")
+        .env("TAKOSUMI_GUARD_FAULT_OBSERVE", "always");
+    let mut guard = case.spawn(command);
+    let root = guard.records.wait("root");
+    guard.signal(libc::SIGTERM);
+    let status = guard.wait(Duration::from_secs(20));
+    let proof = case.proof();
+    assert_eq!(status.code(), Some(1), "{proof}");
+    assert_eq!(proof["rootExit"], -libc::SIGTERM, "{proof}");
+    assert_eq!(proof["complete"], true, "{proof}");
+    assert_eq!(proof["kernelNoChildren"], true);
+    assert!(errno_12(&proof, "cleanupErrors"), "{proof}");
+    assert!(ended(root));
 }
 
 fn an_inherited_sigchld_ignore_keeps_the_browser_exit_status() {

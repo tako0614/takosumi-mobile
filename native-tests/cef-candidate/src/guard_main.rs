@@ -20,9 +20,10 @@
 //! drain ended with the kernel's proof of no children, the browser exited 0
 //! and nothing failed. As in guard.py, a forced cleanup alone does not change
 //! the exit status; the App separately requires `forcedCleanup == 0` for a
-//! normal end. `nonFatalErrors` names observation failures while the browser
-//! ran; they did not stop it, and the drain's own observation and ECHILD still
-//! decide completeness. A refusal before the receipt exists exits 2 and starts
+//! normal end. `nonFatalErrors` names failures while the browser ran
+//! (observation, the browser's pidfd, a reap or wait that recovered); they did
+//! not stop it, and the drain's own observation and ECHILD still decide
+//! completeness. A refusal before the receipt exists exits 2 and starts
 //! nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +52,10 @@ const DRAIN: [(Option<libc::c_int>, Duration); 3] = [
     (Some(libc::SIGKILL), Duration::from_secs(2)),
 ];
 const MAX_ANCESTRY: usize = 128;
+/// Consecutive running ticks in which reaping or waiting may fail before the
+/// guard gives up watching and drains (about 2 s). A shorter failure is
+/// recorded in `nonFatalErrors` and the browser keeps running.
+const MAX_RUNNING_FAULTS: u32 = 8;
 
 fn main() -> ExitCode {
     // The self-test build runs its tests unless it is asked to act as the
@@ -154,6 +159,30 @@ fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
+/// Self-test fault injection, compiled into the self-test binary only; in a
+/// release build every call is a constant `false`.
+#[cfg(test)]
+fn injected(point: &str) -> bool {
+    tests::inject(point)
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn injected(_point: &str) -> bool {
+    false
+}
+
+fn injected_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOMEM)
+}
+
+/// The direct child's pidfd.
+fn child_pidfd(pid: i32) -> io::Result<OwnedFd> {
+    if injected("CHILD_PIDFD") {
+        return Err(injected_error());
+    }
+    pidfd_open(pid)
+}
+
 fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: a live owned pidfd, a null siginfo and no flags.
     let result = unsafe {
@@ -169,6 +198,17 @@ fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether the process behind a pidfd still exists, zombies included, without
+/// opening anything (so it works at the descriptor limit): signal 0 checks
+/// existence and permission only. EPERM means it exists under other
+/// credentials; only ESRCH (reaped) means gone.
+fn exists(fd: &OwnedFd) -> bool {
+    match pidfd_signal(fd, 0) {
+        Ok(()) => true,
+        Err(error) => error.raw_os_error() != Some(libc::ESRCH),
+    }
 }
 
 /// Whether `pid` descends from the live guard `owner` (start `owner_start`)
@@ -221,17 +261,16 @@ struct Tracker {
 
 impl Tracker {
     fn observe(&mut self, owner: i32) -> Result<(), String> {
-        // Release the handles of processes that are gone (reaped, or the pid
-        // now names a later process). Only processes that still exist,
-        // zombies included, keep a pidfd, so the guard's descriptors follow
-        // the live process tree however many renderers come and go. A gone
-        // process never reappears in a snapshot, so it is never counted twice.
-        self.handles
-            .retain(|pid, (start, _)| match start_time(*pid) {
-                Ok(Some(now)) => now == *start,
-                Ok(None) => false,
-                Err(_) => true, // Unknown: keep it; `alive` reports it as remaining.
-            });
+        // Release the handles of processes that have been reaped. Only
+        // processes that still exist, zombies included, keep a pidfd, so the
+        // guard's descriptors follow the live process tree however many
+        // renderers come and go. A gone process never reappears in a
+        // snapshot, so it is never counted twice. The check uses the pidfd
+        // itself, so pruning still works when no descriptor is free.
+        self.handles.retain(|_, (_, fd)| exists(fd));
+        if injected("OBSERVE") {
+            return Err(fault(&injected_error()));
+        }
         let owner_start = start_time(owner)?.ok_or("IdentityUnavailable")?;
         for pid in descendants(owner)? {
             let Some(start) = start_time(pid)? else {
@@ -239,7 +278,9 @@ impl Tracker {
             };
             match self.handles.get(&pid) {
                 Some((known, _)) if *known == start => continue,
-                // The pid now names a later process: close the stale handle.
+                // A kept handle's process still exists and so still holds
+                // its pid; a different start time here can only mean a
+                // stale read. Replace the handle rather than trust either.
                 Some(_) => {
                     self.handles.remove(&pid);
                 }
@@ -263,16 +304,11 @@ impl Tracker {
         Ok(())
     }
 
-    /// Retained processes that still exist (zombies included). An unreadable
-    /// one is reported as remaining rather than assumed gone.
+    /// Retained processes that still exist (zombies included).
     fn alive(&self) -> Vec<i32> {
         self.handles
             .iter()
-            .filter(|(pid, (start, _))| match start_time(**pid) {
-                Ok(Some(now)) => now == *start,
-                Ok(None) => false,
-                Err(_) => true,
-            })
+            .filter(|(_, (_, fd))| exists(fd))
             .map(|(pid, _)| *pid)
             .collect()
     }
@@ -607,7 +643,7 @@ impl Run {
     }
 
     /// Signal every retained descendant through its pidfd, and the direct
-    /// child through its own pidfd while it is unreaped.
+    /// child while it is unreaped.
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
         for (pid, (_, fd)) in &self.tracker.handles {
@@ -622,8 +658,22 @@ impl Run {
             }
         }
         // Covers an observation failure before the direct child was retained.
-        if let (Some(fd), None) = (&self.child_fd, self.root_exit) {
-            match pidfd_signal(fd, signal) {
+        if let (Some(pid), None) = (self.child, self.root_exit) {
+            if self.child_fd.is_none() {
+                self.child_fd = child_pidfd(pid).ok(); // Retry a failed open.
+            }
+            let sent = match &self.child_fd {
+                Some(fd) => pidfd_signal(fd, signal),
+                // Still no pidfd: signal by pid. SIGCHLD has its default
+                // disposition and this guard has not reaped the child
+                // (root_exit unset), so the kernel keeps the pid for it.
+                // SAFETY: kill takes integers only.
+                None => match unsafe { libc::kill(pid, signal) } {
+                    0 => Ok(()),
+                    _ => Err(io::Error::last_os_error()),
+                },
+            };
+            match sent {
                 Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
                 Err(error) => {
@@ -637,19 +687,54 @@ impl Run {
     /// cap. Blocks on the signalfd between observations.
     fn running(&mut self, signals: &Signals) -> Result<(), String> {
         let mut stopping = false;
+        let mut faults = 0;
         while self.root_exit.is_none() && !stopping {
             // A failed observation must not end a healthy browser: the drain
             // observes again and ECHILD decides completeness.
             if let Err(error) = self.tracker.observe(self.me) {
                 self.non_fatal.insert(error);
             }
-            if self.reap()? && self.root_exit.is_none() {
-                // No child left, yet this guard never reaped the browser:
-                // its exit status is unknown.
-                return Err("RootExitLost".to_string());
+            // Neither may a failed reap or wait, unless it keeps failing: then
+            // the guard can no longer see the browser end or a stop request,
+            // and it drains after MAX_RUNNING_FAULTS consecutive ticks.
+            let mut failed = None;
+            let reaped = if injected("REAP") {
+                Err(fault(&injected_error()))
+            } else {
+                self.reap()
+            };
+            match reaped {
+                Ok(true) if self.root_exit.is_none() => {
+                    // No child left, yet this guard never reaped the browser:
+                    // its exit status is unknown.
+                    return Err("RootExitLost".to_string());
+                }
+                Ok(_) => {}
+                Err(error) => failed = Some(error),
             }
             if self.root_exit.is_none() {
-                stopping |= signals.wait(RUNNING_TICK).map_err(|error| fault(&error))?;
+                let waited = if injected("WAIT") {
+                    Err(injected_error())
+                } else {
+                    signals.wait(RUNNING_TICK)
+                };
+                match waited {
+                    Ok(stop) => stopping |= stop,
+                    Err(error) => {
+                        failed = Some(fault(&error));
+                        std::thread::sleep(RUNNING_TICK);
+                    }
+                }
+            }
+            match failed {
+                None => faults = 0,
+                Some(error) => {
+                    self.non_fatal.insert(error.clone());
+                    faults += 1;
+                    if faults >= MAX_RUNNING_FAULTS {
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(())
@@ -724,14 +809,15 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
                 // unreaped child keeps its pid and this pidfd names it.
                 let pid = child.id() as i32;
                 run.child = Some(pid);
-                match pidfd_open(pid) {
-                    Ok(fd) => {
-                        run.child_fd = Some(fd);
-                        if let Err(error) = run.running(&signals) {
-                            failure = Some(error);
-                        }
+                match child_pidfd(pid) {
+                    Ok(fd) => run.child_fd = Some(fd),
+                    // Not fatal: `send` retries and can signal by pid.
+                    Err(error) => {
+                        run.non_fatal.insert(fault(&error));
                     }
-                    Err(error) => failure = Some(fault(&error)),
+                }
+                if let Err(error) = run.running(&signals) {
+                    failure = Some(error);
                 }
             }
             Err(error) => failure = Some(fault(&error)),
