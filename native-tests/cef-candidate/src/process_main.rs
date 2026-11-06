@@ -387,8 +387,9 @@ mod x11_front {
 /// Windows browser windows. The browser's native handle may be a child of
 /// its frame; both the raise and the `window_id` reported to the App use the
 /// frame, the top-level window (`GA_ROOT`) the person sees and switches to.
-/// Bringing a reused window to the front restores it when minimized, shows it
-/// and asks for the foreground. Windows hands the foreground only to a
+/// Bringing a reused window to the front restores it when minimized, shows it,
+/// puts it at the top of the Z-order and asks for the foreground. Windows
+/// hands the foreground only to a
 /// process allowed to take it (for example one the foreground App passed that
 /// right with `AllowSetForegroundWindow`); otherwise it flashes the taskbar
 /// button, and the refusal is reported like an X11 one. A stale handle makes
@@ -404,11 +405,25 @@ mod win32_front {
         fn GetAncestor(window: Hwnd, flags: c_uint) -> Hwnd;
         fn IsIconic(window: Hwnd) -> c_int;
         fn ShowWindow(window: Hwnd, command: c_int) -> c_int;
+        fn SetWindowPos(
+            window: Hwnd,
+            after: Hwnd,
+            x: c_int,
+            y: c_int,
+            width: c_int,
+            height: c_int,
+            flags: c_uint,
+        ) -> c_int;
         fn SetForegroundWindow(window: Hwnd) -> c_int;
     }
     const GA_ROOT: c_uint = 2;
     const SW_SHOW: c_int = 5;
     const SW_RESTORE: c_int = 9;
+    /// `HWND_TOP`: the top of the (non-topmost) Z-order.
+    const HWND_TOP: Hwnd = std::ptr::null_mut();
+    const SWP_NOSIZE: c_uint = 0x0001;
+    const SWP_NOMOVE: c_uint = 0x0002;
+    const SWP_SHOWWINDOW: c_uint = 0x0040;
 
     /// The top-level window of a browser handle (itself when it has none).
     pub fn top_level(window: Hwnd) -> Hwnd {
@@ -443,8 +458,28 @@ mod win32_front {
                     SW_SHOW
                 },
             );
+            // Ask for the reorder explicitly before the foreground. In CI
+            // (run 42298520970) SetForegroundWindow alone made a reused window
+            // the foreground window, yet its page stayed `hidden`: another
+            // profile's window at the same rectangle had covered it, and
+            // Chromium's native occlusion tracker still counted it as
+            // covered. A real move to the top of the Z-order (not a
+            // minimize/restore or a topmost toggle) reorders the window and
+            // raises the reorder event the tracker recomputes on.
+            let reordered = SetWindowPos(
+                top,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            ) != 0;
             if SetForegroundWindow(top) == 0 {
                 return Err("Windows refused the foreground change");
+            }
+            if !reordered {
+                return Err("Windows refused the move to the top of the Z-order");
             }
         }
         Ok(())
