@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Actual Tauri App on Windows -> per-profile CEF browser processes (W3).
+
+The Windows counterpart of browser_process.py. Python 3 standard library only
+(ctypes for Win32, ssl and http.server for the fixture site); no OS tools
+besides git, which it reads the source revision from.
+
+The App is built with the feature native-browser-process-fixture, the browser
+with the cef-candidate features fixture-inspection and
+windows-unsandboxed-candidate, and the guard is takosumi-browser-guard.exe.
+Each phase starts the App suspended, puts it into a kill-on-close Job Object
+this runner owns and resumes it, so the App, its WebView2, its guards and every
+browser process are accounted; it then runs windows_browser_observer.py
+against the App's CEF browsers and requires a normal App exit, every guard's
+normal receipt and an empty job. The phases share one case (the App's data):
+the first launch, then with --restart and --reset the later launches.
+
+The App's own home (WebView2) is driven in-process by the fixture
+(src-tauri/tests/desktop/browser_process.rs); the observer reaches the CEF
+pages through the browsers' PID-attested loopback inspection ports and the
+windows through Win32. The connections are this runner's local HTTPS fixture
+site (https://127.0.0.1:<port>: a synthetic sign-in stand-in, an app home and
+an app page); its certificate comes from windows_fixture_tls.ps1, whose CA
+the machine must trust. Real sites, notifications, the native file chooser,
+popups and the open-outside choice are inspected by the Linux runner only.
+External links are never opened: the fixture build records them to the
+session's external-open.log instead of calling ShellExecuteW, and the run
+requires that log to stay empty.
+
+It prints `PASS case <name>` for each verified case and writes summary.json
+into the case directory, which it never removes.
+"""
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+from http.cookies import SimpleCookie
+from pathlib import Path
+from urllib.parse import parse_qs
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[1]
+sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
+from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, require, tail  # noqa: E402
+
+WINDOWS = os.name == "nt"
+OBSERVER = HERE / "windows_browser_observer.py"
+# As browser_process.py: the App gives a browser that agreed to stop up to
+# STOP_FINISH (30 s, process_adapter.rs) to end normally, and the runner waits
+# that long plus a margin before calling an App exit abnormal.
+APP_STOP_FINISH = 30
+APP_EXIT_WAIT = APP_STOP_FINISH + 15
+OBSERVER_WAIT = 85
+# After the App exited: its WebView2 processes and any other descendant must
+# leave the job within this bound (windows_smoke.py's leftover bound).
+LEFTOVER_WAIT = 10
+DETACHED_PROCESS = 0x8
+# The case name also names the App's data (see browser_process_windows.rs);
+# short, since Chromium's profile files there come close to 260 characters.
+CASE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,23}")
+IDENTIFIER = "com.takosumi.fixture.browserprocess"
+# Cases each launch's observer verifies, in order; the runner then requires
+# the App's normal exit, every guard's normal receipt and an empty job.
+OBSERVED_CASES = {
+    "": ("separate-profiles", "home-by-window-switch", "reuse-raises-window", "quit-cancel-stops",
+         "quit-partial-order"),
+    "restart": ("restart-keeps-separation",),
+    "reset": ("clear-only-one-profile",),
+}
+# Verified by the runner: the first launch's final quit closed every
+# connection normally, and after all launches nothing was left or opened.
+QUIT_CASE = "quit-completes"
+FINAL_CASES = ("no-process-left", "no-external-open")
+WINDOWS_SOURCES = (
+    "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
+    "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
+    "native-tests/desktop/windows_fixture_tls.ps1", "native-tests/cef-candidate/windows_smoke.py",
+    "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
+    "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/src/process_main.rs",
+    "native-tests/cef-candidate/src/guard_entry.rs", "native-tests/cef-candidate/src/guard_windows.rs",
+    "native-tests/cef-candidate/windows/takosumi-cef-browser-process.exe.manifest",
+    "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs", "src-tauri/src/lib.rs",
+    "src-tauri/src/main.rs", "src-tauri/tests/desktop/browser_process.rs",
+    "src-tauri/tests/desktop/browser_process_windows.rs", "src-tauri/tauri.conf.json",
+    "src-tauri/plugins/app-screen/Cargo.toml", "src-tauri/plugins/app-screen/build.rs",
+)
+SYNTHETIC_USERS = ("work", "personal")
+
+
+class Site(http.server.BaseHTTPRequestHandler):
+    """The connections' site: a synthetic sign-in stand-in (no credential, a
+    name posted to /session sets an HttpOnly session cookie), the signed-in
+    app home and its app page. Every page names its role and user in
+    <main data-page data-user>."""
+    timeout = 15
+
+    def send(self, body, status=200, headers=None):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def user(self):
+        session = SimpleCookie(self.headers.get("Cookie", "")).get("fixture_session")
+        return session.value if session and session.value in SYNTHETIC_USERS else ""
+
+    def do_GET(self):
+        path, user = self.path.split("?", 1)[0], self.user()
+        if path == "/" and not user:
+            self.send("""<!doctype html><title>Sign in</title><main data-page="login">
+                <p>Synthetic fixture only; no real credentials.</p>
+                <form method="post" action="/session"><label>User <input name="user"></label>
+                <button>Sign in</button></form></main>""")
+        elif path == "/":
+            self.send(f"""<!doctype html><title>{user} apps</title>
+                <main data-page="home" data-user="{user}"><h1>{user} apps</h1>
+                <a data-app="editor" href="/app/">Editor</a></main>""")
+        elif path == "/app/" and user:
+            self.send(f"""<!doctype html><title>Editor</title>
+                <main data-page="app" data-user="{user}"><h1>Editor</h1><textarea></textarea></main>""")
+        elif path == "/app/":
+            self.send("", status=303, headers={"Location": "/"})
+        else:
+            self.send("", status=404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if self.path != "/session" or length > 1024:
+            self.send("", status=404)
+            return
+        user = parse_qs(self.rfile.read(length).decode("utf-8", "replace")).get("user", [""])[0]
+        if user not in SYNTHETIC_USERS:
+            self.send("", status=400)
+            return
+        self.send("", status=303, headers={
+            "Location": "/",
+            "Set-Cookie": f"fixture_session={user}; Path=/; Max-Age=86400; Secure; HttpOnly; SameSite=Lax",
+        })
+
+    def log_message(self, format, *args):
+        requests = self.server.requests
+        if len(requests) < 512:
+            requests.append(f"{self.command} {self.path.split('?', 1)[0]} {args[1] if len(args) > 1 else ''}")
+
+
+def start_site(cert, key):
+    """The fixture site on 127.0.0.1 (an ephemeral port), served from a thread
+    for the whole run, so every phase reaches the saved connection's origin."""
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    server.requests = []
+    # The handshake runs in each request's thread (on its first read), so a
+    # stalled client cannot hold up the accepting thread.
+    server.socket = tls.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    threading.Thread(target=server.serve_forever, name="fixture-site", daemon=True).start()
+    return server, f"https://127.0.0.1:{server.server_port}"
+
+
+def check_site(site, ca):
+    """The site answers with a certificate the machine's trust store accepts
+    (Python's default context reads the Windows ROOT store), and with the
+    fixture CA alone; Chromium verifies against the same store."""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    with opener.open(site + "/", timeout=10) as response:
+        require(b'data-page="login"' in response.read(), "The fixture site did not serve its sign-in page")
+    # With a cafile, the context trusts that CA only.
+    pinned = ssl.create_default_context(cafile=str(ca))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=pinned))
+    with opener.open(site + "/", timeout=10) as response:
+        require(response.status == 200, "The fixture CA does not verify the site")
+
+
+def normal(receipt, what="The guard"):
+    """browser_process.py's receipt check, for a guard's receipt or the
+    session job's counterpart (`what` names it in the failure)."""
+    require(type(receipt["rootExit"]) is int and receipt["rootExit"] == 0 and receipt["complete"] is True,
+            f"{what} root must exit normally and completely")
+    require(receipt["kernelNoChildren"] is True and receipt["remaining"] == [],
+            f"{what} must have no remaining child: {receipt['remaining']}")
+    require(type(receipt["forcedCleanup"]) is int and receipt["forcedCleanup"] == 0 and receipt["cleanupErrors"] == [],
+            f"{what} must not require forced cleanup")
+    require(receipt["error"] is None, f"{what} must not report an error")
+
+
+def create_exclusive(path, mode="w"):
+    """A new file this runner writes: never an existing file."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    handle = os.open(path, flags, 0o600)
+    return os.fdopen(handle, "wb") if mode == "wb" else os.fdopen(handle, "w", encoding="utf-8", newline="\n")
+
+
+def read_session(path, limit=4 * 1024 * 1024):
+    """A file the session wrote, read as data: a plain regular file (no link
+    or other reparse point) of at most `limit` bytes."""
+    info = os.lstat(path)
+    reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    require(stat.S_ISREG(info.st_mode) and not reparse, f"Session file {path} is not a plain file")
+    with open(path, "rb") as source:
+        data = source.read(limit + 1)
+    require(len(data) <= limit, f"Session file {path} is larger than {limit} bytes")
+    return data
+
+
+def read_json(path):
+    return json.loads(read_session(path))
+
+
+def digest(file):
+    checksum = hashlib.sha256()
+    with open(file, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def source_files(repo):
+    tracked = subprocess.check_output(["git", "ls-files", "--", "src", "src-tauri/plugins/app-screen/src",
+                                       "src-tauri/capabilities"], cwd=repo, text=True).splitlines()
+    selected = set(WINDOWS_SOURCES)
+    for name in tracked:
+        path = Path(name)
+        if ((name.startswith("src/") and path.suffix in {".ts", ".tsx", ".css"}) or
+                (name.startswith("src-tauri/plugins/app-screen/src/") and path.suffix == ".rs") or
+                (name.startswith("src-tauri/capabilities/") and path.suffix == ".json")):
+            selected.add(name)
+    result = []
+    for name in sorted(selected):
+        file = repo / name
+        require(file.is_file() and not file.is_symlink() and file.resolve().is_relative_to(repo.resolve()),
+                f"Expected a local Windows fixture source: {name}")
+        result.append(file)
+    return result
+
+
+def new_case(path):
+    """A new case directory inside this user's profile, where the App's
+    browser runtime root must lie (process_setup_windows.rs). Its name also
+    names the App's data, which must not exist yet."""
+    parent = Path(os.path.realpath(path.parent))
+    profile = Path(os.path.realpath(os.environ["USERPROFILE"]))
+    require(parent.is_dir() and parent.is_relative_to(profile),
+            f"--data must be a new directory inside the user's profile {profile}")
+    require(CASE_NAME.fullmatch(path.name) is not None,
+            "--data must be named with at most 24 lowercase letters, digits and hyphens")
+    case = parent / path.name
+    require(not os.path.lexists(case), "--data must be a new directory")
+    return case
+
+
+def app_data(name):
+    """Where Tauri keeps this case's App data on Windows (its known folders)."""
+    identifier = f"{IDENTIFIER}.{name}"
+    return [Path(os.environ[variable]) / identifier for variable in ("LOCALAPPDATA", "APPDATA")]
+
+
+def job_pids(job):
+    """Process ids still in the job (JobObjectBasicProcessIdList)."""
+    import ctypes
+
+    class IdList(ctypes.Structure):
+        _fields_ = [("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32), ("ids", ctypes.c_size_t * 256)]
+
+    ids = IdList()
+    if not job.kernel32.QueryInformationJobObject(job.handle, 3, ctypes.byref(ids), ctypes.sizeof(ids), None):
+        return None
+    return [ids.ids[index] for index in range(min(ids.listed, 256))]
+
+
+def session_receipt(job, app_exit):
+    """The session's counterpart of the Linux outer guard receipt: the App's
+    job must empty within LEFTOVER_WAIT of the App's exit, without force."""
+    deadline = time.monotonic() + LEFTOVER_WAIT
+    while True:
+        total, active = job.processes()
+        if active == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    remaining = job_pids(job) if active else []
+    return {"rootExit": app_exit, "complete": True, "kernelNoChildren": active == 0, "remaining": remaining or [],
+            "forcedCleanup": 0, "cleanupErrors": [] if remaining is not None else ["JobProcessListUnavailable"],
+            "error": None, "observed": total}
+
+
+def tails(session, suffix):
+    """Logs of a failed phase, for the CI log."""
+    names = [f"app{suffix}.log", f"observer{suffix}.log", f"browser-observation{suffix}.json"]
+    for name in names:
+        print(f"----- tail of {session / name} -----", file=sys.stderr)
+        print(tail(session / name), file=sys.stderr)
+    marker = session / (f"app-browser-process{suffix}-open.json" if suffix else "app-browser-process-open.json")
+    try:
+        processes = read_json(marker)["processes"]
+    except (OSError, ValueError, KeyError, Failure):
+        return
+    for process in processes:
+        directory = Path(process["directory"])
+        for name in ("browser.log", "cef-native.log"):
+            print(f"----- tail of {directory / name} -----", file=sys.stderr)
+            print(tail(directory / name, 8192), file=sys.stderr)
+
+
+def run_phase(args, env, files, before, head, suffix):
+    """One App launch on the case's data; returns its proof."""
+    session, phase = args.session, suffix[1:]
+    proof = {"passed": False, "phase": phase or "first", "sourceHead": head, "artifactsBefore": before}
+    execution = {"passed": False}
+    observer_env = {key: value for key, value in os.environ.items() if not key.upper().startswith("TAKOSUMI_")}
+    with create_exclusive(session / f"app{suffix}.log", "wb") as log:
+        job = WindowsJob()
+        try:
+            # Suspended until it is in the job, detached from any console.
+            app = subprocess.Popen([str(args.binary)], cwd=session, env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, creationflags=CREATE_SUSPENDED | DETACHED_PROCESS)
+        except BaseException:
+            job.close()
+            raise
+        try:
+            job.adopt(app.pid)
+        except BaseException:
+            app.kill()
+            app.wait()
+            job.close()
+            raise
+        proof["appPid"] = app.pid
+        try:
+            with create_exclusive(session / f"observer{suffix}.log") as observer:
+                subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
+                                "--app-pid", str(app.pid), "--phase", phase],
+                               env=observer_env, check=True, timeout=OBSERVER_WAIT, stdout=observer,
+                               stderr=subprocess.STDOUT)
+            execution["appExit"] = app.wait(timeout=APP_EXIT_WAIT)
+            require(execution["appExit"] == 0, "The App must exit normally")
+            require(read_json(session / f"app-browser-process{suffix}-complete.json")["passed"] is True,
+                    "The actual App flow must pass")
+            observation = read_json(session / f"browser-observation{suffix}.json")
+            require(observation["passed"] is True, "The browser observation must pass")
+            opened = read_json(session / (f"app-browser-process{suffix}-open.json" if suffix
+                                          else "app-browser-process-open.json"))
+            execution["browserGuards"] = []
+            for process in opened["processes"]:
+                receipt = read_json(Path(process["guardReceipt"]))
+                normal(receipt)
+                execution["browserGuards"].append(receipt)
+            proof["sessionJob"] = session_receipt(job, execution["appExit"])
+            normal(proof["sessionJob"], "The App's job")
+            execution["passed"] = True
+            proof["cases"] = observation.get("cases", [])
+            proof["passed"] = True
+        except Exception as error:
+            proof["error"] = execution["error"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            try:
+                if app.poll() is None:
+                    # This exact Popen is owned; ending it closes the App's own
+                    # job, which ends its guards and browsers (no receipts).
+                    app.terminate()
+                    app.wait(timeout=10)
+                total, active = job.processes()
+                proof.setdefault("sessionJob", {"observed": total, "remaining": job_pids(job) or []})
+                if active:
+                    proof["passed"] = False
+                    proof["sessionJob"]["forcedCleanup"] = active
+                    job.terminate()
+            except Exception as error:
+                proof["passed"] = False
+                proof["cleanupError"] = str(error)
+            finally:
+                job.close()
+                try:
+                    proof["artifactsAfter"] = {str(file): digest(file) for file in files}
+                    proof["sourceHeadAfter"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO,
+                                                                       text=True).strip()
+                    if proof["artifactsAfter"] != before or proof["sourceHeadAfter"] != head:
+                        proof["passed"] = False
+                        proof.setdefault("error", "Sources or executables changed during the run")
+                except Exception as error:
+                    proof["passed"] = False
+                    proof["artifactError"] = str(error)
+                with create_exclusive(session / f"app-execution{suffix}.json") as output:
+                    output.write(json.dumps(execution, indent=2) + "\n")
+                with create_exclusive(args.data / f"execution{suffix}.json") as output:
+                    output.write(json.dumps(proof, indent=2) + "\n")
+                if not proof["passed"]:
+                    tails(session, suffix)
+    return proof
+
+
+def main():
+    # Logs and App messages may hold text the console's code page lacks.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--binary", type=Path, required=True,
+                        help="takosumi-mobile.exe built with --features native-browser-process-fixture")
+    parser.add_argument("--browser", type=Path, required=True,
+                        help="takosumi-cef-browser-process.exe built with the cef-candidate features "
+                             "fixture-inspection,windows-unsandboxed-candidate (libcef.dll beside it)")
+    parser.add_argument("--guard", type=Path, required=True, help="takosumi-browser-guard.exe")
+    parser.add_argument("--data", type=Path, required=True,
+                        help="a new case directory inside the user's profile, named with at most 24 lowercase "
+                             "letters, digits and hyphens (the App's browser runtime root must lie in the profile)")
+    parser.add_argument("--tls-cert", type=Path, required=True,
+                        help="the fixture site's certificate chain (cert.pem from windows_fixture_tls.ps1)")
+    parser.add_argument("--tls-key", type=Path, required=True, help="its private key (key.pem)")
+    parser.add_argument("--tls-ca", type=Path, required=True, help="the trusted fixture CA (ca.pem)")
+    parser.add_argument("--restart", action="store_true",
+                        help="relaunch the App on the same data and verify per-profile state after restart")
+    parser.add_argument("--reset", action="store_true",
+                        help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
+    args = parser.parse_args()
+    if not WINDOWS:
+        parser.error("windows_browser_process.py runs on Windows; browser_process.py is the Linux runner")
+    for name in ("binary", "browser", "guard", "tls_cert", "tls_key", "tls_ca"):
+        setattr(args, name, Path(os.path.realpath(getattr(args, name))))
+        require(getattr(args, name).is_file(), f"No file at {getattr(args, name)}")
+    args.data = new_case(Path(os.path.abspath(args.data)))
+    stored = [directory for directory in app_data(args.data.name) if os.path.lexists(directory)]
+    require(not stored, f"App data for this case name already exists: {stored}")
+    summary = {"passed": False, "case": str(args.data), "appData": [str(path) for path in app_data(args.data.name)],
+               "cases": [], "phases": []}
+    args.data.mkdir()
+    args.data.joinpath(".owned-browser-reference").write_text(args.data.name)
+    try:
+        run(args, summary)
+        summary["passed"] = True
+    except Exception as error:
+        summary["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        with create_exclusive(args.data / "summary.json") as output:
+            output.write(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps({key: summary[key] for key in ("passed", "case", "appData", "cases", "error") if key in summary},
+                     indent=2))
+    if not summary["passed"]:
+        print(f"windows_browser_process: FAILED: {summary['error']}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def run(args, summary):
+    # Everything the App, the observer and the browsers write lives in the
+    # session directory, named like the case (its name is the observer's
+    # synthetic nonce and the App's data identifier).
+    session = args.session = args.data / args.data.name
+    session.mkdir()
+    session.joinpath(".owned-browser-reference").write_text(args.data.name)
+    for name in ("r", "tmp"):
+        (session / name).mkdir()
+    server, args.site = start_site(args.tls_cert, args.tls_key)
+    summary["site"] = args.site
+    try:
+        check_site(args.site, args.tls_ca)
+        log = session / "external-open.log"
+        env = {key: value for key, value in os.environ.items()
+               if not key.upper().startswith(("TAKOSUMI_", "WEBVIEW2_"))}
+        env.update(TEMP=str(session / "tmp"), TMP=str(session / "tmp"),
+                   TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
+                   TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard),
+                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(session / "r"),
+                   TAKOSUMI_BROWSER_PROCESS_CASE=str(session),
+                   TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
+                   TAKOSUMI_BROWSER_PROCESS_APP="local",
+                   TAKOSUMI_BROWSER_PROCESS_SITE=args.site,
+                   # The fixture build appends any link it would open outside here.
+                   TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(log))
+        runtime = args.browser.parent / "libcef.dll"
+        require(runtime.is_file(), f"No libcef.dll beside {args.browser}")
+        files = sorted(set([args.binary, args.browser, runtime, args.guard] + source_files(REPO)))
+        before = {str(file): digest(file) for file in files}
+        snapshot = args.data / "source-snapshot"
+        for file in files:
+            if file.is_relative_to(REPO) and file.stat().st_size <= 2 * 1024 * 1024:
+                target = snapshot / file.relative_to(REPO)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(file, target)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+        phases = [""] + (["-restart"] if args.restart else []) + (["-reset"] if args.reset else [])
+        for suffix in phases:
+            phase_env = dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE=suffix[1:]) if suffix else env
+            proof = run_phase(args, phase_env, files, before, head, suffix)
+            summary["phases"].append({"phase": proof["phase"], "passed": proof["passed"],
+                                      "sessionJob": proof.get("sessionJob")})
+            require(proof["passed"] is True, f"The {proof['phase']} App launch did not pass")
+            expected = list(OBSERVED_CASES[suffix[1:]])
+            require(proof["cases"] == expected,
+                    f"The {proof['phase']} launch verified {proof['cases']}, not {expected}")
+            # The first launch's final quit: the App exited 0 after closing
+            # Personal (and Work before it) with normal guard receipts.
+            for name in expected + ([QUIT_CASE] if not suffix else []):
+                print(f"PASS case {name}", flush=True)
+                summary["cases"].append(name)
+        # Every launch ended with its job empty, no forced cleanup and every
+        # browser guard's normal receipt (checked per phase above).
+        print(f"PASS case {FINAL_CASES[0]}", flush=True)
+        summary["cases"].append(FINAL_CASES[0])
+        # Nothing reached the opener: no case chooses to open a link outside.
+        opened = read_session(log, 1024 * 1024).decode().splitlines() if os.path.lexists(log) else []
+        summary["externalOpens"] = len(opened)
+        require(opened == [], f"Expected no external open, saw {len(opened)}")
+        print(f"PASS case {FINAL_CASES[1]}", flush=True)
+        summary["cases"].append(FINAL_CASES[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        summary["siteRequests"] = server.requests
+
+
+if __name__ == "__main__":
+    sys.exit(main())

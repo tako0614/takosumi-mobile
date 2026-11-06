@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""Observe the actual App's CEF browsers on Windows (windows_browser_process.py).
+
+The Windows counterpart of browser-process.mjs; the runner starts it once per
+App launch. Python 3 standard library only: ctypes for Win32 (windows, the
+foreground, the TCP table), a minimal RFC 6455 client for the browsers'
+DevTools endpoints. No replacement shell IPC: the App's own home drives the
+browsers; this reads their pages and windows and answers at the checkpoints
+the App waits for (the marker files of browser_process.rs).
+
+Each browser's loopback inspection port (cef-candidate `fixture-inspection`)
+must be the one its `inspection.json` names, listened on by exactly the App's
+attested native browser process. Pages are the runner's local fixture site.
+State is synthetic (a nonce in localStorage and a script cookie, and the
+site's HttpOnly session cookie set by the sign-in stand-in); no real login.
+
+Window switching uses SetForegroundWindow (then, if Windows refuses, the
+task switchers' AttachThreadInput route). It never sends keyboard or mouse
+input. Beforeunload dialogs are cancelled through DevTools
+(Page.handleJavaScriptDialog), not with a native key as on Linux; native
+window closes are WM_CLOSE, as a click on the title bar's close button.
+"""
+import argparse
+import base64
+import ctypes
+import hashlib
+import http.client
+import json
+import os
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "cef-candidate"))
+from windows_smoke import Failure, require  # noqa: E402
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_MESSAGE = 16 * 1024 * 1024
+MARKER_WAIT = 30
+SETTLE_WAIT = 10
+# The fixture site's documents: a navigation within a profile, or the boot
+# load of a new browser (the cef-candidate popup probe's 25 s load bound).
+LOAD_WAIT = 25
+# Windows: a profile's browser and guard ending after its last window closed
+# (the Linux observer allows 10 s; process teardown is slower here).
+END_WAIT = 20
+RAISE_REFUSED = "Reused browser window was not raised:"
+GA_ROOT = 2
+WM_CLOSE = 0x0010
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+AF_INET = 2
+TCP_TABLE_OWNER_PID_LISTENER = 3
+MIB_TCP_STATE_LISTEN = 2
+ERROR_INSUFFICIENT_BUFFER = 122
+
+
+# --- Win32 -----------------------------------------------------------------
+
+class Win32:
+    """user32, kernel32 and iphlpapi with the prototypes used here."""
+
+    def __init__(self):
+        handle, boolean, dword = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        for library, name, restype, argtypes in (
+            (self.user32, "GetWindowThreadProcessId", dword, [handle, ctypes.POINTER(dword)]),
+            (self.user32, "IsWindow", boolean, [handle]),
+            (self.user32, "IsWindowVisible", boolean, [handle]),
+            (self.user32, "IsIconic", boolean, [handle]),
+            (self.user32, "GetAncestor", handle, [handle, ctypes.c_uint]),
+            (self.user32, "GetForegroundWindow", handle, []),
+            (self.user32, "SetForegroundWindow", boolean, [handle]),
+            (self.user32, "BringWindowToTop", boolean, [handle]),
+            (self.user32, "AttachThreadInput", boolean, [dword, dword, boolean]),
+            (self.user32, "PostMessageW", boolean, [handle, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]),
+            (self.user32, "SystemParametersInfoW", boolean, [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+                                                             ctypes.c_uint]),
+            (self.kernel32, "GetCurrentThreadId", dword, []),
+            (self.iphlpapi, "GetExtendedTcpTable", dword, [ctypes.c_void_p, ctypes.POINTER(dword), boolean,
+                                                           ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]),
+        ):
+            function = getattr(library, name)
+            function.restype, function.argtypes = restype, argtypes
+
+    def owner(self, window):
+        """(process id, thread id) owning a window; (0, 0) for none."""
+        pid = ctypes.c_uint32()
+        thread = self.user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+        return pid.value, thread
+
+    def foreground(self):
+        return self.user32.GetForegroundWindow() or 0
+
+    def top_level(self, window):
+        return (self.user32.GetAncestor(window, GA_ROOT) or 0) == window
+
+    def visible(self, window):
+        return bool(self.user32.IsWindow(window) and self.user32.IsWindowVisible(window)
+                    and not self.user32.IsIconic(window))
+
+    def lock_timeout(self):
+        value = ctypes.c_uint32()
+        if not self.user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(value), 0):
+            return None
+        return value.value
+
+    def wait_foreground(self, window, bound=2.0):
+        deadline = time.monotonic() + bound
+        while True:
+            if self.foreground() == window:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def switch_to(self, window, what, change=True):
+        """Bring a top-level window to the foreground, as the OS's window
+        switching does. Never synthesizes input. With `change`, the window
+        must not already be in front (the switch would prove nothing)."""
+        before = self.foreground()
+        if before == window:
+            require(not change, f"{what} is already in front; the switch would prove nothing")
+            return {"route": "already", "before": before}
+        self.user32.SetForegroundWindow(window)
+        if self.wait_foreground(window):
+            return {"route": "SetForegroundWindow", "before": before}
+        # Windows refused the change (its foreground lock): join the current
+        # foreground thread's input state for the call, as task switchers do.
+        current = self.foreground()
+        thread = self.owner(current)[1] if current else 0
+        me = self.kernel32.GetCurrentThreadId()
+        attached = bool(thread and thread != me and self.user32.AttachThreadInput(me, thread, True))
+        try:
+            self.user32.BringWindowToTop(window)
+            self.user32.SetForegroundWindow(window)
+        finally:
+            if attached:
+                self.user32.AttachThreadInput(me, thread, False)
+        if self.wait_foreground(window):
+            return {"route": "AttachThreadInput", "before": before}
+        raise Failure(f"{what} did not come to the front (foreground {self.foreground()}, "
+                      f"foreground lock timeout {self.lock_timeout()} ms)")
+
+    def close(self, window):
+        """A native close request (WM_CLOSE), as the title bar's close button."""
+        require(self.user32.PostMessageW(window, WM_CLOSE, 0, 0), f"WM_CLOSE to {window} was refused")
+
+    def listeners(self, port):
+        """Owning process ids of IPv4 TCP listeners on 127.0.0.1:`port`."""
+        size = ctypes.c_uint32(0)
+        result = self.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET,
+                                                   TCP_TABLE_OWNER_PID_LISTENER, 0)
+        require(result == ERROR_INSUFFICIENT_BUFFER, f"GetExtendedTcpTable size query failed ({result})")
+        for _ in range(4):
+            buffer = ctypes.create_string_buffer(size.value + 4096)
+            size = ctypes.c_uint32(len(buffer))
+            result = self.iphlpapi.GetExtendedTcpTable(buffer, ctypes.byref(size), False, AF_INET,
+                                                       TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if result == 0:
+                return loopback_listeners(buffer.raw[:size.value], port)
+            require(result == ERROR_INSUFFICIENT_BUFFER, f"GetExtendedTcpTable failed ({result})")
+        raise Failure("The TCP table kept growing")
+
+
+def loopback_listeners(table, port):
+    """Parse MIB_TCPTABLE_OWNER_PID: a count, then rows of six DWORDs (state,
+    local address, local port, remote address, remote port, owning pid), the
+    address in network order and the port in the low 16 bits, network order."""
+    (count,) = struct.unpack_from("<I", table, 0)
+    require(4 + 24 * count <= len(table), "Truncated TCP table")
+    loopback = struct.unpack("<I", socket.inet_aton("127.0.0.1"))[0]
+    owners = []
+    for index in range(count):
+        state, address, local_port, _, _, pid = struct.unpack_from("<6I", table, 4 + 24 * index)
+        if state == MIB_TCP_STATE_LISTEN and address == loopback and socket.ntohs(local_port & 0xFFFF) == port:
+            owners.append(pid)
+    return owners
+
+
+# --- DevTools ----------------------------------------------------------------
+
+def mask_bytes(payload, mask):
+    return bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+
+
+class WebSocket:
+    """A minimal RFC 6455 client: text messages, masked client frames,
+    fragmented server messages, ping/pong and close. A frame is taken from the
+    buffer only once it is complete, so a read that times out loses nothing."""
+
+    def __init__(self, host, port, path, timeout=5.0, connection=None):
+        self.sock = connection or socket.create_connection((host, port), timeout=timeout)
+        self.buffer = b""
+        self.partial = None
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        self.sock.settimeout(timeout)
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                          .encode("ascii"))
+        deadline = time.monotonic() + timeout
+        while b"\r\n\r\n" not in self.buffer:
+            require(len(self.buffer) < 16384, "Oversized WebSocket handshake")
+            self._fill(deadline)
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        require(lines[0].split(" ")[1:2] == ["101"], f"WebSocket upgrade refused: {lines[0][:200]!r}")
+        headers = {name.strip().lower(): value.strip()
+                   for name, value in (line.split(":", 1) for line in lines[1:] if ":" in line)}
+        accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
+        require(headers.get("sec-websocket-accept") == accept, "WebSocket accept key mismatch")
+
+    def _fill(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("WebSocket read timed out")
+        self.sock.settimeout(remaining)
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("WebSocket closed")
+        self.buffer += chunk
+
+    def _frame(self, deadline):
+        """(fin, opcode, payload) of the next complete frame."""
+        while True:
+            if len(self.buffer) >= 2:
+                first, second = self.buffer[0], self.buffer[1]
+                length, offset = second & 0x7F, 2
+                if length == 126 and len(self.buffer) >= 4:
+                    length, offset = int.from_bytes(self.buffer[2:4], "big"), 4
+                elif length == 127 and len(self.buffer) >= 10:
+                    length, offset = int.from_bytes(self.buffer[2:10], "big"), 10
+                if (second & 0x7F) < 126 or offset > 2:
+                    require(length <= MAX_MESSAGE, "Oversized WebSocket frame")
+                    masked = second & 0x80
+                    end = offset + (4 if masked else 0) + length
+                    if len(self.buffer) >= end:
+                        mask = self.buffer[offset:offset + 4] if masked else None
+                        payload = self.buffer[end - length:end]
+                        self.buffer = self.buffer[end:]
+                        return bool(first & 0x80), first & 0x0F, mask_bytes(payload, mask) if mask else payload
+            self._fill(deadline)
+
+    def send_text(self, text):
+        self._send(0x1, text.encode("utf-8"))
+
+    def _send(self, opcode, payload):
+        header = bytearray([0x80 | opcode])
+        if len(payload) < 126:
+            header.append(0x80 | len(payload))
+        elif len(payload) < 65536:
+            header.append(0x80 | 126)
+            header += len(payload).to_bytes(2, "big")
+        else:
+            header.append(0x80 | 127)
+            header += len(payload).to_bytes(8, "big")
+        mask = os.urandom(4)
+        self.sock.settimeout(5)
+        self.sock.sendall(bytes(header) + mask + mask_bytes(payload, mask))
+
+    def receive(self, deadline):
+        """The next text message; TimeoutError when none completes in time."""
+        while True:
+            fin, opcode, payload = self._frame(deadline)
+            if opcode == 0x8:
+                raise ConnectionError("WebSocket closed by the browser")
+            if opcode == 0x9:
+                self._send(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                require(self.partial is None, "Interleaved WebSocket message")
+                self.partial = bytearray(payload)
+            elif opcode == 0x0:
+                require(self.partial is not None, "Unexpected WebSocket continuation")
+                self.partial += payload
+            else:
+                raise Failure(f"Unexpected WebSocket opcode {opcode}")
+            require(len(self.partial) <= MAX_MESSAGE, "Oversized WebSocket message")
+            if fin:
+                message, self.partial = bytes(self.partial), None
+                return message.decode("utf-8")
+
+    def close(self):
+        try:
+            self._send(0x8, b"")
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class Cdp:
+    """One browser's DevTools connection. Events are kept (the oldest dropped
+    past 4096) and addressed by absolute marks."""
+
+    def __init__(self, websocket, label):
+        self.websocket, self.label = websocket, label
+        self.next = 0
+        self.events = []
+        self.base = 0
+        self.closed = None
+
+    def mark(self):
+        return self.base + len(self.events)
+
+    def since(self, mark):
+        return self.events[max(0, mark - self.base):]
+
+    def _next(self, deadline):
+        try:
+            message = json.loads(self.websocket.receive(deadline))
+        except TimeoutError:
+            return None
+        except (ConnectionError, OSError) as error:
+            self.closed = str(error)
+            raise Failure(f"DevTools connection of {self.label} ended: {error}") from None
+        if "method" in message:
+            self.events.append(message)
+            if len(self.events) > 4096:
+                del self.events[:1024]
+                self.base += 1024
+        return message
+
+    def command(self, method, params=None, session=None, timeout=5.0):
+        self.next += 1
+        ident = self.next
+        request = {"id": ident, "method": method, "params": params or {}}
+        if session:
+            request["sessionId"] = session
+        self.websocket.send_text(json.dumps(request))
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._next(deadline)
+            if message is None:
+                raise Failure(f"CDP timeout {method} ({self.label})")
+            if message.get("id") == ident:
+                if "error" in message:
+                    raise Failure(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}")
+                return message.get("result", {})
+
+    def wait_event(self, predicate, mark, timeout, what):
+        deadline = time.monotonic() + timeout
+        while True:
+            for event in self.since(mark):
+                if predicate(event):
+                    return event
+            if self._next(deadline) is None:
+                raise Failure(what)
+
+    def drain(self, seconds=0.3):
+        """Take whatever events arrive within `seconds`."""
+        deadline = time.monotonic() + seconds
+        while self._next(deadline) is not None:
+            pass
+
+
+class Page:
+    """The one top-level document of a profile's browser, through a flattened
+    target session on that browser's own DevTools connection."""
+
+    def __init__(self, cdp, session, process, target):
+        self.cdp, self.session, self.process, self.target = cdp, session, process, target
+        self.native = process["opened"]
+        self.window = self.native["windowId"]
+
+    def send(self, method, params=None, timeout=5.0):
+        return self.cdp.command(method, params, self.session, timeout)
+
+    def evaluate(self, expression, gesture=False):
+        result = self.send("Runtime.evaluate", {"expression": expression, "returnByValue": True,
+                                                "awaitPromise": True, "userGesture": gesture})
+        require(not result.get("exceptionDetails"), json.dumps(result.get("exceptionDetails"))[:1000])
+        return result["result"].get("value")
+
+    def pages(self):
+        return [target["targetId"] for target in self.cdp.command("Target.getTargets")["targetInfos"]
+                if target["type"] == "page"]
+
+
+# --- Observation ---------------------------------------------------------------
+
+class Observer:
+    def __init__(self, data, site, app_pid, phase, win32=None):
+        self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
+        self.suffix = f"-{phase}" if phase else ""
+        self.nonce = data.name
+        self.key = f"sumi_app_process_{self.nonce}"
+        self.win = win32
+        self.clients = []
+        self.proof = {"passed": False, "cases": [],
+                      "scope": "Disposable Windows actual App/browser process fixture; local fixture site, "
+                               "no real login or Push"}
+
+    # Helpers shared with browser-process.mjs's shape.
+    def step(self, name, page=None):
+        self.proof["stage"] = {"name": name, "pid": page.native["nativePid"] if page else None,
+                               "profile": page.process["profile"] if page else None}
+
+    def case(self, name, evidence=None):
+        self.proof["cases"].append(name)
+        if evidence is not None:
+            self.proof.setdefault("evidence", {})[name] = evidence
+
+    def json_file(self, name):
+        with open(self.data / name, "rb") as source:
+            return json.loads(source.read(4 * 1024 * 1024))
+
+    def marker(self, name):
+        deadline = time.monotonic() + MARKER_WAIT
+        while time.monotonic() < deadline:
+            # Markers are written non-atomically: an incomplete file is not yet
+            # ready (nor, on Windows, one its writer still holds exclusively).
+            try:
+                return self.json_file(name)
+            except (FileNotFoundError, PermissionError, ValueError):
+                time.sleep(0.05)
+        raise Failure(f"Missing App checkpoint: {name}")
+
+    def checkpoint(self, name):
+        with open(self.data / name, "x", encoding="utf-8") as output:
+            output.write("ready")
+
+    @staticmethod
+    def settled(test, message, bound=SETTLE_WAIT, tolerate=False):
+        """Until `test()` holds. With `tolerate`, a failing evaluation (a page
+        between documents) counts as not yet."""
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            try:
+                if test():
+                    return
+            except Failure:
+                if not tolerate:
+                    raise
+            time.sleep(0.05)
+        raise Failure(message)
+
+    @staticmethod
+    def guard_ended(receipt):
+        # The guard creates its receipt when it starts and writes JSON only at its end.
+        try:
+            with open(receipt, "rb") as source:
+                text = source.read()
+        except (FileNotFoundError, PermissionError):
+            return False
+        if not text:
+            return False
+        try:
+            json.loads(text)
+            return True
+        except ValueError:
+            return False
+
+    def normal_receipt(self, receipt, message, bound=SETTLE_WAIT):
+        self.settled(lambda: self.guard_ended(receipt), message, bound)
+        with open(receipt, "rb") as source:
+            value = json.loads(source.read())
+        require(value["rootExit"] == 0 and value["complete"] is True and value["kernelNoChildren"] is True
+                and value["forcedCleanup"] == 0 and value["remaining"] == [] and value["cleanupErrors"] == []
+                and value["error"] is None, f"{message}: abnormal receipt {json.dumps(value)[:500]}")
+        return value
+
+    def cookie_of(self):
+        key = self.key
+        return (f"(document.cookie.split('; ').find(c=>c.startsWith({json.dumps(key + '=')}))"
+                f"?.slice({len(key) + 1})??null)")
+
+    def sample(self, page):
+        key = json.dumps(self.key)
+        return page.evaluate(
+            f"({{document:globalThis[{key}],storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
+            "origin:location.origin,frame:window===top,page:document.querySelector('main')?.dataset.page??null,"
+            "user:document.querySelector('main')?.dataset.user??null})")
+
+    def persisted(self, page):
+        key = json.dumps(self.key)
+        return page.evaluate(
+            f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
+            "page:document.querySelector('main')?.dataset.page??null,"
+            "user:document.querySelector('main')?.dataset.user??null})")
+
+    def process_of(self, opened, name):
+        connection = next((item for item in opened["connections"] if item["name"] == name), None)
+        require(connection is not None, f"Missing saved {name}")
+        process = next((item for item in opened["processes"] if item["profile"] == connection["profile"]), None)
+        require(process is not None, f"No browser process for {name}")
+        return process
+
+    def attach(self, process):
+        native = process["opened"]
+        self.proof["stage"] = {"name": "attach", "pid": native["nativePid"], "profile": process["profile"]}
+        # Only a browser built with the cef-candidate `fixture-inspection` feature writes it.
+        try:
+            inspection = json.loads((Path(process["directory"]) / "inspection.json").read_bytes())
+        except OSError as error:
+            raise Failure(f"No inspection.json: build the browser with --features fixture-inspection ({error})")
+        require(inspection["pid"] == native["nativePid"], "inspection.json names another process")
+        port = inspection["port"]
+        owners = self.win.listeners(port)
+        require(owners == [native["nativePid"]],
+                f"Only the attested native browser may listen on 127.0.0.1:{port} (listeners {owners})")
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.request("GET", "/json/version")
+            info = json.loads(connection.getresponse().read(65536))
+        finally:
+            connection.close()
+        endpoint = urlsplit(info["webSocketDebuggerUrl"])
+        require(endpoint.hostname == "127.0.0.1" and endpoint.port == port, "Unexpected DevTools endpoint")
+        cdp = Cdp(WebSocket("127.0.0.1", port, endpoint.path), process["profile"])
+        self.clients.append(cdp)
+        targets = [target for target in cdp.command("Target.getTargets")["targetInfos"] if target["type"] == "page"]
+        require(len(targets) == 1, "Exactly one initial document per process")
+        session = cdp.command("Target.attachToTarget", {"targetId": targets[0]["targetId"], "flatten": True})
+        page = Page(cdp, session["sessionId"], process, targets[0])
+        page.send("Page.enable")
+        try:
+            self.settled(lambda: page.evaluate(
+                f"location.origin==={json.dumps(self.site)} && document.readyState==='complete' "
+                "&& Boolean(document.querySelector('main[data-page]'))"),
+                "The local fixture page did not load", LOAD_WAIT, tolerate=True)
+        except Failure:
+            try:
+                self.proof["startupDocument"] = page.evaluate(
+                    "({url:location.href,ready:document.readyState,title:document.title,"
+                    "body:document.body?.innerText.slice(0,500)})")
+            except Failure as error:
+                self.proof["startupDocument"] = {"error": str(error)}
+            raise
+        window = native["windowId"]
+        owner = self.win.owner(window)[0]
+        require(owner == native["nativePid"], f"The browser window {window} belongs to {owner}")
+        require(self.win.top_level(window) and self.win.visible(window),
+                f"The browser window {window} is not a visible top-level window")
+        context = page.evaluate(
+            "({origin:location.origin,secure:isSecureContext,tauri:typeof __TAURI_INTERNALS__,"
+            "ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc,"
+            "webview2:typeof window.chrome?.webview})")
+        require(context["secure"] is True, "The fixture page must be a secure context")
+        for field in ("tauri", "ipc", "wry", "webview2"):
+            require(context[field] == "undefined", f"A CEF page must not see the App's {field} bridge")
+        page.context = context
+        return page
+
+    def sign_in(self, page, user):
+        """The sign-in stand-in, then the app home's app, in this profile."""
+        self.step(f"{user} sign-in stand-in", page)
+        require(page.evaluate("document.querySelector('main')?.dataset.page") == "login",
+                f"A new {user} profile must start signed out")
+        page.evaluate("(()=>{document.querySelector('input[name=user]').value=" + json.dumps(user) +
+                      ";document.querySelector('form').requestSubmit();return true})()", True)
+        signed = json.dumps(user)
+        self.settled(lambda: page.evaluate(
+            "document.readyState==='complete' && document.querySelector('main')?.dataset.page==='home' "
+            f"&& document.querySelector('main')?.dataset.user==={signed}"),
+            f"The {user} sign-in did not reach its app home", LOAD_WAIT, tolerate=True)
+        self.step(f"{user} opens the app", page)
+        page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
+        self.settled(lambda: page.evaluate(
+            "document.readyState==='complete' && location.pathname==='/app/' "
+            "&& document.querySelector('main')?.dataset.page==='app' "
+            f"&& document.querySelector('main')?.dataset.user==={signed}"),
+            f"The {user} app did not open", LOAD_WAIT, tolerate=True)
+        require(page.pages() == [page.target["targetId"]], f"The {user} app must stay in its one window")
+
+    def raise_refusals(self, page):
+        try:
+            with open(Path(page.process["directory"]) / "browser.log", "rb") as source:
+                text = source.read().decode("utf-8", "replace")
+        except FileNotFoundError:
+            return []
+        return [line[:300] for line in text.splitlines() if RAISE_REFUSED in line]
+
+    def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
+        return page.cdp.wait_event(
+            lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
+            and event["params"].get("type") == kind, mark, bound, what)
+
+    def cancel_dialog(self, page, mark, what):
+        """Cancel the page's open dialog through DevTools and see it closed
+        with result false (which the browser's own close observer reports)."""
+        page.send("Page.handleJavaScriptDialog", {"accept": False})
+        return page.cdp.wait_event(
+            lambda event: event["method"] == "Page.javascriptDialogClosed" and event.get("sessionId") == page.session
+            and event["params"].get("result") is False, mark, SETTLE_WAIT, what)
+
+    def first_launch(self):
+        win = self.win
+        opened = self.proof["opened"] = self.marker("app-browser-process-open.json")
+        require(len(opened["processes"]) == 2, "Expected two browser processes")
+        home = opened["homeWindow"]
+        require(win.owner(home)[0] == self.app_pid and win.top_level(home),
+                "The home window must be the App's own top-level window")
+        pages = [self.attach(self.process_of(opened, name)) for name in ("Work", "Personal")]
+        work, personal = pages
+        for page, user in ((work, "work"), (personal, "personal")):
+            self.sign_in(page, user)
+        self.step("separate initial state")
+        key = json.dumps(self.key)
+        for index, page in enumerate(pages):
+            require(page.evaluate(f"localStorage.getItem({key})") is None, "A new profile has no storage")
+            require(page.evaluate(self.cookie_of()) is None, "A new profile has no script cookie")
+            value = f"{index}:{self.nonce}"
+            page.evaluate(f"(()=>{{globalThis[{key}]={json.dumps(value)};localStorage.setItem({key},globalThis[{key}]);"
+                          f"document.cookie={json.dumps(f'{self.key}={value}; Max-Age=86400; Path=/; Secure; SameSite=Lax')}"
+                          ";return true})()")
+        expected = self.proof["initial"] = [self.sample(page) for page in pages]
+        require(expected[0]["storage"] != expected[1]["storage"], "Each profile must keep its own storage")
+        require([item["cookie"] for item in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"],
+                "Each profile must see only its own cookie")
+        require([item["user"] for item in expected] == ["work", "personal"],
+                "Each profile must keep its own signed-in session")
+        require(work.native["nativePid"] != personal.native["nativePid"] and work.window != personal.window,
+                "Each connection must have its own browser process and window")
+        self.case("separate-profiles", {"bindings": [{"native": page.native, "context": page.context}
+                                                     for page in pages]})
+
+        # The home comes back through the OS's window switching (the owner's
+        # decision: no in-browser home button). A browser window is in front
+        # first, so the switch is real; Work must not be in front, so the
+        # reopen below has to raise it.
+        self.step("home through OS window switching")
+        switch = {"precondition": win.switch_to(personal.window, "Personal's window", change=False)}
+        switch["home"] = win.switch_to(home, "The home window")
+        require(win.foreground() == home and win.visible(home), "The home window must be in front and visible")
+        switch["lockTimeout"] = win.lock_timeout()
+        self.case("home-by-window-switch", switch)
+        self.checkpoint("inspect-ready")
+
+        self.step("home reopens Work")
+        resumed = self.proof["resumed"] = self.marker("app-browser-process.json")
+        require([self.sample(page) for page in pages] == expected,
+                "Reopening from the home must retain both exact documents and storage")
+        require(sorted(item["opened"]["nativePid"] for item in resumed["after"])
+                == sorted(page.native["nativePid"] for page in pages) and len(resumed["after"]) == 2,
+                "Reopening must not start another browser process")
+        require(win.wait_foreground(work.window), f"Reopened Work's window is not in front ({win.foreground()})")
+        self.settled(lambda: work.evaluate("document.visibilityState") == "visible",
+                     "Reopened Work's document is not visible")
+        require(work.pages() == [work.target["targetId"]], "Reopening must not open another window")
+        refusals = self.raise_refusals(work)
+        require(refusals == [], f"Work's browser refused the raise: {refusals}")
+        self.case("reuse-raises-window", {"window": work.window, "foreground": win.foreground()})
+
+        # Chrome's real beforeunload path needs sticky user activation. CDP's
+        # userGesture is synthetic and is reported as such, not a real click.
+        self.step("Work beforeunload setup", work)
+        unload = work.cdp.mark()
+        work.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
+                      "addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()", True)
+        # Sequential App quit (owner's decision): profiles close oldest first, so
+        # Work closes first; cancelling its beforeunload stops the quit and
+        # Personal is never asked to close.
+        personal_mark = personal.cdp.mark()
+        self.checkpoint("request-exit")
+        self.step("Work beforeunload on sequential quit", work)
+        dialog = self.dialog(work, unload, "beforeunload", "The beforeunload dialog did not open")
+        self.proof["dialog"] = {"type": dialog["params"]["type"], "url": dialog["params"].get("url")}
+        require(urlsplit(dialog["params"]["url"])._replace(path="", query="", fragment="").geturl() == self.site,
+                "The dialog must belong to the fixture site")
+        personal.cdp.drain()
+        require(not any(event["method"].startswith("Page.javascriptDialog")
+                        for event in personal.cdp.since(personal_mark)),
+                "Personal must not be asked to close before Work agrees")
+        require(not self.guard_ended(personal.process["guardReceipt"]),
+                "Personal must still be running during Work's dialog")
+        self.cancel_dialog(work, unload, "Work's beforeunload cancel was not observed")
+        require([self.sample(page) for page in pages] == expected, "A cancelled sequential quit must keep every document")
+        self.step("sequential quit stopped at the cancel", work)
+        self.checkpoint("cancel-inspected")
+        self.proof["blocked"] = self.marker("app-browser-process-blocked.json")
+        require(len(self.proof["blocked"]) == 2, "Both profiles must remain after the cancelled quit")
+        self.proof["cancelled"] = self.marker("app-browser-process-cancelled.json")
+        require([self.sample(page) for page in pages] == expected, "The documents must survive the cancelled quit")
+        work.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
+                      "delete window.__sumiBeforeUnload;return true})()")
+        self.case("quit-cancel-stops", {"dialog": self.proof["dialog"]})
+
+        # The accepted sequential trade-off: Work (oldest) now agrees to leave
+        # and closes normally first; Personal cancels, so the quit stops with
+        # Work closed and Personal kept.
+        self.step("Personal cancels after Work closed", personal)
+        personal_unload = personal.cdp.mark()
+        personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
+                          "addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()", True)
+        self.checkpoint("request-partial-exit")
+        self.dialog(personal, personal_unload, "beforeunload",
+                    "Personal's beforeunload did not open after Work closed", END_WAIT)
+        # The App drops Work only after its normal receipt, before asking Personal.
+        require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
+        self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
+                                                            "Work must have closed normally")
+        self.cancel_dialog(personal, personal_unload, "Personal's beforeunload cancel was not observed")
+        require(self.sample(personal) == expected[1], "The cancelled Personal must keep its document")
+        self.checkpoint("partial-inspected")
+        self.proof["partial"] = self.marker("app-browser-process-partial.json")
+        require([item["profile"] for item in self.proof["partial"]] == [personal.process["profile"]],
+                "Only Personal remains after Work closed and Personal cancelled")
+        personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
+                          "delete window.__sumiBeforeUnload;return true})()")
+        self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"]})
+        self.step("Personal final exit", personal)
+        self.checkpoint("request-final-exit")
+        self.proof["passed"] = True
+
+    def relaunch(self, kind):
+        """A later launch on the same App data. restart: each profile's
+        storage, script cookie and signed-in session from the first launch
+        survive and stay separate. reset: Work was cleared from the home, so
+        only Personal keeps its state, and a clear of the running Personal
+        was refused."""
+        self.proof["scope"] = f"Disposable Windows actual App {kind} on the same data; local fixture site"
+        opened = self.proof["opened"] = self.marker(f"app-browser-process-{kind}-open.json")
+        pages = [self.attach(self.process_of(opened, name)) for name in ("Work", "Personal")]
+        work, personal = pages
+        self.step(f"per-profile state after {kind}")
+        persisted = self.proof["persisted"] = [self.persisted(page) for page in pages]
+        kept = {"storage": f"1:{self.nonce}", "cookie": f"1:{self.nonce}", "page": "home", "user": "personal"}
+        if kind == "reset":
+            require(persisted == [{"storage": None, "cookie": None, "page": "login", "user": None}, kept],
+                    f"Only Work's site data may be cleared: {persisted}")
+            require(opened["runningClearRefused"] is True, "Clearing a running profile must be refused")
+            require(opened["personalLockHeld"] is True, "Chromium must hold the running Personal's lockfile")
+            self.case("clear-only-one-profile", {"persisted": persisted})
+        else:
+            require(persisted == [{"storage": f"0:{self.nonce}", "cookie": f"0:{self.nonce}", "page": "home",
+                                   "user": "work"}, kept],
+                    f"Each profile must keep its own storage, cookie and session across App restart: {persisted}")
+            self.case("restart-keeps-separation", {"persisted": persisted})
+        self.checkpoint(f"{kind}-inspected")
+        self.step(f"Personal native close after {kind}", personal)
+        self.win.close(personal.window)
+        self.proof["personalClosed"] = self.normal_receipt(personal.process["guardReceipt"],
+                                                           f"Personal guard did not finish after {kind}", END_WAIT)
+        self.step(f"Work ordinary exit after {kind}", work)
+        self.checkpoint(f"{kind}-request-exit")
+        self.proof["passed"] = True
+
+    def failure_capture(self):
+        try:
+            window = self.win.foreground()
+            self.proof["failureForeground"] = {"window": window, "owner": self.win.owner(window)[0] if window else 0}
+        except Exception as error:  # diagnostics only
+            self.proof["failureForeground"] = {"error": str(error)}
+
+    def run(self):
+        try:
+            if self.phase:
+                self.relaunch(self.phase)
+            else:
+                self.first_launch()
+        except Exception as error:
+            self.proof["error"] = f"{type(error).__name__}: {error}"
+            self.failure_capture()
+            raise
+        finally:
+            for client in self.clients:
+                try:
+                    client.websocket.close()
+                except OSError:
+                    pass
+            with open(self.data / f"browser-observation{self.suffix}.json", "w", encoding="utf-8") as output:
+                output.write(json.dumps(self.proof, indent=2) + "\n")
+
+
+def main():
+    # Logs and App messages may hold text the console's code page lacks.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--data", type=Path, required=True, help="the runner's session directory")
+    parser.add_argument("--site", required=True, help="the fixture site origin")
+    parser.add_argument("--app-pid", type=int, required=True)
+    parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
+    args = parser.parse_args()
+    if os.name != "nt":
+        parser.error("windows_browser_observer.py runs on Windows")
+    data = args.data.resolve(strict=True)
+    require((data / ".owned-browser-reference").is_file(), "No owned session directory")
+    Observer(data, args.site, args.app_pid, args.phase, Win32()).run()
+
+
+if __name__ == "__main__":
+    main()
