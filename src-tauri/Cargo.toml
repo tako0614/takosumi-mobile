@@ -21,9 +21,16 @@ tauri-build = { version = "2", features = [] }
 # Windows compiles the same adapter for the unsandboxed test candidate
 # ("Windows browser process"); nothing is packaged for Windows yet.
 desktop-cef = ["tauri-plugin-app-screen/desktop-process-experiment"]
-native-browser-process-fixture = ["desktop-cef", "tauri-plugin-app-screen/fixture-overrides", "tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
+# Explicit actual-App fixture: the real home drives the per-profile CEF
+# browser (tests/desktop/browser_process.rs); never enabled by normal builds
+# or releases.
+native-browser-process-fixture = ["desktop-cef", "tauri-plugin-app-screen/fixture-overrides", "tauri/custom-protocol", "native-fixture-gtk"]
+# The actual-App fixtures' GTK/WebKit driver pieces. They are Linux-only
+# optional dependencies (see the Linux target section), so nothing is
+# resolved or built for them on other OSes. Not a product feature.
+native-fixture-gtk = ["dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
 # Explicit actual-App fixture; never enabled by normal builds or releases.
-native-web-home-fixture = ["tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
+native-web-home-fixture = ["tauri/custom-protocol", "native-fixture-gtk"]
 
 [dependencies]
 serde_json = "1"
