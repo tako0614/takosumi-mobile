@@ -792,6 +792,11 @@ impl Process {
         result
     }
     fn shutdown(&mut self) -> Result<bool> {
+        // A person answers each window's beforeunload in turn: the reply bound
+        // is interactive, unlike the write bound.
+        self.shutdown_until(std::time::Instant::now() + Duration::from_secs(300))
+    }
+    fn shutdown_until(&mut self, reply_deadline: std::time::Instant) -> Result<bool> {
         if let Some(status) = self.child.try_wait().map_err(failure)? {
             return if status.success() {
                 self.normal_guard().map(|()| true)
@@ -806,8 +811,6 @@ impl Process {
         let id = self.next;
         self.opening = None;
         let now = std::time::Instant::now();
-        // A person answers each window's beforeunload in turn: the reply bound
-        // is interactive, unlike the write bound.
         // A browser whose last window was just closed is already ending: its
         // pipe or reply channel closes. Only then accept a normal end; a
         // protocol fault stays an error.
@@ -818,7 +821,7 @@ impl Process {
                 .map_err(|_| error);
         }
         // A timeout leaves any late answer queued for `recover`.
-        let reply = match self.receive(id, now + Duration::from_secs(300)) {
+        let reply = match self.receive(id, reply_deadline) {
             Ok(reply) => reply,
             Err(Wait::Closed) => {
                 return self
@@ -857,8 +860,9 @@ impl Process {
     }
     /// Settle a browser left in doubt by an earlier timeout before using it:
     /// a late reply to its last request, or its own normal end. Returns true
-    /// when it has ended (the caller drops it); a late cancel, refusal or
-    /// verified creation makes it usable. Other replies keep it in doubt.
+    /// when it has ended (the caller drops it); a late cancel, refusal, error
+    /// or verified creation makes it usable. Other replies keep it in doubt,
+    /// and a fault is an error.
     fn recover(&mut self) -> Result<bool> {
         if !self.uncertain {
             return Ok(false);
@@ -870,7 +874,15 @@ impl Process {
                 Err(Error::InvalidRequest("Browser process ended abnormally."))
             };
         }
-        while let Ok(Ok(reply)) = self.replies.try_recv() {
+        loop {
+            let reply = match self.replies.try_recv() {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(message)) => {
+                    self.uncertain = true;
+                    return Err(failure(message));
+                }
+                Err(_) => break,
+            };
             match reply {
                 Reply::Cancelled { id, ref profile } | Reply::CloseBlocked { id, ref profile }
                     if id == self.next && *profile == self.profile =>
@@ -887,6 +899,12 @@ impl Process {
                             self.uncertain = false;
                         }
                     }
+                }
+                // The browser rejected the last request outright: every native
+                // error path leaves no pending stop or creation behind.
+                Reply::Error { id, .. } if id == self.next => {
+                    self.uncertain = false;
+                    self.opening = None;
                 }
                 _ => {}
             }
@@ -1263,44 +1281,75 @@ mod tests {
         drop(state); // Drop's SIGTERM path ends the lingering stand-in.
         std::fs::remove_dir_all(&root).unwrap();
     }
+    const NORMAL_RECEIPT: &str = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
+    /// Poll for a stand-in's marker file; Python start-up under host I/O load
+    /// must not eat a bound under test.
+    fn marker(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "missing {path:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    /// A stand-in guard: starts the "native" child (the program argument) and
+    /// another child with a different executable, then ends normally once its
+    /// input closes. SIGTERM (Drop) also ends both children.
+    fn recovering_guard(root: &std::path::Path) -> PathBuf {
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,pathlib,signal,subprocess,sys\nhere=pathlib.Path(sys.argv[1])\nnative=subprocess.Popen([sys.argv[2],'30'])\nother=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\ndef end():\n    native.kill();other.kill();native.wait();other.wait()\ndef stop(*_):\n    end();sys.exit(0)\nsignal.signal(signal.SIGTERM,stop)\nhere.with_name('other').write_text(str(other.pid))\nhere.with_name('native').write_text(str(native.pid))\nsys.stdin.read()\nend()\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        guard
+    }
+    /// A live stand-in browser for `profile` with injected replies, as after a
+    /// request with id 2 timed out.
+    fn in_doubt(
+        root: &std::path::Path,
+        guard: &std::path::Path,
+        program: &std::path::Path,
+        parent: &mpsc::Sender<SpawnRequest>,
+        index: usize,
+        profile: &str,
+    ) -> (Process, mpsc::Sender<std::result::Result<Reply, String>>) {
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let mut process = Process::spawn(
+            program.to_owned(),
+            guard.to_owned(),
+            root.join(format!("{index}")).join(profile),
+            root.join(format!("r{index}")),
+            payload,
+            parent,
+        )
+        .unwrap();
+        marker(&process.guard_receipt.with_file_name("native"));
+        let (send, replies) = mpsc::channel();
+        process.replies = replies;
+        process.next = 2;
+        process.uncertain = true;
+        (process, send)
+    }
     #[test]
     fn a_late_answer_recovers_a_profile_left_in_doubt() {
-        // As after a request with id 2 timed out. Replies are injected in order;
-        // the stand-in guard starts the "native" child (the program argument)
-        // and ends normally only once its input closes.
         let root = std::env::temp_dir().join(format!("sumi-recover-{}", std::process::id()));
         private_directory(&root).unwrap();
         let (work, personal) = (
             "11111111-1111-4111-8111-111111111111",
             "22222222-2222-4222-8222-222222222222",
         );
-        let receipt = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
-        let guard = root.join("guard.py");
-        std::fs::write(&guard, format!("import json,pathlib,subprocess,sys\nnative=subprocess.Popen([sys.argv[2],'30'])\npathlib.Path(sys.argv[1]).with_name('native').write_text(str(native.pid))\nsys.stdin.read()\nnative.kill();native.wait()\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        let guard = recovering_guard(&root);
         let program = std::fs::canonicalize("/bin/sleep").unwrap();
         let parent = spawner().unwrap();
         let mut index = 0;
         let mut spawn = |profile: &str| {
             index += 1;
-            let payload = serde_json::from_value(serde_json::json!({
-                "key":format!("web-home:{profile}:https://excalidraw.com"),
-                "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
-            }))
-            .unwrap();
-            let mut process = Process::spawn(
-                program.clone(),
-                guard.clone(),
-                root.join(format!("{index}")).join(profile),
-                root.join(format!("r{index}")),
-                payload,
-                &parent,
-            )
-            .unwrap();
-            let (send, replies) = mpsc::channel();
-            process.replies = replies;
-            process.next = 2;
-            process.uncertain = true;
-            (process, send)
+            in_doubt(&root, &guard, &program, &parent, index, profile)
         };
         let cancelled = |id, profile: &str| {
             Ok(Reply::Cancelled {
@@ -1308,13 +1357,32 @@ mod tests {
                 profile: profile.to_owned(),
             })
         };
+        let blocked = |id, profile: &str| {
+            Ok(Reply::CloseBlocked {
+                id,
+                profile: profile.to_owned(),
+            })
+        };
+        let error = |id| {
+            Ok(Reply::Error {
+                id,
+                message: "Native browser creation rejected".into(),
+            })
+        };
         // A cancel: only the answer to the last request, for this profile, counts.
         let (mut process, send) = spawn(work);
         assert!(!process.recover().unwrap(), "no answer yet");
         assert!(process.uncertain, "stays in doubt without an answer");
-        send.send(cancelled(1, work)).unwrap();
-        send.send(cancelled(2, personal)).unwrap();
-        send.send(Ok(Reply::Stopped { id: 1 })).unwrap();
+        for stale in [
+            cancelled(1, work),
+            cancelled(2, personal),
+            blocked(1, work),
+            blocked(2, personal),
+            error(1),
+            Ok(Reply::Stopped { id: 1 }),
+        ] {
+            send.send(stale).unwrap();
+        }
         assert!(!process.recover().unwrap(), "stale or foreign answers");
         assert!(
             process.uncertain,
@@ -1331,6 +1399,25 @@ mod tests {
         );
         assert!(!process.uncertain, "and makes it usable again");
         drop(process);
+        // A refusal (a window was still opening) or an error leaves nothing pending.
+        for answer in [blocked(2, work), error(2)] {
+            let (mut process, send) = spawn(work);
+            process.opening = Some("pending".into());
+            send.send(answer).unwrap();
+            assert!(
+                !process.recover().unwrap(),
+                "a late refusal or error keeps the browser"
+            );
+            assert!(!process.uncertain, "and makes it usable again");
+            drop(process);
+        }
+        // A fault is not an answer, even after one.
+        let (mut process, send) = spawn(work);
+        send.send(cancelled(2, work)).unwrap();
+        send.send(Err("Invalid browser reply".into())).unwrap();
+        assert!(process.recover().is_err(), "a fault is an error");
+        assert!(process.uncertain, "and keeps it in doubt");
+        drop(process);
         // A stop: dropped only after the browser, told its input is done, ends normally.
         let (mut process, send) = spawn(personal);
         send.send(Ok(Reply::Stopped { id: 2 })).unwrap();
@@ -1340,52 +1427,117 @@ mod tests {
         );
         drop(process);
         // A creation: only a reply for this browser's own native child, profile
-        // cache and pending key makes it usable.
+        // cache and pending key makes it usable. Each negative fails exactly one check.
         let (mut process, send) = spawn(work);
         let key = format!("web-home:{work}:https://excalidraw.com");
         process.opening = Some(key.clone());
-        let marker = process.guard_receipt.with_file_name("native");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let native_pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|text| text.parse::<u32>().ok())
-            {
-                break pid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "stand-in native child never started"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let native_pid: u32 = marker(&process.guard_receipt.with_file_name("native"))
+            .parse()
+            .unwrap();
+        let other_pid: u32 = marker(&process.guard_receipt.with_file_name("other"))
+            .parse()
+            .unwrap();
+        let mut stranger = Command::new(&program).arg("30").spawn().unwrap();
         let cache = process.directory.join("cef-profiles").join(work);
-        let opened = |id, key: &str, native_pid| {
+        let opened = |id,
+                      key: &str,
+                      profile: &str,
+                      cache: &std::path::Path,
+                      browser_id,
+                      window_id,
+                      native_pid| {
             Ok(Reply::Opened {
                 id,
                 key: key.to_owned(),
-                profile: work.to_owned(),
-                browser_id: 1,
+                profile: profile.to_owned(),
+                browser_id,
                 cache_path: cache.to_string_lossy().into_owned(),
-                window_id: 7,
+                window_id,
                 native_pid,
             })
         };
-        send.send(opened(1, &key, native_pid)).unwrap();
-        send.send(opened(2, "web-home:other", native_pid)).unwrap();
-        send.send(opened(2, &key, std::process::id())).unwrap();
-        assert!(!process.recover().unwrap());
-        assert!(
-            process.uncertain,
-            "an unverified creation keeps it in doubt"
-        );
-        send.send(opened(2, &key, native_pid)).unwrap();
+        let elsewhere = process.directory.join("cef-profiles").join(personal);
+        for (case, reply) in [
+            ("stale id", opened(1, &key, work, &cache, 1, 7, native_pid)),
+            (
+                "another key",
+                opened(2, "web-home:other", work, &cache, 1, 7, native_pid),
+            ),
+            (
+                "another profile",
+                opened(2, &key, personal, &cache, 1, 7, native_pid),
+            ),
+            (
+                "another cache",
+                opened(2, &key, work, &elsewhere, 1, 7, native_pid),
+            ),
+            (
+                "no browser",
+                opened(2, &key, work, &cache, 0, 7, native_pid),
+            ),
+            ("no window", opened(2, &key, work, &cache, 1, 0, native_pid)),
+            (
+                "not the guard's child",
+                opened(2, &key, work, &cache, 1, 7, stranger.id()),
+            ),
+            (
+                "another executable",
+                opened(2, &key, work, &cache, 1, 7, other_pid),
+            ),
+        ] {
+            send.send(reply).unwrap();
+            assert!(!process.recover().unwrap(), "{case}");
+            assert!(
+                process.uncertain,
+                "an unverified creation keeps it in doubt: {case}"
+            );
+        }
+        send.send(opened(2, &key, work, &cache, 1, 7, native_pid))
+            .unwrap();
         assert!(
             !process.recover().unwrap(),
             "a verified late creation keeps the browser"
         );
         assert!(!process.uncertain, "and makes it usable again");
         assert_eq!(process.opened["nativePid"], native_pid);
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn a_timed_out_shutdown_leaves_the_late_answer_for_recovery() {
+        // The person's cancel is already queued when the reply deadline has
+        // passed: the timeout must not consume it.
+        let root = std::env::temp_dir().join(format!("sumi-timeout-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let work = "11111111-1111-4111-8111-111111111111";
+        let guard = recovering_guard(&root);
+        let program = std::fs::canonicalize("/bin/sleep").unwrap();
+        let parent = spawner().unwrap();
+        let (mut process, send) = in_doubt(&root, &guard, &program, &parent, 1, work);
+        process.next = 1;
+        process.uncertain = false;
+        send.send(Ok(Reply::Cancelled {
+            id: 2,
+            profile: work.to_owned(),
+        }))
+        .unwrap();
+        let passed = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        match process.shutdown_until(passed) {
+            Err(Error::InvalidRequest(message)) => {
+                assert_eq!(message, "Browser response timed out.")
+            }
+            other => panic!("{other:?}"),
+        }
+        process.uncertain = true; // As `drain` marks a failed shutdown.
+        assert!(
+            !process.recover().unwrap(),
+            "the late cancel keeps the browser"
+        );
+        assert!(!process.uncertain, "and makes it usable again");
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1398,7 +1550,7 @@ mod tests {
         let profile = "11111111-1111-4111-8111-111111111111";
         let receipt = "{'rootExit':0,'complete':True,'kernelNoChildren':True,'remaining':[],'forcedCleanup':0,'error':None,'cleanupErrors':[]}";
         let guard = root.join("guard.py");
-        std::fs::write(&guard, format!("import json,sys\nsys.stdin.readline()\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
+        std::fs::write(&guard, format!("import json,pathlib,sys\npathlib.Path(sys.argv[1]).with_name('ready').write_text('1')\nsys.stdin.readline()\nopen(sys.argv[1],'w').write(json.dumps({receipt}))\n")).unwrap();
         let parent = spawner().unwrap();
         for (index, fault) in [false, true].into_iter().enumerate() {
             let payload = serde_json::from_value(serde_json::json!({
@@ -1415,6 +1567,7 @@ mod tests {
                 &parent,
             )
             .unwrap();
+            marker(&process.guard_receipt.with_file_name("ready"));
             let (send, replies) = mpsc::channel();
             process.replies = replies;
             if fault {
