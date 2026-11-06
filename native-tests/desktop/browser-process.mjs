@@ -10,7 +10,7 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
@@ -69,6 +69,17 @@ async function guardEnded(receipt) {
   try{text=await readFile(receipt,'utf8');}catch(e){if(e.code==='ENOENT')return false;throw e;}
   if(!text)return false;
   try{JSON.parse(text);return true;}catch(e){if(e instanceof SyntaxError)return false;throw e;}
+}
+// A guard's complete receipt that records a normal, unforced end.
+async function normalReceipt(file,message) {
+  let receipt;
+  await settled(async()=>{
+    if(!(await guardEnded(file)))return false;
+    receipt=JSON.parse(await readFile(file,'utf8'));return true;
+  },message);
+  assert.equal(receipt.rootExit,0,message);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
+  assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
+  return receipt;
 }
 async function failureClient() {
   const live=[];
@@ -180,6 +191,9 @@ async function attach(process) {
 // running Personal was refused.
 async function relaunchFlow(kind) {
   proof.scope=`Disposable Linux actual App ${kind} on the same data; no real login or Push`;
+  // notify: start the owned notification server before the App opens any
+  // browser, as on a desktop session; CEF chooses its route at startup.
+  if(kind==='notify')await startNotifier();
   const opened=await marker(`app-browser-process-${kind}-open.json`);proof.opened=opened;
   const pages=[];
   for(const name of ['Work','Personal']) {
@@ -189,6 +203,7 @@ async function relaunchFlow(kind) {
   }
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
   step(`per-profile state after ${kind}`);
+  if(kind==='notify')return notifyProbes(pages);
   proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
   const kept={storage:`1:${nonce}`,cookie:`1:${nonce}`};
   if(kind==='reset') {
@@ -201,6 +216,10 @@ async function relaunchFlow(kind) {
     assert.deepEqual(proof.persisted,[{storage:`0:${nonce}`,cookie:`0:${nonce}`},kept],'Each profile must keep its own site storage and cookie across App restart');
   }
   await writeFile(path.join(data,`${kind}-inspected`),'ready',{flag:'wx'});
+  await closePersonalAfterRelaunch(personal,kind);
+  proof.passed=true;
+}
+async function closePersonalAfterRelaunch(personal,kind) {
   step(`Personal native close after ${kind}`,personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
@@ -213,8 +232,42 @@ async function relaunchFlow(kind) {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     proof.personalClosed=receipt;return true;
   },`Personal guard did not finish after ${kind}`);
-  step(`Work ordinary exit after ${kind}`,pages[0]);
+  step(`Work ordinary exit after ${kind}`);
   await writeFile(path.join(data,`${kind}-request-exit`),'ready',{flag:'wx'});
+}
+
+// notify (runner --notifications): native Chrome permission UI and real OS
+// notifications per profile, reusing the CEF candidate's inspected probes.
+// Permissions are only ever chosen through the native prompt, never by CDP.
+const desktopAsync=async(tool,args,allowMissing=false)=>{
+  try{return desktop(tool,args);}catch(e){if(allowMissing&&e.status===1)return String(e.stdout??'').trim();throw e;}
+};
+let notifier=null;
+async function startNotifier() {
+  const binary=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFIER;
+  assert(binary&&path.isAbsolute(binary),'The owned notification daemon is required');
+  const {startNotificationBackend}=await import('../cef-candidate/notification-backend.mjs');
+  notifier=await startNotificationBackend({binary,data,nonce,env:process.env,desktop:desktopAsync});
+  await writeFile(path.join(data,'notify-backend-ready'),'ready',{flag:'wx'});
+}
+async function notifyProbes(pages) {
+  const [,personal]=pages;
+  await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
+  const {probeNotifications}=await import('../cef-candidate/notifications.mjs');
+  const {inspectPermissions}=await import('../cef-candidate/permissions.mjs');
+  // The probes need the attested native PID and a process-local browser command.
+  const probePages=pages.map(page=>({...page,nativePid:page.native.nativePid,browserCommand:(method,params)=>page.c.command(method,params)}));
+  step('native permissions and OS notifications');
+  const backend=notifier;
+  try {
+    proof.permissions=await inspectPermissions({pages:probePages,data,nonce,desktop:desktopAsync,decide:true,
+      command:()=>{throw Error('Unscoped browser command is forbidden across processes');},
+      notificationProbe:({pages,windows})=>probeNotifications({pages,windows,data,nonce,desktop:desktopAsync,backend})});
+    assert(proof.permissions.permissionPassed&&proof.permissions.nativeNotifications.passed,'Native permission and notification probes must pass');
+  } finally {
+    await backend.stop();
+  }
+  await closePersonalAfterRelaunch(personal,'notify');
   proof.passed=true;
 }
 async function firstLaunch() {
@@ -281,42 +334,28 @@ async function firstLaunch() {
   const unloadStart=work.c.events.length;
   step('Work beforeunload setup',work);
   await work.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
+  // Sequential App quit (owner's decision): profiles close oldest first, so
+  // Work closes first; cancelling its native beforeunload stops the quit and
+  // Personal is never asked to close.
+  const personalStart=personal.c.events.length;
   await writeFile(path.join(data,'request-exit'),'ready',{flag:'wx'});
-  step('multi-profile quit refusal');
-  proof.blocked=await marker('app-browser-process-blocked.json');
-  assert.equal(proof.blocked.length,2);assert.deepEqual(await Promise.all(pages.map(sample)),expected,'Refused multi-profile quit must preserve every document');
-  assert(!work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'),'Multi-profile refusal must occur before any close/dialog');
-  // Close Personal using the existing Chrome window shortcut, then require
-  // native guard completion before asking App to close the sole Work window.
-  step('Personal native close',personal);
-  // Resume raised Work over Personal; a user clicks Personal to the front first.
-  desktop('xdotool',['windowraise',String(personal.native.windowId)]);
-  await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
-  desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
-  desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
-  // Require the exact parent-attested guard receipt, not target IDs from a
-  // different process or a process-name search.
-  await settled(async()=>{
-    let receipt;try {receipt=JSON.parse(await readFile(personal.process.guardReceipt,'utf8'));}
-    catch(e){if(e.code==='ENOENT'||e instanceof SyntaxError)return false;throw e;}
-    assert.equal(receipt.rootExit,0);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
-    assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
-    proof.personalClosed=receipt;return true;
-  },'Personal guard did not finish');
-  step('Work native beforeunload',work);
-  await writeFile(path.join(data,'request-single-exit'),'ready',{flag:'wx'});
+  step('Work native beforeunload on sequential quit',work);
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Native beforeunload dialog did not open');
   proof.dialog=work.c.events.slice(unloadStart).find(e=>e.method==='Page.javascriptDialogOpening');
   assert.equal(new URL(proof.dialog.params.url).origin,origin);
+  assert(!personal.c.events.slice(personalStart).some(e=>e.method.startsWith('Page.javascriptDialog')),'Personal must not be asked to close before Work agrees');
+  assert.equal(await guardEnded(personal.process.guardReceipt),false,'Personal must still be running during Work\'s dialog');
   desktop('import',['-window','root',path.join(data,'beforeunload.png')]);
   desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
   desktop('xdotool',['key','--clearmodifiers','Escape']);
   await settled(()=>Promise.resolve(work.c.events.slice(unloadStart).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel beforeunload');
-  assert.deepEqual(await sample(work),expected[0],'Cancelled native close must retain the actual Work document');
-  step('Work close cancelled',work);
+  assert.deepEqual(await Promise.all(pages.map(sample)),expected,'A cancelled sequential quit must keep every document');
+  step('sequential quit stopped at the cancel',work);
   await writeFile(path.join(data,'cancel-inspected'),'ready',{flag:'wx'});
+  proof.blocked=await marker('app-browser-process-blocked.json');
+  assert.equal(proof.blocked.length,2,'Both profiles must remain after the cancelled quit');
   proof.cancelled=await marker('app-browser-process-cancelled.json');
-  assert.deepEqual(await sample(work),expected[0]);
+  assert.deepEqual(await Promise.all(pages.map(sample)),expected);
   // The native Page observer is now enabled by the first real close attempt.
   // Exercise its handling of remote-controlled long dialog text while active.
   // A page may replace window.alert (Photopea binds an in-page toast), which
@@ -344,7 +383,27 @@ async function firstLaunch() {
   proof.longAlert={messageLength:9001,closed:true,documentRetained:true,source:'pristine same-origin realm',pageAlertName:proof.pageAlertName,
     frameId:alertEvent.params.frameId,topFrame:true,url:alertEvent.params.url};
   await work.evaluate("(()=>{window.__sumiAlertFrame.remove();delete window.__sumiAlertFrame;removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
-  step('Work final exit',work);
+  // The accepted sequential trade-off: Work (oldest) now agrees to leave and
+  // closes normally first; Personal cancels, so the quit stops with Work closed
+  // and Personal kept.
+  step('Personal cancels after Work closed',personal);
+  const personalUnload=personal.c.events.length;
+  await personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()",true);
+  await writeFile(path.join(data,'request-partial-exit'),'ready',{flag:'wx'});
+  await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogOpening'&&e.params.type==='beforeunload')),'Personal beforeunload did not open after Work closed');
+  // The App drops Work only after its normal receipt, before asking Personal:
+  // check once, at the moment Personal's dialog is open, without polling.
+  assert.equal(await guardEnded(work.process.guardReceipt),true,'Work must have closed before Personal is asked');
+  proof.workClosedFirst=await normalReceipt(work.process.guardReceipt,'Work must have closed normally');
+  desktop('xdotool',['windowfocus','--sync',String(personal.native.windowId)]);
+  desktop('xdotool',['key','--clearmodifiers','Escape']);
+  await settled(()=>Promise.resolve(personal.c.events.slice(personalUnload).some(e=>e.method==='Page.javascriptDialogClosed'&&e.params.result===false)),'Native Escape did not cancel Personal beforeunload');
+  assert.deepEqual(await sample(personal),expected[1],'The cancelled Personal must keep its document');
+  await writeFile(path.join(data,'partial-inspected'),'ready',{flag:'wx'});
+  proof.partial=await marker('app-browser-process-partial.json');
+  assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
+  await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  step('Personal final exit',personal);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
 }
@@ -367,5 +426,6 @@ try {
 }
 finally {
   for(const c of clients)c.socket.close();
+  if(notifier&&!notifier.proof.stopped)await notifier.stop().catch(e=>{proof.notifierStopError=String(e);});
   await writeFile(path.join(data,`browser-observation${suffix}.json`),JSON.stringify(proof,null,2)+'\n');
 }

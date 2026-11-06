@@ -24,6 +24,8 @@ LINUX_SOURCES = (
     "native-tests/desktop/browser_snapshot.py", "native-tests/desktop/test_browser_snapshot.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/x11-owner.py",
+    "native-tests/cef-candidate/permissions.mjs", "native-tests/cef-candidate/notifications.mjs",
+    "native-tests/cef-candidate/notification-backend.mjs",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs",
     "src-tauri/src/lib.rs", "src-tauri/src/main.rs", "src-tauri/tests/desktop/browser_process.rs",
     "src-tauri/tauri.conf.json", "src-tauri/tauri.web-client.conf.json",
@@ -95,7 +97,7 @@ def worker(args):
     enable_child_subreaper()
     result = {"passed": False}
     phase = os.environ.get("TAKOSUMI_BROWSER_PROCESS_PHASE", "")
-    require(phase in {"", "restart", "reset"}, "Unknown browser fixture phase")
+    require(phase in {"", "restart", "reset", "notify"}, "Unknown browser fixture phase")
     suffix = f"-{phase}" if phase else ""
     with (args.data / f"app{suffix}.log").open("x") as log:
         app = subprocess.Popen([str(args.binary)], stdout=log, stderr=subprocess.STDOUT)
@@ -199,11 +201,15 @@ def main():
                         help="relaunch the App on the same data and verify per-profile state after restart")
     parser.add_argument("--reset", action="store_true",
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
+    parser.add_argument("--notifications", type=Path,
+                        help="relaunch with this owned Dunst binary and verify native permission UI and OS notifications")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.browser = args.browser.resolve(strict=True)
     args.data = args.data.absolute()
+    if args.notifications:
+        args.notifications = args.notifications.resolve(strict=True)
     if args.worker:
         args.data = owned_case_path(args.data)
         return worker(args)
@@ -230,7 +236,8 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
-    files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so"] + source_files(REPO)))
+    files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so"] + source_files(REPO)
+                       + ([args.notifications] if args.notifications else [])))
     before = {str(file):digest(file) for file in files}
     # Preserve small source bytes and the executable inodes used in this case.
     # These links are retention only; processes still use the attested original
@@ -257,6 +264,13 @@ def main():
         # Personal (and a clear attempt while it runs) must keep its state.
         reset = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="reset"), files, before, head, "-reset")
         require(reset["passed"] is True, "The reset native execution did not pass")
+    if args.notifications:
+        # Another launch: native Chrome permission UI and real OS notifications
+        # per profile, through an owned notification daemon on the session bus.
+        notify = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="notify",
+                                        TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications)),
+                             files, before, head, "-notify")
+        require(notify["passed"] is True, "The notification native execution did not pass")
 
 
 if __name__ == "__main__":

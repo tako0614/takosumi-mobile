@@ -179,6 +179,12 @@ async fn relaunch_flow(
     println!("{kind}: saved home lists both connections");
     // The first launch's own guard receipts prove its browsers ended; the
     // runner checked them before this relaunch.
+    if kind == "notify" {
+        // A desktop's notification server runs before any browser starts. CEF
+        // picks its notification route at startup (a portal only as fallback).
+        checkpoint(case, "notify-backend-ready").await?;
+        println!("notify: notification server is up before the browsers");
+    }
     let mut running_clear_refused = false;
     if kind == "reset" {
         tap_in_row(view, "Work", "保存データを消去…").await?;
@@ -253,7 +259,19 @@ async fn relaunch_flow(
         // refused attempt left the confirmation open, so a user retries there.
         ready(view, "document.querySelector('.web-clear')").await?;
         tap_in_row(view, "Personal", "保存データを消去").await?;
-        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') && !document.querySelector('.web-clear')").await?;
+        // Wait for either outcome so a refusal fails at once with its own text.
+        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') || document.querySelector('.web-error')").await?;
+        if let Value::String(error) = eval(
+            view,
+            "document.querySelector('.web-error')?.textContent ?? null",
+        )
+        .await?
+        {
+            return Err(format!(
+                "In-session clear of closed Personal was refused: {error}"
+            ));
+        }
+        ready(view, "!document.querySelector('.web-clear')").await?;
         if personal_data.join("cef-profiles").exists() {
             return Err("In-session clear left Personal's site data".into());
         }
@@ -287,7 +305,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     if let Ok(kind) = std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE") {
-        if kind != "restart" && kind != "reset" {
+        if !["restart", "reset", "notify"].contains(&kind.as_str()) {
             return Err("Unknown browser fixture phase".into());
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
@@ -352,23 +370,28 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .map_err(|error| error.to_string())?;
     checkpoint(&case, "request-exit").await?;
-    // Multiple profiles must be refused before any destructive close.
+    // Sequential quit, oldest first: Work closes first, the observer cancels
+    // its native beforeunload, and the quit stops with both profiles open.
     app.exit(0);
-    let blocked = exit_cancelled(app, 0).await?;
-    if blocked.as_array().unwrap().len() != 2 {
-        return Err("Multi-profile exit destroyed a profile".into());
+    checkpoint(&case, "cancel-inspected").await?;
+    let stopped = exit_cancelled(app, 0).await?;
+    let kept = stopped.as_array().ok_or("Missing process array")?;
+    let unchanged = kept.len() == 2
+        && kept.iter().all(|process| {
+            process["uncertain"] == false
+                && before.as_array().unwrap().iter().any(|original| {
+                    original["profile"] == process["profile"]
+                        && original["opened"] == process["opened"]
+                })
+        });
+    if !unchanged {
+        return Err("A cancelled sequential quit must keep both original browsers".into());
     }
     std::fs::write(
         case.join("app-browser-process-blocked.json"),
-        serde_json::to_vec_pretty(&blocked).unwrap(),
+        serde_json::to_vec_pretty(&stopped).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    checkpoint(&case, "request-single-exit").await?;
-    // The observer has closed Personal through its actual native UI. Test
-    // ordinary App exit against Work's real beforeunload dialog now.
-    app.exit(0);
-    checkpoint(&case, "cancel-inspected").await?;
-    exit_cancelled(app, 1).await?;
     resume_work(&view).await?;
     let retained = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
@@ -386,12 +409,42 @@ async fn flow(app: &AppHandle) -> Result<()> {
         serde_json::to_vec_pretty(&retained).unwrap(),
     )
     .map_err(|error| error.to_string())?;
+    checkpoint(&case, "request-partial-exit").await?;
+    // Work now agrees to leave and closes first; Personal cancels, so the quit
+    // stops with only Personal kept (the accepted sequential trade-off).
+    app.exit(0);
+    checkpoint(&case, "partial-inspected").await?;
+    let partial = exit_cancelled(app, 1).await?;
+    let personal_profile = connections
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "Personal"))
+        .and_then(|item| item["profile"].as_str())
+        .ok_or("Missing Personal")?;
+    let only_personal = partial.as_array().is_some_and(|items| {
+        items.len() == 1
+            && items[0]["profile"] == personal_profile
+            && items[0]["uncertain"] == false
+            && before.as_array().unwrap().iter().any(|original| {
+                original["profile"] == personal_profile && original["opened"] == items[0]["opened"]
+            })
+    });
+    if !only_personal {
+        return Err(
+            "Work must close and the original Personal must remain after its cancel".into(),
+        );
+    }
+    std::fs::write(
+        case.join("app-browser-process-partial.json"),
+        serde_json::to_vec_pretty(&partial).unwrap(),
+    )
+    .map_err(|error| error.to_string())?;
     checkpoint(&case, "request-final-exit").await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
         b"{\"passed\":true}\n",
     )
     .map_err(|error| error.to_string())?;
-    println!("PASS actual App shell-to-browser creation/reuse and native close cancellation; normal exit still requires outer receipt");
+    // Returning lets the ordinary exit close Work and then Personal.
+    println!("PASS actual App shell-to-browser creation/reuse and sequential quit cancellation; normal exit still requires outer receipt");
     Ok(())
 }
