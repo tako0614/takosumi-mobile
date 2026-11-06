@@ -1,6 +1,7 @@
 //! Opt-in Linux browser service. Its only control input is the parent's pipe.
 //! No remote-page IPC/V8 extension or permission handler. Explicit fixture
-//! inspection uses a loopback DevTools port, never the parent's control pipe.
+//! inspection (`fixture-inspection` builds only) uses a loopback DevTools
+//! port, never the parent's control pipe.
 use cef::*;
 use std::{
     cell::RefCell,
@@ -510,7 +511,7 @@ wrap_load_handler! {
             let note=with_state(|state|state.screens.get_mut(&browser.identifier()).is_some_and(|screen|{
                 if screen.load_noted {false} else {screen.load_noted=true;true}
             }));
-            if note && std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()==Some(std::ffi::OsStr::new("1")) {
+            if note && inspection() {
                 let directory=with_state(|state|state.directory.clone());
                 std::fs::write(directory.join(format!("load-ready-{}.json",browser.identifier())),serde_json::to_vec(
                     &serde_json::json!({"pid":std::process::id(),"browserId":browser.identifier(),"mainFrame":true})).unwrap()).unwrap();
@@ -674,6 +675,43 @@ wrap_app! {
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
 }
 
+/// The native fixture's observation seam: only a browser built with this
+/// crate's `fixture-inspection` feature honours
+/// `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`. A product browser has no DevTools
+/// port and writes no observation files, whatever its environment says.
+#[cfg(feature = "fixture-inspection")]
+fn inspection() -> bool {
+    std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+}
+#[cfg(not(feature = "fixture-inspection"))]
+fn inspection() -> bool {
+    false
+}
+
+/// A loopback DevTools port for the fixture's observer, recorded with this
+/// process's pid; 0 (no port) otherwise.
+#[cfg(feature = "fixture-inspection")]
+fn inspection_port(directory: &std::path::Path) -> i32 {
+    if !inspection() {
+        return 0;
+    }
+    // The small bind-to-start race can only fail this isolated probe.
+    // The runner additionally binds targets to the attested native PID.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port() as i32;
+    std::fs::write(
+        directory.join("inspection.json"),
+        serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"port":port})).unwrap(),
+    )
+    .unwrap();
+    port
+}
+#[cfg(not(feature = "fixture-inspection"))]
+fn inspection_port(_directory: &std::path::Path) -> i32 {
+    0
+}
+
 /// Chromium's sandbox runs unless the App started this browser with
 /// `--no-sandbox` (the App is root, or the fixture opted out). Chromium also
 /// refuses its sandbox to root, so root never asks for it. CEF's own setting
@@ -730,23 +768,7 @@ fn main() {
             unload_dialogs: BTreeSet::new(),
         }))
     });
-    let inspection = std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()
-        == Some(std::ffi::OsStr::new("1"));
-    let port = if inspection {
-        // The small bind-to-start race can only fail this isolated probe.
-        // The runner additionally binds targets to the attested native PID.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.local_addr().unwrap().port() as i32
-    } else {
-        0
-    };
-    if inspection {
-        std::fs::write(
-            directory.join("inspection.json"),
-            serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"port":port})).unwrap(),
-        )
-        .unwrap();
-    }
+    let port = inspection_port(&directory);
     let settings = Settings {
         no_sandbox: i32::from(without_sandbox(std::env::args_os().skip(1))),
         root_cache_path: CefString::from(cache.to_str().unwrap()),
