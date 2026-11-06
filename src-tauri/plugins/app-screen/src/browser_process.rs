@@ -155,25 +155,34 @@ pub fn link_host(url: &str) -> Option<&str> {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // host[:port], where an IPv6 host is bracketed.
-    let (host, port) = match authority.strip_prefix('[') {
+    // host[:port]: a DNS-style host (letters, digits, dots, hyphens; at most
+    // 253) or a bracketed IPv6 address, and a port of at most 65535.
+    let (host_ok, port) = match authority.strip_prefix('[') {
         Some(inside) => {
             let (address, after) = inside.split_once(']')?;
-            if address.is_empty() {
-                return None;
-            }
-            (&authority[..address.len() + 2], after)
+            let ok = address.matches(':').count() >= 2
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+            (ok, after)
         }
-        None => match authority.find(':') {
-            Some(colon) => (&authority[..colon], &authority[colon..]),
-            None => (authority, ""),
-        },
+        None => {
+            let (host, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+            let ok = !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            (ok, port)
+        }
     };
     let port_ok = port.is_empty()
-        || port
-            .strip_prefix(':')
-            .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()));
-    (!host.is_empty() && port_ok && !authority.contains('@')).then_some(authority)
+        || port.strip_prefix(':').is_some_and(|digits| {
+            !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+                && digits.parse::<u32>().is_ok_and(|port| port <= 65535)
+        });
+    (host_ok && port_ok).then_some(authority)
 }
 
 /// Only complete bounded packets cross the pipe; no arbitrary eval or path command.
@@ -236,6 +245,14 @@ mod tests {
             "https://::1/",
             "https://[]/",
             "https://example.com:/",
+            "https://ex[ample.com/",
+            "https://a&b.example/",
+            "https://a%41.example/",
+            "https://user@example.com:443/",
+            "https://[evil.com]/",
+            "https://[:]x/",
+            "https://[:]/",
+            "https://example.com:65536/",
             "ftp://example.com/",
             long.as_str(),
         ] {

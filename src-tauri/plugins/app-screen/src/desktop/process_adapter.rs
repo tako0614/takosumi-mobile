@@ -113,29 +113,30 @@ fn open_externally(url: &str) {
         eprintln!("Too many external links are opening; this one was dropped.");
         return;
     }
-    let mut command = Command::new("xdg-open");
-    command
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    match command.spawn() {
-        Ok(mut child) => {
-            let reaper = std::thread::Builder::new()
-                .name("external-open".into())
-                .spawn(move || {
+    let url = url.to_owned();
+    // The thread that starts the opener also reaps it, so no child is ever
+    // left unwatched and every slot is returned.
+    let started = std::thread::Builder::new()
+        .name("external-open".into())
+        .spawn(move || {
+            let mut command = Command::new("xdg-open");
+            command
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            match command.spawn() {
+                Ok(mut child) => {
                     let _ = child.wait();
-                    OPENERS.fetch_sub(1, Ordering::SeqCst);
-                });
-            if let Err(error) = reaper {
-                eprintln!("The external link opener is not watched: {error}");
+                }
+                Err(error) => eprintln!("The external link could not be opened: {error}"),
             }
-        }
-        Err(error) => {
             OPENERS.fetch_sub(1, Ordering::SeqCst);
-            eprintln!("The external link could not be opened: {error}");
-        }
+        });
+    if let Err(error) = started {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("The external link could not be opened: {error}");
     }
 }
 /// Tests never start the desktop's opener: they record what would be opened.
@@ -1741,7 +1742,7 @@ mod tests {
         );
         drop(process);
         let foreign = root.join("foreign.py");
-        std::fs::write(&foreign, "import json,sys\nprint(json.dumps({'event':'openExternal','profile':'22222222-2222-4222-8222-222222222222','url':'https://example.com/foreign'}),flush=True)\nsys.stdin.read()\n").unwrap();
+        std::fs::write(&foreign, format!("import json,sys\nprint(json.dumps({{'event':'openExternal','profile':'22222222-2222-4222-8222-222222222222','url':'https://example.com/foreign'}}),flush=True)\nprint(json.dumps({{'event':'openExternal','profile':'{profile}','url':'https://example.com/after-fault'}}),flush=True)\nsys.stdin.read()\n")).unwrap();
         let payload = serde_json::from_value(serde_json::json!({
             "key":format!("web-home:{profile}:https://excalidraw.com"),
             "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
@@ -1765,13 +1766,14 @@ mod tests {
             process.uncertain,
             "a foreign request leaves the browser in doubt"
         );
+        let opened = OPENED.lock().unwrap().clone();
         assert!(
-            !OPENED
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|url| url.ends_with("/foreign")),
+            !opened.iter().any(|url| url.ends_with("/foreign")),
             "another profile's link is never opened"
+        );
+        assert!(
+            !opened.iter().any(|url| url.ends_with("/after-fault")),
+            "the reader stops at the fault"
         );
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();

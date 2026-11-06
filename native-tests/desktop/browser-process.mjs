@@ -538,9 +538,13 @@ async function openExternalProbe(work,personal,expected,sample) {
   await settled(async()=>(await opened()).length>0,'The App did not hand the chosen link to the desktop opener');
   state.opened=await opened();
   assert.deepEqual(state.opened.map(entry=>entry.argv),[[url]],'Exactly the chosen link must reach the opener');
-  // From the App itself (the opener's parent), not from a profile browser.
-  state.openerParent=await readlink(`/proc/${state.opened[0].ppid}/exe`).catch(e=>`unreadable: ${e.code}`);
-  assert.equal(path.basename(state.openerParent),'takosumi-mobile','The App must start the opener');
+  // From the App itself (the opener's parent, whose PID names the browser
+  // runtime directories `p-<App PID>-<n>`), in its own process group.
+  const appPid=Number(path.basename(path.dirname(work.process.guardReceipt)).split('-')[1]);
+  state.openerParent={pid:state.opened[0].ppid,appPid,exe:await readlink(`/proc/${state.opened[0].ppid}/exe`).catch(e=>`unreadable: ${e.code}`)};
+  assert.equal(state.openerParent.pid,appPid,'The App must start the opener');
+  assert.equal(path.basename(state.openerParent.exe),'takosumi-mobile','The opener parent must be the App binary');
+  assert.equal(state.opened[0].groupLeader,true,'The opener must run in its own process group');
   await settled(async()=>!viewable(menu),'The context menu did not close');
   assert.deepEqual((await pages(work)).map(t=>t.targetId),workPages,'Nothing may open inside the App');
   assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'Personal must not change');

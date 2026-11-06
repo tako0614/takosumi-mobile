@@ -251,17 +251,22 @@ def main():
     opener = args.data / "opener"
     opener.mkdir(mode=0o700)
     stub = opener / "xdg-open"
+    # The log path is built in, not read from the environment: a profile
+    # browser (whose environment is cleared) starting xdg-open is recorded too.
+    log = args.data / "external-open.log"
     stub.write_text(f"#!{sys.executable} -I\nimport json, os, sys\n"
-                    "with open(os.environ['TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG'], 'a') as log:\n"
-                    "    log.write(json.dumps({'argv': sys.argv[1:], 'ppid': os.getppid()}) + '\\n')\n")
+                    "path = os.environ.get('TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST') or " + repr(str(log)) + "\n"
+                    "with open(path, 'a') as out:\n"
+                    "    out.write(json.dumps({'argv': sys.argv[1:], 'ppid': os.getppid(),"
+                    " 'groupLeader': os.getpgrp() == os.getpid()}) + '\\n')\n")
     stub.chmod(0o700)
     env["PATH"] = f"{opener}{os.pathsep}{env.get('PATH', '')}"
-    env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(args.data / "external-open.log")
+    env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(log)
     # The stand-in must be what the App resolves, and it must actually run:
     # a failing exec would make PATH lookup fall through to the real opener.
     require(shutil.which("xdg-open", path=env["PATH"]) == str(stub), "The recording opener is not first on PATH")
     selftest = opener / "selftest.log"
-    subprocess.run([str(stub), "selftest"], env=dict(env, TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(selftest)),
+    subprocess.run([str(stub), "selftest"], env=dict(env, TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST=str(selftest)),
                    check=True, timeout=30)
     require(json.loads(selftest.read_text())["argv"] == ["selftest"], "The recording opener did not record")
     file_input = file_nonce = None
