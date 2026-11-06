@@ -343,13 +343,16 @@ support. Retain each exact-source receipt when comparing later candidates.
 The App feature `desktop-cef` enables this per-profile browser path in a normal
 App build, without the fixture driver; `native-browser-process-fixture` now
 implies it. It is Linux only, never enabled by default, and nothing here
-publishes or signs a package. The owner's first local packaging default is a
-deb plus an AppImage.
+publishes or signs a package. The first local packaging default (chosen by the
+coordinator, not an approval to publish or distribute) is a deb plus an AppImage.
 
 **Locations** (`src-tauri/plugins/app-screen/src/desktop/process_setup.rs`).
 `TAKOSUMI_BROWSER_PROCESS_PROGRAM`, `TAKOSUMI_BROWSER_PROCESS_GUARD` and
 `TAKOSUMI_BROWSER_PROCESS_RUNTIME` stay explicit overrides, and the fixture
-sets all three. Without them, the browser and guard are
+sets all three. They are honoured only with the plugin feature
+`fixture-overrides` (enabled by `native-browser-process-fixture`); a
+`desktop-cef` product build ignores them, like the sandbox opt-out and the
+loopback inspection seam below. Without them, the browser and guard are
 `<resource_dir>/cef/takosumi-cef-browser-process` and
 `<resource_dir>/cef/takosumi-browser-guard`; both must canonicalize to
 existing files. On Linux, Tauri's resource directory is `<exe dir>/../lib/<productName>`
@@ -373,8 +376,8 @@ fits in 108 bytes. Any missing file or unusable root fails the plugin setup,
 so the App does not start. There is no silent fallback to the Wry adapter.
 
 **Sandbox.** The adapter adds `--no-sandbox` only when the App runs as root
-(Chromium refuses its sandbox to root, and the fixture runs as root) or when
-`TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` is set. The browser sets CEF's
+(Chromium refuses its sandbox to root, and the fixture runs as root) or, in a
+fixture build only, when `TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` is set. The browser sets CEF's
 `no_sandbox` from the same switch, or when its own euid is 0. Otherwise
 Chromium uses its user-namespace sandbox. `chrome-sandbox` is not packaged:
 it works only as a setuid-root helper, which neither bundle installs. A host
