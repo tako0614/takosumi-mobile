@@ -84,7 +84,7 @@ QUIT_CASE = "quit-completes"
 FINAL_CASES = ("no-process-left", "no-opener-request")
 # The observer's evidence printed to the CI log (bindings and samples stay in
 # browser-observation.json).
-EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility")
+EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder")
 WINDOWS_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",

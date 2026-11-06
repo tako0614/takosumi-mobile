@@ -50,6 +50,11 @@ LOAD_WAIT = 25
 END_WAIT = 20
 RAISE_REFUSED = "Reused browser window was not raised:"
 GA_ROOT = 2
+GW_HWNDNEXT = 2
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x8
+# Bound on the top-level windows walked for the Z-order evidence.
+Z_ORDER_LIMIT = 4096
 WM_CLOSE = 0x0010
 SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
 AF_INET = 2
@@ -98,6 +103,9 @@ class Win32:
                                                              ctypes.c_uint]),
             (self.user32, "GetWindowPlacement", boolean, [handle, ctypes.POINTER(Placement)]),
             (self.user32, "GetWindowRect", boolean, [handle, ctypes.POINTER(Rect)]),
+            (self.user32, "GetTopWindow", handle, [handle]),
+            (self.user32, "GetWindow", handle, [handle, ctypes.c_uint]),
+            (self.user32, "GetWindowLongPtrW", ctypes.c_ssize_t, [handle, ctypes.c_int]),
             (self.user32, "GetLastInputInfo", boolean, [ctypes.POINTER(LastInput)]),
             (self.kernel32, "GetTickCount", dword, []),
             (self.kernel32, "GetCurrentThreadId", dword, []),
@@ -142,6 +150,30 @@ class Win32:
         if self.user32.GetWindowRect(window, ctypes.byref(rect)):
             state["rect"] = [rect.left, rect.top, rect.right, rect.bottom]
         return state
+
+    def z_order(self, named):
+        """Where the `named` top-level windows stand in the desktop's Z-order
+        (0 = top, walking GetTopWindow/GW_HWNDNEXT), whether each is
+        always-on-top, and the visible windows above the lowest of them with
+        their owners, so the evidence shows what covers what."""
+        positions, above, index = {}, [], 0
+        window = self.user32.GetTopWindow(None) or 0
+        order = []
+        while window and index < Z_ORDER_LIMIT:
+            order.append(window)
+            window = self.user32.GetWindow(window, GW_HWNDNEXT) or 0
+            index += 1
+        for name, handle in named.items():
+            positions[name] = order.index(handle) if handle in order else None
+        found = [position for position in positions.values() if position is not None]
+        lowest = max(found) if found else None
+        if lowest is not None:
+            for position, handle in enumerate(order[:lowest]):
+                if self.user32.IsWindowVisible(handle):
+                    above.append({"position": position, "window": handle, "owner": self.owner(handle)[0]})
+        topmost = {name: bool(self.user32.GetWindowLongPtrW(handle, GWL_EXSTYLE) & WS_EX_TOPMOST)
+                   for name, handle in named.items()}
+        return {"positions": positions, "topmost": topmost, "visibleAbove": above[:16], "walked": len(order)}
 
     def foreground_lock(self):
         """Windows' foreground lock: its timeout and the time since the last
@@ -695,6 +727,8 @@ class Observer:
         switch["homeWindow"] = win.window_state(home)
         self.case("home-by-window-switch", switch)
         self.visibility(work, "before-reuse")
+        named = {"home": home, "work": work.window, "personal": personal.window}
+        self.proof.setdefault("zOrder", {})["before-reuse"] = win.z_order(named)
         self.checkpoint("inspect-ready")
 
         self.step("home reopens Work")
@@ -731,6 +765,11 @@ class Observer:
         except Failure:
             evidence["visibility"] = "hidden"
         self.visibility(work, "after-reuse")
+        # Personal still visible here means Work, though in front, was not
+        # reordered above it; Personal hidden with Work hidden means the
+        # reorder happened but occlusion was not recomputed.
+        self.visibility(personal, "after-reuse")
+        self.proof["zOrder"]["after-reuse"] = win.z_order(named)
         evidence["desktopReportsVisible"] = reported
         require(evidence["visibility"] == "visible" or not reported,
                 "Reopened Work's document stayed hidden although this desktop reported a front CEF window "
