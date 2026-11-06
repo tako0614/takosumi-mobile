@@ -14,7 +14,8 @@ assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser 
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 // The app's own document has rendered (not the initial about:blank of a new window).
-const appContent=origin.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
+const contentOf=site=>site.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
+const appContent=contentOf(origin);
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
 // Name the active operation and its exact page, so a failure snapshot inspects
 // that profile rather than whichever client happened to attach last.
@@ -438,32 +439,37 @@ async function openPopupForQuit(page) {
   return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,requested:url,observed};
 }
 // An external link (target=_blank to another site) opens as an ordinary Web
-// screen in the same profile and browser process, without its opener;
-// Personal sees nothing. The Web Share API is recorded, not assumed.
+// screen in the same profile (browser process and context), and Chrome's
+// implicit noopener for _blank leaves it without an opener; Personal sees
+// nothing. The Web Share API is recorded, not assumed.
 async function externalLinkProbe(work,personal,expected,sample) {
   const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
   const ref=`sumi_external_${nonce.replaceAll('-','')}`, url=`${other}/?${ref}`;
-  const state={method:'Anchor target=_blank rel=noopener to another site, clicked with a user gesture; synthetic, no login'};
+  const state={method:'Test-inserted anchor target=_blank (no rel) to another site; untrusted click via Runtime.evaluate with user activation, not native input; closed via CDP; no login'};
   const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   assert.deepEqual((await pages(work)).map(t=>t.targetId),[work.target.targetId],'Work must have one document before the link');
-  state.share=await work.evaluate("({share:typeof navigator.share,canShare:typeof navigator.canShare})");
-  await work.evaluate(`(()=>{const a=document.createElement('a');a.href=${JSON.stringify(url)};a.target='_blank';a.rel='noopener';a.textContent='external';document.body.append(a);a.click();a.remove();return true})()`,true);
+  state.share={page:'Work',platform:process.platform,...await work.evaluate("({share:typeof navigator.share,canShare:typeof navigator.canShare})")};
+  await work.evaluate(`(()=>{const a=document.createElement('a');a.href=${JSON.stringify(url)};a.target='_blank';a.textContent='external';document.body.append(a);a.click();a.remove();return true})()`,true);
   let target;
   await settled(async()=>{
     const found=(await pages(work)).filter(t=>t.targetId!==work.target.targetId);
     assert(found.length<=1,'Unexpected external window family');
     target=found[0];return Boolean(target);
   },'External link did not open in Work\'s own browser process');
+  assert.equal(target.browserContextId,work.target.browserContextId,"The external link must open in Work's own browser context");
+  state.target={targetId:target.targetId,browserContextId:target.browserContextId,openerId:target.openerId??null,canAccessOpener:target.canAccessOpener??null,requested:url};
   assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'The external link must not open in Personal');
   const session=(await work.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
   const evaluate=async expression=>{
     const value=await work.c.command('Runtime.evaluate',{expression,returnByValue:true},session);
     assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
   };
-  // Same 25 s load bound as the popup; the requested page's own navigation.
-  const end=Date.now()+25000;let loaded=false;
+  // The requested page's own navigation and the other site's content. 15 s,
+  // shorter than the popup's 25 s: the first launch's steps before the quit
+  // share the App's wait (browser_process.rs).
+  const end=Date.now()+15000;let loaded=false;
   while(Date.now()<end&&!loaded) {
-    loaded=await evaluate(`performance.getEntriesByType('navigation')[0]?.name===${JSON.stringify(url)}&&document.readyState==='complete'`).catch(()=>false);
+    loaded=await evaluate(`performance.getEntriesByType('navigation')[0]?.name===${JSON.stringify(url)}&&document.readyState==='complete'&&${contentOf(other)}`).catch(()=>false);
     if(!loaded)await delay(100);
   }
   assert(loaded,'External page must load');
@@ -474,7 +480,7 @@ async function externalLinkProbe(work,personal,expected,sample) {
   const closed=await work.c.command('Target.closeTarget',{targetId:target.targetId});assert.equal(closed.success,true);
   await settled(async()=>!(await pages(work)).some(t=>t.targetId===target.targetId),'External window did not close');
   assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
-  state.target={targetId:target.targetId,requested:url};state.passed=true;return state;
+  state.passed=true;return state;
 }
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;

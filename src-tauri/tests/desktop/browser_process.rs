@@ -376,8 +376,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
         .unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    // Resume, download, the popup and the external link (each page load may
-    // take 25 s) run before the observer asks to quit.
+    // Resume, download, the popup (load up to 25 s) and the external link
+    // (15 s) run before the observer asks to quit. The App watchdog (90 s)
+    // remains the overall bound; the observer's stage names a slow step.
     checkpoint_within(&case, "request-exit", Duration::from_secs(60)).await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
