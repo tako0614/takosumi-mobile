@@ -26,7 +26,8 @@ LINUX_SOURCES = (
     "native-tests/desktop/browser_process.py", "native-tests/desktop/browser-process.mjs",
     "native-tests/desktop/browser_snapshot.py", "native-tests/desktop/test_browser_snapshot.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
-    "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/x11-owner.py",
+    "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/guard_main.rs",
+    "native-tests/cef-candidate/x11-owner.py",
     "native-tests/cef-candidate/permissions.mjs", "native-tests/cef-candidate/notifications.mjs",
     "native-tests/cef-candidate/notification-backend.mjs", "native-tests/cef-candidate/gtk-readiness.mjs",
     "native-tests/desktop/native-files.mjs", "native-tests/desktop/browser_apps.py",
@@ -209,6 +210,9 @@ def main():
                         help="relaunch and verify the native OS Open/Save As chooser in Work (Excalidraw only)")
     parser.add_argument("--notifications", type=Path,
                         help="relaunch with this owned Dunst binary and verify native permission UI and OS notifications")
+    parser.add_argument("--guard", type=Path, default=GUARD,
+                        help="the App's per-profile browser guard (default: the fixture guard.py; "
+                             "or the Rust takosumi-browser-guard binary)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
@@ -240,7 +244,7 @@ def main():
     runtime = args.data / "r"
     runtime.mkdir(mode=0o700)
     env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
-               TAKOSUMI_BROWSER_PROCESS_GUARD=str(GUARD),
+               TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard.resolve()),
                TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime),
                TAKOSUMI_BROWSER_PROCESS_CASE=str(args.data),
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
@@ -275,7 +279,7 @@ def main():
         (args.data / "files").mkdir(mode=0o700)
         file_nonce = str(uuid.uuid4())
         file_input = create_input(args.data / "files", "excalidraw", file_nonce)
-    files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so"] + source_files(REPO)
+    files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so", args.guard.resolve()] + source_files(REPO)
                        + ([args.notifications] if args.notifications else [])
                        + ([file_input] if file_input else [])))
     before = {str(file):digest(file) for file in files}

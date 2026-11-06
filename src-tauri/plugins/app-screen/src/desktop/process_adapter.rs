@@ -609,6 +609,22 @@ impl Process {
         // The guard owns this process group and its exact descendants. Do not
         // put it in the App's or another runner's process group.
         command.process_group(0);
+        // Tie the guard to the App from the moment it forks: if the App died
+        // before this point, the guard would otherwise arm its parent-death
+        // signal against its new parent and outlive the App.
+        let app = std::process::id();
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() as u32 != app {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
         command.env_clear();
         // Optional observation seam for the disposable native fixture only.
         // It is never a page IPC command or enabled in a normal App build.
