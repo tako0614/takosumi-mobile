@@ -180,6 +180,44 @@ class ProcessLifecycleTests(unittest.TestCase):
             other.terminate()
             other.wait(timeout=5)
 
+    def test_shutdown_description_names_descriptor_kinds_without_paths(self):
+        with tempfile.TemporaryDirectory(prefix="sumi-fds-") as temporary:
+            log = Path(temporary) / "SYNTHETIC_PRIVATE_PATH.log"
+            with log.open("w") as output:
+                child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                         stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL)
+            try:
+                pipe = os.fstat(child.stdin.fileno()).st_ino
+                details = web_home.shutdown_description(child.pid)
+            finally:
+                child.stdin.close()
+                child.wait(timeout=5)
+            text = json.dumps(details)
+            self.assertEqual(details["fds"], {"0": f"pipe:[{pipe}]", "1": "file", "2": "char"})
+            self.assertNotIn("SYNTHETIC_PRIVATE_PATH", text)
+            self.assertNotIn(temporary, text)
+            self.assertNotIn("/dev/null", text)
+
+    def test_still_alive_diagnostics_show_the_childs_and_the_workers_descriptors(self):
+        # A child that outlives the 5 s bound: the failure names its standard
+        # descriptors and this worker's stdout/stderr for comparison.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            pipe = os.fstat(child.stdout.fileno()).st_ino
+            tracked = {child.pid: web_home.process_identity(child.pid)[0]}
+            descriptions = {child.pid: web_home.process_description(child.pid)}
+            with self.assertRaises(RuntimeError) as raised:
+                web_home.wait_engine_children(tracked, descriptions)
+            message = str(raised.exception)
+            self.assertIn("Old App engine children still alive", message)
+            self.assertIn(f"'1': 'pipe:[{pipe}]'", message)
+            self.assertIn("worker descriptors: {'1': ", message)
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+
     def run_control(self, mode):
         with tempfile.TemporaryDirectory(prefix="sumi-process-test-") as temporary:
             result = subprocess.run([sys.executable, __file__, "--worker", temporary, mode],

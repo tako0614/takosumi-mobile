@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Linux raw-fixture protocol controls; fake binaries supply no engine evidence."""
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,8 +10,52 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True
+import run as fixture_run
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class CapturedSessionTests(unittest.TestCase):
+    def test_a_failing_session_is_replayed_from_its_file(self):
+        with tempfile.TemporaryDirectory(prefix="sumi-capture-") as temporary:
+            path = Path(temporary) / "session.log"
+            replayed = io.StringIO()
+            with contextlib.redirect_stdout(replayed), self.assertRaises(subprocess.CalledProcessError):
+                fixture_run.run_captured(
+                    [sys.executable, "-c",
+                     "import sys; print('session wrote this', flush=True); "
+                     "print('and this to stderr', file=sys.stderr, flush=True); sys.exit(3)"],
+                    dict(os.environ), path)
+            self.assertIn("session wrote this\n", replayed.getvalue())
+            self.assertIn("and this to stderr\n", replayed.getvalue())
+            self.assertEqual(path.read_text(), replayed.getvalue())
+
+    def test_a_timed_out_session_is_replayed_with_its_bound_unchanged(self):
+        def timed_out(command, env, timeout, *, stdout, stderr):
+            self.assertEqual(timeout, 50)
+            self.assertIs(stderr, subprocess.STDOUT)
+            stdout.write("written before the bound\n")
+            stdout.flush()
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        with tempfile.TemporaryDirectory(prefix="sumi-capture-") as temporary:
+            replayed = io.StringIO()
+            with mock.patch.object(fixture_run, "run_desktop_session", side_effect=timed_out), \
+                    contextlib.redirect_stdout(replayed), self.assertRaises(subprocess.TimeoutExpired):
+                fixture_run.run_captured(["synthetic-session"], {}, Path(temporary) / "session.log")
+            self.assertEqual(replayed.getvalue(), "written before the bound\n")
+
+    def test_a_successful_session_is_replayed_and_returned(self):
+        with tempfile.TemporaryDirectory(prefix="sumi-capture-") as temporary:
+            replayed = io.StringIO()
+            with contextlib.redirect_stdout(replayed):
+                captured = fixture_run.run_captured([sys.executable, "-c", "print('done', flush=True)"],
+                                                    dict(os.environ), Path(temporary) / "session.log")
+            self.assertEqual(captured, "done\n")
+            self.assertEqual(replayed.getvalue(), "done\n")
 
 
 class ErrorPageProtocolTests(unittest.TestCase):
