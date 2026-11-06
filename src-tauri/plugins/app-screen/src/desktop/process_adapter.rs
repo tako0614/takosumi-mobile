@@ -1,5 +1,5 @@
 //! Explicit Linux experiment behind the existing shell-only `open` command.
-use super::{failure, private_directory};
+use super::{failure, private_directory, process_setup as setup};
 use crate::{
     browser_process::{external_link, read_packet, write_until, Reply, Request, MAX_PACKET_BYTES},
     Error, OpenRequest, Result,
@@ -34,6 +34,8 @@ struct State {
     guard: PathBuf,
     directory: PathBuf,
     runtime_root: PathBuf,
+    /// Root, or the fixture's explicit opt-out: see `setup::without_sandbox`.
+    no_sandbox: bool,
     processes: BTreeMap<String, Process>,
     spawner: mpsc::Sender<SpawnRequest>,
 }
@@ -147,27 +149,28 @@ fn open_externally(url: &str) {
     OPENED.lock().unwrap().push(url.to_owned());
 }
 
+/// Find the browser, its guard and the runtime root: the fixture's explicit
+/// environment overrides, otherwise the App's packaged `cef/` resources and
+/// the per-user runtime directory (see `process_setup`).
 pub(super) fn install(app: &AppHandle) -> Result<()> {
-    let program = PathBuf::from(std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PROGRAM").ok_or(
-        Error::InvalidRequest("The explicit browser-process fixture needs its executable."),
-    )?)
-    .canonicalize()
-    .map_err(failure)?;
-    if !program.is_file() {
-        return Err(Error::InvalidRequest(
-            "Browser process executable is unavailable.",
-        ));
-    }
-    let guard = PathBuf::from(std::env::var_os("TAKOSUMI_BROWSER_PROCESS_GUARD").ok_or(
-        Error::InvalidRequest("The browser fixture needs its owned descendant guard."),
-    )?)
-    .canonicalize()
-    .map_err(failure)?;
-    if !guard.is_file() {
-        return Err(Error::InvalidRequest(
-            "Browser fixture guard is unavailable.",
-        ));
-    }
+    let paths = app.path();
+    let plan = setup::plan(
+        &setup::Overrides::from_env(),
+        paths.resource_dir().ok().as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        paths.app_cache_dir().ok().as_deref(),
+    )?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let setup::Located {
+        program,
+        guard,
+        runtime: runtime_root,
+    } = setup::locate(plan, euid)?;
+    let no_sandbox = setup::without_sandbox(
+        euid,
+        std::env::var_os("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX").as_deref(),
+    );
     let directory = app
         .path()
         .app_local_data_dir()
@@ -175,22 +178,13 @@ pub(super) fn install(app: &AppHandle) -> Result<()> {
         .join("browser-process-experiment");
     private_directory(&directory)?;
     let directory = directory.canonicalize().map_err(failure)?;
-    let runtime_root = PathBuf::from(std::env::var_os("TAKOSUMI_BROWSER_PROCESS_RUNTIME").ok_or(
-        Error::InvalidRequest("The browser fixture needs an owned short runtime directory."),
-    )?)
-    .canonicalize()
-    .map_err(failure)?;
-    if !runtime_root.is_dir() {
-        return Err(Error::InvalidRequest(
-            "Browser runtime directory is unavailable.",
-        ));
-    }
     app.manage(Backend(
         Arc::new(Mutex::new(State {
             program,
             guard,
             directory,
             runtime_root,
+            no_sandbox,
             processes: BTreeMap::new(),
             spawner: spawner()?,
         })),
@@ -256,6 +250,7 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 runtime,
                 payload,
                 &state.spawner,
+                state.no_sandbox,
             )?;
             // Retain ownership before waiting for the native creation reply.
             let result = process.expect_open(1, &key);
@@ -555,6 +550,7 @@ impl Process {
         runtime: PathBuf,
         payload: OpenRequest,
         spawner: &mpsc::Sender<SpawnRequest>,
+        no_sandbox: bool,
     ) -> Result<Self> {
         private_directory(&directory)?;
         if directory
@@ -573,12 +569,7 @@ impl Process {
             eprintln!("Detached browser data was not removed: {problem}");
         }
         let profile = payload.profile.clone();
-        if runtime
-            .join("tmp/org.chromium.Chromium.XXXXXX/SingletonSocket")
-            .as_os_str()
-            .len()
-            >= 108
-        {
+        if !setup::socket_path_fits(&runtime) {
             return Err(Error::InvalidRequest(
                 "Browser runtime socket path is too long.",
             ));
@@ -674,8 +665,9 @@ impl Process {
         command
             .env("TAKOSUMI_BROWSER_PROCESS_DIRECTORY", &directory)
             .env("LD_LIBRARY_PATH", program.parent().unwrap())
+            // The browser derives CEF's own sandbox setting from this switch.
+            .args(no_sandbox.then_some("--no-sandbox"))
             .args([
-                "--no-sandbox",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-background-networking",
@@ -1182,6 +1174,7 @@ mod tests {
                 runtime,
                 payload,
                 &requester,
+                true,
             )
             .unwrap();
             // Keep the requester alive until the link is armed, so a fork on
@@ -1234,9 +1227,13 @@ open(d+"/pdeathsig","w").write(str(s.value))
 open(d+"/ready","w").close()
 sys.stdin.read()' "$1"
 "#;
-    #[test]
-    fn open_requests_execute_a_guard_binary_directly() {
-        let root = std::env::temp_dir().join(format!("sumi-pa-direct-{}", std::process::id()));
+    /// Start the stand-in product guard through the actual open path and
+    /// return the argv it recorded.
+    fn direct_guard_argv(no_sandbox: bool) -> Vec<String> {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-pa-direct-{no_sandbox}-{}",
+            std::process::id()
+        ));
         private_directory(&root).unwrap();
         let guard = root.join("takosumi-browser-guard");
         // Written and made executable by a process that has exited, so no
@@ -1267,6 +1264,7 @@ sys.stdin.read()' "$1"
             runtime.clone(),
             payload,
             &parent,
+            no_sandbox,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1280,7 +1278,7 @@ sys.stdin.read()' "$1"
         let recorded = recorded.expect("the guard binary was not executed directly");
         // Armed by the adapter between fork and exec, before the guard runs.
         assert_eq!(pdeathsig.unwrap(), libc::SIGTERM.to_string());
-        let lines = recorded.lines().collect::<Vec<_>>();
+        let lines = recorded.lines().map(str::to_owned).collect::<Vec<_>>();
         let receipt = runtime.join("guard.json");
         assert_eq!(
             lines[..3],
@@ -1290,8 +1288,29 @@ sys.stdin.read()' "$1"
                 "/bin/true"
             ]
         );
-        assert!(lines.contains(&"--no-sandbox"), "{lines:?}");
         drop(parent);
+        lines
+    }
+    #[test]
+    fn open_requests_execute_a_guard_binary_directly() {
+        let lines = direct_guard_argv(true);
+        assert!(lines.iter().any(|line| line == "--no-sandbox"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "--no-first-run"),
+            "{lines:?}"
+        );
+    }
+    #[test]
+    fn a_sandboxed_browser_is_started_without_the_no_sandbox_switch() {
+        let lines = direct_guard_argv(false);
+        assert!(
+            !lines.iter().any(|line| line == "--no-sandbox"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "--no-first-run"),
+            "{lines:?}"
+        );
     }
     #[test]
     fn clearing_site_data_removes_only_that_profiles_cache_and_never_follows_links() {
@@ -1438,6 +1457,7 @@ sys.stdin.read()' "$1"
                 root.join(format!("r{index}")),
                 payload,
                 &parent,
+                true,
             )
             .unwrap();
             processes.insert(profile.to_owned(), process);
@@ -1447,6 +1467,7 @@ sys.stdin.read()' "$1"
             guard: lingering.clone(),
             directory: root.clone(),
             runtime_root: root.clone(),
+            no_sandbox: true,
             processes,
             spawner: parent.clone(),
         };
@@ -1524,6 +1545,7 @@ sys.stdin.read()' "$1"
             root.join(format!("r{index}")),
             payload,
             parent,
+            true,
         )
         .unwrap();
         marker(&process.guard_receipt.with_file_name("native"));
@@ -1824,6 +1846,7 @@ sys.stdin.read()' "$1"
             root.join("r"),
             payload,
             &parent,
+            true,
         )
         .unwrap();
         process.next = 1;
@@ -1855,6 +1878,7 @@ sys.stdin.read()' "$1"
             root.join("s"),
             payload,
             &parent,
+            true,
         )
         .unwrap();
         process.next = 1;
@@ -1902,6 +1926,7 @@ sys.stdin.read()' "$1"
                 root.join(format!("r{index}")),
                 payload,
                 &parent,
+                true,
             )
             .unwrap();
             marker(&process.guard_receipt.with_file_name("ready"));

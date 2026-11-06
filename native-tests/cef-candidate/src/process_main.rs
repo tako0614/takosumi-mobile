@@ -674,6 +674,16 @@ wrap_app! {
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
 }
 
+/// Chromium's sandbox runs unless the App started this browser with
+/// `--no-sandbox` (the App is root, or the fixture opted out). Chromium also
+/// refuses its sandbox to root, so root never asks for it. CEF's own setting
+/// follows the same decision as the switch.
+fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    root || args.any(|arg| arg == "--no-sandbox")
+}
+
 fn main() {
     const {
         assert!(cfg!(target_os = "linux"));
@@ -738,7 +748,7 @@ fn main() {
         .unwrap();
     }
     let settings = Settings {
-        no_sandbox: 1,
+        no_sandbox: i32::from(without_sandbox(std::env::args_os().skip(1))),
         root_cache_path: CefString::from(cache.to_str().unwrap()),
         log_file: CefString::from(directory.join("cef-native.log").to_str().unwrap()),
         remote_debugging_port: port,

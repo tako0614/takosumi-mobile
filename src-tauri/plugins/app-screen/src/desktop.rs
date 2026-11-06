@@ -23,6 +23,8 @@ use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest,
 mod gtk_navigation;
 #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
 mod process_adapter;
+#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+mod process_setup;
 mod profile_reset;
 mod resume_navigation;
 

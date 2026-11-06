@@ -26,6 +26,7 @@ LINUX_SOURCES = (
     "native-tests/desktop/browser_process.py", "native-tests/desktop/browser-process.mjs",
     "native-tests/desktop/browser_snapshot.py", "native-tests/desktop/test_browser_snapshot.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
+    "native-tests/cef-candidate/build.rs",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/guard_main.rs",
     "native-tests/cef-candidate/x11-owner.py",
     "native-tests/cef-candidate/permissions.mjs", "native-tests/cef-candidate/notifications.mjs",
