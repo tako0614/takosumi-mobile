@@ -815,9 +815,72 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
+#[cfg(target_os = "linux")]
 wrap_app! {
     struct Application;
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
+}
+#[cfg(windows)]
+wrap_app! {
+    struct Application;
+    impl App {
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
+            // The browser process's own command line; its helpers inherit
+            // the feature switches from it.
+            if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
+            if let Some(command_line) = command_line { disable_native_occlusion(command_line); }
+        }
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) }
+    }
+}
+
+/// Windows: Chromium's native window occlusion tracking is off, as Electron
+/// does. In CI (run 42306043123) the tracker marked a browser window covered
+/// by another profile's window as hidden, but after that window was moved to
+/// the top of the Z-order and became the foreground window, neither
+/// browser process recomputed: the reused window's page stayed `hidden` and
+/// the window now below stayed `visible`. Whether the tracker would follow
+/// on a real desktop is unknown. The trade-off: a covered window that is not
+/// minimized keeps rendering at the normal rate; a minimized window is still
+/// hidden. Any `--disable-features` already given is kept.
+#[cfg(windows)]
+const NATIVE_OCCLUSION: &str = "CalculateNativeWinOcclusion";
+#[cfg(windows)]
+fn disable_native_occlusion(command_line: &mut CommandLine) {
+    let name = CefString::from("disable-features");
+    let current = CefString::from(&command_line.switch_value(Some(&name))).to_string();
+    let merged = with_feature(&current, NATIVE_OCCLUSION);
+    // A repeated switch replaces the earlier value, so the merged list wins.
+    command_line.append_switch_with_value(Some(&name), Some(&CefString::from(merged.as_str())));
+}
+/// A comma-separated feature list with `feature` in it once.
+#[cfg(any(windows, test))]
+fn with_feature(current: &str, feature: &str) -> String {
+    let mut features: Vec<&str> = current
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if !features.contains(&feature) {
+        features.push(feature);
+    }
+    features.join(",")
+}
+#[cfg(test)]
+mod feature_tests {
+    #[test]
+    fn a_disabled_feature_is_added_once_and_others_are_kept() {
+        let feature = "CalculateNativeWinOcclusion";
+        assert_eq!(super::with_feature("", feature), feature);
+        assert_eq!(
+            super::with_feature("Foo, Bar,", feature),
+            format!("Foo,Bar,{feature}")
+        );
+        assert_eq!(
+            super::with_feature(&format!("{feature},Foo"), feature),
+            format!("{feature},Foo")
+        );
+    }
 }
 
 /// The native fixture's observation seam: only a browser built with this
