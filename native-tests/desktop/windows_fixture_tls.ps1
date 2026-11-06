@@ -9,14 +9,14 @@ https://127.0.0.1:<port>. Chromium (CEF) on Windows verifies that certificate
 against the machine's trust store, and the App passes the browser no switch
 that could relax it, so this script:
 
-- creates a CA ("Takosumi W3 fixture CA (disposable)", valid for two days) and
-  a leaf for the IP address 127.0.0.1 (serverAuth, valid for one day) signed
-  by it, both RSA 2048 / SHA-256;
+- creates a CA ("Takosumi W3 fixture CA (disposable)", valid for two days,
+  name-constrained to the IP address 127.0.0.1/32) and a leaf for 127.0.0.1
+  (serverAuth, valid for one day) signed by it, both RSA 2048 / SHA-256;
 - writes cert.pem (leaf, then CA), key.pem (the leaf's PKCS#8 key), ca.pem and
   ca-thumbprint.txt into the new directory -Out;
-- adds the CA's public certificate to LocalMachine\Root, which needs an
-  elevated PowerShell 7 (the windows-latest runner is one). The CA's private
-  key is never written anywhere.
+- records the CA's thumbprint, then adds its public certificate to
+  LocalMachine\Root, which needs an elevated PowerShell 7 (the windows-latest
+  runner is one). The CA's private key is never written anywhere.
 
 -Remove takes the CA recorded in -Out\ca-thumbprint.txt out of
 LocalMachine\Root. Meant for disposable machines such as the CI runner; on
@@ -65,6 +65,10 @@ $caRequest.CertificateExtensions.Add((New-Object "$x509.X509BasicConstraintsExte
 $caRequest.CertificateExtensions.Add((New-Object "$x509.X509KeyUsageExtension" (
     [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]'KeyCertSign, CrlSign', $true)))
 $caRequest.CertificateExtensions.Add((New-Object "$x509.X509SubjectKeyIdentifierExtension" ($caRequest.PublicKey, $false)))
+# NameConstraints (2.5.29.30, critical): permittedSubtrees = { iPAddress
+# 127.0.0.1/255.255.255.255 }, so the CA can vouch for nothing else.
+[byte[]]$constraints = 0x30, 0x0E, 0xA0, 0x0C, 0x30, 0x0A, 0x87, 0x08, 0x7F, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF
+$caRequest.CertificateExtensions.Add((New-Object "$x509.X509Extension" ('2.5.29.30', $constraints, $true)))
 $ca = $caRequest.CreateSelfSigned($now.AddHours(-1), $now.AddDays(2))
 
 $leafKey = [System.Security.Cryptography.RSA]::Create(2048)
@@ -90,11 +94,12 @@ $leaf = $leafRequest.Create($ca, $now.AddHours(-1), $now.AddDays(1), $serial)
 [System.IO.File]::WriteAllText((Join-Path $Out 'ca.pem'), $ca.ExportCertificatePem() + "`n")
 
 $public = New-Object "$x509.X509Certificate2" (, $ca.RawData)
+# Recorded first, so -Remove can find the CA even if adding it fails midway.
+[System.IO.File]::WriteAllText($thumbprintFile, $public.Thumbprint + "`n")
 $store = Open-RootStore
 try {
     $store.Add($public)
 } finally {
     $store.Close()
 }
-[System.IO.File]::WriteAllText($thumbprintFile, $public.Thumbprint + "`n")
 Write-Output "Trusted fixture CA $($public.Thumbprint) in LocalMachine\Root; TLS files in $Out"
