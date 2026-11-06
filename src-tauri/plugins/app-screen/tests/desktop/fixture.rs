@@ -886,6 +886,66 @@ struct PendingDocument {
     app: AppHandle,
     deadline: std::time::Instant,
     callback: RefCell<Option<Box<dyn FnOnce()>>>,
+    trail: Rc<LoadTrail>,
+    /// The trail's view signal handlers, disconnected once the wait ends.
+    handlers: RefCell<Vec<gtk::glib::SignalHandlerId>>,
+}
+
+/// Diagnostics only: what the view reported while one fixture document was
+/// awaited, each with the milliseconds since the wait began (monotonic): its
+/// load events with the view's URI, load failures (URI and error domain,
+/// code and message) and web-process terminations, the last 20 kept. No
+/// cookie, storage value, credential or argv is recorded, and nothing here
+/// changes a decision: the failure handler lets WebKit's default run. The
+/// fixture installs no policy handler on these views, so no policy outcome
+/// is recorded.
+struct LoadTrail {
+    started: std::time::Instant,
+    events: RefCell<std::collections::VecDeque<String>>,
+}
+
+impl LoadTrail {
+    fn note(&self, event: String) {
+        let mut events = self.events.borrow_mut();
+        if events.len() == 20 {
+            events.pop_front();
+        }
+        events.push_back(format!("+{}ms {event}", self.started.elapsed().as_millis()));
+    }
+
+    fn summary(&self) -> String {
+        let events = self.events.borrow();
+        format!(
+            "[{}] (at +{}ms)",
+            events.iter().cloned().collect::<Vec<_>>().join("; "),
+            self.started.elapsed().as_millis()
+        )
+    }
+
+    fn watch(view: &webkit2gtk::WebView, trail: &Rc<Self>) -> Vec<gtk::glib::SignalHandlerId> {
+        let changed = trail.clone();
+        let failed = trail.clone();
+        let terminated = trail.clone();
+        vec![
+            view.connect_load_changed(move |view, event| {
+                changed.note(format!("load-changed {event:?} uri={:?}", view.uri()));
+            }),
+            view.connect_load_failed(move |_, event, uri, error| {
+                failed.note(format!("load-failed {event:?} uri={uri} error={error:?}"));
+                false
+            }),
+            view.connect_web_process_terminated(move |_, reason| {
+                terminated.note(format!("web-process-terminated {reason:?}"));
+            }),
+        ]
+    }
+}
+
+/// The awaited document is ready or the wait failed: stop recording.
+fn end_trail(view: &webkit2gtk::WebView, pending: &PendingDocument) {
+    for handler in pending.handlers.borrow_mut().drain(..) {
+        view.disconnect(handler);
+    }
 }
 
 fn after_document_load(
@@ -895,12 +955,18 @@ fn after_document_load(
     app: AppHandle,
     next: impl FnOnce() + 'static,
 ) {
+    let trail = Rc::new(LoadTrail {
+        started: std::time::Instant::now(),
+        events: RefCell::new(std::collections::VecDeque::new()),
+    });
     let pending = Rc::new(PendingDocument {
         uri,
         nonce,
         app,
         deadline: std::time::Instant::now() + Duration::from_secs(5),
         callback: RefCell::new(Some(Box::new(next))),
+        handlers: RefCell::new(LoadTrail::watch(view, &trail)),
+        trail,
     });
     poll_document(view.clone(), pending);
 }
@@ -911,7 +977,8 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
     // replace. Check the native document first, including across process swaps.
     if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
         if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}", pending.uri, pending.nonce, view.uri(), view.is_loading());
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, events={}", pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary());
+            end_trail(&view, &pending);
             pending.app.exit(1);
         } else {
             gtk::glib::timeout_add_local_once(Duration::from_millis(25), move || {
@@ -931,10 +998,12 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
             && serde_json::from_str::<serde_json::Value>(&diagnostic).ok().is_some_and(|value|
             value["uri"] == pending.uri && value["nonce"] == pending.nonce && value["ready"] == "complete");
         if ready {
+            end_trail(&native, &pending);
             let callback = pending.callback.borrow_mut().take();
             if let Some(next) = callback { next(); }
         } else if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}", pending.uri, pending.nonce, native.uri(), native.is_loading());
+            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}, events={}", pending.uri, pending.nonce, native.uri(), native.is_loading(), pending.trail.summary());
+            end_trail(&native, &pending);
             pending.app.exit(1);
         } else {
             // Readiness only. Cookies/storage are read and asserted exactly
