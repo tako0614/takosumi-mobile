@@ -316,13 +316,11 @@ pub(super) fn shell_open(url: &str) -> bool {
 /// it the link is dropped. Returns whether it was recorded.
 #[cfg(all(not(test), feature = "fixture-overrides"))]
 pub(super) fn shell_open(url: &str) -> bool {
-    let Some(log) = std::env::var_os("TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG")
-        .map(PathBuf::from)
-        .filter(|log| log.is_absolute())
-    else {
+    use super::process_setup::{environment, opener_log, opener_record};
+    let Some(log) = opener_log(&environment) else {
         return false;
     };
-    let line = serde_json::json!({"argv": [url], "pid": std::process::id()}).to_string() + "\n";
+    let line = opener_record(url, std::process::id());
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
