@@ -27,11 +27,11 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const TH32CS_SNAPPROCESS: u32 = 0x2;
 const INVALID_HANDLE_VALUE: isize = -1;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 const SW_SHOWNORMAL: i32 = 1;
 #[cfg(test)]
 const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -74,13 +74,13 @@ extern "system" {
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn CancelIoEx(file: Handle, overlapped: *mut c_void) -> i32;
 }
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 #[link(name = "ole32")]
 extern "system" {
     fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32;
     fn CoUninitialize();
 }
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 #[link(name = "shell32")]
 extern "system" {
     fn ShellExecuteW(
@@ -101,7 +101,7 @@ fn owned(handle: Handle) -> Option<OwnedHandle> {
     Some(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 fn wide(text: &OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     text.encode_wide().chain(Some(0)).collect()
@@ -277,8 +277,9 @@ pub(super) fn singleton_live(root: &Path) -> bool {
 
 /// Hand a validated http(s) link to the person's default browser
 /// (`ShellExecuteW`'s `open`), on the calling thread. Returns whether the
-/// shell accepted it. (Tests record links instead of opening them.)
-#[cfg(not(test))]
+/// shell accepted it. (Tests record links instead of opening them, and so
+/// does a fixture build: see the `fixture-overrides` variant below.)
+#[cfg(not(any(test, feature = "fixture-overrides")))]
 pub(super) fn shell_open(url: &str) -> bool {
     let operation = wide(OsStr::new("open"));
     let file = wide(OsStr::new(url));
@@ -303,6 +304,30 @@ pub(super) fn shell_open(url: &str) -> bool {
         }
         result as isize > 32
     }
+}
+
+/// A fixture build (`fixture-overrides`) never hands a link to the shell, so
+/// no test can start the person's default browser: `ShellExecuteW` is not
+/// compiled into it. Each link is appended as one JSON line (`argv` and the
+/// App's `pid`) to the runner's recording log named by
+/// `TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG` (an absolute path, as on Linux,
+/// where the runner puts a recording `xdg-open` first on `PATH`); without
+/// it the link is dropped. Returns whether it was recorded.
+#[cfg(all(not(test), feature = "fixture-overrides"))]
+pub(super) fn shell_open(url: &str) -> bool {
+    let Some(log) = std::env::var_os("TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG")
+        .map(PathBuf::from)
+        .filter(|log| log.is_absolute())
+    else {
+        return false;
+    };
+    let line = serde_json::json!({"argv": [url], "pid": std::process::id()}).to_string() + "\n";
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .is_ok()
 }
 
 /// The App's end of a browser's control pipe. Windows has no portable
