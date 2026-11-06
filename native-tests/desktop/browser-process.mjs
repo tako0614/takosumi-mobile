@@ -437,6 +437,45 @@ async function openPopupForQuit(page) {
   const observed=await evaluate("({navigation:performance.getEntriesByType('navigation')[0]?.name??null,href:location.href,ready:document.readyState})");
   return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,requested:url,observed};
 }
+// An external link (target=_blank to another site) opens as an ordinary Web
+// screen in the same profile and browser process, without its opener;
+// Personal sees nothing. The Web Share API is recorded, not assumed.
+async function externalLinkProbe(work,personal,expected,sample) {
+  const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
+  const ref=`sumi_external_${nonce.replaceAll('-','')}`, url=`${other}/?${ref}`;
+  const state={method:'Anchor target=_blank rel=noopener to another site, clicked with a user gesture; synthetic, no login'};
+  const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+  assert.deepEqual((await pages(work)).map(t=>t.targetId),[work.target.targetId],'Work must have one document before the link');
+  state.share=await work.evaluate("({share:typeof navigator.share,canShare:typeof navigator.canShare})");
+  await work.evaluate(`(()=>{const a=document.createElement('a');a.href=${JSON.stringify(url)};a.target='_blank';a.rel='noopener';a.textContent='external';document.body.append(a);a.click();a.remove();return true})()`,true);
+  let target;
+  await settled(async()=>{
+    const found=(await pages(work)).filter(t=>t.targetId!==work.target.targetId);
+    assert(found.length<=1,'Unexpected external window family');
+    target=found[0];return Boolean(target);
+  },'External link did not open in Work\'s own browser process');
+  assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'The external link must not open in Personal');
+  const session=(await work.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
+  const evaluate=async expression=>{
+    const value=await work.c.command('Runtime.evaluate',{expression,returnByValue:true},session);
+    assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
+  };
+  // Same 25 s load bound as the popup; the requested page's own navigation.
+  const end=Date.now()+25000;let loaded=false;
+  while(Date.now()<end&&!loaded) {
+    loaded=await evaluate(`performance.getEntriesByType('navigation')[0]?.name===${JSON.stringify(url)}&&document.readyState==='complete'`).catch(()=>false);
+    if(!loaded)await delay(100);
+  }
+  assert(loaded,'External page must load');
+  state.context=await evaluate("({href:location.href,origin:location.origin,secure:isSecureContext,opener:window.opener===null?null:'present',tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc})");
+  assert.equal(state.context.origin,other);assert.equal(state.context.secure,true);
+  assert.equal(state.context.opener,null,'An external link must not get its opener');
+  for(const field of ['tauri','ipc','wry'])assert.equal(state.context[field],'undefined');
+  const closed=await work.c.command('Target.closeTarget',{targetId:target.targetId});assert.equal(closed.success,true);
+  await settled(async()=>!(await pages(work)).some(t=>t.targetId===target.targetId),'External window did not close');
+  assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
+  state.target={targetId:target.targetId,requested:url};state.passed=true;return state;
+}
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -498,6 +537,8 @@ async function firstLaunch() {
   proof.download={profile:work.process.profile,file:fileName,bytes:Buffer.byteLength(fileText),otherProfileClean:true};
   step('Work same-origin popup',work);
   proof.popup=await popupProbe(work,personal,key,expected,sample);
+  step('Work external link',work);
+  proof.externalLink=await externalLinkProbe(work,personal,expected,sample);
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
