@@ -11,7 +11,16 @@ import { waitForGtkConfirm } from '../cef-candidate/gtk-readiness.mjs';
 export function nativeFiles({desktop,data}) {
   async function visibleWindows() {
     const ids=(await desktop('xdotool',['search','--onlyvisible','--name','.*'],true)).split(/\s+/).filter(Boolean);
-    return Promise.all(ids.map(async id=>({id,title:await desktop('xdotool',['getwindowname',id])})));
+    const rows=await Promise.all(ids.map(async id=>{
+      try{return {id,title:await desktop('xdotool',['getwindowname',id])};}
+      catch(e){
+        // A window destroyed between the search and this query (the portal's
+        // closing dialog, ex27) is no longer visible; any other error fails.
+        if(/BadWindow/.test(`${e.message}${e.stderr??''}`))return null;
+        throw e;
+      }
+    }));
+    return rows.filter(Boolean);
   }
   async function nativeDialog(before,kind) {
     const deadline=Date.now()+8000;let added=[];
