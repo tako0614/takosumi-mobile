@@ -93,12 +93,42 @@ def normal(receipt):
     require(receipt["error"] is None, "The guard must not report an error")
 
 
-def digest(file):
+def digest(file, session=None):
+    # A file inside the session directory is read as untrusted data.
+    if session is not None and file.is_relative_to(session):
+        return hashlib.sha256(read_untrusted(session, file.relative_to(session), 16 * 1024 * 1024)).hexdigest()
     checksum = hashlib.sha256()
     with file.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             checksum.update(chunk)
     return checksum.hexdigest()
+
+
+def create_exclusive(path):
+    """A new file this runner writes: never an existing file or a planted link."""
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "w")
+
+
+def read_untrusted(base, relative, limit=4 * 1024 * 1024):
+    """Read a file the session wrote below `base` as untrusted data: no link is
+    followed at any component, only a regular file is read, and at most
+    `limit` bytes. The session account may own everything below `base`."""
+    parts = Path(relative).parts
+    require(parts and all(part not in ("", ".", "..", "/") for part in parts), f"Invalid session path {relative}")
+    directory = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in parts[:-1]:
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = inner
+        handle = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+    finally:
+        os.close(directory)
+    with os.fdopen(handle, "rb") as source:
+        require(stat.S_ISREG(os.fstat(source.fileno()).st_mode), f"Session file {relative} is not a regular file")
+        data = source.read(limit + 1)
+    require(len(data) <= limit, f"Session file {relative} is larger than {limit} bytes")
+    return data
 
 
 def worker(args):
@@ -150,7 +180,8 @@ def worker(args):
                 result["cleanupError"] = str(error)
                 raise
             finally:
-                (args.data / f"app-execution{suffix}.json").write_text(json.dumps(result, indent=2)+"\n")
+                with create_exclusive(args.data / f"app-execution{suffix}.json") as output:
+                    output.write(json.dumps(result, indent=2)+"\n")
 
 
 def hand_over(path, uid, gid):
@@ -172,9 +203,9 @@ def run_session(args, env, files, before, head, suffix):
     drop = ["setpriv", f"--reuid={user[0]}", f"--regid={user[1]}", "--clear-groups", "--"] if user else []
     command = ["python3", "-B", str(GUARD), str(receipt), *drop, "xvfb-run", "-a", "-s", "-screen 0 1280x960x24",
                "dbus-run-session", "--", "python3", "-B", str(Path(__file__).resolve()), "--worker",
-               "--binary", str(args.binary), "--browser", str(args.browser), "--data", str(args.data)]
+               "--binary", str(args.binary), "--browser", str(args.browser), "--data", str(args.session)]
     proof = {"passed":False,"sourceHead":head,"artifactsBefore":before}
-    with (args.data / f"session{suffix}.log").open("x") as log:
+    with create_exclusive(args.data / f"session{suffix}.log") as log:
         process = subprocess.Popen(command, env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
         proof["sessionPid"] = process.pid
         identity = process_identity(process.pid)
@@ -184,7 +215,7 @@ def run_session(args, env, files, before, head, suffix):
             proof["sessionGuard"] = json.loads(receipt.read_text())
             normal(proof["sessionGuard"])
             require(proof["sessionExit"] == 0, "The owned session must exit normally")
-            require(json.loads((args.data / f"app-execution{suffix}.json").read_text())["passed"] is True,
+            require(json.loads(read_untrusted(args.session, f"app-execution{suffix}.json"))["passed"] is True,
                     "The actual App execution must pass")
             proof["passed"] = True
         except Exception as error:
@@ -201,7 +232,7 @@ def run_session(args, env, files, before, head, suffix):
                 raise
             finally:
                 try:
-                    proof["artifactsAfter"] = {str(file):digest(file) for file in files}
+                    proof["artifactsAfter"] = {str(file):digest(file, args.session) for file in files}
                     proof["sourceHeadAfter"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
                     if proof["artifactsAfter"] != before or proof["sourceHeadAfter"] != head:
                         proof["passed"] = False
@@ -209,7 +240,8 @@ def run_session(args, env, files, before, head, suffix):
                     proof["passed"] = False
                     proof["artifactError"] = str(error)
                 finally:
-                    (args.data / f"execution{suffix}.json").write_text(json.dumps(proof, indent=2)+"\n")
+                    with create_exclusive(args.data / f"execution{suffix}.json") as output:
+                        output.write(json.dumps(proof, indent=2)+"\n")
     return proof
 
 
@@ -217,7 +249,10 @@ def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--browser", type=Path, required=True)
+    parser.add_argument("--browser", type=Path, required=True,
+                        help="takosumi-cef-browser-process built with the cef-candidate feature fixture-inspection "
+                             "(the observer needs its loopback inspection seam); with --packaged, cef/ beside "
+                             "--binary must hold such a browser")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=["excalidraw", "photopea"], default="excalidraw")
     parser.add_argument("--restart", action="store_true",
@@ -254,6 +289,13 @@ def main():
         parser.error("--data must be a new owned short directory under /root/dev/tmp")
     args.data.mkdir(mode=0o700)
     args.data.joinpath(".owned-browser-reference").write_text(args.data.name)
+    # Everything the session writes (App, observer and worker artifacts, the
+    # opener log, profile data and runtime directories) lives in one session
+    # directory; the case root and what root writes stay root's. It is named
+    # like the case, so the observer's synthetic nonce stays the case name.
+    session = args.session = args.data / args.data.name
+    session.mkdir(mode=0o700)
+    session.joinpath(".owned-browser-reference").write_text(args.data.name)
     env = dict(os.environ)
     # Only --restart selects the restart phase; never inherit it from the caller.
     env.pop("TAKOSUMI_BROWSER_PROCESS_PHASE", None)
@@ -261,10 +303,10 @@ def main():
         env.pop(key, None)
     for key, name in {"HOME":"home", "XDG_DATA_HOME":"data", "XDG_CONFIG_HOME":"config",
                       "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "TMPDIR":"tmp"}.items():
-        directory = args.data / name
+        directory = session / name
         directory.mkdir(mode=0o700)
         env[key] = str(directory)
-    runtime = args.data / "r"
+    runtime = session / "r"
     runtime.mkdir(mode=0o700)
     if args.packaged:
         # The App resolves everything itself: cef/ beside the binary (Tauri's
@@ -273,7 +315,7 @@ def main():
         cef = args.binary.resolve().parent / "cef"
         args.browser, args.guard = cef / "takosumi-cef-browser-process", cef / "takosumi-browser-guard"
         require(args.browser.is_file() and args.guard.is_file(), "--packaged needs the staged cef/ resources beside --binary")
-        short = args.data / "x"
+        short = session / "x"
         short.mkdir(mode=0o700)
         require(len(str(short / "takosumi-cef")) + len("/p-4194304-999999/tmp/org.chromium.Chromium.XXXXXX/SingletonSocket") <= 107,
                 "--packaged needs a shorter --data path for the browser runtime sockets")
@@ -282,24 +324,26 @@ def main():
         env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
                    TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard.resolve()),
                    TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime))
-    env.update(TAKOSUMI_BROWSER_PROCESS_CASE=str(args.data),
+    env.update(TAKOSUMI_BROWSER_PROCESS_CASE=str(session),
+               TAKOSUMI_BROWSER_PROCESS_SNAPSHOT_PROGRAM=str(args.browser),
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
     # A recording stand-in for the desktop's opener, first on PATH: the App hands
     # links the person chose to open outside to xdg-open. Nothing real opens.
+    # The opener stays root's (the session may run it, not change it).
     opener = args.data / "opener"
-    opener.mkdir(mode=0o700)
+    opener.mkdir(mode=0o755)
     stub = opener / "xdg-open"
     # The log path is built in, not read from the environment: a profile
     # browser (whose environment is cleared) starting xdg-open is recorded too.
-    log = args.data / "external-open.log"
+    log = session / "external-open.log"
     stub.write_text(f"#!{sys.executable} -I\nimport json, os, sys\n"
                     "path = os.environ.get('TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST') or " + repr(str(log)) + "\n"
                     "with open(path, 'a') as out:\n"
                     "    out.write(json.dumps({'argv': sys.argv[1:], 'ppid': os.getppid(),"
                     " 'groupLeader': os.getpgrp() == os.getpid()}) + '\\n')\n")
-    stub.chmod(0o700)
+    stub.chmod(0o755)
     env["PATH"] = f"{opener}{os.pathsep}{env.get('PATH', '')}"
     env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(log)
     # The stand-in must be what the App resolves, and it must actually run:
@@ -312,13 +356,13 @@ def main():
     file_input = file_nonce = None
     if args.files:
         # The owned input is hashed with the sources: Save As must not overwrite it.
-        (args.data / "files").mkdir(mode=0o700)
+        (session / "files").mkdir(mode=0o700)
         file_nonce = str(uuid.uuid4())
-        file_input = create_input(args.data / "files", "excalidraw", file_nonce)
+        file_input = create_input(session / "files", "excalidraw", file_nonce)
     files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so", args.guard.resolve()] + source_files(REPO)
                        + ([args.notifications] if args.notifications else [])
                        + ([file_input] if file_input else [])))
-    before = {str(file):digest(file) for file in files}
+    before = {str(file):digest(file, session) for file in files}
     # Preserve small source bytes and the executable inodes used in this case.
     # These links are retention only; processes still use the attested original
     # paths and any in-run byte change makes the result fail.
@@ -336,13 +380,11 @@ def main():
         require(account.pw_uid != 0, "--user must be an unprivileged account")
         require(not args.notifications, "--user cannot reach the owned notification daemon; run it without --notifications")
         args.session_user = (account.pw_uid, account.pw_gid)
-        # Hand over only the case root itself and the fresh session directories.
-        # The hard-linked executables stay root's: changing them would change
-        # the originals' owner.
-        os.chown(args.data, *args.session_user)
-        for name in ("home", "data", "config", "cache", "runtime", "tmp", "r", "x", "opener", "files"):
-            if (args.data / name).exists():
-                hand_over(args.data / name, *args.session_user)
+        # Hand over only the session directory. The case root stays root's and
+        # traversable (0711): root writes its receipts and logs there, and the
+        # hard-linked executables keep the originals' owner.
+        hand_over(session, *args.session_user)
+        os.chmod(args.data, 0o711)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     proof = run_session(args, env, files, before, head, "")
     require(proof["passed"] is True, "The native execution did not pass")
@@ -370,7 +412,7 @@ def main():
                                 files, before, head, "-files")
         require(files_run["passed"] is True, "The native file chooser execution did not pass")
     # Over all phases, only the first launch's chosen link reached the opener.
-    opened = (args.data / "external-open.log").read_text().splitlines()
+    opened = read_untrusted(session, "external-open.log", 1024 * 1024).decode().splitlines()
     require(len(opened) == 1, f"Expected exactly one external open, saw {len(opened)}")
 
 

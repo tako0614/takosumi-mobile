@@ -116,9 +116,15 @@ with patch.object(r.subprocess,'check_output',return_value='src/escape.ts\\n'):
     for binary in (app_binary, browser_binary, browser_binary.parent / "libcef.so"):
         binary.write_text("synthetic executable identity, never run\n")
     outer_case = data / "outer-cleanup-injection"
+    def opener_selftest(command, env, **_):
+        # The recording opener's self-test, without starting a process under
+        # the mocked Popen: record exactly what the stand-in would.
+        assert command[1:] == ["selftest"]
+        Path(env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST"]).write_text(json.dumps({"argv": ["selftest"]}) + "\n")
     with patch.object(runner, "REPO", fake_repo), \
          patch.object(runner, "source_files", return_value=[fake_repo / "src/good.ts"]), \
          patch.object(runner.subprocess, "check_output", return_value="fixed-source-head\n"), \
+         patch.object(runner.subprocess, "run", side_effect=opener_selftest), \
          patch.object(runner.subprocess, "Popen", return_value=StuckGuard()), \
          patch.object(sys, "argv", ["browser_process.py", "--binary", str(app_binary),
                                    "--browser", str(browser_binary), "--data", str(outer_case)]):
@@ -131,7 +137,40 @@ with patch.object(r.subprocess,'check_output',return_value='src/escape.ts\\n'):
     recorded = json.loads((outer_case / "execution.json").read_text())
     assert recorded["passed"] is False and recorded["error"] and recorded["cleanupError"]
     assert recorded["artifactsBefore"] == recorded["artifactsAfter"]
+    # The session writes only inside its own directory, named like the case.
+    session = outer_case / outer_case.name
+    assert (session / ".owned-browser-reference").is_file() and (session / "home").is_dir()
+    assert not (outer_case / "home").exists() and (outer_case / "opener" / "xdg-open").is_file()
     proof["controls"].append({"name": "uninterruptible guard cleanup preserves outer failure receipt", "passed": True})
+    # Root reads what a session account wrote as untrusted data and writes only
+    # new files: no link at any component, no FIFO, bounded size.
+    untrusted = data / "untrusted-session"
+    (untrusted / "inner").mkdir(parents=True)
+    secret = data / "root-only.json"
+    secret.write_text('{"passed": true}')
+    (untrusted / "inner" / "ok.json").write_text("{}")
+    (untrusted / "link.json").symlink_to(secret)
+    (untrusted / "via").symlink_to(data)
+    (untrusted / "big.json").write_bytes(b"x" * 33)
+    os.mkfifo(untrusted / "fifo")
+    assert runner.read_untrusted(untrusted, "inner/ok.json") == b"{}"
+    for name, limit in [("link.json", 64), ("via/root-only.json", 64), ("fifo", 64),
+                        ("../root-only.json", 64), ("big.json", 32)]:
+        try:
+            runner.read_untrusted(untrusted, name, limit)
+        except (OSError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"Untrusted session read accepted {name}")
+    (untrusted / "planted.json").symlink_to(secret)
+    try:
+        runner.create_exclusive(untrusted / "planted.json")
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("A planted link was written through")
+    assert secret.read_text() == '{"passed": true}'
+    proof["controls"].append({"name": "session files are untrusted data; root writes only new files", "passed": True})
     class BoundedSource:
         remaining = 3 * 1024 * 1024 + 17
         def open(self, mode):
