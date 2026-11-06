@@ -1120,6 +1120,15 @@ impl Process {
             .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
         let id = self.next;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // Windows: the browser raises its reused window before it replies;
+        // pass it the foreground right the App holds while the home is used.
+        #[cfg(windows)]
+        if let Some(pid) = self.opened["nativePid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        {
+            windows::allow_foreground(pid);
+        }
         if let Err(error) = self.send(Request::Open { id, payload }, deadline) {
             self.uncertain = true;
             return Err(error);

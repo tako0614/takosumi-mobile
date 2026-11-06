@@ -1,8 +1,9 @@
 //! Windows pieces of the per-profile browser adapter (`process_adapter.rs`):
 //! the bounded control-pipe writer, the identity checks on a browser's
-//! `opened` reply, the guard's stop event name, Chromium's profile lock and
-//! the external-link opener. Minimal `extern "system"` declarations of
-//! documented Win32 functions; no crate dependency.
+//! `opened` reply, the guard's stop event name, Chromium's profile lock, the
+//! foreground hand-over and the external-link opener. Minimal
+//! `extern "system"` declarations of documented Win32 functions; no crate
+//! dependency.
 use std::{
     ffi::{c_void, OsStr, OsString},
     io::{self, Write},
@@ -328,6 +329,23 @@ pub(super) fn shell_open(url: &str) -> bool {
         .open(log)
         .and_then(|mut file| file.write_all(line.as_bytes()))
         .is_ok()
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn AllowSetForegroundWindow(pid: u32) -> i32;
+}
+
+/// Let the browser `pid` bring its reused window to the front. Windows hands
+/// the foreground only to a process allowed to take it; the App is the
+/// foreground process while the person uses the home and may pass that right
+/// on. A refusal (the App is not in front) is harmless: the browser then
+/// flashes its taskbar button and reports that it was not raised.
+pub(super) fn allow_foreground(pid: u32) {
+    // SAFETY: a documented user32 call taking a plain process id.
+    unsafe {
+        AllowSetForegroundWindow(pid);
+    }
 }
 
 /// The App's end of a browser's control pipe. Windows has no portable
