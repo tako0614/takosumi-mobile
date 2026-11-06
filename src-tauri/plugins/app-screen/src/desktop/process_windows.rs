@@ -310,8 +310,9 @@ pub(super) fn shell_open(url: &str) -> bool {
 /// write and the caller waits for it until the deadline, as the Linux
 /// non-blocking writer does: a write the browser does not read in time
 /// times out, and the next one first waits for it. Closing ends the thread
-/// (and with it the pipe) after any write in progress; that write is
-/// cancelled, so a browser that stopped reading still sees the pipe close.
+/// (and with it the pipe): a write in progress is cancelled, repeatedly
+/// until the thread has ended (bounded by `CANCEL_BOUND`), so a browser that
+/// stopped reading still sees the pipe close.
 pub(super) struct Input {
     requests: Option<mpsc::Sender<Vec<u8>>>,
     done: mpsc::Receiver<io::Result<()>>,
@@ -337,7 +338,7 @@ impl Input {
             .name("browser-process-writer".into())
             .spawn(move || {
                 for bytes in received {
-                    let result = write_all_unless(&writer, &bytes, &stop);
+                    let result = write_all_unless(&*writer, &bytes, &stop);
                     let failed = result.is_err();
                     if report.send(result).is_err() || failed {
                         break;
@@ -388,9 +389,13 @@ impl Input {
     }
 }
 
-/// Write all of `bytes` unless the App's end is closing.
-fn write_all_unless(writer: &ChildStdin, mut bytes: &[u8], closing: &AtomicBool) -> io::Result<()> {
-    let mut writer = writer;
+/// Write all of `bytes` unless the App's end is closing: the flag is read
+/// before every write, so a request cancelled part way is not continued.
+fn write_all_unless<W: Write>(
+    mut writer: W,
+    mut bytes: &[u8],
+    closing: &AtomicBool,
+) -> io::Result<()> {
     while !bytes.is_empty() {
         if closing.load(Ordering::Acquire) {
             return Err(closed());
@@ -417,20 +422,81 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "Browser pipe closed")
 }
 
+/// How long closing the App's end keeps cancelling a write in progress
+/// until the writer thread has ended. Cancellation ends a pending pipe write
+/// at once; the repetition covers a write the thread issues just after a
+/// cancel (it then reads the closing flag before any further write).
+const CANCEL_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Drop for Input {
     fn drop(&mut self) {
         // The thread ends once its channel closes and any write returns.
         self.requests.take();
-        if self.pending {
-            self.closing.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if !self.pending {
+            // Idle: it ends at once, closing the pipe before this returns.
+            let _ = thread.join();
+            return;
+        }
+        self.closing.store(true, Ordering::Release);
+        let deadline = Instant::now() + CANCEL_BOUND;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                eprintln!("A browser control-pipe write could not be cancelled in time.");
+                return;
+            }
             // SAFETY: `pipe` keeps the handle open for this call; cancelling
-            // only ends the write in progress on it (if any) with an error.
+            // only ends a write in progress on it (if any) with an error.
             unsafe {
                 CancelIoEx(self.pipe.as_raw_handle().cast(), std::ptr::null_mut());
             }
-        } else if let Some(thread) = self.thread.take() {
-            // Idle: it ends at once, closing the pipe before this returns.
-            let _ = thread.join();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let _ = thread.join();
+    }
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+
+    /// A pipe that takes at most three bytes per write and records them; the
+    /// App's end starts closing during its first write.
+    struct Partial<'a> {
+        written: Vec<u8>,
+        calls: usize,
+        closing: &'a AtomicBool,
+    }
+    impl Write for Partial<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let count = bytes.len().min(3);
+            self.written.extend_from_slice(&bytes[..count]);
+            self.closing.store(true, Ordering::Release);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partly_written_request_is_not_continued_once_closing() {
+        let closing = AtomicBool::new(false);
+        let mut pipe = Partial {
+            written: Vec::new(),
+            calls: 0,
+            closing: &closing,
+        };
+        let result = write_all_unless(&mut pipe, b"{\"operation\":\"shutdown\"}\n", &closing);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!((pipe.calls, pipe.written.as_slice()), (1, &b"{\"o"[..]));
+        // Without closing, the same pipe receives every byte.
+        let open = AtomicBool::new(false);
+        let mut whole = Vec::new();
+        write_all_unless(&mut whole, b"{\"operation\":\"shutdown\"}\n", &open).unwrap();
+        assert_eq!(whole, b"{\"operation\":\"shutdown\"}\n");
     }
 }

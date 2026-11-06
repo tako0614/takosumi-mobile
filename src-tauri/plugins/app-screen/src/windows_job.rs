@@ -45,6 +45,7 @@ const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 const TH32CS_SNAPTHREAD: u32 = 0x4;
 const THREAD_SUSPEND_RESUME: u32 = 0x2;
 const SYNCHRONIZE: u32 = 0x0010_0000;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const ERROR_ALREADY_EXISTS: i32 = 183;
 const ERROR_MORE_DATA: i32 = 234;
 const WAIT_OBJECT_0: u32 = 0;
@@ -148,6 +149,8 @@ extern "system" {
     fn SetEvent(event: Handle) -> i32;
     fn SetLastError(code: u32);
     fn WaitForMultipleObjects(count: u32, handles: *const Handle, all: i32, millis: u32) -> u32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+    fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
 }
 
 /// A handle a creating function returned, or its error: null (and for
@@ -312,6 +315,24 @@ pub fn in_job() -> io::Result<bool> {
     // a null job asks about any job.
     check(unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut result) })?;
     Ok(result != 0)
+}
+
+/// A process by id, opened to wait for it and read its exit code. While the
+/// handle is open the id cannot name another process.
+pub fn open_process(pid: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: plain call; the result is checked.
+    owned(unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+}
+
+/// The exit code of a process `process` holds open, or None while it runs.
+pub fn exit_code(process: &OwnedHandle) -> io::Result<Option<u32>> {
+    if wait_any(&[process.as_raw_handle()], Some(Duration::ZERO))?.is_none() {
+        return Ok(None);
+    }
+    let mut code = 0;
+    // SAFETY: a live process handle and a valid result pointer.
+    check(unsafe { GetExitCodeProcess(process.as_raw_handle().cast(), &mut code) })?;
+    Ok(Some(code))
 }
 
 /// A manual-reset event: the App creates it under a fresh name and keeps it

@@ -66,9 +66,23 @@ fn standin(args: &[String]) -> ExitCode {
             say(format!("linger {}", helper.id()));
             ExitCode::SUCCESS
         }
+        // Leave a descendant that ends by itself after `args[1]` seconds.
+        Some("linger-for") => {
+            #[allow(clippy::zombie_processes)]
+            let helper = Command::new(std::env::current_exe().unwrap())
+                .args([STANDIN, "sleep", &args[1]])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            say(format!("linger {}", helper.id()));
+            ExitCode::SUCCESS
+        }
         Some("sleep") => {
             say(format!("ready {}", std::process::id()));
-            std::thread::sleep(Duration::from_secs(60));
+            let seconds = args.get(1).map_or(60, |seconds| seconds.parse().unwrap());
+            std::thread::sleep(Duration::from_secs(seconds));
             ExitCode::SUCCESS
         }
         Some("marker") => {
@@ -89,6 +103,7 @@ const TESTS: &[Test] = tests![
     the_browser_keeps_the_pipes_but_not_the_stop_event,
     a_lingering_descendant_is_terminated_with_the_job,
     a_job_that_empties_as_the_natural_budget_ends_is_not_forced,
+    a_process_that_ends_just_before_the_termination_is_not_forced,
     a_stop_request_drains_a_running_browser,
     ending_the_apps_job_ends_the_guard_and_the_browser,
     a_pending_stop_starts_no_browser,
@@ -405,6 +420,28 @@ fn a_job_that_empties_as_the_natural_budget_ends_is_not_forced() {
     case.assert_nothing_left();
 }
 
+fn a_process_that_ends_just_before_the_termination_is_not_forced() {
+    // The descendant outlives the natural budget and then ends by itself
+    // (after 3 s); the guard under test holds its list of the job and lets
+    // everything in it end before it terminates the job. None of them ended
+    // with the forced exit code, so nothing counts as forced.
+    let case = Case::new("terminate-late");
+    let mut command = case.guard(&["linger-for", "3"]);
+    command.env("TAKOSUMI_GUARD_FAULT_TERMINATE_LATE", "1");
+    let mut guard = case.start(command);
+    let lines = Lines::of(&mut guard);
+    let line = lines.next(Duration::from_secs(10)).unwrap();
+    assert!(line.starts_with("linger "), "{line}");
+    let status = finish(&mut guard, Duration::from_secs(20));
+    let proof = case.receipt();
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(clean(&proof), "{proof}");
+    assert_eq!(proof["rootExit"], 0);
+    assert_eq!(proof["complete"], true);
+    assert_eq!(proof["forcedCleanup"], 0, "nothing was ended by the drain");
+    case.assert_nothing_left();
+}
+
 fn a_stop_request_drains_a_running_browser() {
     let case = Case::new("stop");
     let mut guard = case.start(case.guard(&["sleep"]));
@@ -419,7 +456,7 @@ fn a_stop_request_drains_a_running_browser() {
     assert_eq!(status.code(), Some(1), "{proof}");
     assert!(clean(&proof), "{proof}");
     assert_eq!(proof["complete"], true);
-    assert_eq!(proof["rootExit"], FORCED_EXIT);
+    assert_eq!(proof["rootExit"], FORCED_EXIT as i32);
     assert!(proof["forcedCleanup"].as_u64().unwrap() >= 1, "{proof}");
     assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     case.assert_nothing_left();

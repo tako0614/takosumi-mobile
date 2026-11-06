@@ -26,8 +26,11 @@
 //!
 //! The drain then always runs: up to 0.5 s for the browser and every process
 //! in the job to end by themselves, then `TerminateJobObject` (each process
-//! still in the job ends with exit code 1, and they count as forced cleanup),
-//! then up to 2 s for the job to empty. The completion proof is the job's
+//! still in the job ends with the exit code `FORCED_EXIT`), then up to 2 s for
+//! the job to empty. Forced cleanup counts the processes that were in the job
+//! before the termination and ended with `FORCED_EXIT`, plus any that entered
+//! the job after that list was read; one whose end cannot be attributed is a
+//! cleanup error (the receipt is then not normal), never a guess. The completion proof is the job's
 //! `ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
 //! browser exited.
 //!
@@ -53,12 +56,13 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 use tauri_plugin_app_screen::windows_job::{
-    in_job, spawn_in, wait_any, Event, Job, CREATE_NO_WINDOW, STOP_EVENT_ENV,
+    exit_code, in_job, open_process, spawn_in, wait_any, Event, Job, CREATE_NO_WINDOW,
+    STOP_EVENT_ENV,
 };
 
 /// Natural end, then the job is terminated and may take this long to empty.
@@ -70,8 +74,12 @@ const DRAIN_TICK: Duration = Duration::from_millis(20);
 /// failures (about 2 s) make the guard give up waiting and drain.
 const FAULT_PAUSE: Duration = Duration::from_millis(250);
 const MAX_RUNNING_FAULTS: u32 = 8;
-/// The exit code of processes the drain terminates.
-const FORCED_EXIT: u32 = 1;
+/// The exit code of processes the drain terminates: an NTSTATUS-shaped
+/// customer code (`0xE...`) no program returns by accident, unlike 1. In the
+/// receipt it appears as the negative `rootExit` -536841118.
+const FORCED_EXIT: u32 = 0xE000_7462;
+/// `OpenProcess` of an id no process has any more.
+const ERROR_INVALID_PARAMETER: i32 = 87;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Called by `guard_entry.rs` on Windows.
@@ -264,20 +272,76 @@ impl Run {
         if self.natural() {
             return true;
         }
-        // Count what is about to be terminated before terminating it. A job
-        // that emptied just as the natural budget ran out has nothing left
-        // to end: no termination, and no forced cleanup is recorded.
-        let active = self.active();
-        if active == Some(0) {
+        // A job that emptied just as the natural budget ran out has nothing
+        // left to end: no termination, and no forced cleanup is recorded.
+        let before = self.job.processes();
+        if matches!(before, Ok((_, 0))) {
             return self.settled() || self.settle_within(FORCED);
         }
-        match self.job.terminate(FORCED_EXIT) {
-            Ok(()) => self.forced += active.unwrap_or(0).max(1),
+        // What is in the job now, held open (so no id is reused meanwhile).
+        // The total is read first: a process that enters between the two
+        // reads is counted twice rather than missed.
+        let listed = match self.job.process_ids() {
+            Ok(listed) => listed,
             Err(error) => {
                 self.cleanup_errors.insert(fault(&error));
+                Vec::new()
+            }
+        };
+        let held: Vec<(u32, io::Result<OwnedHandle>)> = listed
+            .into_iter()
+            .map(|pid| (pid, open_process(pid)))
+            .collect();
+        if injected("TERMINATE_LATE") {
+            self.wait_empty();
+        }
+        if let Err(error) = self.job.terminate(FORCED_EXIT) {
+            self.cleanup_errors.insert(fault(&error));
+        }
+        let empty = self.settle_within(FORCED);
+        self.count_forced(held, before);
+        empty
+    }
+
+    /// Forced cleanup, counted exactly: the listed processes that ended with
+    /// `FORCED_EXIT` (one still running after the termination was also told
+    /// to end), and every process that entered the job after the total was
+    /// read. A listed process that had already gone before it could be
+    /// opened ended by itself. Any other failure leaves the count unknown:
+    /// it is recorded in `cleanupErrors`, which makes the receipt abnormal,
+    /// as a failed signal does on Linux.
+    fn count_forced(
+        &mut self,
+        held: Vec<(u32, io::Result<OwnedHandle>)>,
+        before: io::Result<(u32, u32)>,
+    ) {
+        for (_, handle) in held {
+            let ended = handle.and_then(|handle| exit_code(&handle));
+            match ended {
+                Ok(Some(FORCED_EXIT)) | Ok(None) => self.forced += 1,
+                Ok(Some(_)) => {}
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => {}
+                Err(error) => {
+                    self.cleanup_errors
+                        .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
+                }
             }
         }
-        self.settle_within(FORCED)
+        match (before, self.job.processes()) {
+            (Ok((before, _)), Ok((after, _))) => self.forced += after.saturating_sub(before),
+            (Err(error), _) | (_, Err(error)) => {
+                self.cleanup_errors
+                    .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
+            }
+        }
+    }
+
+    /// Self-test only: wait (bounded) until the job is empty.
+    fn wait_empty(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.active() != Some(0) && Instant::now() < deadline {
+            std::thread::sleep(DRAIN_TICK);
+        }
     }
 
     /// The natural part of the drain. The self-test build can instead let
@@ -285,10 +349,7 @@ impl Run {
     /// timing alone cannot produce on demand.
     fn natural(&mut self) -> bool {
         if injected("LATE_EMPTY") {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while self.active() != Some(0) && Instant::now() < deadline {
-                std::thread::sleep(DRAIN_TICK);
-            }
+            self.wait_empty();
             return false;
         }
         self.settle_within(NATURAL)

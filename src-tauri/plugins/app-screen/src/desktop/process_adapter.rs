@@ -2500,6 +2500,10 @@ mod windows_tests {
         // and prints how much arrived. A write that was cancelled when the
         // App's end was dropped leaves part of the 4 MiB, and the end of
         // input follows; a write that went on would deliver all of it.
+        // Python is on the windows-latest image (the W1 smoke runs under
+        // it too). A PowerShell reader was not used: whether powershell.exe
+        // leaves a redirected standard input unread before its -Command
+        // script runs was not established.
         let mut child = Command::new("python")
             .args([
                 "-I",
@@ -2704,27 +2708,62 @@ mod windows_tests {
         process
     }
 
-    /// CEF helper processes of the browser: its children running the
-    /// browser's own executable. The browser's console host (`conhost.exe`,
-    /// a child of every console program started with a hidden console) is
-    /// not one. Waits up to 30 s for the first (the renderer of the page, if
-    /// not already the GPU or a utility process).
-    fn cef_helpers(native_pid: u32, program: &Path) -> Vec<u32> {
+    /// The browser's direct children, each held open before it is examined
+    /// (so its id cannot name another process meanwhile): CEF helpers run
+    /// the browser's own executable; console hosts are `conhost.exe`, which
+    /// Windows starts for the browser's windowless console. Only helpers
+    /// still running when held count. Waits up to 30 s for the first helper
+    /// (the page's renderer, if not already the GPU or a utility process).
+    struct Children {
+        helpers: Vec<(u32, std::os::windows::io::OwnedHandle)>,
+        hosts: Vec<(u32, std::os::windows::io::OwnedHandle)>,
+    }
+    fn children(native_pid: u32, program: &Path) -> Children {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let helpers = windows::tree_of(native_pid)
-                .into_iter()
-                .filter(|pid| {
-                    *pid != native_pid
-                        && windows::parent_of(*pid) == Some(native_pid)
-                        && windows::image_of(*pid).as_deref() == Some(program)
-                })
-                .collect::<Vec<_>>();
-            if !helpers.is_empty() || Instant::now() >= deadline {
-                return helpers;
+            let mut found = Children {
+                helpers: Vec::new(),
+                hosts: Vec::new(),
+            };
+            for pid in windows::tree_of(native_pid) {
+                let Some(handle) = windows::waitable(pid) else {
+                    continue;
+                };
+                if pid == native_pid || windows::parent_of(pid) != Some(native_pid) {
+                    continue;
+                }
+                let image = windows::image_of(pid);
+                if image.as_deref() == Some(program) {
+                    if matches!(crate::windows_job::exit_code(&handle), Ok(None)) {
+                        found.helpers.push((pid, handle));
+                    }
+                } else if image
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("conhost.exe"))
+                {
+                    found.hosts.push((pid, handle));
+                }
+            }
+            if !found.helpers.is_empty() || Instant::now() >= deadline {
+                return found;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// A fresh view of `root`'s process tree for a failure message: each
+    /// process with its recorded parent and image, and the expected program.
+    fn describe(root: u32, program: &Path) -> String {
+        let mut lines = vec![format!("expected program: {program:?}")];
+        for pid in windows::tree_of(root) {
+            lines.push(format!(
+                "  process {pid}: parent {:?}, image {:?}",
+                windows::parent_of(pid),
+                windows::image_of(pid)
+            ));
+        }
+        lines.join("\n")
     }
 
     /// The entries of a directory, for a failure message.
@@ -2766,11 +2805,22 @@ mod windows_tests {
                 .to_str()
         );
         let tree = windows::tree_of(process.child.id());
-        let helpers = cef_helpers(native_pid, &located.program);
-        println!("guard tree while open: {tree:?}; CEF helpers: {helpers:?}");
+        let children = children(native_pid, &located.program);
+        let ids = |held: &[(u32, _)]| held.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
+        println!(
+            "guard tree while open: {tree:?}; CEF helpers: {:?}; console hosts: {:?}",
+            ids(&children.helpers),
+            ids(&children.hosts)
+        );
         assert!(
-            !helpers.is_empty(),
-            "no CEF helper below the browser: {tree:?}"
+            !children.helpers.is_empty(),
+            "no CEF helper below the browser:\n{}",
+            describe(native_pid, &located.program)
+        );
+        assert!(
+            !children.hosts.is_empty(),
+            "no console host below the browser:\n{}",
+            describe(native_pid, &located.program)
         );
         // CEF's process singleton holds the profile's lockfile while the
         // browser runs: what clear_profile's refusal relies on.
@@ -2813,11 +2863,18 @@ mod windows_tests {
             receipt["kernelNoChildren"], true,
             "the guard's job is empty"
         );
-        // The helpers are the browser's children and cannot break away from
-        // its job, so the job counted them besides the browser.
+        // The browser, its console host(s) and the helpers held while it ran
+        // were all in the guard's job: a helper outside it would leave the
+        // count short, since the browser and its console host alone make
+        // two.
+        let expected = 1 + children.hosts.len() + children.helpers.len();
+        let observed = receipt["observed"].as_u64().unwrap();
         assert!(
-            receipt["observed"].as_u64().unwrap() > helpers.len() as u64,
-            "CEF's helper processes were in the guard's job"
+            observed >= expected as u64,
+            "the guard's job counted {observed} processes, fewer than the browser, \
+             {} console host(s) and {} CEF helper(s)",
+            children.hosts.len(),
+            children.helpers.len()
         );
         assert!(process
             .child
@@ -2847,17 +2904,26 @@ mod windows_tests {
         let profile = "22222222-2222-4222-8222-222222222222";
         let mut process = opened(&case, &located, &parent, profile);
         let native_pid = process.opened["nativePid"].as_u64().unwrap() as u32;
-        let helpers = cef_helpers(native_pid, &located.program);
-        let tree = windows::tree_of(process.child.id());
-        println!("guard tree before the App's job ends: {tree:?}; CEF helpers: {helpers:?}");
-        assert!(tree.contains(&native_pid), "{tree:?}");
+        // Helpers held while running: one that ends by itself before the
+        // App's job does has still ended, so it cannot make this flaky.
+        let children = children(native_pid, &located.program);
         assert!(
-            !helpers.is_empty(),
-            "no CEF helper below the browser: {tree:?}"
+            !children.helpers.is_empty(),
+            "no CEF helper below the browser:\n{}",
+            describe(native_pid, &located.program)
         );
-        // A short-lived CEF helper may already have ended by now; the guard,
-        // the browser itself and at least one helper must still be there.
-        let handles = tree
+        let tree = windows::tree_of(process.child.id());
+        println!(
+            "guard tree before the App's job ends: {tree:?}; CEF helpers: {:?}",
+            children
+                .helpers
+                .iter()
+                .map(|(pid, _)| *pid)
+                .collect::<Vec<_>>()
+        );
+        assert!(tree.contains(&native_pid), "{tree:?}");
+        // The guard and the browser itself must still be there.
+        let mut handles = tree
             .iter()
             .filter_map(|pid| windows::waitable(*pid).map(|handle| (*pid, handle)))
             .collect::<Vec<_>>();
@@ -2867,10 +2933,8 @@ mod windows_tests {
                 "process {pid} is not open"
             );
         }
-        assert!(
-            handles.iter().any(|(held, _)| helpers.contains(held)),
-            "no CEF helper is open: {helpers:?}"
-        );
+        handles.extend(children.helpers);
+        handles.extend(children.hosts);
         // The App side ends: its spawner closes the App's Job Object, as the
         // App process's end does.
         drop(parent);
