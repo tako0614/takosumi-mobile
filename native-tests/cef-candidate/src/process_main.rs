@@ -13,7 +13,7 @@ use std::{
     },
 };
 use tauri_plugin_app_screen::{
-    browser_process::{decode, read_packet, Reply, Request},
+    browser_process::{decode, external_link, read_packet, Reply, Request},
     OpenRequest,
 };
 
@@ -468,6 +468,34 @@ wrap_client! {
     impl Client {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(Lifetime::new(self.id,self.key.clone(),self.bound)) }
         fn load_handler(&self) -> Option<LoadHandler> {Some(Loads::new())}
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {Some(LinkMenu::new())}
+    }
+}
+/// `MENU_ID_USER_FIRST` in cef_types.h.
+const OPEN_EXTERNALLY: i32 = 26500;
+// The person may choose to open a web link outside the App (policy: external
+// links stay in the profile unless the person chooses otherwise). The browser
+// runs with its profile's HOME and XDG directories, so it only hands the link
+// to the App, which opens it with the person's own desktop.
+wrap_context_menu_handler! {
+    struct LinkMenu;
+    impl ContextMenuHandler {
+        fn on_before_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
+            let (Some(params),Some(model))=(params,model) else {return;};
+            if external_link(&CefString::from(&params.link_url()).to_string()) {
+                model.insert_item_at(0,OPEN_EXTERNALLY,Some(&CefString::from("既定のブラウザで開く")));
+                model.insert_separator_at(1);
+            }
+        }
+        fn on_context_menu_command(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, command_id: ::std::os::raw::c_int, _event_flags: EventFlags) -> ::std::os::raw::c_int {
+            if command_id!=OPEN_EXTERNALLY {return 0;}
+            let Some(params)=params else {return 1;};
+            let url=CefString::from(&params.link_url()).to_string();
+            if external_link(&url) {
+                reply(Reply::OpenExternal{profile:with_state(|state|state.profile.clone()),url});
+            }
+            1
+        }
     }
 }
 wrap_load_handler! {

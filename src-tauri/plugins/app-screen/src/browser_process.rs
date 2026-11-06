@@ -124,6 +124,33 @@ pub enum Reply {
         id: u64,
         message: String,
     },
+    /// The person chose to open a link outside the App (from its context
+    /// menu). Not a reply to any request: the App opens it with the person's
+    /// own desktop environment.
+    OpenExternal {
+        profile: String,
+        url: String,
+    },
+}
+
+/// A link the person may open outside the App: an absolute http(s) URL with
+/// a host and no credentials, without whitespace or control characters, and
+/// bounded. Anything else (file:, javascript:, custom schemes) stays inside.
+pub fn external_link(url: &str) -> bool {
+    if url.is_empty()
+        || url.len() > 4096
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
 }
 
 /// Only complete bounded packets cross the pipe; no arbitrary eval or path command.
@@ -148,6 +175,39 @@ mod tests {
             "key":format!("web-home:{PROFILE}:https://excalidraw.com"),"url":"https://excalidraw.com/","title":"Work",
             "profile":PROFILE,"webHome":true,"resume":true
         }})
+    }
+
+    #[test]
+    fn only_bounded_web_links_without_credentials_may_open_outside() {
+        for url in [
+            "https://excalidraw.com/",
+            "http://example.com/a?b=c#d",
+            "https://www.photopea.com/?x=1",
+        ] {
+            assert!(external_link(url), "{url}");
+        }
+        let long = format!("https://example.com/{}", "a".repeat(4096));
+        for url in [
+            "",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "takosumi://open",
+            "https:///path",
+            "https://user:secret@example.com/",
+            "https://user@example.com/",
+            "https://example.com/a b",
+            "https://example.com/\n",
+            "https://exa\u{7f}mple.com/",
+            "ftp://example.com/",
+            long.as_str(),
+        ] {
+            assert!(!external_link(url), "{url:?}");
+        }
+        let reply: Reply = serde_json::from_str(
+            r#"{"event":"openExternal","profile":"p","url":"https://example.com/"}"#,
+        )
+        .unwrap();
+        assert!(matches!(reply, Reply::OpenExternal { .. }));
     }
 
     #[test]
