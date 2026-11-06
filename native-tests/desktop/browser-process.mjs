@@ -287,6 +287,21 @@ async function filesProbe(pages) {
   const {nativeFiles,key,ready}=await import('./native-files.mjs');
   const files=nativeFiles({desktop:desktopIo,data});
   const owner=id=>JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(id)]));
+  // Attribute a native dialog to Work. Without a desktop portal the dialog
+  // belongs to Work's own browser. With one (the App's GTK starts it, as on a
+  // desktop) CEF asks the shared file chooser portal, whose backend draws the
+  // dialog; it must then be transient for Work's own window (ex26).
+  const attribute=async(dialog,kind)=>{
+    const by=owner(dialog.id);
+    if(by.pid===work.native.nativePid)return {route:'browser',owner:by};
+    const exe=await readlink(`/proc/${by.pid}/exe`);
+    assert.equal(path.basename(exe),'xdg-desktop-portal-gtk',`The ${kind} dialog belongs to neither Work's browser nor the portal backend: ${exe}`);
+    const transient=desktop('xprop',['-id',String(dialog.id),'WM_TRANSIENT_FOR']).match(/window id # (0x[0-9a-f]+)$/i)?.[1];
+    assert(transient,`The portal ${kind} dialog must be transient for the requesting window`);
+    const parent=owner(Number.parseInt(transient,16));
+    assert.equal(parent.pid,work.native.nativePid,`The portal ${kind} dialog must be transient for Work's own window`);
+    return {route:'xdg-desktop-portal',owner:by,backend:exe,transientFor:Number.parseInt(transient,16),parentOwner:parent,workWindow:work.native.windowId};
+  };
   const front=async()=>{
     // Personal opened last and covers Work; Chrome holds input to a covered window.
     desktop('xdotool',['windowraise',String(work.native.windowId)]);
@@ -305,8 +320,7 @@ async function filesProbe(pages) {
   const before=await files.visibleWindows();
   await key(work.send,'o',2);
   const open=await files.nativeDialog(before,'open');
-  proof.files.openOwner=owner(open.id);
-  assert.equal(proof.files.openOwner.pid,work.native.nativePid,"The Open dialog must belong to Work's native browser");
+  proof.files.openOwner=await attribute(open,'Open');
   await files.selectNativePath(open,input,'files-native-open');
   proof.files.open=open;
   await ready(work.evaluate,"[...document.querySelectorAll('.excalidraw canvas')].some(c=>{const context=c.getContext('2d');if(!context||!c.width||!c.height)return false;const p=context.getImageData(Math.floor(c.width/2),Math.floor(c.height/2),1,1).data;return p[0]>240&&p[1]<15&&p[2]<15&&p[3]>240})",12);
@@ -320,8 +334,8 @@ async function filesProbe(pages) {
   const beforeSave=await files.visibleWindows();
   await key(work.send,'s',2);
   const save=await files.nativeDialog(beforeSave,'save');
-  proof.files.saveOwner=owner(save.id);
-  assert.equal(proof.files.saveOwner.pid,work.native.nativePid,"The Save As dialog must belong to Work's native browser");
+  proof.files.saveOwner=await attribute(save,'Save As');
+  assert.equal(proof.files.saveOwner.route,proof.files.openOwner.route,'Open and Save As must take the same dialog route');
   await files.selectNativePath(save,output,'files-native-save');
   proof.files.save=save;
   await ready(work.evaluate,"document.body.innerText.includes('File saved.')",8);
