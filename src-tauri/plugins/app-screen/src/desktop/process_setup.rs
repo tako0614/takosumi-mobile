@@ -30,7 +30,12 @@ pub(super) struct Overrides {
     pub runtime: Option<OsString>,
 }
 impl Overrides {
+    /// Only a fixture build honours these; a product build always resolves
+    /// its own bundled files.
     pub(super) fn from_env() -> Self {
+        if !cfg!(feature = "fixture-overrides") {
+            return Self::default();
+        }
         Self {
             program: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PROGRAM"),
             guard: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_GUARD"),

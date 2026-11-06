@@ -167,9 +167,13 @@ pub(super) fn install(app: &AppHandle) -> Result<()> {
         guard,
         runtime: runtime_root,
     } = setup::locate(plan, euid)?;
+    // The sandbox opt-out is a fixture seam only; a product build runs
+    // sandboxed unless it runs as root (which Chromium refuses to sandbox).
     let no_sandbox = setup::without_sandbox(
         euid,
-        std::env::var_os("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX").as_deref(),
+        std::env::var_os("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX")
+            .filter(|_| cfg!(feature = "fixture-overrides"))
+            .as_deref(),
     );
     let directory = app
         .path()
@@ -621,8 +625,9 @@ impl Process {
         command.env_clear();
         // Optional observation seam for the disposable native fixture only.
         // It is never a page IPC command or enabled in a normal App build.
-        if std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+        if cfg!(feature = "fixture-overrides")
+            && std::env::var_os("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
         {
             command.env("TAKOSUMI_BROWSER_PROCESS_INSPECT", "1");
         }
@@ -945,7 +950,11 @@ impl Process {
             }
         }
         self.input.take();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // The person already agreed to leave and every window has closed; the
+        // browser may still flush its profile. On a slow disk that can exceed a
+        // few seconds (pk1), and an App that cannot finish quitting is worse
+        // than waiting a little longer for a clean, normal end.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().map_err(failure)? {
                 return if status.success() {

@@ -19,7 +19,7 @@ tauri-build = { version = "2", features = [] }
 # process, found in the bundle's `cef/` resources (see
 # native-tests/cef-candidate/README.md, "Linux packaging"). No fixture driver.
 desktop-cef = ["tauri-plugin-app-screen/desktop-process-experiment"]
-native-browser-process-fixture = ["desktop-cef", "tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
+native-browser-process-fixture = ["desktop-cef", "tauri-plugin-app-screen/fixture-overrides", "tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
 # Explicit actual-App fixture; never enabled by normal builds or releases.
 native-web-home-fixture = ["tauri/custom-protocol", "dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]
 
