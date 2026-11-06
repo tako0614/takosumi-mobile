@@ -12,6 +12,9 @@ import subprocess
 import sys
 import time
 
+import uuid
+
+from browser_apps import create_input
 from web_home import enable_child_subreaper, process_identity, wait_engine_children
 
 REPO = Path(__file__).resolve().parents[2]
@@ -25,7 +28,8 @@ LINUX_SOURCES = (
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/x11-owner.py",
     "native-tests/cef-candidate/permissions.mjs", "native-tests/cef-candidate/notifications.mjs",
-    "native-tests/cef-candidate/notification-backend.mjs",
+    "native-tests/cef-candidate/notification-backend.mjs", "native-tests/cef-candidate/gtk-readiness.mjs",
+    "native-tests/desktop/native-files.mjs", "native-tests/desktop/browser_apps.py",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs",
     "src-tauri/src/lib.rs", "src-tauri/src/main.rs", "src-tauri/tests/desktop/browser_process.rs",
     "src-tauri/tauri.conf.json", "src-tauri/tauri.web-client.conf.json",
@@ -97,7 +101,7 @@ def worker(args):
     enable_child_subreaper()
     result = {"passed": False}
     phase = os.environ.get("TAKOSUMI_BROWSER_PROCESS_PHASE", "")
-    require(phase in {"", "restart", "reset", "notify"}, "Unknown browser fixture phase")
+    require(phase in {"", "restart", "reset", "notify", "files"}, "Unknown browser fixture phase")
     suffix = f"-{phase}" if phase else ""
     with (args.data / f"app{suffix}.log").open("x") as log:
         app = subprocess.Popen([str(args.binary)], stdout=log, stderr=subprocess.STDOUT)
@@ -201,6 +205,8 @@ def main():
                         help="relaunch the App on the same data and verify per-profile state after restart")
     parser.add_argument("--reset", action="store_true",
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
+    parser.add_argument("--files", action="store_true",
+                        help="relaunch and verify the native OS Open/Save As chooser in Work (Excalidraw only)")
     parser.add_argument("--notifications", type=Path,
                         help="relaunch with this owned Dunst binary and verify native permission UI and OS notifications")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -210,6 +216,8 @@ def main():
     args.data = args.data.absolute()
     if args.notifications:
         args.notifications = args.notifications.resolve(strict=True)
+    if args.files and args.app != "excalidraw":
+        parser.error("--files is inspected for --app excalidraw only")
     if args.worker:
         args.data = owned_case_path(args.data)
         return worker(args)
@@ -222,6 +230,8 @@ def main():
     env = dict(os.environ)
     # Only --restart selects the restart phase; never inherit it from the caller.
     env.pop("TAKOSUMI_BROWSER_PROCESS_PHASE", None)
+    for key in ("TAKOSUMI_BROWSER_PROCESS_FILES_INPUT", "TAKOSUMI_BROWSER_PROCESS_FILES_NONCE"):
+        env.pop(key, None)
     for key, name in {"HOME":"home", "XDG_DATA_HOME":"data", "XDG_CONFIG_HOME":"config",
                       "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "TMPDIR":"tmp"}.items():
         directory = args.data / name
@@ -236,8 +246,15 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
+    file_input = file_nonce = None
+    if args.files:
+        # The owned input is hashed with the sources: Save As must not overwrite it.
+        (args.data / "files").mkdir(mode=0o700)
+        file_nonce = str(uuid.uuid4())
+        file_input = create_input(args.data / "files", "excalidraw", file_nonce)
     files = sorted(set([args.binary, args.browser, args.browser.parent / "libcef.so"] + source_files(REPO)
-                       + ([args.notifications] if args.notifications else [])))
+                       + ([args.notifications] if args.notifications else [])
+                       + ([file_input] if file_input else [])))
     before = {str(file):digest(file) for file in files}
     # Preserve small source bytes and the executable inodes used in this case.
     # These links are retention only; processes still use the attested original
@@ -271,6 +288,12 @@ def main():
                                         TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications)),
                              files, before, head, "-notify")
         require(notify["passed"] is True, "The notification native execution did not pass")
+    if args.files:
+        files_run = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="files",
+                                           TAKOSUMI_BROWSER_PROCESS_FILES_INPUT=str(file_input),
+                                           TAKOSUMI_BROWSER_PROCESS_FILES_NONCE=file_nonce),
+                                files, before, head, "-files")
+        require(files_run["passed"] is True, "The native file chooser execution did not pass")
 
 
 if __name__ == "__main__":

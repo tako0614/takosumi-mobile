@@ -90,7 +90,10 @@ async fn add(view: &WebView, label: &str, count: usize) -> Result<()> {
     ready(view,&format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')")).await
 }
 async fn checkpoint(case: &std::path::Path, name: &str) -> Result<()> {
-    let end = Instant::now() + Duration::from_secs(30);
+    checkpoint_within(case, name, Duration::from_secs(30)).await
+}
+async fn checkpoint_within(case: &std::path::Path, name: &str, bound: Duration) -> Result<()> {
+    let end = Instant::now() + bound;
     while Instant::now() < end {
         if case.join(name).is_file() {
             return Ok(());
@@ -251,8 +254,12 @@ async fn relaunch_flow(
     .map_err(|error| error.to_string())?;
     // The observer verifies state, then closes Personal natively so the
     // ordinary single-profile exit applies.
-    checkpoint(case, &format!("{kind}-inspected")).await?;
-    checkpoint(case, &format!("{kind}-request-exit")).await?;
+    // The files phase drives native OS dialogs with the standalone driver's
+    // own per-step bounds (up to 25 s each). Wait up to the App watchdog (90 s
+    // overall), so an observer failing one step reports it, not this wait.
+    let bound = Duration::from_secs(if kind == "files" { 80 } else { 30 });
+    checkpoint_within(case, &format!("{kind}-inspected"), bound).await?;
+    checkpoint_within(case, &format!("{kind}-request-exit"), bound).await?;
     if kind == "reset" {
         // The observer closed Personal normally in this session: now it can be
         // cleared here (normal guard receipt, then removal from the map). The
@@ -305,7 +312,7 @@ async fn flow(app: &AppHandle) -> Result<()> {
     )
     .await?;
     if let Ok(kind) = std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE") {
-        if !["restart", "reset", "notify"].contains(&kind.as_str()) {
+        if !["restart", "reset", "notify", "files"].contains(&kind.as_str()) {
             return Err("Unknown browser fixture phase".into());
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
@@ -369,7 +376,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
         .unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(&case, "request-exit").await?;
+    // Resume, download and the popup steps (its load alone may take 25 s)
+    // run before the observer asks to quit.
+    checkpoint_within(&case, "request-exit", Duration::from_secs(60)).await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
     app.exit(0);
@@ -438,7 +447,8 @@ async fn flow(app: &AppHandle) -> Result<()> {
         serde_json::to_vec_pretty(&partial).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(&case, "request-final-exit").await?;
+    // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
+    checkpoint_within(&case, "request-final-exit", Duration::from_secs(60)).await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
         b"{\"passed\":true}\n",

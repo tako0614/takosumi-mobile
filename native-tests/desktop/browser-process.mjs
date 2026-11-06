@@ -1,6 +1,6 @@
 // Observe the actual bundled App's browser children. No replacement shell IPC.
 import assert from 'node:assert/strict';
-import { readFile, readdir, readlink, writeFile } from 'node:fs/promises';
+import { lstat, readFile, readdir, readlink, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
@@ -10,9 +10,11 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset','notify'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
+// The app's own document has rendered (not the initial about:blank of a new window).
+const appContent=origin.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
 // Name the active operation and its exact page, so a failure snapshot inspects
 // that profile rather than whichever client happened to attach last.
@@ -135,8 +137,7 @@ async function attach(process) {
   proof.stage={name:'external Page enable',pid:native.nativePid};
   await send('Page.enable');
   try {
-    const content=origin.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer')";
-    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && (${content})`),'Actual anonymous app document did not load');
+    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && ${appContent}`),'Actual anonymous app document did not load');
     if(origin.includes('photopea') && await evaluate("document.body.innerText.includes('Start using Photopea')")) {
       proof.stage={name:'Photopea landing button',pid:native.nativePid};
       // The site has more than one equivalent CTA. Use the first visible
@@ -204,6 +205,7 @@ async function relaunchFlow(kind) {
   const [,personal]=pages,key=`sumi_app_process_${nonce}`;
   step(`per-profile state after ${kind}`);
   if(kind==='notify')return notifyProbes(pages);
+  if(kind==='files')return filesProbe(pages);
   proof.persisted=await Promise.all(pages.map(page=>page.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`)));
   const kept={storage:`1:${nonce}`,cookie:`1:${nonce}`};
   if(kind==='reset') {
@@ -270,6 +272,171 @@ async function notifyProbes(pages) {
   await closePersonalAfterRelaunch(personal,'notify');
   proof.passed=true;
 }
+// files (runner --files, Excalidraw only): the actual OS file chooser through
+// File System Access on the App path. Native Open of the owned input and Save
+// As to a new path in Work's own Downloads, each dialog attributed to Work's
+// native browser; the saved scene is verified once with the standalone oracle.
+async function filesProbe(pages) {
+  const [work,personal]=pages;
+  assert(origin.includes('excalidraw'),'The native chooser probe is inspected for Excalidraw only');
+  const input=process.env.TAKOSUMI_BROWSER_PROCESS_FILES_INPUT,filesNonce=process.env.TAKOSUMI_BROWSER_PROCESS_FILES_NONCE;
+  assert(input&&path.isAbsolute(input)&&filesNonce,'The owned file input is required');
+  const desktopIo=async(tool,args,allowMissing=false,raw=false)=>{
+    try{const out=execFileSync(tool,args,{timeout:5000,maxBuffer:64*1024*1024});return raw?out:out.toString('utf8').trim();}
+    catch(e){if(allowMissing&&e.status===1)return raw?Buffer.alloc(0):String(e.stdout??'').trim();throw e;}
+  };
+  const {nativeFiles,key,ready}=await import('./native-files.mjs');
+  const files=nativeFiles({desktop:desktopIo,data});
+  const owner=id=>JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(id)]));
+  // Attribute a native dialog to Work. Without a desktop portal the dialog
+  // belongs to Work's own browser. With one (the App's GTK starts it, as on a
+  // desktop) CEF asks the shared file chooser portal, whose backend draws the
+  // dialog; it must then be transient for Work's own window (ex26).
+  const attribute=async(dialog,kind)=>{
+    const by=owner(dialog.id);
+    if(by.pid===work.native.nativePid)return {route:'browser',owner:by};
+    const exe=await readlink(`/proc/${by.pid}/exe`);
+    assert.equal(path.basename(exe),'xdg-desktop-portal-gtk',`The ${kind} dialog belongs to neither Work's browser nor the portal backend: ${exe}`);
+    const transient=desktop('xprop',['-id',String(dialog.id),'WM_TRANSIENT_FOR']).match(/window id # (0x[0-9a-f]+)$/i)?.[1];
+    assert(transient,`The portal ${kind} dialog must be transient for the requesting window`);
+    // Exactly Work's window as the App reported it, and that window is Work's.
+    assert.equal(Number.parseInt(transient,16),work.native.windowId,`The portal ${kind} dialog must be transient for Work's window`);
+    const parent=owner(Number.parseInt(transient,16));
+    assert.equal(parent.pid,work.native.nativePid,`The portal ${kind} dialog must be transient for Work's own window`);
+    return {route:'xdg-desktop-portal',owner:by,backend:exe,transientFor:Number.parseInt(transient,16),parentOwner:parent,workWindow:work.native.windowId};
+  };
+  const front=async()=>{
+    // Personal opened last and covers Work; Chrome holds input to a covered window.
+    desktop('xdotool',['windowraise',String(work.native.windowId)]);
+    await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Raised Work window did not become visible');
+    desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
+  };
+  const personalDownloads=path.join(personal.process.directory,'Downloads'),listing=async()=>(await readdir(personalDownloads)).sort();
+  proof.files={input,started:Date.now(),personalDownloadsBefore:await listing()};
+  step('native Open in Work',work);
+  await front();
+  await ready(work.evaluate,"document.querySelector('.excalidraw canvas') !== null");
+  // Excalidraw uses File System Access whenever the page has it; without it the
+  // site falls back to <input type=file> and a download, a different route.
+  proof.files.fileSystemAccess=await work.evaluate("typeof showOpenFilePicker==='function'&&typeof showSaveFilePicker==='function'");
+  assert.equal(proof.files.fileSystemAccess,true,'The page must use File System Access, not the input/download fallback');
+  const before=await files.visibleWindows();
+  await key(work.send,'o',2);
+  const open=await files.nativeDialog(before,'open');
+  proof.files.openOwner=await attribute(open,'Open');
+  await files.selectNativePath(open,input,'files-native-open');
+  proof.files.open=open;
+  await ready(work.evaluate,"[...document.querySelectorAll('.excalidraw canvas')].some(c=>{const context=c.getContext('2d');if(!context||!c.width||!c.height)return false;const p=context.getImageData(Math.floor(c.width/2),Math.floor(c.height/2),1,1).data;return p[0]>240&&p[1]<15&&p[2]<15&&p[3]>240})",12);
+  proof.files.openedMs=Date.now()-proof.files.started;
+  await writeFile(path.join(data,'files-inspected'),'ready',{flag:'wx'});
+  step('native Save As in Work',work);
+  await front();
+  await key(work.send,'a',2);await key(work.send,'ArrowRight');
+  const output=path.join(work.process.directory,'Downloads','SumiProbeSaved.excalidraw');
+  await assert.rejects(lstat(output),{code:'ENOENT'});
+  const beforeSave=await files.visibleWindows();
+  await key(work.send,'s',2);
+  const save=await files.nativeDialog(beforeSave,'save');
+  proof.files.saveOwner=await attribute(save,'Save As');
+  assert.equal(proof.files.saveOwner.route,proof.files.openOwner.route,'Open and Save As must take the same dialog route');
+  await files.selectNativePath(save,output,'files-native-save');
+  proof.files.save=save;
+  await ready(work.evaluate,"document.body.innerText.includes('File saved.')",8);
+  const saved=await lstat(output);
+  assert(saved.isFile()&&!saved.isSymbolicLink()&&saved.size>0&&saved.size<=1024*1024,'Missing or oversized actual Save As output');
+  proof.files.export=JSON.parse(desktop('python3',['-B','-c','import sys,json;from pathlib import Path;sys.path.insert(0,sys.argv[1]);from browser_apps import verify_export;print(json.dumps(verify_export(Path(sys.argv[2]),sys.argv[3],sys.argv[4])))',
+    fileURLToPath(new URL('.',import.meta.url)),output,'excalidraw',filesNonce]));
+  assert.deepEqual(await listing(),proof.files.personalDownloadsBefore,"Personal's Downloads must not change");
+  // Not a separated surface: the portal backend keeps one recent-files list
+  // for the desktop session, not per connection (Personal's chooser would see
+  // it). Record that list; the only per-profile claim checked is that nothing
+  // wrote Work's files into Personal's own profile data.
+  const recent=async file=>{try{return {file,exists:true,text:await readFile(file,'utf8')};}catch(e){if(e.code==='ENOENT')return {file,exists:false,text:''};throw e;}};
+  const names=[path.basename(input),path.basename(output)];
+  const shared=process.env.XDG_DATA_HOME?await recent(path.join(process.env.XDG_DATA_HOME,'recently-used.xbel')):{file:null,exists:false,text:''};
+  const own=await recent(path.join(personal.process.directory,'data','recently-used.xbel'));
+  proof.files.sessionRecent={file:shared.file,exists:shared.exists,workFiles:names.map(name=>shared.text.includes(name))};
+  proof.files.personalRecent={file:own.file,exists:own.exists,workFiles:names.map(name=>own.text.includes(name))};
+  assert(!proof.files.personalRecent.workFiles.some(Boolean),"Nothing may write Work's files into Personal's profile data");
+  proof.files.savedMs=Date.now()-proof.files.started;
+  await closePersonalAfterRelaunch(personal,'files');
+  proof.passed=true;
+}
+// A sign-in style popup: window.open from Work opens a native popup in Work's
+// own browser process (same profile). It shares Work's storage and cookie,
+// reports Work as its opener, and hands a result back by postMessage before
+// closing itself; Personal sees neither. Synthetic state, not provider login.
+async function popupProbe(work,personal,key,expected,sample) {
+  // The app's own page, as the cef-candidate probe uses: a different document
+  // could carry a different opener policy and sever the opener.
+  const state={method:'Standard window.open/postMessage/window.close with synthetic state, not provider login'};
+  const ref=`sumi_popup_${nonce.replaceAll('-','')}`, url=`${origin}/?${ref}`, result=`popup:${nonce}`;
+  const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+  assert.deepEqual((await pages(work)).map(t=>t.targetId),[work.target.targetId],'Work must have one document before its popup');
+  state.accepted=await work.evaluate(`(()=>{window.__sumiMessages=[];window.__sumiOnMessage=e=>{if(e.data?.sumi===${JSON.stringify(nonce)})window.__sumiMessages.push({origin:e.origin,fromPopup:e.source===globalThis[${JSON.stringify(ref)}],data:e.data})};addEventListener('message',window.__sumiOnMessage);globalThis[${JSON.stringify(ref)}]=window.open(${JSON.stringify(url)},${JSON.stringify(ref)},'popup,width=600,height=500');return Boolean(globalThis[${JSON.stringify(ref)}])})()`,true);
+  assert.equal(state.accepted,true,'Popup request must be accepted');
+  let target;
+  await settled(async()=>{
+    const found=(await pages(work)).filter(t=>t.targetId!==work.target.targetId);
+    assert(found.length<=1,'Unexpected popup family');
+    target=found.find(t=>t.openerId===work.target.targetId);return Boolean(target);
+  },'Popup did not appear in Work\'s own browser process');
+  state.target={targetId:target.targetId,openerId:target.openerId,url:target.url};
+  assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'The popup must not appear in Personal');
+  const session=(await work.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
+  const evaluate=async(expression,userGesture=false)=>{
+    const value=await work.c.command('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,userGesture},session);
+    assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
+  };
+  // Same 25 s load bound as the cef-candidate popup probe; the requested app
+  // page itself, not the new window's initial about:blank.
+  await popupLoaded(evaluate,url);
+  state.context=await evaluate("({href:location.href,origin:location.origin,secure:isSecureContext,opener:window.opener!==null,openerOrigin:window.opener?.location.origin,tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc})");
+  assert.equal(state.context.origin,origin);assert.equal(state.context.secure,true);
+  assert.equal(state.context.opener,true);assert.equal(state.context.openerOrigin,origin);
+  for(const field of ['tauri','ipc','wry'])assert.equal(state.context[field],'undefined');
+  state.sharedBefore=await evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`);
+  assert.deepEqual(state.sharedBefore,{storage:expected[0].storage,cookie:expected[0].cookie},'The popup must share Work\'s storage and cookie');
+  await evaluate(`(()=>{localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(result)});document.cookie=${JSON.stringify(`${key}=${result}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};window.opener.postMessage({sumi:${JSON.stringify(nonce)},result:${JSON.stringify(result)}},${JSON.stringify(origin)});setTimeout(()=>window.close(),0);return true})()`,true);
+  await settled(async()=>await work.evaluate(`globalThis[${JSON.stringify(ref)}].closed`)&&!(await pages(work)).some(t=>t.targetId===target.targetId),'Popup did not close back to Work');
+  state.messages=await work.evaluate('window.__sumiMessages');
+  assert.deepEqual(state.messages,[{origin,fromPopup:true,data:{sumi:nonce,result}}],'Work must receive exactly its popup\'s result');
+  state.workAfter=await work.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`);
+  assert.deepEqual(state.workAfter,{storage:result,cookie:result},'Work must see the state its popup wrote');
+  assert.deepEqual(await sample(personal),expected[1],'Personal must see neither the popup nor its state');
+  // Restore Work's first-launch state, which the later phases check.
+  await work.evaluate(`(()=>{localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(expected[0].storage)});document.cookie=${JSON.stringify(`${key}=${expected[0].cookie}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};removeEventListener('message',window.__sumiOnMessage);delete window.__sumiOnMessage;delete window.__sumiMessages;delete globalThis[${JSON.stringify(ref)}];return true})()`);
+  assert.deepEqual(await sample(work),expected[0],'Work must keep its document after the popup');
+  state.passed=true;return state;
+}
+async function popupLoaded(evaluate,url) {
+  const end=Date.now()+25000;let loaded=false;
+  while(Date.now()<end&&!loaded) {
+    // The navigation entry keeps the URL actually loaded, even if the app
+    // later rewrites its address; the initial about:blank has none.
+    loaded=await evaluate(`performance.getEntriesByType('navigation')[0]?.name===${JSON.stringify(url)}&&document.readyState==='complete'&&${appContent}`).catch(()=>false);
+    if(!loaded)await delay(100);
+  }
+  assert(loaded,'Popup document must load the requested app page');
+}
+// A popup left open when the App quits closes with its profile: the native
+// close chain covers it, and the runner then requires a normal guard and App
+// exit. Quit only after the popup's own document loaded, so its native browser
+// exists in the profile's close chain.
+async function openPopupForQuit(page) {
+  const ref=`sumi_quit_popup_${nonce.replaceAll('-','')}`, url=`${origin}/?${ref}`;
+  assert.equal(await page.evaluate(`(()=>{globalThis[${JSON.stringify(ref)}]=window.open(${JSON.stringify(url)},${JSON.stringify(ref)},'popup,width=500,height=400');return Boolean(globalThis[${JSON.stringify(ref)}])})()`,true),true,'Popup request must be accepted');
+  let target;
+  await settled(async()=>{target=(await page.c.command('Target.getTargets')).targetInfos.find(t=>t.type==='page'&&t.openerId===page.target.targetId);return Boolean(target);},'Popup did not appear before the final quit');
+  const session=(await page.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
+  const evaluate=async expression=>{
+    const value=await page.c.command('Runtime.evaluate',{expression,returnByValue:true},session);
+    assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
+  };
+  await popupLoaded(evaluate,url);
+  const observed=await evaluate("({navigation:performance.getEntriesByType('navigation')[0]?.name??null,href:location.href,ready:document.readyState})");
+  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,requested:url,observed};
+}
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -329,6 +496,8 @@ async function firstLaunch() {
   await settled(async()=>{try{return (await readFile(path.join(ownDownloads,fileName),'utf8'))===fileText;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'Work download did not land in its own Downloads');
   assert.deepEqual((await readdir(otherDownloads)).filter(name=>name.includes(nonce)),[],'Work download must not reach Personal Downloads');
   proof.download={profile:work.process.profile,file:fileName,bytes:Buffer.byteLength(fileText),otherProfileClean:true};
+  step('Work same-origin popup',work);
+  proof.popup=await popupProbe(work,personal,key,expected,sample);
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;
@@ -403,6 +572,8 @@ async function firstLaunch() {
   proof.partial=await marker('app-browser-process-partial.json');
   assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
   await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  step('Personal popup open at the final quit',personal);
+  proof.finalPopup=await openPopupForQuit(personal);
   step('Personal final exit',personal);
   await writeFile(path.join(data,'request-final-exit'),'ready',{flag:'wx'});
   proof.passed=true;
