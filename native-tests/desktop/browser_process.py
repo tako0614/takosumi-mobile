@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import resource
+import pwd
 import signal
+import stat
 import shutil
 import subprocess
 import sys
@@ -151,9 +153,24 @@ def worker(args):
                 (args.data / f"app-execution{suffix}.json").write_text(json.dumps(result, indent=2)+"\n")
 
 
+def hand_over(path, uid, gid):
+    """Give a fresh session directory to the unprivileged session account."""
+    for root, _, names in os.walk(path, followlinks=False):
+        os.chown(root, uid, gid, follow_symlinks=False)
+        for name in names:
+            file = Path(root) / name
+            info = file.lstat()
+            require(not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1, f"Refusing to hand over {file}")
+            os.chown(file, uid, gid, follow_symlinks=False)
+
+
 def run_session(args, env, files, before, head, suffix):
     receipt = args.data / f"session-guard{suffix}.json"
-    command = ["python3", "-B", str(GUARD), str(receipt), "xvfb-run", "-a", "-s", "-screen 0 1280x960x24",
+    user = getattr(args, "session_user", None)
+    # The fixture guard stays root's; everything inside the session runs as the
+    # unprivileged account when --user is given.
+    drop = ["setpriv", f"--reuid={user[0]}", f"--regid={user[1]}", "--clear-groups", "--"] if user else []
+    command = ["python3", "-B", str(GUARD), str(receipt), *drop, "xvfb-run", "-a", "-s", "-screen 0 1280x960x24",
                "dbus-run-session", "--", "python3", "-B", str(Path(__file__).resolve()), "--worker",
                "--binary", str(args.binary), "--browser", str(args.browser), "--data", str(args.data)]
     proof = {"passed":False,"sourceHead":head,"artifactsBefore":before}
@@ -214,6 +231,11 @@ def main():
     parser.add_argument("--guard", type=Path, default=GUARD,
                         help="the App's per-profile browser guard (default: the fixture guard.py; "
                              "or the Rust takosumi-browser-guard binary)")
+    parser.add_argument("--packaged", action="store_true",
+                        help="let the App resolve its bundled browser, guard and runtime itself "
+                             "(cef/ next to --binary and $XDG_RUNTIME_DIR) instead of the fixture overrides")
+    parser.add_argument("--user", help="run the session (Xvfb, D-Bus, App, observer) as this unprivileged "
+                                       "account, so the browsers run with the Chromium sandbox")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
@@ -244,10 +266,23 @@ def main():
         env[key] = str(directory)
     runtime = args.data / "r"
     runtime.mkdir(mode=0o700)
-    env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
-               TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard.resolve()),
-               TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime),
-               TAKOSUMI_BROWSER_PROCESS_CASE=str(args.data),
+    if args.packaged:
+        # The App resolves everything itself: cef/ beside the binary (Tauri's
+        # resource directory for target/<profile> runs) and $XDG_RUNTIME_DIR,
+        # which must be short enough for Chromium's singleton socket path.
+        cef = args.binary.resolve().parent / "cef"
+        args.browser, args.guard = cef / "takosumi-cef-browser-process", cef / "takosumi-browser-guard"
+        require(args.browser.is_file() and args.guard.is_file(), "--packaged needs the staged cef/ resources beside --binary")
+        short = args.data / "x"
+        short.mkdir(mode=0o700)
+        require(len(str(short / "takosumi-cef")) + len("/p-4194304-999999/tmp/org.chromium.Chromium.XXXXXX/SingletonSocket") <= 107,
+                "--packaged needs a shorter --data path for the browser runtime sockets")
+        env["XDG_RUNTIME_DIR"] = str(short)
+    else:
+        env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
+                   TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard.resolve()),
+                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime))
+    env.update(TAKOSUMI_BROWSER_PROCESS_CASE=str(args.data),
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
@@ -296,6 +331,18 @@ def main():
             shutil.copyfile(file, target)
     os.link(args.binary, args.data / "app-executable")
     os.link(args.browser, args.data / "browser-executable")
+    if args.user:
+        account = pwd.getpwnam(args.user)
+        require(account.pw_uid != 0, "--user must be an unprivileged account")
+        require(not args.notifications, "--user cannot reach the owned notification daemon; run it without --notifications")
+        args.session_user = (account.pw_uid, account.pw_gid)
+        # Hand over only the case root itself and the fresh session directories.
+        # The hard-linked executables stay root's: changing them would change
+        # the originals' owner.
+        os.chown(args.data, *args.session_user)
+        for name in ("home", "data", "config", "cache", "runtime", "tmp", "r", "x", "opener", "files"):
+            if (args.data / name).exists():
+                hand_over(args.data / name, *args.session_user)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     proof = run_session(args, env, files, before, head, "")
     require(proof["passed"] is True, "The native execution did not pass")
