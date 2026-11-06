@@ -386,23 +386,38 @@ If no browser, guard or runtime root qualifies, or the App runs setuid or
 setgid (`getuid() != geteuid()`, or the same for the group), the plugin still
 starts. The backend is registered as unavailable with its reason, printed to
 stderr. The home keeps running, and `open` and `clear_profile` return that
-reason; nothing falls back to the Wry adapter.
+reason; nothing falls back to the Wry adapter. `capabilities` then reports
+`clearProfile: false`, so the home does not offer a deletion that would be
+refused.
 
-Each browser's `p-<App pid>-<n>` directory is removed once its guard has ended.
-Callers drop a browser right after verifying its normal receipt; any other
-ended browser is dropped at the App's end. At start, the App also sweeps
-`p-*` directories in its own verified root whose App pid no longer exists, or
-equals its own (left by an earlier instance with a reused pid). A start that
-finds its own name taken removes the stale directory first. Only plain
-directories are removed and no link is followed. A fixture build keeps ended
-directories, because the runner reads each guard's receipt there after the App
-exits; the sweep still applies.
+Each browser's `p-<App pid>-<n>` directory holds a `lock` file. The App keeps
+an exclusive `flock` on it for that browser's whole lifetime and releases it
+only after the directory is removed. Liveness is therefore decided by the lock,
+not by a pid, so another host sharing an NFS cache fallback, or another PID
+namespace sharing `/run/user/<uid>`, keeps its directories. A directory is
+removed once its guard has ended: callers drop a browser right after verifying
+its normal receipt, and any other ended browser is dropped at the App's end.
+
+At start, the App also sweeps its own verified root. It removes a plain
+directory of its user named `p-<pid>-<n>` only when a non-blocking `flock` on
+its lock file succeeds, and removes it while holding that lock. It leaves a
+held lock, a missing lock file (a directory being created, or one from an
+earlier build), a lock file that is a link, links and other entries. A new
+browser's name is used only when it is free or stale by the same test;
+otherwise the App takes the next name. No link is followed. A fixture build
+keeps ended directories, because the runner reads each guard's receipt there
+after the App exits; the sweep still applies.
 
 A browser that agreed to stop has 30 s (`STOP_FINISH`) to end normally. That
 covers an answered `stopped`, a control pipe or reply channel that closed after
 its last window, and a late `stopped` found while recovering. pk1 showed a
 browser still flushing its profile on a stalled disk past the earlier 2–5 s
-bounds.
+bounds. A shutdown request that could not be written within its 20 s write
+bound (the browser never read it, so it never agreed to stop) fails at once,
+leaving the browser in doubt; only a closed pipe waits `STOP_FINISH`. The
+runner waits `STOP_FINISH` plus 15 s for the App's exit, and correspondingly
+longer for the whole session, so it never kills an App that is still within
+that bound.
 
 **Sandbox.** The adapter adds `--no-sandbox` only when the App runs as root
 (Chromium refuses its sandbox to root; the fixture runs as root unless the
@@ -419,16 +434,25 @@ profile allows the executable. The deb ships an allow-everything profile that
 only names the browser and grants `userns`, like the profiles Ubuntu ships for
 Chrome and Chromium (`src-tauri/linux/takosumi-cef-browser.apparmor`,
 installed as `/usr/share/takosumi/apparmor/takosumi-cef-browser`). The
-post-install script copies it into `/etc/apparmor.d` and reloads it only when
-all of these hold: `/etc/apparmor.d/abi/4.0` exists, the kernel mediates user
-namespaces
-(`/sys/kernel/security/apparmor/features/namespaces/userns_create`), and
-`apparmor_parser -Q -T -K` accepts the shipped copy. AppArmor 3.x (Debian 12,
-Ubuntu 22.04) cannot parse `abi <abi/4.0>` or `userns`, and an unparsable file
-in `/etc/apparmor.d` can make `apparmor.service` fail at boot. The post-remove
-script unloads and removes the installed copy on remove and purge. Both
-scripts pass `sh -n`, dash and shellcheck; the profile passes
-`apparmor_parser -Q -T -K` without being loaded.
+post-install script copies it into `/etc/apparmor.d` whenever
+`/etc/apparmor.d/abi/4.0` exists and `apparmor_parser -Q -T -K` accepts the
+shipped copy. That holds whatever the running kernel is, so an install in a
+chroot without securityfs, or before rebooting into a newer kernel, finds the
+profile at boot. It loads the profile now (`-r -W`) only when the running
+kernel mediates user namespaces
+(`/sys/kernel/security/apparmor/features/namespaces/userns_create`). AppArmor
+3.x (Debian 12, Ubuntu 22.04) cannot parse `abi <abi/4.0>` or `userns`, and an
+unparsable file in `/etc/apparmor.d` can make `apparmor.service` fail at boot,
+so it is skipped there. Tauri's deb bundler cannot declare a dpkg trigger, so
+after an upgrade from such a release the package must be reinstalled (for
+example `apt install --reinstall takosumi`) to install the profile. The
+post-remove script unloads and removes the installed copy on remove and purge.
+On purge it also removes the compiled cache entries named
+`takosumi-cef-browser`: in `apparmor_parser --print-cache-dir`, under each
+`/var/cache/apparmor/*/` and in the pre-3.0 `/etc/apparmor.d/cache`, never
+following links or touching other files. Both scripts pass `sh -n`, `dash -n`
+and shellcheck. The profile passes `apparmor_parser -Q -T -K` without being
+loaded; the scripts were not executed.
 
 **Known limits.** An AppImage cannot install a profile. On a host that restricts
 unprivileged user namespaces, its browser cannot start, and the App reports
@@ -447,6 +471,11 @@ only with the cef-candidate feature `fixture-inspection`. Build fixture
 browsers with it, including the stage behind `browser_process.py --packaged`.
 Build a browser staged for a package without it, so the shipped executable
 cannot open a DevTools port even if its environment asks. The staging script
+refuses a browser containing the `TAKOSUMI_BROWSER_PROCESS_INSPECT` bytes
+unless `--fixture` is given. A fixture stage defaults to
+`src-tauri/target/linux-cef-fixture` (mapped by
+`src-tauri/tauri.linux-cef-fixture.conf.json`), is never written to the package
+stage path (even through a link), and is recorded as such in its manifest. It
 strips ELF files into the stage and symlinks the unchanged data files
 (`--copy` copies them instead). It stages the two executables, `libcef.so`,
 `icudtl.dat`, the V8 snapshot, the `.pak` files, all `locales/*.pak`,
@@ -465,6 +494,9 @@ bun scripts/stage-linux-cef.mjs --cef /absolute/owned/sdk/154.0.34/cef_linux_x86
 bunx tauri build --debug --bundles deb,appimage --features desktop-cef --config src-tauri/tauri.linux-cef.conf.json
 # Fixture browser (browser_process.py --browser, or a stage for --packaged):
 CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+bun scripts/stage-linux-cef.mjs --fixture --cef /absolute/owned/sdk/154.0.34/cef_linux_x86_64 --bin /absolute/owned/target/debug
+# tauri-build copies the fixture stage into target/debug/cef/ for --packaged:
+TAURI_CONFIG="$(cat src-tauri/tauri.linux-cef-fixture.conf.json)" cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 ```
 
 The stage must not exist yet; the script never replaces or removes files. To
