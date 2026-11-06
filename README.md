@@ -73,6 +73,9 @@ this candidate keeps the existing Tauri 2 mobile plugins. On Linux, the
 explicit `desktop-cef` feature opens each connection in its own guarded CEF
 browser process packaged under the bundle's `cef/` resources; see
 [Linux packaging](native-tests/cef-candidate/README.md#linux-packaging-desktop-cef).
+On Windows the same adapter and a Job Object guard compile and are tested in
+CI with an unsandboxed browser candidate, without an App UI or package yet; see
+[Windows guard and adapter](native-tests/cef-candidate/README.md#windows-guard-and-adapter).
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its

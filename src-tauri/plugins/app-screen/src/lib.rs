@@ -22,9 +22,19 @@ pub use models::*;
 pub mod browser_process;
 mod error;
 mod models;
-#[cfg(all(feature = "desktop-process-experiment", not(target_os = "linux")))]
-compile_error!("The browser-process experiment is Linux only.");
-#[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+#[cfg(all(windows, feature = "browser-process"))]
+pub mod windows_job;
+// Linux and Windows (an unsandboxed test candidate there). macOS and others
+// have no adapter for the per-profile browser.
+#[cfg(all(
+    feature = "desktop-process-experiment",
+    not(any(target_os = "linux", windows))
+))]
+compile_error!("The browser-process experiment is available on Linux and Windows only.");
+#[cfg(all(
+    any(target_os = "linux", windows),
+    feature = "desktop-process-experiment"
+))]
 pub use desktop::{browser_process_experiment_status, shutdown_browser_process_experiment};
 #[cfg(any(test, all(desktop, feature = "desktop")))]
 mod resume;

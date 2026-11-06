@@ -1,22 +1,32 @@
-//! Explicit Linux experiment behind the existing shell-only `open` command.
+//! Explicit experiment behind the existing shell-only `open` command, on
+//! Linux and (an unsandboxed test candidate) Windows. The OS-specific pieces
+//! are small cfg'd functions here and in `process_windows.rs`.
+#[cfg(windows)]
+use super::process_windows as windows;
 use super::{failure, private_directory, process_setup as setup};
+#[cfg(target_os = "linux")]
+use crate::browser_process::write_until;
 use crate::{
-    browser_process::{external_link, read_packet, write_until, Reply, Request, MAX_PACKET_BYTES},
+    browser_process::{external_link, read_packet, Reply, Request, MAX_PACKET_BYTES},
     Error, OpenRequest, Result,
 };
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     io::{BufReader, Write},
-    os::fd::AsRawFd,
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    os::fd::AsRawFd,
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    process::ChildStdin,
 };
 use tauri::{AppHandle, Manager};
 
@@ -35,11 +45,18 @@ struct State {
     directory: PathBuf,
     runtime_root: PathBuf,
     /// Root, or the fixture's explicit opt-out: see `setup::without_sandbox`.
+    /// Always false on Windows, where the browser decides its sandbox itself.
     no_sandbox: bool,
     processes: BTreeMap<String, Process>,
     spawner: mpsc::Sender<SpawnRequest>,
 }
 type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+/// The App's end of a browser's control pipe: non-blocking on Linux, a
+/// bounded writer thread on Windows (`process_windows::Input`).
+#[cfg(target_os = "linux")]
+type Input = ChildStdin;
+#[cfg(windows)]
+type Input = windows::Input;
 
 /// Linux delivers a child's parent-death signal when the *thread* that forked
 /// it exits, not only when the App process exits. Tauri's blocking pool
@@ -48,6 +65,7 @@ type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
 /// If it ever panicked, its guards drain their browsers and later opens fail
 /// as unavailable: closed, never an unowned browser. Requesters always wait
 /// for the reply, so a spawned guard is never left untracked.
+#[cfg(target_os = "linux")]
 fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
     let (send, requests) = mpsc::channel::<SpawnRequest>();
     std::thread::Builder::new()
@@ -60,6 +78,31 @@ fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
             loop {
                 std::thread::park();
             }
+        })
+        .map_err(failure)?;
+    Ok(send)
+}
+/// Windows has no parent-death signal. Every guard starts inside one Job
+/// Object this thread owns: created suspended, assigned, then resumed, so it
+/// runs no code outside the job, and detached from any console (no console
+/// window and no console host process; its standard handles are the pipes
+/// and log passed explicitly). The job ends
+/// every guard and browser in it when its last handle closes: when the App
+/// process ends, however it ends, or when every requester is gone (the App
+/// state was dropped, or a test ended). Spawning from one thread also keeps
+/// one guard's pipe ends out of another's inherited handles.
+#[cfg(windows)]
+fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
+    use crate::windows_job::{spawn_in, Job, DETACHED_PROCESS};
+    let job = Job::kill_on_close().map_err(failure)?;
+    let (send, requests) = mpsc::channel::<SpawnRequest>();
+    std::thread::Builder::new()
+        .name("browser-process-parent".into())
+        .spawn(move || {
+            for (mut command, reply) in requests {
+                let _ = reply.send(spawn_in(&job, &mut command, DETACHED_PROCESS));
+            }
+            drop(job);
         })
         .map_err(failure)?;
     Ok(send)
@@ -86,7 +129,7 @@ impl From<Wait> for Error {
 }
 struct Process {
     child: Child,
-    input: Option<ChildStdin>,
+    input: Option<Input>,
     replies: mpsc::Receiver<std::result::Result<Reply, String>>,
     profile: String,
     directory: PathBuf,
@@ -106,6 +149,10 @@ struct Process {
     program: PathBuf,
     /// Opening order: an App quit closes the oldest profile first.
     order: u64,
+    /// The guard's stop request (Windows): this App created it under a fresh
+    /// name the guard opened at start; setting it makes the guard drain.
+    #[cfg(windows)]
+    stop: crate::windows_job::Event,
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 /// How long a browser that agreed to stop (it answered Stopped, or its pipe
@@ -127,7 +174,7 @@ static OPENERS: AtomicU64 = AtomicU64::new(0);
 /// Hand a validated link to the desktop's opener without waiting for it. Its
 /// own process group keeps the desktop browser it may start out of the App's
 /// terminal signals.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn open_externally(url: &str) {
     if OPENERS.fetch_add(1, Ordering::SeqCst) >= 8 {
         OPENERS.fetch_sub(1, Ordering::SeqCst);
@@ -152,6 +199,29 @@ fn open_externally(url: &str) {
                     let _ = child.wait();
                 }
                 Err(error) => eprintln!("The external link could not be opened: {error}"),
+            }
+            OPENERS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if let Err(error) = started {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("The external link could not be opened: {error}");
+    }
+}
+/// Windows: the person's default browser through the shell's `open`, on a
+/// thread of its own, within the same budget of openers.
+#[cfg(all(not(test), windows))]
+fn open_externally(url: &str) {
+    if OPENERS.fetch_add(1, Ordering::SeqCst) >= 8 {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("Too many external links are opening; this one was dropped.");
+        return;
+    }
+    let url = url.to_owned();
+    let started = std::thread::Builder::new()
+        .name("external-open".into())
+        .spawn(move || {
+            if !windows::shell_open(&url) {
+                eprintln!("The external link could not be opened.");
             }
             OPENERS.fetch_sub(1, Ordering::SeqCst);
         });
@@ -198,44 +268,65 @@ pub(super) fn install<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<()> {
 }
 
 fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
-    // SAFETY: these identity calls have no preconditions and cannot fail.
-    let (uid, euid, gid, egid) = unsafe {
-        (
-            libc::getuid(),
-            libc::geteuid(),
-            libc::getgid(),
-            libc::getegid(),
-        )
+    #[cfg(target_os = "linux")]
+    let owner = {
+        // SAFETY: these identity calls have no preconditions and cannot fail.
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
+        setup::plain_identity(uid, euid, gid, egid)?;
+        euid
     };
-    setup::plain_identity(uid, euid, gid, egid)?;
     let paths = app.path();
+    // Windows: the runtime root must lie in this user's profile directory.
+    #[cfg(windows)]
+    let identity = setup::Identity::of(&paths.home_dir().map_err(failure)?)?;
+    #[cfg(windows)]
+    let owner = &identity;
+    #[cfg(target_os = "linux")]
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    // Windows has no XDG runtime directory: the root is `<app cache>\cef`.
+    #[cfg(windows)]
+    let runtime_dir: Option<std::ffi::OsString> = None;
     let plan = setup::plan(
         &setup::Overrides::from_lookup(&setup::environment),
         paths.resource_dir().ok().as_deref(),
-        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        runtime_dir.as_deref(),
         paths.app_cache_dir().ok().as_deref(),
     )?;
     let setup::Located {
         program,
         guard,
         runtime: runtime_root,
-    } = setup::locate(plan, euid)?;
+    } = setup::locate(plan, owner)?;
     // Runtime directories of ended App instances, judged by their locks
     // (tmpfs keeps them until logout; the cache fallback across reboots).
-    for problem in setup::sweep_runtime(&runtime_root, euid) {
+    for problem in setup::sweep_runtime(&runtime_root, owner) {
         eprintln!("A stale browser runtime directory was not removed: {problem}");
     }
     // The sandbox opt-out is a fixture seam only; a product build runs
     // sandboxed unless it runs as root (which Chromium refuses to sandbox).
-    let no_sandbox =
-        setup::without_sandbox(euid, setup::sandbox_opt_out(&setup::environment).as_deref());
+    #[cfg(target_os = "linux")]
+    let no_sandbox = setup::without_sandbox(
+        owner,
+        setup::sandbox_opt_out(&setup::environment).as_deref(),
+    );
+    // The Windows browser decides its sandbox itself (off in the unsandboxed
+    // test candidate); the App passes no switch.
+    #[cfg(windows)]
+    let no_sandbox = false;
     let directory = app
         .path()
         .app_local_data_dir()
         .map_err(failure)?
         .join("browser-process-experiment");
     private_directory(&directory)?;
-    let directory = directory.canonicalize().map_err(failure)?;
+    let directory = setup::canonical(&directory)?;
     Ok(State {
         program,
         guard,
@@ -537,6 +628,8 @@ const STILL_OPEN: &str = "この接続先の画面をすべて閉じてから消
 /// draining after an App crash). The lock names `<hostname>-<pid>`; a lock from
 /// another host, an unreadable or unparsable one, or a live PID counts as live.
 /// A reused PID refuses on the safe side; reopening the profile renews the lock.
+/// (Windows: Chromium's held `lockfile`, see `process_windows::singleton_live`.)
+#[cfg(target_os = "linux")]
 fn singleton_live(root: &std::path::Path) -> bool {
     let target = match std::fs::read_link(root.join("SingletonLock")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
@@ -637,12 +730,13 @@ impl Process {
                 "Browser profile directory must not be a symlink.",
             ));
         }
-        let directory = directory.canonicalize().map_err(failure)?;
+        let directory = setup::canonical(&directory)?;
         // An interrupted clear may have left a detached old cache root.
         if let Err(problem) = remove_detached(&directory) {
             eprintln!("Detached browser data was not removed: {problem}");
         }
         let profile = payload.profile.clone();
+        #[cfg(target_os = "linux")]
         if !setup::socket_path_fits(&runtime) {
             return Err(Error::InvalidRequest(
                 "Browser runtime socket path is too long.",
@@ -655,11 +749,16 @@ impl Process {
                 "Browser runtime directory is in use by another App instance.",
             ));
         }
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&runtime)
-            .map_err(failure)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&runtime)
+                .map_err(failure)?;
+        }
+        #[cfg(windows)]
+        std::fs::create_dir(&runtime).map_err(failure)?;
         // Removed again if no guard starts; a started guard's Process owns it.
         let mut unowned = Unowned(Some(runtime.clone()));
         // Held for this browser's whole lifetime: the sweep of any App sharing
@@ -671,13 +770,11 @@ impl Process {
         if bytes.len() > MAX_PACKET_BYTES {
             return Err(Error::InvalidRequest("Browser request is too large."));
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(directory.join("boot.json"))
-            .map_err(failure)?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(target_os = "linux")]
+        options.mode(0o600);
+        let mut file = options.open(directory.join("boot.json")).map_err(failure)?;
         file.write_all(&bytes).map_err(failure)?;
         file.flush().map_err(failure)?;
         let guard_receipt = runtime.join("guard.json");
@@ -685,12 +782,16 @@ impl Process {
         command.arg(&guard_receipt).arg(&program);
         // The guard owns this process group and its exact descendants. Do not
         // put it in the App's or another runner's process group.
+        #[cfg(target_os = "linux")]
         command.process_group(0);
         // Tie the guard to the App from the moment it forks: if the App died
         // before this point, the guard would otherwise arm its parent-death
-        // signal against its new parent and outlive the App.
+        // signal against its new parent and outlive the App. (Windows: the
+        // spawner starts the guard inside the App's job before it runs.)
+        #[cfg(target_os = "linux")]
         let app = std::process::id();
         // SAFETY: only async-signal-safe calls between fork and exec.
+        #[cfg(target_os = "linux")]
         unsafe {
             command.pre_exec(move || {
                 // prctl is variadic and reads unsigned longs.
@@ -710,6 +811,7 @@ impl Process {
         if setup::inspection(&setup::environment) {
             command.env("TAKOSUMI_BROWSER_PROCESS_INSPECT", "1");
         }
+        #[cfg(target_os = "linux")]
         for key in [
             "PATH",
             "USER",
@@ -726,6 +828,7 @@ impl Process {
                 command.env(key, value);
             }
         }
+        #[cfg(target_os = "linux")]
         for (key, name) in [
             ("HOME", "home"),
             ("XDG_DATA_HOME", "data"),
@@ -737,18 +840,39 @@ impl Process {
             private_directory(&path)?;
             command.env(key, path);
         }
-        private_directory(&runtime.join("tmp"))?;
-        command.env("TMPDIR", runtime.join("tmp"));
+        #[cfg(target_os = "linux")]
+        {
+            private_directory(&runtime.join("tmp"))?;
+            command.env("TMPDIR", runtime.join("tmp"));
+        }
+        #[cfg(windows)]
+        let stop = {
+            for key in WINDOWS_ENVIRONMENT {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            private_directory(&runtime.join("tmp"))?;
+            command
+                .env("TEMP", runtime.join("tmp"))
+                .env("TMP", runtime.join("tmp"));
+            let name = windows::stop_event_name(&runtime);
+            let stop = crate::windows_job::Event::create(&name).map_err(failure)?;
+            command.env(crate::windows_job::STOP_EVENT_ENV, &name);
+            stop
+        };
         private_directory(&directory.join("Downloads"))?;
-        let output = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(target_os = "linux")]
+        options.mode(0o600);
+        let output = options
             .open(directory.join("browser.log"))
             .map_err(failure)?;
+        command.env("TAKOSUMI_BROWSER_PROCESS_DIRECTORY", &directory);
+        #[cfg(target_os = "linux")]
+        command.env("LD_LIBRARY_PATH", program.parent().unwrap());
         command
-            .env("TAKOSUMI_BROWSER_PROCESS_DIRECTORY", &directory)
-            .env("LD_LIBRARY_PATH", program.parent().unwrap())
             // The browser derives CEF's own sandbox setting from this switch.
             .args(no_sandbox.then_some("--no-sandbox"))
             .args([
@@ -757,9 +881,11 @@ impl Process {
                 "--disable-background-networking",
                 "--disable-component-update",
                 "--disable-sync",
-                "--password-store=basic",
-                "--lang=en-US",
-            ])
+            ]);
+        #[cfg(target_os = "linux")]
+        command.arg("--password-store=basic");
+        command
+            .arg("--lang=en-US")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(output);
@@ -769,7 +895,11 @@ impl Process {
         let (send, replies) = mpsc::channel();
         let process = Self {
             child,
+            #[cfg(target_os = "linux")]
             input: Some(input),
+            // Set just below, once this Process owns the started guard.
+            #[cfg(windows)]
+            input: None,
             replies,
             profile,
             directory,
@@ -782,8 +912,18 @@ impl Process {
             _runtime_lock: runtime_lock,
             program,
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
+            #[cfg(windows)]
+            stop,
         };
+        #[cfg(target_os = "linux")]
         nonblocking(process.input.as_ref().unwrap())?;
+        // A failure here drops the Process, which asks the guard to stop.
+        #[cfg(windows)]
+        let process = {
+            let mut process = process;
+            process.input = Some(windows::Input::new(input).map_err(failure)?);
+            process
+        };
         let owner = process.profile.clone();
         std::thread::Builder::new()
             .name("browser-process-replies".into())
@@ -852,7 +992,7 @@ impl Process {
                 closed: true,
             });
         };
-        write_until(input, &bytes, deadline).map_err(|error| Unsent {
+        write_input(input, &bytes, deadline).map_err(|error| Unsent {
             closed: matches!(
                 error.kind(),
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WriteZero
@@ -952,11 +1092,11 @@ impl Process {
                 && browser_id > 0
                 && window_id > 0
                 && native_pid > 0
-                && native_parent(native_pid) == Some(self.child.id())
-                && std::fs::read_link(format!("/proc/{native_pid}/exe")).ok()
-                    == Some(self.program.clone())
-                && PathBuf::from(&cache_path)
-                    == self.directory.join("cef-profiles").join(&self.profile) =>
+                && native_owned(native_pid, &self.child, &self.program)
+                && same_path(
+                    &cache_path,
+                    &self.directory.join("cef-profiles").join(&self.profile),
+                ) =>
             {
                 self.opened = serde_json::json!({"key":actual,"profile":profile,"browserId":browser_id,"nativeCache":cache_path,"windowId":window_id,"nativePid":native_pid});
                 self.opening = None;
@@ -1188,7 +1328,7 @@ fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     #[test]
@@ -2303,6 +2443,522 @@ sys.stdin.read()' "$1"
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
+/// Windows: unit tests run by the `cef-windows` CI job, and two tests of the
+/// real adapter `Process` with the built `takosumi-browser-guard.exe` and
+/// `takosumi-cef-browser-process.exe` (ignored by default; the job runs them
+/// with `TAKOSUMI_WINDOWS_GUARD` and `TAKOSUMI_WINDOWS_BROWSER` set).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::{os::windows::io::AsRawHandle, path::Path, time::Instant};
+
+    #[test]
+    fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
+        let app = tauri::test::mock_app();
+        install(app.handle()).unwrap();
+        assert!(app.try_state::<Backend>().is_none());
+        let reason = unavailable(app.handle()).expect("an unavailable reason");
+        assert!(
+            reason.starts_with("The desktop browser is unavailable: ")
+                && reason.contains("Browser process executable is unavailable"),
+            "{reason}"
+        );
+        assert!(!super::super::capabilities_of(app.handle()).clear_profile);
+    }
+
+    #[test]
+    fn a_write_the_browser_does_not_read_times_out_and_holds_the_next() {
+        // ping never reads its standard input.
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = windows::Input::new(child.stdin.take().unwrap()).unwrap();
+        let started = Instant::now();
+        let first = input.write_until(&vec![b'x'; 4 << 20], started + Duration::from_millis(300));
+        let second = input.write_until(b"{}\n", Instant::now() + Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        let passed = input.write_until(b"{}\n", Instant::now());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The reader is gone: the pending write fails and the pipe is closed.
+        let after = input.write_until(b"{}\n", Instant::now() + Duration::from_secs(10));
+        drop(input);
+        assert_eq!(first.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(second.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(passed.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(after.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn dropping_the_writer_during_a_blocked_write_closes_the_pipe() {
+        // The reader sleeps without reading, then reads its input to the end
+        // and prints how much arrived. A write that was cancelled when the
+        // App's end was dropped leaves part of the 4 MiB, and the end of
+        // input follows; a write that went on would deliver all of it.
+        // Python is on the windows-latest image (the W1 smoke runs under
+        // it too). A PowerShell reader was not used: whether powershell.exe
+        // leaves a redirected standard input unread before its -Command
+        // script runs was not established.
+        let mut child = Command::new("python")
+            .args([
+                "-I",
+                "-c",
+                "import sys,time\ntime.sleep(3)\nprint(len(sys.stdin.buffer.read()),flush=True)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = windows::Input::new(child.stdin.take().unwrap()).unwrap();
+        let size = 4 << 20;
+        let blocked = input.write_until(
+            &vec![b'x'; size],
+            Instant::now() + Duration::from_millis(300),
+        );
+        drop(input);
+        let mut stdout = child.stdout.take().unwrap();
+        let (send, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = send.send(text);
+        });
+        let text = received.recv_timeout(Duration::from_secs(30));
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(blocked.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let delivered: usize = text
+            .expect("the reader saw the end of its input in time")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            delivered < size,
+            "the blocked write was not cancelled: {delivered}"
+        );
+    }
+
+    #[test]
+    fn a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("sumi-clear-{}", std::process::id()));
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let cache = root.join(profile).join("cef-profiles");
+        private_directory(&cache.join(profile)).unwrap();
+        private_directory(&root.join(profile).join("Downloads")).unwrap();
+        std::fs::write(cache.join(profile).join("Cookies"), b"x").unwrap();
+        std::fs::write(
+            root.join(profile).join("Downloads").join("keep.txt"),
+            b"keep",
+        )
+        .unwrap();
+        let free = windows::singleton_live(&cache);
+        // As Chromium holds it: written, shared for reading only, deleted on close.
+        let held = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0x1)
+            .custom_flags(0x0400_0000)
+            .open(cache.join("lockfile"))
+            .unwrap();
+        let live = windows::singleton_live(&cache);
+        let refused = clear_site_data(&root, profile);
+        let kept = cache.join(profile).join("Cookies").exists();
+        drop(held);
+        let released = !cache.join("lockfile").exists() && !windows::singleton_live(&cache);
+        // A leftover file nobody holds is free.
+        std::fs::write(cache.join("lockfile"), b"").unwrap();
+        let leftover = windows::singleton_live(&cache);
+        let cleared = clear_site_data(&root, profile);
+        let gone = !cache.exists();
+        let downloads = std::fs::read(root.join(profile).join("Downloads").join("keep.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!free && live && kept && released && !leftover);
+        match refused {
+            Err(Error::InvalidRequest(message)) => assert_eq!(message, STILL_OPEN),
+            other => panic!("{other:?}"),
+        }
+        cleared.unwrap();
+        assert!(gone);
+        assert_eq!(downloads.unwrap(), b"keep");
+    }
+
+    /// The built executables, named by the CI job.
+    fn built(key: &str) -> PathBuf {
+        PathBuf::from(
+            std::env::var_os(key).unwrap_or_else(|| panic!("{key} must name the built executable")),
+        )
+    }
+
+    /// A new case directory in this user's profile (where a runtime root must
+    /// be). It is kept for inspection.
+    fn case(name: &str) -> PathBuf {
+        let base = std::env::var_os("TAKOSUMI_WINDOWS_WORK")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let case = base.join(format!("sumi-w2-{name}-{}-{nanos}", std::process::id()));
+        private_directory(&case.join("rt")).unwrap();
+        let case = setup::canonical(&case).unwrap();
+        println!("case directory: {}", case.display());
+        case
+    }
+
+    /// The executables and the case's runtime root as `prepare` locates them.
+    fn located(case: &Path) -> setup::Located {
+        let home = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE"));
+        let identity = setup::Identity::of(&home).unwrap();
+        setup::locate(
+            setup::Plan {
+                program: built("TAKOSUMI_WINDOWS_BROWSER"),
+                guard: built("TAKOSUMI_WINDOWS_GUARD"),
+                runtime: setup::Runtime::Given(case.join("rt")),
+            },
+            &identity,
+        )
+        .unwrap()
+    }
+
+    fn payload(profile: &str, resume: bool) -> OpenRequest {
+        serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://example.com"),
+            "url":"https://example.com/","title":"Windows adapter","profile":profile,
+            "webHome":true,"resume":resume
+        }))
+        .unwrap()
+    }
+
+    fn tail(path: &Path) -> String {
+        let text = std::fs::read(path).unwrap_or_default();
+        String::from_utf8_lossy(&text[text.len().saturating_sub(8192)..]).into_owned()
+    }
+
+    /// What a failed creation needs for diagnosis: the guard's state, its
+    /// children with their images, the expected program and cache path, and
+    /// the browser's logs.
+    fn report(process: &mut Process, located: &setup::Located, error: &Error) {
+        let guard = process.child.id();
+        eprintln!("creation failed: {error}");
+        eprintln!("guard {guard}: {:?}", process.child.try_wait());
+        for pid in windows::tree_of(guard) {
+            eprintln!(
+                "  process {pid}: parent {:?}, image {:?}",
+                windows::parent_of(pid),
+                windows::image_of(pid)
+            );
+        }
+        eprintln!("expected program: {:?}", located.program);
+        eprintln!(
+            "expected cache: {:?}",
+            process
+                .directory
+                .join("cef-profiles")
+                .join(&process.profile)
+        );
+        eprintln!("receipt: {}", tail(&process.guard_receipt));
+        for name in ["browser.log", "cef-native.log"] {
+            eprintln!(
+                "----- {name} -----\n{}",
+                tail(&process.directory.join(name))
+            );
+        }
+    }
+
+    /// Start a profile through the adapter's `Process::spawn` and wait for its
+    /// creation reply through `expect_open_until` (what `expect_open` does,
+    /// with a cold-start bound of 120 s instead of 20 s; the time taken is
+    /// printed).
+    fn opened(
+        case: &Path,
+        located: &setup::Located,
+        parent: &mpsc::Sender<SpawnRequest>,
+        profile: &str,
+    ) -> Process {
+        let started = Instant::now();
+        let mut process = Process::spawn(
+            located.program.clone(),
+            located.guard.clone(),
+            case.join("profiles").join(profile),
+            located.runtime.join(setup::runtime_name(
+                std::process::id(),
+                NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst),
+            )),
+            payload(profile, false),
+            parent,
+            false,
+        )
+        .expect("the guard starts");
+        let key = format!("web-home:{profile}:https://example.com");
+        let result = process.expect_open_until(1, &key, started + Duration::from_secs(120));
+        println!("opened in {:.3} s", started.elapsed().as_secs_f64());
+        if let Err(error) = &result {
+            report(&mut process, located, error);
+        }
+        result.unwrap();
+        process
+    }
+
+    /// The browser's direct children, each held open before it is examined
+    /// (so its id cannot name another process meanwhile): CEF helpers run
+    /// the browser's own executable; console hosts are `conhost.exe`, which
+    /// Windows starts for the browser's windowless console. Only helpers
+    /// still running when held count. Waits up to 30 s for the first helper
+    /// (the page's renderer, if not already the GPU or a utility process).
+    struct Children {
+        helpers: Vec<(u32, std::os::windows::io::OwnedHandle)>,
+        hosts: Vec<(u32, std::os::windows::io::OwnedHandle)>,
+    }
+    fn children(native_pid: u32, program: &Path) -> Children {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut found = Children {
+                helpers: Vec::new(),
+                hosts: Vec::new(),
+            };
+            for pid in windows::tree_of(native_pid) {
+                let Some(handle) = windows::waitable(pid) else {
+                    continue;
+                };
+                if pid == native_pid || windows::parent_of(pid) != Some(native_pid) {
+                    continue;
+                }
+                let image = windows::image_of(pid);
+                if image.as_deref() == Some(program) {
+                    if matches!(crate::windows_job::exit_code(&handle), Ok(None)) {
+                        found.helpers.push((pid, handle));
+                    }
+                } else if image
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("conhost.exe"))
+                {
+                    found.hosts.push((pid, handle));
+                }
+            }
+            if !found.helpers.is_empty() || Instant::now() >= deadline {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A fresh view of `root`'s process tree for a failure message: each
+    /// process with its recorded parent and image, and the expected program.
+    fn describe(root: u32, program: &Path) -> String {
+        let mut lines = vec![format!("expected program: {program:?}")];
+        for pid in windows::tree_of(root) {
+            lines.push(format!(
+                "  process {pid}: parent {:?}, image {:?}",
+                windows::parent_of(pid),
+                windows::image_of(pid)
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// The entries of a directory, for a failure message.
+    fn listing(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| {
+                        Some(entry.ok()?.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "needs the built Windows guard and browser (see the module comment)"]
+    fn windows_adapter_opens_reuses_and_shuts_down_a_profile() {
+        let case = case("open");
+        let located = located(&case);
+        let parent = spawner().unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let mut process = opened(&case, &located, &parent, profile);
+        let first = process.opened.clone();
+        let native_pid = first["nativePid"].as_u64().unwrap() as u32;
+        // What confirm_opened accepted, restated against Windows' records.
+        assert_ne!(native_pid, process.child.id());
+        assert_eq!(windows::parent_of(native_pid), Some(process.child.id()));
+        assert_eq!(
+            windows::image_of(native_pid).as_deref(),
+            Some(located.program.as_path())
+        );
+        assert_eq!(
+            first["nativeCache"].as_str(),
+            process
+                .directory
+                .join("cef-profiles")
+                .join(profile)
+                .to_str()
+        );
+        let tree = windows::tree_of(process.child.id());
+        let children = children(native_pid, &located.program);
+        let ids = |held: &[(u32, _)]| held.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
+        println!(
+            "guard tree while open: {tree:?}; CEF helpers: {:?}; console hosts: {:?}",
+            ids(&children.helpers),
+            ids(&children.hosts)
+        );
+        assert!(
+            !children.helpers.is_empty(),
+            "no CEF helper below the browser:\n{}",
+            describe(native_pid, &located.program)
+        );
+        assert!(
+            !children.hosts.is_empty(),
+            "no console host below the browser:\n{}",
+            describe(native_pid, &located.program)
+        );
+        // CEF's process singleton holds the profile's lockfile while the
+        // browser runs: what clear_profile's refusal relies on.
+        let root = process.directory.join("cef-profiles");
+        assert!(
+            windows::singleton_live(&root),
+            "the live profile's lockfile is not held: {:?}",
+            listing(&root)
+        );
+        // Reopening the same screen reuses its native browser and window.
+        process
+            .open(payload(profile, true))
+            .expect("the same screen reopens");
+        for field in ["browserId", "windowId", "nativePid", "nativeCache"] {
+            assert_eq!(process.opened[field], first[field], "{field}");
+        }
+        // The adapter's ordinary shutdown: the browser stops and its guard
+        // ends normally with a complete receipt.
+        let stopping = Instant::now();
+        let stopped = process.shutdown();
+        let receipt = std::fs::read(&process.guard_receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        println!(
+            "{}",
+            serde_json::json!({
+                "opened": first,
+                "shutdownSeconds": stopping.elapsed().as_secs_f64(),
+                "guardExit": format!("{:?}", process.child.try_wait()),
+                "receipt": receipt,
+            })
+        );
+        assert!(
+            stopped.expect("the profile shuts down"),
+            "no page cancelled"
+        );
+        let receipt = receipt.expect("a guard receipt");
+        require_normal_guard(&receipt).unwrap();
+        assert_eq!(
+            receipt["kernelNoChildren"], true,
+            "the guard's job is empty"
+        );
+        // The browser, its console host(s) and the helpers held while it ran
+        // were all in the guard's job: a helper outside it would leave the
+        // count short, since the browser and its console host alone make
+        // two.
+        let expected = 1 + children.hosts.len() + children.helpers.len();
+        let observed = receipt["observed"].as_u64().unwrap();
+        assert!(
+            observed >= expected as u64,
+            "the guard's job counted {observed} processes, fewer than the browser, \
+             {} console host(s) and {} CEF helper(s)",
+            children.hosts.len(),
+            children.helpers.len()
+        );
+        assert!(process
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success()));
+        assert!(
+            !windows::singleton_live(&root),
+            "the ended profile's lockfile is released: {:?}",
+            listing(&root)
+        );
+        let runtime = process.runtime.clone();
+        drop(process);
+        assert!(
+            !runtime.exists(),
+            "an ended browser's runtime directory goes"
+        );
+        drop(parent);
+    }
+
+    #[test]
+    #[ignore = "needs the built Windows guard and browser (see the module comment)"]
+    fn windows_adapter_ending_the_app_job_ends_guard_and_browser() {
+        let case = case("job");
+        let located = located(&case);
+        let parent = spawner().unwrap();
+        let profile = "22222222-2222-4222-8222-222222222222";
+        let mut process = opened(&case, &located, &parent, profile);
+        let native_pid = process.opened["nativePid"].as_u64().unwrap() as u32;
+        // Helpers held while running: one that ends by itself before the
+        // App's job does has still ended, so it cannot make this flaky.
+        let children = children(native_pid, &located.program);
+        assert!(
+            !children.helpers.is_empty(),
+            "no CEF helper below the browser:\n{}",
+            describe(native_pid, &located.program)
+        );
+        let tree = windows::tree_of(process.child.id());
+        println!(
+            "guard tree before the App's job ends: {tree:?}; CEF helpers: {:?}",
+            children
+                .helpers
+                .iter()
+                .map(|(pid, _)| *pid)
+                .collect::<Vec<_>>()
+        );
+        assert!(tree.contains(&native_pid), "{tree:?}");
+        // The guard and the browser itself must still be there.
+        let mut handles = tree
+            .iter()
+            .filter_map(|pid| windows::waitable(*pid).map(|handle| (*pid, handle)))
+            .collect::<Vec<_>>();
+        for pid in [process.child.id(), native_pid] {
+            assert!(
+                handles.iter().any(|(held, _)| *held == pid),
+                "process {pid} is not open"
+            );
+        }
+        handles.extend(children.helpers);
+        handles.extend(children.hosts);
+        // The App side ends: its spawner closes the App's Job Object, as the
+        // App process's end does.
+        drop(parent);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut outlived = Vec::new();
+        for (pid, handle) in &handles {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ended = crate::windows_job::wait_any(&[handle.as_raw_handle()], Some(remaining));
+            if !matches!(ended, Ok(Some(0))) {
+                outlived.push(format!("{pid} {:?} {ended:?}", windows::image_of(*pid)));
+            }
+        }
+        assert!(
+            outlived.is_empty(),
+            "processes outlived the App's job: {outlived:?}"
+        );
+        assert!(process.child.try_wait().unwrap().is_some());
+        assert!(
+            process.normal_guard().is_err(),
+            "a guard ended with the App leaves no normal receipt"
+        );
+        drop(process);
+    }
+}
 /// The fixture guard (`guard.py`) runs under python3; the product guard
 /// (`takosumi-browser-guard`) is executed directly. Both take the same
 /// arguments and write the same receipt.
@@ -2315,6 +2971,34 @@ fn guard_command(guard: &std::path::Path) -> Command {
         Command::new(guard)
     }
 }
+/// The Windows environment a guard and its browser keep: the system
+/// locations Windows components and Chromium read (`SystemRoot` above all;
+/// Winsock and other system libraries fail without it), the user's profile
+/// folders and `PATH`. `TEMP` and `TMP` point into the browser's runtime
+/// directory instead, and the guard's stop event is added. Nothing else of
+/// the App's environment passes.
+#[cfg(windows)]
+const WINDOWS_ENVIRONMENT: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATH",
+    "PATHEXT",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "CommonProgramFiles",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "USERNAME",
+    "COMPUTERNAME",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
 fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> Result<Child> {
     let (reply, spawned) = mpsc::sync_channel(1);
     spawner
@@ -2322,6 +3006,23 @@ fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> 
         .map_err(|_| Error::InvalidRequest("Browser process parent is unavailable."))?;
     spawned.recv().map_err(failure)?.map_err(failure)
 }
+#[cfg(target_os = "linux")]
+fn write_input(
+    input: &mut Input,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    write_until(input, bytes, deadline)
+}
+#[cfg(windows)]
+fn write_input(
+    input: &mut Input,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    input.write_until(bytes, deadline)
+}
+#[cfg(target_os = "linux")]
 fn nonblocking(input: &ChildStdin) -> Result<()> {
     // SAFETY: this owned pipe is live and protected by the backend mutex.
     let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
@@ -2332,6 +3033,25 @@ fn nonblocking(input: &ChildStdin) -> Result<()> {
     }
     Ok(())
 }
+/// The `opened` reply's native process is the guard's own child running
+/// exactly `program` (Windows: `process_windows::native_owned`).
+#[cfg(target_os = "linux")]
+fn native_owned(native_pid: u32, guard: &Child, program: &std::path::Path) -> bool {
+    native_parent(native_pid) == Some(guard.id())
+        && std::fs::read_link(format!("/proc/{native_pid}/exe"))
+            .ok()
+            .as_deref()
+            == Some(program)
+}
+/// The cache path CEF reported is the requested one (Windows compares the
+/// spelling exactly: `process_windows::same_path`).
+#[cfg(target_os = "linux")]
+fn same_path(reported: &str, expected: &std::path::Path) -> bool {
+    std::path::Path::new(reported) == expected
+}
+#[cfg(windows)]
+use windows::{native_owned, same_path, singleton_live};
+#[cfg(target_os = "linux")]
 fn native_parent(pid: u32) -> Option<u32> {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()?
@@ -2361,8 +3081,15 @@ impl Drop for Process {
             // A live, unreaped direct Child cannot have its PID recycled.
             // SIGTERM asks the dedicated pidfd/subreaper guard to drain all
             // owned descendants; never SIGKILL that guard or scan by name.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+            // Windows: the guard's stop event. Never terminate the guard: its
+            // job would end the browser without a drain or a receipt.
+            #[cfg(windows)]
+            if let Err(error) = self.stop.set() {
+                eprintln!("A browser guard could not be asked to stop: {error}");
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while std::time::Instant::now() < deadline {

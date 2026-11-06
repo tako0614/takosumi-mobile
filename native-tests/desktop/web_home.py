@@ -8,9 +8,11 @@ import json
 from http.cookies import SimpleCookie
 import os
 from pathlib import Path
+import re
 import resource
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -154,8 +156,38 @@ def reap_observed_children(tracked, descriptions, statuses):
             statuses[pid] = (start, os.waitstatus_to_exitcode(status))
 
 
+def descriptor_kinds(pid, descriptors=(0, 1, 2)):
+    # The kind of each standard descriptor, never a path: a pipe or socket
+    # keeps its inode (`pipe:[12345]`) so two processes sharing one can be
+    # matched; anything else is only its kind (`file`, `char`, `anon_inode`).
+    kinds = {}
+    for fd in descriptors:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except FileNotFoundError:
+            kinds[str(fd)] = "closed"
+            continue
+        except (ProcessLookupError, PermissionError, OSError):
+            kinds[str(fd)] = "unreadable"
+            continue
+        if re.fullmatch(r"(pipe|socket):\[\d+\]", target):
+            kinds[str(fd)] = target
+        elif target.startswith("anon_inode:"):
+            kinds[str(fd)] = "anon_inode"
+        else:
+            try:
+                mode = os.stat(f"/proc/{pid}/fd/{fd}").st_mode
+            except OSError:
+                kinds[str(fd)] = "unreadable"
+                continue
+            kinds[str(fd)] = ("file" if stat.S_ISREG(mode) else "char" if stat.S_ISCHR(mode) else
+                              "dir" if stat.S_ISDIR(mode) else "fifo" if stat.S_ISFIFO(mode) else "other")
+    return kinds
+
+
 def shutdown_description(pid):
     details = process_description(pid)
+    details["fds"] = descriptor_kinds(pid)
     threads = []
     try:
         for task in sorted(Path(f"/proc/{pid}/task").iterdir())[:12]:
@@ -193,7 +225,9 @@ def wait_engine_children(tracked, descriptions):
         if not alive:
             break
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"Old App engine children still alive: {[shutdown_description(pid) for pid in alive]}")
+            # This worker's own stdout/stderr, to compare with the children's.
+            raise RuntimeError(f"Old App engine children still alive: {[shutdown_description(pid) for pid in alive]}; "
+                               f"worker descriptors: {descriptor_kinds(os.getpid(), (1, 2))}")
         time.sleep(0.025)
     # WebKit may deliberately kill a WebProcess. Record its status without
     # treating that rendering-process policy as a NetworkProcess flush.
@@ -287,6 +321,8 @@ def run_desktop_session(command, env, timeout=170, *, stdout=None, stderr=None):
         # waits distinguish a live engine/storage stall from a runner timeout.
         for pid in sorted({process.pid} | descendants(process.pid))[:12]:
             print(f"Owned desktop session timeout: {shutdown_description(pid)}", file=sys.stderr, flush=True)
+        print(f"Owned desktop session timeout: runner descriptors {descriptor_kinds(os.getpid(), (1, 2))}",
+              file=sys.stderr, flush=True)
         raise
     finally:
         for sig in (signal.SIGTERM, signal.SIGKILL):

@@ -245,8 +245,9 @@ Run `--app photopea` in another fresh case for the second anonymous origin.
 The fixture browser needs the cef-candidate feature `fixture-inspection` for
 its observation seam (see [Linux packaging](#linux-packaging-desktop-cef)).
 
-`takosumi-browser-guard` (`src/guard_main.rs`, compiled only for Linux through
-`src/guard_entry.rs`) is the product supervisor that
+`takosumi-browser-guard` (`src/guard_main.rs` on Linux, chosen by
+`src/guard_entry.rs`; the Windows guard is described under
+[Windows guard and adapter](#windows-guard-and-adapter)) is the product supervisor that
 replaces the fixture's Python guard for the Linux-first per-profile release. It
 keeps `guard.py`'s arguments and receipt: an exclusive 0600 receipt, its own
 process group, a pidfd probe, the child subreaper, SIGTERM on parent death,
@@ -347,8 +348,10 @@ support. Retain each exact-source receipt when comparing later candidates.
 
 The App feature `desktop-cef` enables this per-profile browser path in a normal
 App build, without the fixture driver; `native-browser-process-fixture` now
-implies it. It is Linux only, never enabled by default, and nothing here
-publishes or signs a package. The first local packaging default (chosen by the
+implies it. This section is about Linux; on Windows the feature compiles for
+the unsandboxed candidate without a package (see
+[Windows guard and adapter](#windows-guard-and-adapter)). It is never enabled
+by default, and nothing here publishes or signs a package. The first local packaging default (chosen by the
 coordinator, not an approval to publish or distribute) is a deb plus an AppImage.
 
 **Locations** (`src-tauri/plugins/app-screen/src/desktop/process_setup.rs`).
@@ -557,25 +560,24 @@ or of a release.
 
 `takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`, as an
 unsandboxed test candidate that must be asked for by name with the
-cef-candidate feature `windows-unsandboxed-candidate`. This first Windows step
-runs the browser on its own, started by `windows_smoke.py` or the CI job; the
-App does not start it on Windows yet (`desktop-process-experiment` and
-`desktop-cef` stay Linux only), and nothing is staged or packaged.
+cef-candidate feature `windows-unsandboxed-candidate`. The first Windows step
+(W1, this section) ran the browser on its own, started by `windows_smoke.py`
+or the CI job. The second (W2, [Windows guard and adapter](#windows-guard-and-adapter))
+adds the Windows `takosumi-browser-guard` and lets the App's adapter start
+both; nothing is staged or packaged.
 
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"   # the first build downloads the Windows distribution here
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
 python -B native-tests/cef-candidate/windows_smoke.py --browser <target>\debug\takosumi-cef-browser-process.exe --work C:\absolute\owned\cases
 ```
 
-Build only that bin on Windows. The guard needs Linux pidfds, signalfd and the
-child subreaper, and the standalone `takosumi-cef-candidate` is a Linux
-experiment. Both refuse to compile on other OSes with a single error, and so
-does the browser without the feature, instead of building something that does
-not work as a product and that a stage could pick up by mistake. A Windows
-supervisor (for example a Job Object owning the browser's processes, as the
-harness uses) is not written. The build needs the MSVC toolchain, CMake and
-Ninja for cef-dll-sys's `libcef_dll_wrapper`, as `windows-latest` provides.
+The standalone `takosumi-cef-candidate` is a Linux experiment and refuses to
+compile on other OSes with a single error, and so does the browser without
+the feature, instead of building something that does not work as a product
+and that a stage could pick up by mistake. The build needs the MSVC
+toolchain, CMake and Ninja for cef-dll-sys's `libcef_dll_wrapper`, as
+`windows-latest` provides.
 
 The X11 raise (`x11_front`), the euid sandbox decision (`libc` is now a
 Linux-only dependency) and the `$ORIGIN` run path are compiled only for Linux,
@@ -632,9 +634,9 @@ effect there. On Windows:
   Otherwise Windows flashes the taskbar button and the browser prints
   `Reused browser window was not raised: Windows refused the foreground change`
   to stderr, as it does for an X11 refusal.
-- **Console.** The executable keeps the console subsystem. An App starting it
-  from a GUI process must pass `CREATE_NO_WINDOW` (or the browser must move to
-  the Windows subsystem) to avoid a console window. Not handled yet.
+- **Console.** The executable keeps the console subsystem. The App starts the
+  guard, and the guard the browser, with `CREATE_NO_WINDOW` (W2), so neither
+  opens a console window.
 
 **Smoke harness.** `windows_smoke.py` uses only the Python 3 standard library
 (`ctypes` for Win32) and runs on both OSes. It creates a new case directory
@@ -677,7 +679,7 @@ its embedded manifest and runs the harness. It then builds the
 
 **2026-11-06 checks.** The browser type-checks for `x86_64-pc-windows-msvc`
 with `cargo check --features cef/dox,windows-unsandboxed-candidate`, and
-without the feature it stops at its single compile error, as the guard does;
+without the feature it stops at its single compile error, as the guard then did;
 `dox` skips cef-dll-sys's build script, which needs the Windows SDK, so
 nothing was linked or run for Windows on the Linux host. The Linux build, the
 guard self-tests and the plugin tests passed. The first version of the harness
@@ -688,6 +690,240 @@ stand-in browser. The first CI run (PR #29, head `afd2c44`, before the
 feature, the manifest check and the stricter harness) passed both smoke runs
 on `windows-latest`, with no raise refusal and no process left by image name.
 Windows evidence comes only from the CI job.
+
+## Windows guard and adapter
+
+The second Windows step (W2) makes the App's per-profile browser backend work
+on Windows at the adapter level: `takosumi-browser-guard` for Windows, and the
+app-screen plugin's `desktop-process-experiment` (and so the App's
+`desktop-cef`) compiled for Windows, where it starts the guard and the browser
+through the same `Process` code as on Linux. macOS and other OSes still refuse
+both with a single compile error. There is no App UI or fixture on Windows
+yet (that is W3), and the browser stays the unsandboxed candidate.
+
+**Guard** (`src/guard_windows.rs`, chosen by `src/guard_entry.rs`; the Linux
+`src/guard_main.rs` is unchanged). Same command line
+(`<absolute new receipt> <program> [args...]`), receipt fields and exit codes.
+It refuses (exit 2, nothing started) a relative or existing receipt path, a
+guard outside any Job Object, and a missing or unopenable stop event. It
+creates its own Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no
+breakaway, reserves the receipt (`CREATE_NEW`, never through a link), and
+starts the browser in the job before it runs any code: created
+`CREATE_SUSPENDED | CREATE_NO_WINDOW` with the guard's own stdin, stdout and
+stderr (the App's control pipe, reply pipe and log), assigned, then resumed.
+`CREATE_NO_WINDOW` gives the browser a console without a window, and with it
+a windowless console host (`conhost.exe`) child in the guard's job. CEF's
+helper processes run the same console program and share that one hidden
+console. Started detached (`DETACHED_PROCESS`, no console), each helper would
+instead get a new console of its own, possibly a visible one, and a console
+host each, so the browser keeps its hidden console. `observed` therefore also
+counts that console host, and the drain waits for it like any other process
+in the job. It then waits, without polling or a lifetime cap, for the browser's exit or a
+stop request. A stop request is the App setting a manual-reset named event
+(`Local\takosumi-browser-guard-stop-<App pid>-<runtime>-<nanos>`) that the App
+created (an existing name is refused) and named in
+`TAKOSUMI_BROWSER_GUARD_STOP_EVENT`; the guard opens it at start and removes
+the variable from the browser's environment. Like a signal on Linux, any
+process of the same user could set it. The drain always runs: up to 0.5 s for
+the browser and every process in the job to end, then `TerminateJobObject`
+(the processes still in the job end with the exit code `0xE0007462`, a
+customer NTSTATUS no program returns by accident; as `rootExit` it reads
+-536841118), then up to 2 s for the job to empty. A job that is found empty
+just after the 0.5 s is not terminated, and nothing is counted as forced.
+`forcedCleanup` is counted exactly: before terminating, the guard reads the
+job's total and then its process list, and holds each listed process open;
+afterwards it counts the listed processes that ended with that exit code
+(or still run), plus every process that entered the job after the total was
+read (counted as forced, so none is missed; one entering between the two
+reads may count twice). A listed process that was already gone when opened
+ended by itself and is not counted (an id reused by an unrelated process
+between the list and the open can only add a count, never hide one). Any other failure to attribute an end
+is recorded in `cleanupErrors` as `ForcedCleanupUnknown`, which makes the
+receipt abnormal, as a failed signal does on Linux. The completion proof is
+`ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
+browser exited, recorded under the Linux key `kernelNoChildren`; `remaining`
+lists the process ids still in the job (`JobObjectBasicProcessIdList`) and
+`observed` is `TotalProcesses` (every process ever in the job, the browser
+included). A process the browser has started outside its tree through a
+system service (COM, WMI, the task scheduler) is not in the job.
+
+**Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
+thread owns one kill-on-close Job Object for the App and starts every guard
+inside it (suspended, assigned, resumed). The guard is started
+`DETACHED_PROCESS`: it needs no console, so it has no console host either;
+its standard handles are the pipes and log passed explicitly. Jobs nest, so a
+browser is in its guard's job and, through it, in the App's. When the App
+process ends, however it ends, the system closes the App's job and ends every
+guard and browser with it: the profiles are retained, but such guards write
+no receipt. The spawner thread drops the job when every requester is gone
+(the App state is dropped, or a test ends).
+
+**Adapter** (`process_adapter.rs`, with the Windows pieces in
+`process_windows.rs`, `process_setup_windows.rs` and the plugin's
+`windows_job.rs`, which the guard also uses):
+
+- The browser and guard are `<resource_dir>\cef\takosumi-cef-browser-process.exe`
+  and `takosumi-browser-guard.exe`. Every path given to the browser or
+  compared with its replies is canonical in the ordinary spelling
+  (`canonicalize` without its `\\?\` prefix), as the browser's own final-path
+  check requires.
+- The runtime root is `<app cache>\cef`, which is
+  `%LOCALAPPDATA%\<identifier>\cef` (Tauri's app cache directory on Windows);
+  there is no `XDG_RUNTIME_DIR` candidate. It must be a plain directory (no
+  link, junction or other reparse point) whose canonical path lies inside the
+  user's profile directory (Tauri's home directory). Not checked: the owner
+  SID and access control list of the root (an inherited or explicit grant to
+  others is not detected), and whether the profile is on a network share.
+  There is no socket-path length rule. Each browser's `p-<pid>-<n>` directory
+  is created as on Linux and holds `tmp\` (the browser's `TEMP` and `TMP`) and
+  the guard receipt.
+- Runtime directory locks: the `lock` file is held open with no read or write
+  sharing (only delete sharing), so another App instance's open fails with a
+  sharing violation; that is the Windows counterpart of the `flock`. The App
+  removes an ended browser's directory while still holding its lock, as on
+  Linux (this relies on POSIX delete semantics on NTFS, checked by a CI unit
+  test). The sweep and the stale-name rule are unchanged; a lock file that is
+  a reparse point is an error, never followed.
+- Environment: the guard and browser get only `SystemRoot`, `SystemDrive`,
+  `windir`, `ComSpec`, `PATH`, `PATHEXT`, `USERPROFILE`, `LOCALAPPDATA`,
+  `APPDATA`, `ProgramData`, `ProgramFiles`, `ProgramFiles(x86)`,
+  `CommonProgramFiles`, `ALLUSERSPROFILE`, `PUBLIC`, `USERNAME`,
+  `COMPUTERNAME`, `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE` from the
+  App, plus `TEMP`/`TMP`, the stop event and
+  `TAKOSUMI_BROWSER_PROCESS_DIRECTORY`; the fixture-only inspection seam stays
+  behind `fixture-overrides`. The profile folders are the person's own:
+  unlike Linux's private HOME/XDG directories, Chromium on Windows takes its
+  data locations from the explicit cache root. No `--no-sandbox` or
+  `--password-store` switch is passed.
+- Control pipe: Windows has no portable non-blocking write on it, so each
+  browser has a writer thread that performs the blocking write while the
+  caller waits for it with the same 20 s bound; a write the browser does not
+  read in time times out and the next one first waits for it. Closing the
+  App's end while a write is pending sets a closing flag the thread reads
+  before every write, then cancels the write in progress (`CancelIoEx`),
+  repeating every 10 ms until the thread has ended, for at most 2 s, so a
+  write the thread issued just after a cancel is cancelled too. The thread
+  then writes nothing more of that request. Only a thread that does not get
+  to run within those 2 s can outlast the close; that is reported on stderr.
+- The `opened` check: the native process is opened first and its handle held,
+  so its id cannot name another process during the check. Then Windows must
+  record the guard as its parent (a process snapshot taken after opening),
+  it must have been created no earlier than the guard (so the record is not
+  one left by an ended process whose id the guard reused), its image path
+  (`QueryFullProcessImageNameW` on the held handle) must equal the browser
+  path exactly, and the reported cache path must equal the requested one
+  exactly.
+- Stopping a guard that is still running when its `Process` is dropped sets
+  the stop event (never terminates the guard, whose job would end the browser
+  without a drain or receipt) and waits up to 5 s, as SIGTERM does on Linux.
+- `clear_profile`'s "still in use" check opens Chromium's `lockfile` in the
+  profile's cache root exclusively: Chromium holds it open for writing, shared
+  for reading only, and deletes it on close, so a live browser (tracked by
+  this App or not) makes the open fail. A missing file or one nobody holds is
+  free; any other failure counts as live.
+- An external link the person chose opens with the shell's `open`
+  (`ShellExecuteW`) on its own thread, within the same budget of openers.
+  This path is compiled but not exercised by a test.
+- No setuid/setgid identity check exists on Windows; an elevated App is not
+  refused.
+
+**CI.** The `cef-windows` job builds the product browser and the guard
+together, keeps the W1 manifest check and both smoke runs, and adds two steps.
+`Guard self-tests (Windows)` runs `cargo test --bin takosumi-browser-guard`
+(eleven cases in `src/guard_windows_tests.rs`; the self-test binary is its
+own stand-in browser, and each case starts the guard detached inside a fresh
+kill-on-close job as the App does): a normal end, a non-zero exit, the pipes
+reaching the browser without the stop event, a lingering descendant
+terminated with the job, a job that empties just as the natural budget ends,
+a descendant that ends by itself after the process list was read but before
+the termination (not counted as forced; self-test-only injections,
+`TAKOSUMI_GUARD_FAULT_LATE_EMPTY` and `TAKOSUMI_GUARD_FAULT_TERMINATE_LATE`,
+produce these two orders, which timing alone cannot produce on demand), a
+stop request, the App's job ending guard and browser, a pending stop, the
+refusals and a browser that cannot start. Cases that require the App's job
+to be empty afterwards wait at most 3 s for processes whose exit is already
+under way (the stand-ins that must be ended sleep 60 s) and name every
+process still there with its image. `App adapter with the built
+guard and browser (Process API)` runs the plugin's Windows tests with
+`TAKOSUMI_WINDOWS_GUARD` and `TAKOSUMI_WINDOWS_BROWSER` pointing at the
+product build: unit tests of the pipe writer (a write the reader does not
+take times out; dropping the App's end during such a write cancels it, so the
+reader sees the end of its input before all the data; that reader is a
+Python one-liner, as Python is on the `windows-latest` image; and, with a fake
+pipe taking three bytes per write, a request is not continued once closing
+is set), the lockfile check
+with `clear_profile`'s data handling, the runtime locks and root rules
+(including `<app cache>\cef` created when missing), and the unavailable
+state; and two `#[ignore]`d tests run with `--include-ignored`.
+`windows_adapter_opens_reuses_and_shuts_down_a_profile` starts a profile
+through `Process::spawn`, waits for the creation reply through
+`expect_open_until` (`expect_open` with a 120 s cold-start bound instead of
+20 s; the time is printed), restates the parent, image and cache checks
+against Windows' records, holds the browser's direct children open and
+requires at least one running CEF helper (running the browser's own
+executable) and its console host (`conhost.exe`), and Chromium's `lockfile`
+in the profile's cache root held, reopens the same key and requires the same
+native browser and window, shuts down through `Process::shutdown` and
+requires a normal receipt (complete, `rootExit` 0, no forced cleanup, the
+job empty, and `observed` at least the browser plus the console hosts and
+helpers held, so a helper outside the guard's job leaves it short), the
+`lockfile` released and the runtime directory's removal.
+`windows_adapter_ending_the_app_job_ends_guard_and_browser` starts a
+profile, holds a running CEF helper and the console host open (a helper that
+then ends by itself has still ended), records the guard's process tree,
+drops the App's spawner (closing the App's job) and requires every process
+held to end within 15 s, naming each survivor with its image, and no normal
+receipt. A missing helper prints a fresh view of the browser's tree with
+each process's parent and image and the expected program. The step fails
+unless each named test passed and exactly thirteen ran. The `desktop` job also checks the App with `--features desktop-cef` on
+Windows.
+
+**2026-11-06 local checks (W2).** On the Linux host the plugin type-checks for
+`x86_64-pc-windows-msvc` with `desktop`, `desktop-process-experiment` and
+`fixture-overrides` (library and tests), and the guard and browser with
+`cef/dox,windows-unsandboxed-candidate` (the guard also in test mode).
+Nothing was linked or run for Windows locally; all Windows evidence comes from
+the CI job. On Linux the plugin tests (66 with each experiment feature set),
+the 30 guard self-tests, the `fixture-inspection` browser and guard build, a
+check of all three cef-candidate bins and a check of the App with
+`desktop-cef` passed, with Linux behaviour unchanged.
+
+**First CI runs (W2).** Run 42264960643 (head `5e2250f`) passed the adapter
+tests (ten then) but failed the guard self-test
+`normal_exit_writes_a_complete_normal_receipt` once: after the guard had
+ended, the App's job still counted one process, while the same test had
+passed on the run before. The guard was then started with `CREATE_NO_WINDOW`,
+so its windowless console host, a child in the App's job, could outlive it
+for a moment. The guard is now started detached (no console host), and the
+check waits a short, stated bound and names what is left.
+
+**Known W2 limits** (documented, not implemented):
+
+- Between `CreateProcess(CREATE_SUSPENDED)` and `AssignProcessToJobObject`
+  the new guard or browser exists outside the intended job. It runs no code
+  then, but if its parent dies in that window it stays suspended and
+  unowned. `PROC_THREAD_ATTRIBUTE_JOB_LIST` (Windows 10) would create it in
+  the job directly; std's `Command` has no stable way to pass it.
+- Inheritable handles are not limited to the three standard handles
+  (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` would do that). The App spawns guards
+  from one thread, and std serializes its own spawns, but a handle another
+  part of the App made inheritable could reach a guard and its browser.
+- A browser ended by the drain has `rootExit` -536841118 (`0xE0007462`); a
+  program that returned that code itself would look the same, but no program
+  returns a customer NTSTATUS by accident. The App only accepts `rootExit` 0
+  with no forced cleanup.
+- The guard's job check proves that it runs in some Job Object, not that it
+  is the App's: Windows 11 and CI runners may place every process in a job.
+- The `ShellExecuteW` path for external links is compiled but not exercised
+  by a test.
+- A pending control-pipe write is cancelled when the App's end closes, for
+  at most 2 s; a writer thread that does not get to run in that time can
+  keep its write blocked until the browser reads or ends (the guard's stop
+  request ends a browser that stopped reading). A pending write exists only
+  after a write timed out, which can happen before the 20 s bound when an
+  earlier write settled close to its own deadline.
+- `observed` includes the browser's console host, so it is one higher than
+  on Linux for the same browser.
 
 ## Observations and limits
 

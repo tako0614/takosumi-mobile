@@ -54,8 +54,12 @@ class Pages(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def run_native_writer(command, env, path, markers):
-    # A stale binary that ignores a new flag must not qualify an empty case.
+def run_captured(command, env, path):
+    # The session (App, WebKit children) writes to a file of its own, never
+    # to the step's inherited stdout pipe, so neither the lifecycle oracle nor
+    # the page-ready oracle depends on the log reader draining that pipe. The
+    # captured text is replayed afterwards, also when the session fails or
+    # times out.
     with path.open("w+") as output:
         try:
             run_desktop_session(command, env, timeout=50, stdout=output, stderr=subprocess.STDOUT)
@@ -63,6 +67,12 @@ def run_native_writer(command, env, path, markers):
             output.seek(0)
             captured = output.read()
             print(captured, end="", flush=True)
+    return captured
+
+
+def run_native_writer(command, env, path, markers):
+    # A stale binary that ignores a new flag must not qualify an empty case.
+    captured = run_captured(command, env, path)
     for marker in markers:
         if marker not in captured.splitlines():
             raise RuntimeError(f"Native writer did not report: {marker}")
@@ -198,10 +208,12 @@ def main():
                                 markers.append("PASS: surviving document changed to the previously cancelled URL")
                             run_native_writer(command, scoped, Path(temporary) / f"{method}-recovery.log", markers)
                         else:
-                            run_desktop_session(command, scoped, timeout=50)
+                            run_captured(command, scoped,
+                                         Path(temporary) / f"{method}{'-readback' if flags else ''}.log")
                 return
             for flags in ([], ["--readback"]):
-                run_desktop_session(native_command(binary, flags), env, timeout=50)
+                run_captured(native_command(binary, flags), env,
+                             Path(temporary) / f"profile{'-readback' if flags else ''}.log")
             negative = data / "missing-document.log"
             code = 0
             with negative.open("w") as output:

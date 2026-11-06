@@ -26,19 +26,19 @@ tauri-plugin-app-screen = { path = "../../src-tauri/plugins/app-screen", default
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# Linux and Windows (first candidate). On Windows build this bin alone with
-# `--bin takosumi-cef-browser-process --features windows-unsandboxed-candidate`:
-# the guard below and the standalone `takosumi-cef-candidate` (src/main.rs)
-# are Linux only and refuse to compile elsewhere, so no inert supervisor can
-# be staged by mistake.
+# Linux and Windows (first candidate). On Windows build it with the guard,
+# `--bin takosumi-cef-browser-process --bin takosumi-browser-guard --features
+# windows-unsandboxed-candidate`: the standalone `takosumi-cef-candidate`
+# (src/main.rs) is Linux only and refuses to compile elsewhere.
 [[bin]]
 name = "takosumi-cef-browser-process"
 path = "src/process_main.rs"
 
-# Product supervisor for one browser process (src/guard_main.rs). It needs
-# Linux pidfds, signalfd and the child subreaper; src/guard_entry.rs compiles
-# it only for Linux. Its self-tests must run the guard as a separate
-# single-threaded process, so libtest is not used.
+# Product supervisor for one browser process: src/guard_main.rs on Linux
+# (pidfds, signalfd, the child subreaper) and src/guard_windows.rs on Windows
+# (Job Objects), chosen by src/guard_entry.rs; any other OS refuses to
+# compile, so no inert supervisor can be staged by mistake. Its self-tests run
+# the guard as a separate process, so libtest is not used.
 [[bin]]
 name = "takosumi-browser-guard"
 path = "src/guard_entry.rs"
