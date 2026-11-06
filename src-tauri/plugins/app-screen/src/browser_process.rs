@@ -124,6 +124,65 @@ pub enum Reply {
         id: u64,
         message: String,
     },
+    /// The person chose to open a link outside the App (from its context
+    /// menu). Not a reply to any request: the App opens it with the person's
+    /// own desktop environment.
+    OpenExternal {
+        profile: String,
+        url: String,
+    },
+}
+
+/// A link the person may open outside the App: an absolute http(s) URL in
+/// its ASCII (punycode) form with a host and no credentials, without
+/// whitespace, control characters or backslashes, and bounded. Anything else
+/// (file:, javascript:, custom schemes) stays inside.
+pub fn external_link(url: &str) -> bool {
+    link_host(url).is_some()
+}
+
+/// The host (with any port) of an `external_link`, shown to the person.
+pub fn link_host(url: &str) -> Option<&str> {
+    if url.is_empty()
+        || url.len() > 4096
+        || !url.is_ascii()
+        || url.contains('\\')
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // host[:port]: a DNS-style host (letters, digits, dots, hyphens; at most
+    // 253) or a bracketed IPv6 address, and a port of at most 65535.
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(inside) => {
+            let (address, after) = inside.split_once(']')?;
+            let ok = address.matches(':').count() >= 2
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+            (ok, after)
+        }
+        None => {
+            let (host, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+            let ok = !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            (ok, port)
+        }
+    };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|digits| {
+            !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+                && digits.parse::<u32>().is_ok_and(|port| port <= 65535)
+        });
+    (host_ok && port_ok).then_some(authority)
 }
 
 /// Only complete bounded packets cross the pipe; no arbitrary eval or path command.
@@ -148,6 +207,62 @@ mod tests {
             "key":format!("web-home:{PROFILE}:https://excalidraw.com"),"url":"https://excalidraw.com/","title":"Work",
             "profile":PROFILE,"webHome":true,"resume":true
         }})
+    }
+
+    #[test]
+    fn only_bounded_web_links_without_credentials_may_open_outside() {
+        for (url, host) in [
+            ("https://excalidraw.com/", "excalidraw.com"),
+            ("http://example.com/a?b=c#d", "example.com"),
+            ("https://www.photopea.com/?x=1", "www.photopea.com"),
+            (
+                "https://xn--bcher-kva.example:8443/x",
+                "xn--bcher-kva.example:8443",
+            ),
+            ("https://[::1]:8443/", "[::1]:8443"),
+            ("https://[::1]/", "[::1]"),
+        ] {
+            assert!(external_link(url), "{url}");
+            assert_eq!(link_host(url), Some(host));
+        }
+        let long = format!("https://example.com/{}", "a".repeat(4096));
+        for url in [
+            "",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "takosumi://open",
+            "https:///path",
+            "https://user:secret@example.com/",
+            "https://user@example.com/",
+            "https://example.com/a b",
+            "https://example.com/\n",
+            "https://exa\u{7f}mple.com/",
+            "https://exa\u{202e}mple.com/",
+            "https://bücher.example/",
+            "https://\\evil.com/",
+            "https://:443/",
+            "https://example.com:x/",
+            "https://::1/",
+            "https://[]/",
+            "https://example.com:/",
+            "https://ex[ample.com/",
+            "https://a&b.example/",
+            "https://a%41.example/",
+            "https://user@example.com:443/",
+            "https://[evil.com]/",
+            "https://[:]x/",
+            "https://[:]/",
+            "https://example.com:65536/",
+            "ftp://example.com/",
+            long.as_str(),
+        ] {
+            assert!(!external_link(url), "{url:?}");
+        }
+        let reply: Reply = serde_json::from_str(
+            r#"{"event":"openExternal","profile":"p","url":"https://example.com/"}"#,
+        )
+        .unwrap();
+        assert!(matches!(reply, Reply::OpenExternal { .. }));
     }
 
     #[test]

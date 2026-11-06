@@ -482,6 +482,76 @@ async function externalLinkProbe(work,personal,expected,sample) {
   assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
   state.passed=true;return state;
 }
+// The person may instead choose to open a link outside the App (policy): the
+// link's native context menu offers it, and the App hands the link to the
+// desktop's opener (the runner's recording stand-in; nothing real opens).
+// Nothing opens inside the App and Personal is unchanged.
+async function openExternalProbe(work,personal,expected,sample) {
+  const log=process.env.TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG;
+  assert(log&&path.isAbsolute(log),'The recording opener is required');
+  const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
+  const url=`${other}/?sumi_open_external_${nonce.replaceAll('-','')}`;
+  const state={method:'Native context menu on a test-inserted link in a srcdoc frame: X11 right click (xdotool), X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
+  const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+  const opened=async()=>{try{return (await readFile(log,'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+  // The click point below assumes CSS pixels equal X pixels.
+  assert.equal(await work.evaluate('devicePixelRatio'),1,'The click mapping assumes devicePixelRatio 1');
+  assert.deepEqual(await opened(),[],'Nothing may reach the opener before the choice');
+  const workPages=(await pages(work)).map(t=>t.targetId);
+  // Editor pages may cancel contextmenu for their own menus (ex35: no native
+  // menu opened on a top-level link in Excalidraw). Record that, and put the
+  // link in a srcdoc frame, whose events never reach the page's listeners.
+  state.pageCancelsContextMenu=await work.evaluate("(()=>{const e=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:60,clientY:60});document.body.dispatchEvent(e);return e.defaultPrevented})()");
+  const frameDoc=`<!doctype html><body style="margin:0;background:#fff"><a id="l" href="${url}" style="display:inline-block;padding:16px;font:24px sans-serif">external</a></body>`;
+  const point=await work.evaluate(`new Promise((resolve,reject)=>{const f=document.createElement('iframe');f.id='sumi-open-external';Object.assign(f.style,{position:'fixed',left:'40px',top:'40px',width:'320px',height:'90px',border:'0',zIndex:'2147483647',background:'#fff'});f.onload=()=>{const a=f.contentDocument.getElementById('l'),fr=f.getBoundingClientRect(),r=a.getBoundingClientRect(),p={x:fr.x+r.x+r.width/2,y:fr.y+r.y+r.height/2};if(document.elementFromPoint(p.x,p.y)!==f||f.contentDocument.elementFromPoint(r.x+r.width/2,r.y+r.height/2)!==a){reject(Error('Link obscured'));return;}resolve(p)};f.srcdoc=${JSON.stringify(frameDoc)};document.body.append(f);})`);
+  desktop('xdotool',['windowraise',String(work.native.windowId)]);
+  await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible before the right click');
+  const tops=()=>desktop('xwininfo',['-root','-children','-int']).split('\n').map(line=>line.match(/^\s+(\d+) /)?.[1]).filter(Boolean);
+  const before=new Set(tops());
+  // A real X right click: a CDP-dispatched one created the menu window but it
+  // closed unmapped at once (ex36), without the native button and grab state.
+  // Screen point = Work's X window origin + the browser toolbar + the CSS point.
+  const geometry=Object.fromEntries(desktop('xdotool',['getwindowgeometry','--shell',String(work.native.windowId)]).split('\n').map(line=>line.split('=')));
+  const toolbar=await work.evaluate("window.outerHeight-window.innerHeight");
+  state.click={x:Math.round(Number(geometry.X)+point.x),y:Math.round(Number(geometry.Y)+toolbar+point.y),toolbar};
+  // No window manager here: give Work the X input focus first, as the
+  // beforeunload steps do; Chrome closes a menu whose window is not active.
+  const viewableBefore=new Set([...before].filter(id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}}));
+  desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
+  desktop('xdotool',['mousemove','--sync',String(state.click.x),String(state.click.y)]);
+  desktop('xdotool',['click','3']);
+  desktop('import',['-window','root',path.join(data,'open-external-after-click.png')]);
+  // The menu is a new viewable top-level window of Work's own browser.
+  const viewable=id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}};
+  const ownerOf=id=>{try{return JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),id])).pid;}catch{return null;}};
+  let menu;
+  await settled(async()=>{menu=tops().filter(id=>!before.has(id)).find(id=>viewable(id)&&ownerOf(id)===work.native.nativePid);return Boolean(menu);},'The link context menu did not open in Work\'s browser').catch(error=>{
+    // What appeared instead, for the failure record.
+    state.newWindows=tops().filter(id=>!before.has(id)).map(id=>({window:Number(id),viewable:viewable(id),owner:ownerOf(id)}));
+    state.becameViewable=[...before].filter(id=>!viewableBefore.has(id)&&viewable(id)).map(id=>({window:Number(id),owner:ownerOf(id)}));
+    proof.openExternal=state;throw error;
+  });
+  state.menu={window:Number(menu),owner:work.native.nativePid};
+  desktop('import',['-window','root',path.join(data,'open-external-menu.png')]);
+  desktop('xdotool',['key','--clearmodifiers','Down']);
+  desktop('xdotool',['key','--clearmodifiers','Return']);
+  await settled(async()=>(await opened()).length>0,'The App did not hand the chosen link to the desktop opener');
+  state.opened=await opened();
+  assert.deepEqual(state.opened.map(entry=>entry.argv),[[url]],'Exactly the chosen link must reach the opener');
+  // From the App itself (the opener's parent, whose PID names the browser
+  // runtime directories `p-<App PID>-<n>`), in its own process group.
+  const appPid=Number(path.basename(path.dirname(work.process.guardReceipt)).split('-')[1]);
+  state.openerParent={pid:state.opened[0].ppid,appPid,exe:await readlink(`/proc/${state.opened[0].ppid}/exe`).catch(e=>`unreadable: ${e.code}`)};
+  assert.equal(state.openerParent.pid,appPid,'The App must start the opener');
+  assert.equal(path.basename(state.openerParent.exe),'takosumi-mobile','The opener parent must be the App binary');
+  assert.equal(state.opened[0].groupLeader,true,'The opener must run in its own process group');
+  await settled(async()=>!viewable(menu),'The context menu did not close');
+  assert.deepEqual((await pages(work)).map(t=>t.targetId),workPages,'Nothing may open inside the App');
+  assert.deepEqual((await pages(personal)).map(t=>t.targetId),[personal.target.targetId],'Personal must not change');
+  await work.evaluate("(()=>{document.getElementById('sumi-open-external').remove();return true})()");
+  assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
+  state.passed=true;return state;
+}
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -545,6 +615,8 @@ async function firstLaunch() {
   proof.popup=await popupProbe(work,personal,key,expected,sample);
   step('Work external link',work);
   proof.externalLink=await externalLinkProbe(work,personal,expected,sample);
+  step('Work link opened outside by choice',work);
+  proof.openExternal=await openExternalProbe(work,personal,expected,sample);
   // Chrome's real beforeunload path needs sticky user activation. CDP's
   // userGesture is synthetic and is reported as such, not a real IdP click.
   const unloadStart=work.c.events.length;

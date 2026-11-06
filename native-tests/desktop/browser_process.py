@@ -246,6 +246,29 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
+    # A recording stand-in for the desktop's opener, first on PATH: the App hands
+    # links the person chose to open outside to xdg-open. Nothing real opens.
+    opener = args.data / "opener"
+    opener.mkdir(mode=0o700)
+    stub = opener / "xdg-open"
+    # The log path is built in, not read from the environment: a profile
+    # browser (whose environment is cleared) starting xdg-open is recorded too.
+    log = args.data / "external-open.log"
+    stub.write_text(f"#!{sys.executable} -I\nimport json, os, sys\n"
+                    "path = os.environ.get('TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST') or " + repr(str(log)) + "\n"
+                    "with open(path, 'a') as out:\n"
+                    "    out.write(json.dumps({'argv': sys.argv[1:], 'ppid': os.getppid(),"
+                    " 'groupLeader': os.getpgrp() == os.getpid()}) + '\\n')\n")
+    stub.chmod(0o700)
+    env["PATH"] = f"{opener}{os.pathsep}{env.get('PATH', '')}"
+    env["TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG"] = str(log)
+    # The stand-in must be what the App resolves, and it must actually run:
+    # a failing exec would make PATH lookup fall through to the real opener.
+    require(shutil.which("xdg-open", path=env["PATH"]) == str(stub), "The recording opener is not first on PATH")
+    selftest = opener / "selftest.log"
+    subprocess.run([str(stub), "selftest"], env=dict(env, TAKOSUMI_BROWSER_PROCESS_EXTERNAL_SELFTEST=str(selftest)),
+                   check=True, timeout=30)
+    require(json.loads(selftest.read_text())["argv"] == ["selftest"], "The recording opener did not record")
     file_input = file_nonce = None
     if args.files:
         # The owned input is hashed with the sources: Save As must not overwrite it.
@@ -294,6 +317,9 @@ def main():
                                            TAKOSUMI_BROWSER_PROCESS_FILES_NONCE=file_nonce),
                                 files, before, head, "-files")
         require(files_run["passed"] is True, "The native file chooser execution did not pass")
+    # Over all phases, only the first launch's chosen link reached the opener.
+    opened = (args.data / "external-open.log").read_text().splitlines()
+    require(len(opened) == 1, f"Expected exactly one external open, saw {len(opened)}")
 
 
 if __name__ == "__main__":
