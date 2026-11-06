@@ -383,8 +383,13 @@ Chromium uses its user-namespace sandbox. `chrome-sandbox` is not packaged:
 it works only as a setuid-root helper, which neither bundle installs. A host
 that blocks unprivileged user namespaces cannot start the sandboxed browser,
 and the App does not fall back to an unsandboxed one. Ubuntu 24.04 and later
-restrict them through AppArmor unless a profile allows the executable, and no
-such profile is shipped.
+restrict them through AppArmor unless a profile allows the executable. The deb
+ships `/etc/apparmor.d/takosumi-cef-browser` (`src-tauri/linux/`), an
+allow-everything profile that only names the browser and grants `userns`, like
+the profiles Ubuntu ships for Chrome and Chromium, and its post-install script
+reloads it when AppArmor is active. An AppImage cannot install a profile: on
+such a host it needs the person (or an administrator) to allow unprivileged
+user namespaces, and otherwise cannot open connections.
 
 **Build and stage.** `build.rs` gives both browser executables a `$ORIGIN`
 run path, so they find the adjacent `libcef.so` without `LD_LIBRARY_PATH`;

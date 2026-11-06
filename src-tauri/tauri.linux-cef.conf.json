@@ -29,7 +29,11 @@
           "libxfixes3",
           "libxkbcommon0",
           "libxrandr2"
-        ]
+        ],
+        "files": {
+          "/etc/apparmor.d/takosumi-cef-browser": "linux/takosumi-cef-browser.apparmor"
+        },
+        "postInstallScript": "linux/postinst.sh"
       }
     }
   }
