@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Smoke test of takosumi-cef-browser-process on its own (no guard, no App).
+
+Written for Windows (the windows-latest CI job) and kept OS neutral, so it also
+runs against the Linux browser. Python 3 standard library only; no OS tools
+except `tasklist`/`taskkill` on Windows.
+
+It creates a new owned case directory and lays it out as the App's adapter
+(src-tauri/plugins/app-screen/src/desktop/process_adapter.rs) lays out a
+browser's profile directory: `boot.json` holding the first Open request,
+`Downloads/`, and on Linux private HOME/XDG/TMPDIR directories. It starts the
+browser directly with `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` and the App's
+switches, then requires, each within a bound:
+
+1. an `opened` reply for the boot request's key and profile, whose cache path
+   is `<case>/cef-profiles/<profile>` and whose native pid is the started one;
+2. with `--expect-load` (a `fixture-inspection` browser only), the browser's
+   main-frame load marker, which shows a renderer process ran;
+3. with `--reuse`, an `opened` reply for a second Open of the same key that
+   reuses the same native browser and window (on Windows this exercises the
+   Win32 raise; a refused foreground change is reported, not failed);
+4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
+   a `stopped` reply for N and process exit code 0.
+
+Requests use browser_process::Request's serde form (compact JSON, one line).
+It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
+exits 1 on any failure, printing the tails of the browser's logs. The case
+directory is never removed. Remaining processes after the exit are reported
+but do not fail the run.
+"""
+import argparse
+import hashlib
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+MAX_PACKET_BYTES = 64 * 1024  # browser_process::MAX_PACKET_BYTES
+WINDOWS = os.name == "nt"
+LINUX = sys.platform.startswith("linux")
+LIBRARY = "libcef.dll" if WINDOWS else "libcef.so"
+# A sockaddr_un path holds 107 bytes; Chromium puts its singleton socket in TMPDIR.
+SOCKET_SUFFIX = "/org.chromium.Chromium.XXXXXX/SingletonSocket"
+# The fixed switches process_adapter.rs passes (--password-store is Linux only).
+APP_SWITCHES = ["--no-first-run", "--no-default-browser-check", "--disable-background-networking",
+                "--disable-component-update", "--disable-sync"]
+OPENED_FIELDS = {"event", "id", "key", "profile", "browser_id", "cache_path", "window_id", "native_pid"}
+URL_SHAPE = re.compile(r"https://(?:[a-z0-9-]+\.)*[a-z0-9-]+(?::[0-9]{1,5})?/")
+RAISE_REFUSED = "Reused browser window was not raised:"
+
+
+class Failure(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Failure(message)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_new(path, data):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as file:
+        file.write(data)
+
+
+def packet(value):
+    """One request line in browser_process::Request's serde_json form."""
+    data = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    require(len(data) <= MAX_PACKET_BYTES and b"\n" not in data, "Request exceeds the pipe packet bound")
+    return data
+
+
+def open_request(request_id, profile, url, resume):
+    # Field order of Request::Open and OpenRequest; omitted fields are the
+    # ones serde skips when empty. The key is the Web home's screen identity.
+    origin = url[:-1]
+    return {"operation": "open", "id": request_id, "payload": {
+        "key": f"web-home:{profile}:{origin}", "url": url, "title": "Windows smoke", "profile": profile,
+        "webHome": True, "resume": resume}}
+
+
+def tail(path, limit=16384):
+    try:
+        with open(path, "rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - limit))
+            return file.read().decode("utf-8", "replace")
+    except OSError as error:
+        return f"<unreadable: {error}>"
+
+
+class Browser:
+    def __init__(self, command, case, env):
+        self.case = case
+        self.log = open(case / "browser.log", "xb")
+        self.protocol = open(case / "protocol.jsonl", "xb")
+        extra = {} if WINDOWS else {"start_new_session": True}
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=self.log, cwd=case, env=env, **extra)
+        self.lines = queue.Queue()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        self.events = 0
+        self.closed = []
+
+    def _read(self):
+        try:
+            while True:
+                line = self.process.stdout.readline(MAX_PACKET_BYTES + 2)
+                if not line:
+                    break
+                self.lines.put(line)
+        finally:
+            self.lines.put(None)
+
+    def send(self, value):
+        data = packet(value)
+        self.process.stdin.write(data + b"\n")
+        self.process.stdin.flush()
+
+    def pump(self, deadline, what):
+        """The next protocol event, or None when nothing arrived in 0.25 s."""
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, f"No {what} within the bound")
+        try:
+            line = self.lines.get(timeout=min(remaining, 0.25))
+        except queue.Empty:
+            return None
+        if line is None:
+            self.lines.put(None)
+            raise Failure(f"Browser stdout closed before {what} (exit {self.process.poll()})")
+        self.protocol.write(line if line.endswith(b"\n") else line + b"\n")
+        self.protocol.flush()
+        require(line.endswith(b"\n") and len(line) - 1 <= MAX_PACKET_BYTES, "Browser wrote an unbounded line")
+        try:
+            event = json.loads(line[:-1].decode("utf-8"))
+        except ValueError:
+            raise Failure(f"Browser wrote a non-protocol line: {line[:200]!r}") from None
+        require(isinstance(event, dict) and isinstance(event.get("event"), str), "Browser reply has no event")
+        self.events += 1
+        return event
+
+    def unsolicited(self, event):
+        kind = event["event"]
+        if kind == "openExternal":
+            return
+        if kind == "closed":
+            self.closed.append(event)
+            return
+        raise Failure(f"Unexpected browser reply: {json.dumps(event)[:500]}")
+
+    def expect(self, kind, request_id, deadline):
+        while True:
+            event = self.pump(deadline, f"{kind} reply for request {request_id}")
+            if event is None:
+                continue
+            if event["event"] == kind and event.get("id") == request_id:
+                return event
+            self.unsolicited(event)
+
+    def wait_until(self, condition, what, deadline):
+        while True:
+            found = condition()
+            if found is not None:
+                return found
+            event = self.pump(deadline, what)
+            if event is not None:
+                self.unsolicited(event)
+
+    def stop_tree(self):
+        """Failure cleanup: end the browser and the processes it started."""
+        try:
+            if WINDOWS:
+                if self.process.poll() is None:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.process.pid)],
+                                   capture_output=True, timeout=30)
+            else:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.process.wait(timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"windows_smoke: cleanup failed: {error}", file=sys.stderr)
+
+    def remaining(self, name):
+        """Processes left after the browser exited (informational)."""
+        deadline = time.monotonic() + 10
+        while True:
+            if WINDOWS:
+                try:
+                    listing = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+                                             capture_output=True, text=True, timeout=30).stdout
+                except (OSError, subprocess.SubprocessError):
+                    return None  # unknown
+                count = sum(1 for row in listing.splitlines() if row.lower().startswith(f'"{name.lower()}"'))
+            else:
+                try:
+                    os.killpg(self.process.pid, 0)
+                    count = 1  # at least one member of the browser's session remains
+                except ProcessLookupError:
+                    count = 0
+                except OSError:
+                    return None  # unknown
+            if count == 0 or time.monotonic() >= deadline:
+                return count
+            time.sleep(0.5)
+
+
+def check_opened(event, request_id, key, profile, case, pid):
+    require(set(event) == OPENED_FIELDS, f"Unexpected opened fields: {sorted(event)}")
+    require(event["id"] == request_id and event["key"] == key and event["profile"] == profile,
+            "The opened reply names another request, screen or profile")
+    require(event["cache_path"] == str(case / "cef-profiles" / profile),
+            f"Unexpected profile cache path {event['cache_path']!r}")
+    require(event["native_pid"] == pid, "The opened reply comes from another process")
+    require(type(event["browser_id"]) is int and type(event["window_id"]) is int and event["window_id"] != 0,
+            "The opened reply has no native browser window")
+
+
+def load_marker(case, browser_id, pid):
+    path = case / f"load-ready-{browser_id}.json"
+    try:
+        marker = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None  # absent, or still being written
+    require(marker == {"pid": pid, "browserId": browser_id, "mainFrame": True},
+            f"Unexpected load marker {marker!r}")
+    return marker
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--browser", type=Path, required=True, help="takosumi-cef-browser-process executable")
+    parser.add_argument("--runtime", type=Path,
+                        help=f"directory holding {LIBRARY} and the CEF resources (default: the executable's)")
+    parser.add_argument("--work", type=Path, help="parent of the new case directory (default: the system temp)")
+    parser.add_argument("--url", default="https://example.com/", help="an https site root")
+    parser.add_argument("--open-timeout", type=float, default=120)
+    parser.add_argument("--stop-timeout", type=float, default=60)
+    parser.add_argument("--expect-load", action="store_true",
+                        help="require the main-frame load marker (fixture-inspection browsers only)")
+    parser.add_argument("--reuse", action="store_true", help="reopen the same screen before shutting down")
+    args = parser.parse_args()
+    if not (WINDOWS or LINUX):
+        parser.error("Only Windows and Linux browsers are supported")
+    if not URL_SHAPE.fullmatch(args.url) or args.url.endswith(":443/"):
+        parser.error("--url must be a lowercase https site root such as https://example.com/")
+
+    browser = Path(os.path.realpath(args.browser))
+    runtime = Path(os.path.realpath(args.runtime or browser.parent))
+    summary = {"passed": False, "platform": sys.platform, "browser": str(browser), "runtime": str(runtime),
+               "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse, "seconds": {}, "error": None}
+    session = None
+    case = None
+    try:
+        require(browser.is_file(), f"No browser executable at {browser}")
+        for name in (LIBRARY, "icudtl.dat"):
+            require((runtime / name).is_file(),
+                    f"No {name} in {runtime}: build with cargo (cef-dll-sys copies the CEF runtime beside the "
+                    "executable) or pass --runtime")
+        summary["browserSha256"] = sha256(browser)
+        work = os.path.realpath(args.work or tempfile.gettempdir())
+        # realpath: the long, final spelling (no 8.3 names or links) the
+        # browser requires of its directory.
+        case = Path(os.path.realpath(tempfile.mkdtemp(prefix="sumi-cef-smoke-", dir=work)))
+        summary["case"] = str(case)
+        profile = str(uuid.uuid4())
+        summary["profile"] = profile
+        boot = open_request(1, profile, args.url, False)
+        key = boot["payload"]["key"]
+        summary["key"] = key
+
+        env = {name: value for name, value in os.environ.items() if name != "TAKOSUMI_BROWSER_PROCESS_INSPECT"}
+        env["TAKOSUMI_BROWSER_PROCESS_DIRECTORY"] = str(case)
+        if args.expect_load:
+            env["TAKOSUMI_BROWSER_PROCESS_INSPECT"] = "1"
+        (case / "Downloads").mkdir(mode=0o700)
+        (case / "tmp").mkdir(mode=0o700)
+        command = [str(browser)]
+        if WINDOWS:
+            # libcef.dll beside the executable is found first anyway; PATH
+            # covers a runtime directory given with --runtime.
+            env["PATH"] = str(runtime) + os.pathsep + env.get("PATH", "")
+            env["TEMP"] = env["TMP"] = str(case / "tmp")
+            # No --no-sandbox: the Windows browser decides that itself.
+            command += APP_SWITCHES
+        else:
+            require(len(str(case / "tmp") + SOCKET_SUFFIX) < 108, "Case path too long for Chromium's socket")
+            for variable, name in (("HOME", "home"), ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),
+                                   ("XDG_CACHE_HOME", "cache"), ("XDG_RUNTIME_DIR", "runtime")):
+                (case / name).mkdir(mode=0o700)
+                env[variable] = str(case / name)
+            env["TMPDIR"] = str(case / "tmp")
+            env["LD_LIBRARY_PATH"] = str(runtime)
+            # As the App: Chromium refuses its sandbox to root.
+            command += (["--no-sandbox"] if os.geteuid() == 0 else []) + APP_SWITCHES + ["--password-store=basic"]
+        command.append("--lang=en-US")
+        summary["command"] = command
+        write_new(case / "boot.json", packet(boot))
+
+        started = time.monotonic()
+        session = Browser(command, case, env)
+        pid = session.process.pid
+        summary["pid"] = pid
+        opened = session.expect("opened", 1, started + args.open_timeout)
+        check_opened(opened, 1, key, profile, case, pid)
+        summary["opened"] = opened
+        summary["seconds"]["opened"] = round(time.monotonic() - started, 3)
+
+        if args.expect_load:
+            summary["loadReady"] = session.wait_until(
+                lambda: load_marker(case, opened["browser_id"], pid), "main-frame load marker",
+                time.monotonic() + args.open_timeout)
+            summary["seconds"]["loadReady"] = round(time.monotonic() - started, 3)
+
+        next_id = 2
+        if args.reuse:
+            session.send(open_request(next_id, profile, args.url, True))
+            reused = session.expect("opened", next_id, time.monotonic() + 30)
+            check_opened(reused, next_id, key, profile, case, pid)
+            require(reused["browser_id"] == opened["browser_id"] and reused["window_id"] == opened["window_id"],
+                    "The reopened screen did not reuse its native browser window")
+            summary["reused"] = reused
+            next_id += 1
+
+        stop_deadline = time.monotonic() + args.stop_timeout
+        session.send({"operation": "shutdown", "id": next_id})
+        summary["stopped"] = session.expect("stopped", next_id, stop_deadline)
+        summary["seconds"]["stopped"] = round(time.monotonic() - started, 3)
+        closed = [event for event in session.closed if event.get("browser_id") == opened["browser_id"]]
+        require(len(closed) == 1 and closed[0] == {"event": "closed", "id": 0, "key": key, "profile": profile,
+                                                   "browser_id": opened["browser_id"]},
+                f"Expected one closed reply for the browser before stopped: {session.closed}")
+        summary["closed"] = closed[0]
+        try:
+            code = session.process.wait(timeout=max(0.1, stop_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise Failure("The browser did not exit within the bound after stopped") from None
+        summary["exitCode"] = code
+        summary["seconds"]["exit"] = round(time.monotonic() - started, 3)
+        require(code == 0, f"The browser exited with {code}")
+        session.reader.join(timeout=5)
+        summary["stdoutClosed"] = not session.reader.is_alive()
+        summary["passed"] = True
+    except Failure as failure:
+        summary["error"] = str(failure)
+    except Exception as error:  # every failure ends in the summary and exit 1
+        summary["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        if session is not None:
+            if not summary["passed"]:
+                session.stop_tree()
+                summary.setdefault("exitCode", session.process.poll())
+            summary["remainingProcesses"] = session.remaining(browser.name)
+            if not WINDOWS and summary["remainingProcesses"]:
+                session.stop_tree()
+            try:
+                session.process.stdin.close()
+            except OSError:
+                pass
+            summary["events"] = session.events
+            session.log.close()
+            session.protocol.close()
+            refused = [line for line in tail(case / "browser.log").splitlines() if RAISE_REFUSED in line]
+            summary["raiseRefused"] = refused[-1][:300] if refused else None
+    text = json.dumps(summary, indent=2)
+    print(text)
+    if case is not None:
+        write_new(case / "summary.json", text.encode("utf-8") + b"\n")
+    if not summary["passed"]:
+        print(f"windows_smoke: FAILED: {summary['error']}", file=sys.stderr)
+        if case is not None:
+            for name in ("browser.log", "cef-native.log"):
+                print(f"----- tail of {case / name} -----", file=sys.stderr)
+                print(tail(case / name), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
