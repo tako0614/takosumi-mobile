@@ -13,6 +13,8 @@ const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.st
 assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
+// The app's own document has rendered (not the initial about:blank of a new window).
+const appContent=origin.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
 // Name the active operation and its exact page, so a failure snapshot inspects
 // that profile rather than whichever client happened to attach last.
@@ -135,8 +137,7 @@ async function attach(process) {
   proof.stage={name:'external Page enable',pid:native.nativePid};
   await send('Page.enable');
   try {
-    const content=origin.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer')";
-    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && (${content})`),'Actual anonymous app document did not load');
+    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && ${appContent}`),'Actual anonymous app document did not load');
     if(origin.includes('photopea') && await evaluate("document.body.innerText.includes('Start using Photopea')")) {
       proof.stage={name:'Photopea landing button',pid:native.nativePid};
       // The site has more than one equivalent CTA. Use the first visible
@@ -298,6 +299,8 @@ async function filesProbe(pages) {
     assert.equal(path.basename(exe),'xdg-desktop-portal-gtk',`The ${kind} dialog belongs to neither Work's browser nor the portal backend: ${exe}`);
     const transient=desktop('xprop',['-id',String(dialog.id),'WM_TRANSIENT_FOR']).match(/window id # (0x[0-9a-f]+)$/i)?.[1];
     assert(transient,`The portal ${kind} dialog must be transient for the requesting window`);
+    // Exactly Work's window as the App reported it, and that window is Work's.
+    assert.equal(Number.parseInt(transient,16),work.native.windowId,`The portal ${kind} dialog must be transient for Work's window`);
     const parent=owner(Number.parseInt(transient,16));
     assert.equal(parent.pid,work.native.nativePid,`The portal ${kind} dialog must be transient for Work's own window`);
     return {route:'xdg-desktop-portal',owner:by,backend:exe,transientFor:Number.parseInt(transient,16),parentOwner:parent,workWindow:work.native.windowId};
@@ -344,6 +347,15 @@ async function filesProbe(pages) {
   proof.files.export=JSON.parse(desktop('python3',['-B','-c','import sys,json;from pathlib import Path;sys.path.insert(0,sys.argv[1]);from browser_apps import verify_export;print(json.dumps(verify_export(Path(sys.argv[2]),sys.argv[3],sys.argv[4])))',
     fileURLToPath(new URL('.',import.meta.url)),output,'excalidraw',filesNonce]));
   assert.deepEqual(await listing(),proof.files.personalDownloadsBefore,"Personal's Downloads must not change");
+  // Not a separated surface: the portal backend keeps one recent-files list
+  // for the desktop session, not per connection. Record it; Personal's own
+  // data must still hold no trace of Work's files.
+  const recent=async file=>{try{return await readFile(file,'utf8');}catch(e){if(e.code==='ENOENT')return '';throw e;}};
+  const names=[path.basename(input),path.basename(output)];
+  const sessionRecent=process.env.XDG_DATA_HOME?await recent(path.join(process.env.XDG_DATA_HOME,'recently-used.xbel')):'';
+  proof.files.sessionRecentHasWorkFiles=names.map(name=>sessionRecent.includes(name));
+  const personalRecent=await recent(path.join(personal.process.directory,'data','recently-used.xbel'));
+  assert(!names.some(name=>personalRecent.includes(name)),"Personal's own data must not list Work's files");
   proof.files.savedMs=Date.now()-proof.files.started;
   await closePersonalAfterRelaunch(personal,'files');
   proof.passed=true;
@@ -374,14 +386,10 @@ async function popupProbe(work,personal,key,expected,sample) {
     const value=await work.c.command('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,userGesture},session);
     assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
   };
-  // Same 25 s load bound as the cef-candidate popup probe.
-  const end=Date.now()+25000;let loaded=false;
-  while(Date.now()<end&&!loaded) {
-    loaded=await evaluate(`location.origin===${JSON.stringify(origin)}&&document.readyState==='complete'`).catch(()=>false);
-    if(!loaded)await delay(100);
-  }
-  assert(loaded,'Popup document must load');
-  state.context=await evaluate("({origin:location.origin,secure:isSecureContext,opener:window.opener!==null,openerOrigin:window.opener?.location.origin,tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc})");
+  // Same 25 s load bound as the cef-candidate popup probe; the requested app
+  // page itself, not the new window's initial about:blank.
+  await popupLoaded(evaluate,url);
+  state.context=await evaluate("({href:location.href,origin:location.origin,secure:isSecureContext,opener:window.opener!==null,openerOrigin:window.opener?.location.origin,tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc})");
   assert.equal(state.context.origin,origin);assert.equal(state.context.secure,true);
   assert.equal(state.context.opener,true);assert.equal(state.context.openerOrigin,origin);
   for(const field of ['tauri','ipc','wry'])assert.equal(state.context[field],'undefined');
@@ -394,20 +402,36 @@ async function popupProbe(work,personal,key,expected,sample) {
   state.workAfter=await work.evaluate(`({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)}})`);
   assert.deepEqual(state.workAfter,{storage:result,cookie:result},'Work must see the state its popup wrote');
   assert.deepEqual(await sample(personal),expected[1],'Personal must see neither the popup nor its state');
-  await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible after its popup closed');
   // Restore Work's first-launch state, which the later phases check.
   await work.evaluate(`(()=>{localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(expected[0].storage)});document.cookie=${JSON.stringify(`${key}=${expected[0].cookie}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};removeEventListener('message',window.__sumiOnMessage);delete window.__sumiOnMessage;delete window.__sumiMessages;delete globalThis[${JSON.stringify(ref)}];return true})()`);
   assert.deepEqual(await sample(work),expected[0],'Work must keep its document after the popup');
   state.passed=true;return state;
 }
+async function popupLoaded(evaluate,url) {
+  const end=Date.now()+25000;let loaded=false;
+  while(Date.now()<end&&!loaded) {
+    // The navigation entry keeps the URL actually loaded, even if the app
+    // later rewrites its address; the initial about:blank has none.
+    loaded=await evaluate(`performance.getEntriesByType('navigation')[0]?.name===${JSON.stringify(url)}&&document.readyState==='complete'&&${appContent}`).catch(()=>false);
+    if(!loaded)await delay(100);
+  }
+  assert(loaded,'Popup document must load the requested app page');
+}
 // A popup left open when the App quits closes with its profile: the native
-// close chain covers it, and the runner then requires a normal guard and App exit.
+// close chain covers it, and the runner then requires a normal guard and App
+// exit. Quit only after the popup's own document loaded, so its native browser
+// exists in the profile's close chain.
 async function openPopupForQuit(page) {
   const ref=`sumi_quit_popup_${nonce.replaceAll('-','')}`, url=`${origin}/?${ref}`;
   assert.equal(await page.evaluate(`(()=>{globalThis[${JSON.stringify(ref)}]=window.open(${JSON.stringify(url)},${JSON.stringify(ref)},'popup,width=500,height=400');return Boolean(globalThis[${JSON.stringify(ref)}])})()`,true),true,'Popup request must be accepted');
   let target;
   await settled(async()=>{target=(await page.c.command('Target.getTargets')).targetInfos.find(t=>t.type==='page'&&t.openerId===page.target.targetId);return Boolean(target);},'Popup did not appear before the final quit');
-  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile};
+  const session=(await page.c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
+  await popupLoaded(async expression=>{
+    const value=await page.c.command('Runtime.evaluate',{expression,returnByValue:true},session);
+    assert(!value.exceptionDetails,JSON.stringify(value.exceptionDetails));return value.result.value;
+  },url);
+  return {targetId:target.targetId,openerId:target.openerId,profile:page.process.profile,loaded:url};
 }
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;

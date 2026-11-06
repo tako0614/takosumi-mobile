@@ -9,8 +9,21 @@ import path from 'node:path';
 import { waitForGtkConfirm } from '../cef-candidate/gtk-readiness.mjs';
 
 export function nativeFiles({desktop,data}) {
+  // xdotool exits 1 with no output when nothing matches, but also when a
+  // window vanishes mid-search (Xlib BadWindow): retry that case only.
+  async function search() {
+    for(let attempt=0;;attempt++) {
+      try{return (await desktop('xdotool',['search','--onlyvisible','--name','.*'])).split(/\s+/).filter(Boolean);}
+      catch(e){
+        const stderr=String(e.stderr??'');
+        if(e.status===1&&!stderr.trim())return [];
+        if(/BadWindow/.test(stderr)&&attempt<20){await delay(50);continue;}
+        throw e;
+      }
+    }
+  }
   async function visibleWindows() {
-    const ids=(await desktop('xdotool',['search','--onlyvisible','--name','.*'],true)).split(/\s+/).filter(Boolean);
+    const ids=await search();
     const rows=await Promise.all(ids.map(async id=>{
       try{return {id,title:await desktop('xdotool',['getwindowname',id])};}
       catch(e){
@@ -23,15 +36,17 @@ export function nativeFiles({desktop,data}) {
     return rows.filter(Boolean);
   }
   async function nativeDialog(before,kind) {
-    const deadline=Date.now()+8000;let added=[];
+    const matches=w=>kind==='open'
+      ?['Open','Open File','Open Files','Select a file this site can read'].includes(w.title)
+      :(/^Save(?: .+)?$/.test(w.title)||w.title==='Warning: this site can see edits you make');
+    // Another new window (e.g. a portal helper) may appear first: wait for the dialog itself.
+    const deadline=Date.now()+8000;let added=[],dialogs=[];
     while(Date.now()<deadline) {
       added=(await visibleWindows()).filter(w=>!before.some(old=>old.id===w.id));
-      if(added.length)break;
+      dialogs=added.filter(matches);
+      if(dialogs.length)break;
       await delay(50);
     }
-    const dialogs=added.filter(w=>kind==='open'
-      ?['Open','Open File','Open Files','Select a file this site can read'].includes(w.title)
-      :(/^Save(?: .+)?$/.test(w.title)||w.title==='Warning: this site can see edits you make'));
     assert(dialogs.length===1,`No unique native ${kind} dialog: ${JSON.stringify(added)}`);
     return {before,added,id:dialogs[0].id};
   }

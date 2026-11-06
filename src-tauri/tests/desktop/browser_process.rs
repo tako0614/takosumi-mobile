@@ -255,8 +255,8 @@ async fn relaunch_flow(
     // The observer verifies state, then closes Personal natively so the
     // ordinary single-profile exit applies.
     // The files phase drives native OS dialogs with the standalone driver's
-    // own per-step bounds (about 70 s at worst). Wait up to the App watchdog,
-    // so the observer reports the step that failed rather than this wait.
+    // own per-step bounds (up to 25 s each). Wait up to the App watchdog (90 s
+    // overall), so an observer failing one step reports it, not this wait.
     let bound = Duration::from_secs(if kind == "files" { 80 } else { 30 });
     checkpoint_within(case, &format!("{kind}-inspected"), bound).await?;
     checkpoint_within(case, &format!("{kind}-request-exit"), bound).await?;
@@ -376,7 +376,9 @@ async fn flow(app: &AppHandle) -> Result<()> {
         .unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(&case, "request-exit").await?;
+    // Resume, download and the popup steps (its load alone may take 25 s)
+    // run before the observer asks to quit.
+    checkpoint_within(&case, "request-exit", Duration::from_secs(60)).await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
     app.exit(0);
