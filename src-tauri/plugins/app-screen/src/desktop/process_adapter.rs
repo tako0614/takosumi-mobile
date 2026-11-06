@@ -100,6 +100,9 @@ struct Process {
     /// This browser's `p-<pid>-<n>` directory; removed once its guard ended
     /// (kept in fixture builds, see `setup::KEEP_ENDED_RUNTIME`).
     runtime: PathBuf,
+    /// The exclusive lock on the runtime directory's lock file, released only
+    /// after `Drop` has removed the directory (fields drop after `drop`).
+    _runtime_lock: std::fs::File,
     program: PathBuf,
     /// Opening order: an App quit closes the oldest profile first.
     order: u64,
@@ -110,6 +113,14 @@ static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 /// flushing its profile; on a stalled disk that exceeded a few seconds (pk1),
 /// and an App that cannot finish quitting is worse than waiting longer.
 const STOP_FINISH: Duration = Duration::from_secs(30);
+/// How long writing one request to a browser's control pipe may take.
+const WRITE_BOUND: Duration = Duration::from_secs(20);
+/// A request that was not written, and whether the browser had already closed
+/// its end of the pipe (it is ending) rather than, say, not reading in time.
+struct Unsent {
+    error: Error,
+    closed: bool,
+}
 /// Openers started and not yet ended; a burst beyond this is dropped.
 #[cfg(not(test))]
 static OPENERS: AtomicU64 = AtomicU64::new(0);
@@ -209,9 +220,9 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
         guard,
         runtime: runtime_root,
     } = setup::locate(plan, euid)?;
-    // Runtime directories of ended App instances (tmpfs keeps them until
-    // logout; the cache fallback keeps them across reboots).
-    for problem in setup::sweep_runtime(&runtime_root, std::process::id(), setup::pid_alive) {
+    // Runtime directories of ended App instances, judged by their locks
+    // (tmpfs keeps them until logout; the cache fallback across reboots).
+    for problem in setup::sweep_runtime(&runtime_root, euid) {
         eprintln!("A stale browser runtime directory was not removed: {problem}");
     }
     // The sandbox opt-out is a fixture seam only; a product build runs
@@ -281,10 +292,7 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 return Err(Error::InvalidRequest("Browser profile limit reached."));
             }
             let key = payload.key.clone();
-            let runtime = state.runtime_root.join(setup::runtime_name(
-                std::process::id(),
-                NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst),
-            ));
+            let runtime = free_runtime(&state.runtime_root)?;
             let mut process = Process::spawn(
                 state.program.clone(),
                 state.guard.clone(),
@@ -302,6 +310,24 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
     })
     .await
     .map_err(failure)?
+}
+
+/// The next free runtime directory for a new browser. Names are unique within
+/// this App instance, but another instance sharing the root (another host on
+/// an NFS cache, or another PID namespace) may have the same pid.
+fn free_runtime(root: &std::path::Path) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let candidate = root.join(setup::runtime_name(
+            std::process::id(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst),
+        ));
+        if setup::claim_runtime(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::InvalidRequest(
+        "No free browser runtime directory name is available.",
+    ))
 }
 
 fn drain(backend: &Backend) -> Result<bool> {
@@ -622,9 +648,13 @@ impl Process {
                 "Browser runtime socket path is too long.",
             ));
         }
-        // Names are unique within this App instance, so an existing one was left
-        // by an earlier instance that had the same pid: remove it first.
-        setup::remove_runtime(&runtime)?;
+        // An existing directory with this name is replaced only when it is
+        // stale (its lock is free); one that another App holds is refused.
+        if !setup::claim_runtime(&runtime)? {
+            return Err(Error::InvalidRequest(
+                "Browser runtime directory is in use by another App instance.",
+            ));
+        }
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -632,6 +662,9 @@ impl Process {
             .map_err(failure)?;
         // Removed again if no guard starts; a started guard's Process owns it.
         let mut unowned = Unowned(Some(runtime.clone()));
+        // Held for this browser's whole lifetime: the sweep of any App sharing
+        // the root leaves a locked directory alone.
+        let runtime_lock = setup::lock_runtime(&runtime)?;
         let boot = Request::Open { id: 1, payload };
         boot.validate(&profile)?;
         let bytes = serde_json::to_vec(&boot).map_err(failure)?;
@@ -746,6 +779,7 @@ impl Process {
             opened: serde_json::Value::Null,
             guard_receipt,
             runtime: unowned.0.take().expect("Owned runtime directory"),
+            _runtime_lock: runtime_lock,
             program,
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
         };
@@ -790,17 +824,41 @@ impl Process {
         Ok(process)
     }
     fn send(&mut self, request: Request, deadline: std::time::Instant) -> Result<()> {
-        request.validate(&self.profile)?;
-        let mut bytes = serde_json::to_vec(&request).map_err(failure)?;
+        self.write_request(request, deadline)
+            .map_err(|unsent| unsent.error)
+    }
+    fn write_request(
+        &mut self,
+        request: Request,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), Unsent> {
+        let refused = |error| Unsent {
+            error,
+            closed: false,
+        };
+        request.validate(&self.profile).map_err(refused)?;
+        let mut bytes = serde_json::to_vec(&request)
+            .map_err(failure)
+            .map_err(refused)?;
         if bytes.len() > MAX_PACKET_BYTES {
-            return Err(Error::InvalidRequest("Browser request is too large."));
+            return Err(refused(Error::InvalidRequest(
+                "Browser request is too large.",
+            )));
         }
         bytes.push(b'\n');
-        let input = self
-            .input
-            .as_mut()
-            .ok_or(Error::InvalidRequest("Browser pipe is closed."))?;
-        write_until(input, &bytes, deadline).map_err(failure)
+        let Some(input) = self.input.as_mut() else {
+            return Err(Unsent {
+                error: Error::InvalidRequest("Browser pipe is closed."),
+                closed: true,
+            });
+        };
+        write_until(input, &bytes, deadline).map_err(|error| Unsent {
+            closed: matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WriteZero
+            ),
+            error: failure(error),
+        })
     }
     fn receive(
         &mut self,
@@ -935,8 +993,15 @@ impl Process {
     }
     /// Any failure leaves the browser in doubt, except an error it answered.
     fn shutdown_until(&mut self, reply_deadline: std::time::Instant) -> Result<bool> {
+        self.shutdown_within(WRITE_BOUND, reply_deadline)
+    }
+    fn shutdown_within(
+        &mut self,
+        write_bound: Duration,
+        reply_deadline: std::time::Instant,
+    ) -> Result<bool> {
         let mut rejected = false;
-        let result = self.shutdown_attempt(reply_deadline, &mut rejected);
+        let result = self.shutdown_attempt(write_bound, reply_deadline, &mut rejected);
         if result.is_err() && !rejected {
             self.uncertain = true;
         }
@@ -944,6 +1009,7 @@ impl Process {
     }
     fn shutdown_attempt(
         &mut self,
+        write_bound: Duration,
         reply_deadline: std::time::Instant,
         rejected: &mut bool,
     ) -> Result<bool> {
@@ -964,11 +1030,20 @@ impl Process {
         // A browser whose last window was just closed is already ending: its
         // pipe or reply channel closes. Only then accept a normal end; a
         // protocol fault stays an error.
-        if let Err(error) = self.send(Request::Shutdown { id }, now + Duration::from_secs(20)) {
-            return self
-                .ended_within(STOP_FINISH)
-                .map(|()| true)
-                .map_err(|_| error);
+        match self.write_request(Request::Shutdown { id }, now + write_bound) {
+            Ok(()) => {}
+            Err(Unsent {
+                error,
+                closed: true,
+            }) => {
+                return self
+                    .ended_within(STOP_FINISH)
+                    .map(|()| true)
+                    .map_err(|_| error);
+            }
+            // It never agreed to stop (it did not even read the request within
+            // the write bound): no reason to wait for its end.
+            Err(Unsent { error, .. }) => return Err(error),
         }
         // A timeout leaves any late answer queued for `recover`.
         let reply = match self.receive(id, reply_deadline) {
@@ -1132,6 +1207,10 @@ mod tests {
             reason.contains("Browser process executable is unavailable"),
             "{reason}"
         );
+        // The home then offers no data deletion, which would be refused.
+        assert!(!super::super::capabilities_of(app.handle()).clear_profile);
+        let ready = tauri::test::mock_app();
+        assert!(super::super::capabilities_of(ready.handle()).clear_profile);
     }
     #[test]
     fn a_zero_exit_never_substitutes_for_complete_normal_descendant_proof() {
@@ -1405,12 +1484,28 @@ sys.stdin.read()' "$1"
         private_directory(&root.join("outside")).unwrap();
         let guard = ending_guard(&root);
         let runtime = root.join("r");
-        // Left by an earlier App instance with the same pid: junk, a socket
-        // directory and a link to outside, which must not be followed.
+        // Left by an ended App instance with the same pid (its lock is free):
+        // junk, a socket directory and a link to outside, never followed.
         private_directory(&runtime.join("tmp").join("org.chromium.Chromium.x")).unwrap();
         std::fs::write(runtime.join("guard.json"), b"stale").unwrap();
         std::os::unix::fs::symlink(root.join("outside"), runtime.join("tmp").join("out")).unwrap();
+        drop(setup::lock_runtime(&runtime).unwrap());
+        // One that another App instance holds is refused, never replaced.
+        let held_dir = root.join("held");
+        private_directory(&held_dir).unwrap();
+        let held = setup::lock_runtime(&held_dir).unwrap();
         let parent = spawner().unwrap();
+        let refused = Process::spawn(
+            PathBuf::from("/bin/true"),
+            root.join("guard.py"),
+            root.join("profile"),
+            held_dir.clone(),
+            work_payload(),
+            &parent,
+            true,
+        );
+        let held_intact = held_dir.join("lock").exists();
+        drop(held);
         let mut process = Process::spawn(
             PathBuf::from("/bin/true"),
             guard,
@@ -1430,6 +1525,10 @@ sys.stdin.read()' "$1"
         let kept = runtime.exists();
         let outside = root.join("outside").is_dir();
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            refused.is_err() && held_intact,
+            "a held runtime is never replaced"
+        );
         assert!(stale_gone, "the stale directory was removed first");
         assert!(status.is_some_and(|status| status.success()));
         verified.unwrap();
@@ -2103,6 +2202,74 @@ sys.stdin.read()' "$1"
             drop(process);
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    /// A live stand-in browser started through the actual open path, whose
+    /// guard runs `script` (with `ready` written beside the receipt position).
+    fn stand_in(root: &std::path::Path, script: &str) -> (Process, mpsc::Sender<SpawnRequest>) {
+        private_directory(root).unwrap();
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, script).unwrap();
+        let parent = spawner().unwrap();
+        let process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("profile"),
+            root.join("r"),
+            work_payload(),
+            &parent,
+            true,
+        )
+        .unwrap();
+        marker(&process.guard_receipt.with_file_name("ready"));
+        (process, parent)
+    }
+    #[test]
+    fn a_shutdown_that_cannot_be_written_in_time_does_not_wait_for_a_stop() {
+        // The browser never reads its pipe: it never agreed to stop.
+        let root = std::env::temp_dir().join(format!("sumi-unread-{}", std::process::id()));
+        let (mut process, parent) = stand_in(
+            &root,
+            "import pathlib,sys,time\npathlib.Path(sys.argv[1]).with_name('ready').write_text('1')\ntime.sleep(30)\n",
+        );
+        let input = process.input.as_mut().unwrap();
+        let block = [b'x'; 4096];
+        while input.write(&block).is_ok() {}
+        let started = std::time::Instant::now();
+        let result =
+            process.shutdown_within(Duration::from_millis(100), started + Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        let alive = process.child.try_wait().unwrap().is_none();
+        let uncertain = process.uncertain;
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        drop(parent);
+        match result {
+            Err(Error::Desktop(message)) => assert_eq!(message, "Browser pipe write timed out"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a write timeout returns at once, not after STOP_FINISH: {elapsed:?}"
+        );
+        assert!(alive && uncertain, "the browser is kept in doubt");
+    }
+    #[test]
+    fn a_shutdown_into_a_closed_pipe_waits_for_the_normal_end() {
+        // Its last window just closed: the browser closed its pipe and is
+        // still flushing for a moment before its guard ends normally.
+        let root = std::env::temp_dir().join(format!("sumi-closedpipe-{}", std::process::id()));
+        let (mut process, parent) = stand_in(
+            &root,
+            &format!("import json,os,pathlib,sys,time\nos.close(0)\npathlib.Path(sys.argv[1]).with_name('ready').write_text('1')\ntime.sleep(1)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n"),
+        );
+        let result = process.shutdown_within(
+            Duration::from_millis(100),
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        drop(parent);
+        assert!(result.unwrap(), "a closed pipe and a normal end stop it");
     }
     #[test]
     fn a_nonreading_child_cannot_hold_the_pipe_writer_past_its_deadline() {

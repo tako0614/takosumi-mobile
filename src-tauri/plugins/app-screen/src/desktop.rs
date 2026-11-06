@@ -112,11 +112,18 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
 }
 
 #[tauri::command]
-fn capabilities() -> CapabilitiesResponse {
+fn capabilities(app: AppHandle) -> CapabilitiesResponse {
+    capabilities_of(&app)
+}
+
+fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> CapabilitiesResponse {
     #[cfg(target_os = "macos")]
     let clear_profile = objc2::available!(macos = 14.0);
     #[cfg(not(target_os = "macos"))]
     let clear_profile = true;
+    // An unavailable browser refuses `clear_profile`, so the home must not offer it.
+    #[cfg(all(target_os = "linux", feature = "desktop-process-experiment"))]
+    let clear_profile = clear_profile && process_adapter::unavailable(_app).is_none();
     CapabilitiesResponse {
         pin_shortcut: false,
         clear_profile,

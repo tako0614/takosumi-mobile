@@ -313,11 +313,90 @@ pub(super) fn socket_path_fits(runtime: &Path) -> bool {
 pub(super) fn runtime_name(pid: u32, n: u64) -> String {
     format!("p-{pid}-{n}")
 }
-/// The App pid a runtime directory name was made for.
-fn runtime_owner(name: &str) -> Option<u32> {
-    let (pid, n) = name.strip_prefix("p-")?.split_once('-')?;
-    n.parse::<u64>().ok()?;
-    pid.parse().ok()
+/// Whether a name is a browser runtime directory's (`p-<pid>-<n>`).
+fn is_runtime_name(name: &str) -> bool {
+    name.strip_prefix("p-")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, n)| pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok())
+}
+
+/// The lock file inside each browser runtime directory. The App holds an
+/// exclusive `flock` on it for that browser's whole lifetime, so liveness is
+/// decided by the lock, not by a pid: another host sharing an NFS cache, or
+/// another PID namespace sharing `/run/user/<uid>`, keeps its directories.
+const RUNTIME_LOCK: &str = "lock";
+
+/// Create and lock a fresh runtime directory's lock file. The returned file
+/// holds the lock until it is closed; it is never inherited by the guard
+/// (close-on-exec).
+pub(super) fn lock_runtime(runtime: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(runtime.join(RUNTIME_LOCK))
+        .map_err(failure)?;
+    match try_lock(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(Error::InvalidRequest(
+            "Browser runtime directory is locked by another App instance.",
+        )),
+        Err(error) => Err(failure(error)),
+    }
+}
+
+/// A non-blocking exclusive `flock`: false when another open file description
+/// holds it.
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a live descriptor owned by `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// The lock of an existing runtime directory, if this App can take it now:
+/// `None` while another instance holds it, and also when there is no lock
+/// file (a directory being created, or one from an earlier build), which is
+/// never judged stale. The lock file is never followed as a link.
+fn stale_lock(runtime: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(runtime.join(RUNTIME_LOCK))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(error)),
+    };
+    Ok(try_lock(&file).map_err(failure)?.then_some(file))
+}
+
+/// Make `runtime` free for a new browser: true when it is missing, or was a
+/// stale directory (its lock taken) and has been removed; false when another
+/// App instance holds it or it has no lock file to judge by.
+pub(super) fn claim_runtime(runtime: &Path) -> Result<bool> {
+    match runtime.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(failure(error)),
+        Ok(metadata) if !metadata.file_type().is_dir() => Err(Error::InvalidRequest(
+            "Browser runtime entry is not a plain directory.",
+        )),
+        Ok(_) => match stale_lock(runtime)? {
+            // Removed while its lock is held, so no other App can claim it meanwhile.
+            Some(_lock) => remove_runtime(runtime).map(|()| true),
+            None => Ok(false),
+        },
+    }
 }
 
 /// Remove one browser runtime directory. Only a plain directory is removed;
@@ -336,12 +415,13 @@ pub(super) fn remove_runtime(path: &Path) -> Result<()> {
     }
 }
 
-/// Inside the verified runtime root, remove browser runtime directories left
-/// by App instances that have ended (their pid is gone) or by an earlier
-/// instance that had this App's pid (none of this instance's exist yet).
-/// Another live instance's directories, links and other entries stay. Returns
-/// the failures; none stops the App.
-pub(super) fn sweep_runtime(root: &Path, own_pid: u32, alive: impl Fn(u32) -> bool) -> Vec<String> {
+/// Inside the verified runtime root, remove browser runtime directories whose
+/// lock no App instance holds: those of ended instances, on this host or any
+/// other sharing the root. Only plain directories of `euid` named
+/// `p-<pid>-<n>` with a lock file are considered; a held lock, a missing lock
+/// file, links and other entries stay. Returns the failures; none stops the
+/// App.
+pub(super) fn sweep_runtime(root: &Path, euid: u32) -> Vec<String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) => return vec![error.to_string()],
@@ -355,24 +435,26 @@ pub(super) fn sweep_runtime(root: &Path, own_pid: u32, alive: impl Fn(u32) -> bo
                 continue;
             }
         };
-        let Some(pid) = entry.file_name().to_str().and_then(runtime_owner) else {
+        if !entry.file_name().to_str().is_some_and(is_runtime_name) {
             continue;
-        };
-        let is_dir = entry
-            .file_type()
-            .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink());
-        if is_dir && (pid == own_pid || !alive(pid)) {
-            if let Err(error) = remove_runtime(&entry.path()) {
-                problems.push(format!("{}: {error}", entry.path().display()));
-            }
+        }
+        let path = entry.path();
+        let ours = path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_dir() && metadata.uid() == euid);
+        if !ours {
+            continue;
+        }
+        let result = stale_lock(&path).and_then(|lock| match lock {
+            // Removed while its lock is held, so no other App can claim it meanwhile.
+            Some(_lock) => remove_runtime(&path),
+            None => Ok(()),
+        });
+        if let Err(error) = result {
+            problems.push(format!("{}: {error}", path.display()));
         }
     }
     problems
-}
-
-/// Whether a process with this pid exists now.
-pub(super) fn pid_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 /// Chromium refuses its sandbox to root, so a root App (the native fixture
@@ -802,49 +884,87 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_removes_only_ended_or_own_runtime_dirs_and_never_follows_links() {
+    fn the_sweep_removes_only_unlocked_runtime_dirs_and_never_follows_links() {
         let root = scratch("s");
-        let (own, live, dead) = (std::process::id(), 4_000_001, 4_000_002);
         let outside = root.join("outside");
         private_directory(&outside.join("kept")).unwrap();
         let runtime = root.join("rt");
         private_directory(&runtime).unwrap();
-        for name in [
-            runtime_name(dead, 1),
-            runtime_name(own, 3),
-            runtime_name(live, 2),
-            "keep".into(),
-            "p-x-1".into(),
-        ] {
-            private_directory(&runtime.join(&name).join("tmp")).unwrap();
-            std::fs::write(runtime.join(&name).join("guard.json"), b"{}").unwrap();
+        // Stale: its lock file exists and nobody holds it. A link inside it is
+        // removed, not followed.
+        let stale = runtime.join(runtime_name(4_000_002, 1));
+        private_directory(&stale.join("tmp")).unwrap();
+        drop(lock_runtime(&stale).unwrap());
+        std::os::unix::fs::symlink(&outside, stale.join("tmp").join("out")).unwrap();
+        // Live: another open file description holds its lock (another App,
+        // possibly on another host or in another PID namespace with this pid).
+        let live = runtime.join(runtime_name(std::process::id(), 2));
+        private_directory(&live).unwrap();
+        let held = lock_runtime(&live).unwrap();
+        // Not judged: no lock file (being created, or from an earlier build).
+        let unjudged = runtime.join(runtime_name(4_000_003, 3));
+        private_directory(&unjudged).unwrap();
+        // A lock file that is a link is never followed.
+        let linked = runtime.join(runtime_name(4_000_004, 4));
+        private_directory(&linked).unwrap();
+        std::os::unix::fs::symlink(outside.join("kept"), linked.join(RUNTIME_LOCK)).unwrap();
+        // Links, files and other names, even with an unlocked lock file.
+        std::os::unix::fs::symlink(&outside, runtime.join(runtime_name(4_000_002, 9))).unwrap();
+        std::fs::write(runtime.join(runtime_name(4_000_002, 8)), b"").unwrap();
+        for other in ["keep", "p-x-1"] {
+            private_directory(&runtime.join(other)).unwrap();
+            drop(lock_runtime(&runtime.join(other)).unwrap());
         }
-        // A stale-looking link and file are never removed or followed.
-        std::os::unix::fs::symlink(&outside, runtime.join(runtime_name(dead, 9))).unwrap();
-        std::fs::write(runtime.join(runtime_name(dead, 8)), b"").unwrap();
-        // Inside a stale directory, a link to outside is removed, not followed.
-        std::os::unix::fs::symlink(&outside, runtime.join(runtime_name(dead, 1)).join("out"))
-            .unwrap();
-        let problems = sweep_runtime(&runtime, own, |pid| pid == live);
+        let problems = sweep_runtime(&runtime, euid());
+        drop(held);
         let mut left = std::fs::read_dir(&runtime)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         left.sort();
         let outside_kept = outside.join("kept").is_dir();
-        let refused = remove_runtime(&runtime.join(runtime_name(dead, 9)));
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(problems.is_empty(), "{problems:?}");
         let mut expected = vec![
-            runtime_name(live, 2),
-            runtime_name(dead, 8),
-            runtime_name(dead, 9),
+            runtime_name(std::process::id(), 2),
+            runtime_name(4_000_003, 3),
+            runtime_name(4_000_004, 4),
+            runtime_name(4_000_002, 8),
+            runtime_name(4_000_002, 9),
             "keep".into(),
             "p-x-1".into(),
         ];
         expected.sort();
         assert_eq!(left, expected);
+        assert_eq!(problems.len(), 1, "only the linked lock file: {problems:?}");
         assert!(outside_kept, "links are never followed");
-        assert!(refused.is_err(), "a link is not a runtime directory");
+    }
+
+    #[test]
+    fn a_runtime_name_is_claimed_only_when_missing_or_stale() {
+        let root = scratch("c");
+        let missing = root.join(runtime_name(4_000_001, 1));
+        let stale = root.join(runtime_name(4_000_001, 2));
+        private_directory(&stale.join("tmp")).unwrap();
+        drop(lock_runtime(&stale).unwrap());
+        let held_dir = root.join(runtime_name(4_000_001, 3));
+        private_directory(&held_dir).unwrap();
+        let held = lock_runtime(&held_dir).unwrap();
+        let unjudged = root.join(runtime_name(4_000_001, 4));
+        private_directory(&unjudged).unwrap();
+        let file = root.join(runtime_name(4_000_001, 5));
+        std::fs::write(&file, b"").unwrap();
+        let results = [
+            claim_runtime(&missing).unwrap(),
+            claim_runtime(&stale).unwrap(),
+            claim_runtime(&held_dir).unwrap(),
+            claim_runtime(&unjudged).unwrap(),
+        ];
+        let not_a_dir = claim_runtime(&file);
+        let (stale_gone, held_kept) = (!stale.exists(), held_dir.join(RUNTIME_LOCK).exists());
+        drop(held);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(results, [true, true, false, false]);
+        assert!(not_a_dir.is_err());
+        assert!(stale_gone && held_kept);
     }
 }
