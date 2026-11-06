@@ -491,7 +491,7 @@ async function openExternalProbe(work,personal,expected,sample) {
   assert(log&&path.isAbsolute(log),'The recording opener is required');
   const other=origin.includes('excalidraw')?'https://www.photopea.com':'https://excalidraw.com';
   const url=`${other}/?sumi_open_external_${nonce.replaceAll('-','')}`;
-  const state={method:'Native context menu on a test-inserted link in a srcdoc frame: CDP right click, X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
+  const state={method:'Native context menu on a test-inserted link in a srcdoc frame: X11 right click (xdotool), X11 keys select its first item; the App hands the link to a recording xdg-open stand-in'};
   const pages=async page=>(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   const opened=async()=>{try{return (await readFile(log,'utf8')).split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if(e.code==='ENOENT')return [];throw e;}};
   assert.deepEqual(await opened(),[],'Nothing may reach the opener before the choice');
@@ -506,9 +506,14 @@ async function openExternalProbe(work,personal,expected,sample) {
   await settled(()=>work.evaluate("document.visibilityState==='visible'"),'Work must be visible before the right click');
   const tops=()=>desktop('xwininfo',['-root','-children','-int']).split('\n').map(line=>line.match(/^\s+(\d+) /)?.[1]).filter(Boolean);
   const before=new Set(tops());
-  await work.send('Input.dispatchMouseEvent',{type:'mouseMoved',button:'none',buttons:0,...point});
-  await work.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'right',buttons:2,clickCount:1,...point});
-  await work.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'right',buttons:0,clickCount:1,...point});
+  // A real X right click: a CDP-dispatched one created the menu window but it
+  // closed unmapped at once (ex36), without the native button and grab state.
+  // Screen point = Work's X window origin + the browser toolbar + the CSS point.
+  const geometry=Object.fromEntries(desktop('xdotool',['getwindowgeometry','--shell',String(work.native.windowId)]).split('\n').map(line=>line.split('=')));
+  const toolbar=await work.evaluate("window.outerHeight-window.innerHeight");
+  state.click={x:Math.round(Number(geometry.X)+point.x),y:Math.round(Number(geometry.Y)+toolbar+point.y),toolbar};
+  desktop('xdotool',['mousemove','--sync',String(state.click.x),String(state.click.y)]);
+  desktop('xdotool',['click','3']);
   // The menu is a new viewable top-level window of Work's own browser.
   const viewable=id=>{try{return /Map State:\s+IsViewable/.test(desktop('xwininfo',['-id',id,'-stats']));}catch{return false;}};
   const ownerOf=id=>{try{return JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),id])).pid;}catch{return null;}};
