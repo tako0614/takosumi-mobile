@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests of the W3 Windows runner and observer pieces that need no App,
 browser or Windows: the WebSocket client, the DevTools event bookkeeping, the
-TCP table parser, the fixture site and the receipt check. Standard library
-only; runs on Linux and Windows."""
+TCP table parser, the fixture site, the receipt check and the case list the
+CI job requires. Standard library only; runs on Linux and Windows."""
 import base64
 import hashlib
 import http.client
@@ -241,6 +241,19 @@ class RunnerTests(unittest.TestCase):
                              ("forcedCleanup", 1), ("cleanupErrors", ["x"]), ("error", "x"), ("rootExit", True)):
             with self.assertRaises(Failure):
                 runner.normal(dict(receipt, **{field: value}))
+
+    def test_the_ci_job_requires_exactly_the_runner_cases(self):
+        cases = [name for phase in ("", "restart", "reset") for name in runner.OBSERVED_CASES[phase]]
+        cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
+        cases += list(runner.FINAL_CASES)
+        self.assertEqual(len(cases), len(set(cases)))
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text()
+        block = re.search(r"\$w3Cases = @\(\n(.*?)\n\s*\)", workflow, re.S)
+        count = re.search(r"\$w3Count -ne (\d+)\)", workflow)
+        self.assertIsNotNone(block, "The cef-windows-app job lists its required cases")
+        self.assertIsNotNone(count, "The cef-windows-app job requires an exact case count")
+        self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
+        self.assertEqual(int(count.group(1)), len(cases))
 
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.
