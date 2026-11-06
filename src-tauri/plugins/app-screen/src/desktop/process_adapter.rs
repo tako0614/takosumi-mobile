@@ -616,7 +616,9 @@ impl Process {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                // prctl is variadic and reads unsigned longs.
+                let (term, zero) = (libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong);
+                if libc::prctl(libc::PR_SET_PDEATHSIG, term, zero, zero, zero) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() as u32 != app {
@@ -1219,8 +1221,19 @@ mod tests {
     }
     /// A stand-in product guard that is not Python: run under python3 it would
     /// fail to parse and never record how it was started. It records its argv
-    /// beside the receipt position, then waits for the control pipe to close.
-    const DIRECT_GUARD: &str = "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > \"${1%/*}/argv\"\n: > \"${1%/*}/ready\"\nwhile read -r line; do :; done\n";
+    /// beside the receipt position, then execs a reader of its parent-death
+    /// signal (kept across exec; neither sh nor python sets one), which waits
+    /// for the control pipe to close.
+    const DIRECT_GUARD: &str = r#"#!/bin/sh
+printf '%s\n' "$0" "$@" > "${1%/*}/argv"
+exec python3 -I -B -c 'import ctypes,os,sys
+d=os.path.dirname(sys.argv[1])
+s=ctypes.c_int(-1)
+ctypes.CDLL(None).prctl(2,ctypes.byref(s),0,0,0)
+open(d+"/pdeathsig","w").write(str(s.value))
+open(d+"/ready","w").close()
+sys.stdin.read()' "$1"
+"#;
     #[test]
     fn open_requests_execute_a_guard_binary_directly() {
         let root = std::env::temp_dir().join(format!("sumi-pa-direct-{}", std::process::id()));
@@ -1261,9 +1274,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let recorded = std::fs::read_to_string(runtime.join("argv"));
+        let pdeathsig = std::fs::read_to_string(runtime.join("pdeathsig"));
         drop(process); // Closing the control pipe ends the stand-in.
         std::fs::remove_dir_all(&root).unwrap();
         let recorded = recorded.expect("the guard binary was not executed directly");
+        // Armed by the adapter between fork and exec, before the guard runs.
+        assert_eq!(pdeathsig.unwrap(), libc::SIGTERM.to_string());
         let lines = recorded.lines().collect::<Vec<_>>();
         let receipt = runtime.join("guard.json");
         assert_eq!(
