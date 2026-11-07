@@ -462,6 +462,40 @@ class SiteTests(unittest.TestCase):
         self.assertIn('data-page="login"', self.request("GET", "/", cookie="fixture_session=admin")[2])
 
 
+class SandboxEvidenceTests(unittest.TestCase):
+    """windows_smoke.py --expect-sandbox (W7): the pure parts."""
+
+    def test_command_lines_split_like_the_c_runtime(self):
+        import windows_smoke as smoke
+        self.assertEqual(smoke.windows_arguments('"C:\\a b\\x.exe" --type=renderer "--lang=en US" c\\d'),
+                         ["C:\\a b\\x.exe", "--type=renderer", "--lang=en US", "c\\d"])
+        self.assertEqual(smoke.windows_arguments('x.exe "e\\"f" g\\\\"h i" "j""k"'),
+                         ["x.exe", 'e"f', "g\\h i", 'j"k'])
+        self.assertEqual(smoke.process_type(smoke.windows_arguments("x.exe --type=renderer --x")), "renderer")
+        self.assertIsNone(smoke.process_type(smoke.windows_arguments("x.exe -- --type=renderer")))
+        self.assertIsNone(smoke.process_type(smoke.windows_arguments("--type=gpu-process x")))
+        self.assertTrue(smoke.has_no_sandbox(smoke.windows_arguments("x.exe --type=renderer --no-sandbox")))
+        self.assertFalse(smoke.has_no_sandbox(smoke.windows_arguments("x.exe -- --no-sandbox")))
+
+    def test_only_restricted_renderers_below_the_browser_show_the_sandbox(self):
+        import windows_smoke as smoke
+        browser = {"pid": 1, "integrity": 0x2000, "noSandbox": False}
+        untrusted = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
+        low = {"pid": 3, "integrity": 0x1000, "noSandbox": False}
+        self.assertEqual(smoke.sandbox_problems(browser, [untrusted, low]), [])
+        cases = (
+            (browser, [], "no renderer"),
+            (browser, [{"pid": 4, "integrity": 0x2000, "noSandbox": False}], "medium integrity"),
+            (browser, [{"pid": 5, "integrity": 0x0000, "noSandbox": True}], "--no-sandbox"),
+            (browser, [{"pid": 6, "integrity": None, "noSandbox": False, "error": "denied"}], "unknown"),
+            ({"pid": 1, "integrity": 0x2000, "noSandbox": True}, [untrusted], "the browser runs with --no-sandbox"),
+            ({"pid": 1, "integrity": 0x1000, "noSandbox": False}, [low], "not below the browser's"),
+        )
+        for owner, renderers, problem in cases:
+            problems = smoke.sandbox_problems(owner, renderers)
+            self.assertTrue(any(problem in text for text in problems), (problem, problems))
+
+
 class RunnerTests(unittest.TestCase):
     def test_case_names_also_fit_the_app_identifier(self):
         for name in ("sumi-w3", "a", "x" * 24):

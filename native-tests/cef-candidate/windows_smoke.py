@@ -25,7 +25,12 @@ session and process group. It then requires, each within a bound:
 4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
    a `stopped` reply for N and process exit code 0;
 5. no process left: none still in the Job Object (Windows) or the process
-   group (Linux) within 10 s of the exit.
+   group (Linux) within 10 s of the exit;
+6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
+   shutdown: at least one renderer process in the job, each without
+   `--no-sandbox` and with a token integrity level of Low or Untrusted,
+   below the browser's own (read from its token), and no `--no-sandbox` in
+   the browser's command line either; recorded as `sandbox`.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -154,6 +159,172 @@ def last_error(what):
     return OSError(f"{what} failed (Windows error {code})")
 
 
+# Token integrity levels (the mandatory label's RID).
+INTEGRITY = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium", 0x2100: "medium-plus", 0x3000: "high",
+             0x4000: "system"}
+LOW_INTEGRITY = 0x1000
+
+
+def windows_arguments(line):
+    """A Windows command line split as the C runtime does (the program name
+    first, without backslash escapes; then quotes, 2n/2n+1 backslashes before
+    a quote, and "" inside quotes), as process_type.rs splits it."""
+    arguments, index, program, quoted = [], 0, [], False
+    while index < len(line) and (quoted or line[index] not in " \t"):
+        if line[index] == '"':
+            quoted = not quoted
+        else:
+            program.append(line[index])
+        index += 1
+    arguments.append("".join(program))
+    while True:
+        while index < len(line) and line[index] in " \t":
+            index += 1
+        if index >= len(line):
+            return arguments
+        argument, quoted = [], False
+        while index < len(line):
+            c = line[index]
+            if c == "\\":
+                start = index
+                while index < len(line) and line[index] == "\\":
+                    index += 1
+                count = index - start
+                if index < len(line) and line[index] == '"':
+                    argument.append("\\" * (count // 2))
+                    if count % 2:
+                        argument.append('"')
+                        index += 1
+                else:
+                    argument.append("\\" * count)
+                continue
+            if c == '"':
+                if quoted and index + 1 < len(line) and line[index + 1] == '"':
+                    argument.append('"')
+                    index += 2
+                    continue
+                quoted = not quoted
+                index += 1
+                continue
+            if not quoted and c in " \t":
+                break
+            argument.append(c)
+            index += 1
+        arguments.append("".join(argument))
+
+
+def process_type(arguments):
+    """The Chromium process type of split arguments (None: the browser
+    process); switches end at a bare `--`."""
+    kind = None
+    for argument in arguments[1:]:
+        if argument == "--":
+            break
+        if argument.startswith("--type="):
+            kind = argument[len("--type="):]
+    return kind
+
+
+def has_no_sandbox(arguments):
+    rest = arguments[1:]
+    return "--no-sandbox" in (rest[:rest.index("--")] if "--" in rest else rest)
+
+
+def sandbox_problems(browser, renderers):
+    """Why the sandbox is not shown (empty when it is): `browser` and each
+    of `renderers` are {"integrity": RID or None, "noSandbox": bool}."""
+    problems = []
+    if browser.get("noSandbox"):
+        problems.append("the browser runs with --no-sandbox")
+    if browser.get("integrity") is None:
+        problems.append("the browser's integrity level is unknown")
+    if not renderers:
+        problems.append("no renderer process was found")
+    for renderer in renderers:
+        integrity = renderer.get("integrity")
+        if renderer.get("noSandbox"):
+            problems.append(f"renderer {renderer.get('pid')} runs with --no-sandbox")
+        if integrity is None:
+            problems.append(f"renderer {renderer.get('pid')}: integrity level unknown ({renderer.get('error')})")
+        elif integrity > LOW_INTEGRITY or (browser.get("integrity") is not None
+                                           and integrity >= browser["integrity"]):
+            problems.append(f"renderer {renderer.get('pid')} runs at {INTEGRITY.get(integrity, hex(integrity))} "
+                            f"integrity, not below the browser's and at most low")
+    return problems
+
+
+def process_facts(kernel32, advapi32, ntdll, pid):
+    """A process's split command line and token integrity RID (Windows):
+    {"pid", "arguments", "integrity", "error"?}."""
+    facts = {"pid": pid, "arguments": None, "integrity": None}
+    process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        facts["error"] = f"OpenProcess: Windows error {ctypes.get_last_error()}"
+        return facts
+    try:
+        size = ctypes.c_uint32(0)
+        buffer = (ctypes.c_uint64 * 8192)()  # 64 KiB, aligned for UNICODE_STRING
+        status = ntdll.NtQueryInformationProcess(process, 60, buffer, ctypes.sizeof(buffer), ctypes.byref(size))
+        if status == 0:
+            length = ctypes.c_uint16.from_buffer(buffer, 0).value
+            address = ctypes.c_void_p.from_buffer(buffer, 8).value
+            facts["arguments"] = windows_arguments(ctypes.wstring_at(address, length // 2)) if address else []
+        else:
+            facts["error"] = f"NtQueryInformationProcess: 0x{status & 0xFFFFFFFF:08X}"
+        token = ctypes.c_void_p()
+        if advapi32.OpenProcessToken(process, 0x8, ctypes.byref(token)):  # TOKEN_QUERY
+            try:
+                label = (ctypes.c_uint64 * 16)()
+                needed = ctypes.c_uint32(0)
+                # TokenIntegrityLevel: a TOKEN_MANDATORY_LABEL, its SID first.
+                if advapi32.GetTokenInformation(token, 25, label, ctypes.sizeof(label), ctypes.byref(needed)):
+                    sid = ctypes.c_void_p.from_buffer(label, 0)
+                    count = advapi32.GetSidSubAuthorityCount(sid)[0]
+                    facts["integrity"] = advapi32.GetSidSubAuthority(sid, count - 1)[0]
+                else:
+                    facts["error"] = f"GetTokenInformation: Windows error {ctypes.get_last_error()}"
+            finally:
+                kernel32.CloseHandle(token)
+        else:
+            facts["error"] = f"OpenProcessToken: Windows error {ctypes.get_last_error()}"
+    finally:
+        kernel32.CloseHandle(process)
+    return facts
+
+
+def sandbox_evidence(job, browser_pid, deadline):
+    """Windows: the browser's and its renderers' integrity levels and
+    command lines, once at least one renderer is in the job (until
+    `deadline`); raises when they do not show Chromium's sandbox."""
+    handle, dword = ctypes.c_void_p, ctypes.c_uint32
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    advapi32.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
+    advapi32.GetTokenInformation.argtypes = [handle, ctypes.c_int, ctypes.c_void_p, dword, ctypes.POINTER(dword)]
+    advapi32.GetSidSubAuthorityCount.argtypes = [handle]
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthority.argtypes = [handle, dword]
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(dword)
+    ntdll.NtQueryInformationProcess.argtypes = [handle, ctypes.c_int, ctypes.c_void_p, dword, ctypes.POINTER(dword)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_int32
+    while True:
+        facts = [process_facts(job.kernel32, advapi32, ntdll, pid) for pid in job.process_ids()]
+        renderers = [fact for fact in facts if fact["arguments"] and process_type(fact["arguments"]) == "renderer"]
+        if renderers or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    browser = next((fact for fact in facts if fact["pid"] == browser_pid), {"pid": browser_pid})
+    summarize = lambda fact: {"pid": fact["pid"], "integrity": fact.get("integrity"),
+                              "integrityName": INTEGRITY.get(fact.get("integrity")),
+                              "noSandbox": bool(fact.get("arguments")) and has_no_sandbox(fact["arguments"]),
+                              **({"error": fact["error"]} if "error" in fact else {})}
+    evidence = {"browser": summarize(browser), "renderers": [summarize(fact) for fact in renderers],
+                "types": sorted({process_type(fact["arguments"]) or "browser" for fact in facts
+                                 if fact["arguments"]})}
+    evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"])
+    return evidence
+
+
 class WindowsJob:
     """A kill-on-close Job Object that owns the browser and every process it starts."""
 
@@ -213,6 +384,17 @@ class WindowsJob:
                                                        ctypes.byref(info), ctypes.sizeof(info), None):
             raise last_error("QueryInformationJobObject")
         return info.TotalProcesses, info.ActiveProcesses
+
+    def process_ids(self):
+        """The ids of the processes now in the job (the first 1024)."""
+        class IdList(ctypes.Structure):  # JOBOBJECT_BASIC_PROCESS_ID_LIST
+            _fields_ = [("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32),
+                        ("ids", ctypes.c_size_t * 1024)]
+
+        ids = IdList()
+        if not self.kernel32.QueryInformationJobObject(self.handle, 3, ctypes.byref(ids), ctypes.sizeof(ids), None):
+            raise last_error("QueryInformationJobObject")
+        return [ids.ids[index] for index in range(min(ids.listed, 1024))]
 
     def terminate(self):
         if self.handle and not self.kernel32.TerminateJobObject(self.handle, 1):
@@ -451,16 +633,22 @@ def main():
                         help="require the main-frame load marker (fixture-inspection browsers only)")
     parser.add_argument("--reuse", action="store_true",
                         help="reopen the same screen and require the raise before shutting down")
+    parser.add_argument("--expect-sandbox", action="store_true",
+                        help="Windows (W7): require the renderers to run in Chromium's sandbox (token integrity "
+                             "low or untrusted, below the browser's; no --no-sandbox)")
     args = parser.parse_args()
     if not (WINDOWS or LINUX):
         parser.error("Only Windows and Linux browsers are supported")
+    if args.expect_sandbox and not WINDOWS:
+        parser.error("--expect-sandbox reads Windows tokens")
     if not URL_SHAPE.fullmatch(args.url) or args.url.endswith(":443/"):
         parser.error("--url must be a lowercase https site root such as https://example.com/")
 
     browser = Path(os.path.realpath(args.browser))
     runtime = Path(os.path.realpath(args.runtime or browser.parent))
     summary = {"passed": False, "platform": sys.platform, "browser": str(browser), "runtime": str(runtime),
-               "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse, "seconds": {}, "error": None}
+               "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse,
+               "expectSandbox": args.expect_sandbox, "seconds": {}, "error": None}
     session = None
     case = None
     try:
@@ -537,6 +725,11 @@ def main():
                 check_foreground(session.job.user32, reused["window_id"])
                 summary["foreground"] = True
             next_id += 1
+
+        if args.expect_sandbox:
+            summary["sandbox"] = sandbox_evidence(session.job, pid, time.monotonic() + args.open_timeout)
+            require(not summary["sandbox"]["problems"],
+                    f"The browser's processes do not show Chromium's sandbox: {summary['sandbox']['problems']}")
 
         stop_deadline = time.monotonic() + args.stop_timeout
         session.send({"operation": "shutdown", "id": next_id})
