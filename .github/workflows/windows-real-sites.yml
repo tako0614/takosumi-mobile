@@ -1,11 +1,13 @@
 name: Windows real sites
 
-# Manual evidence run (W4), not a merge gate: the actual App on Windows opens
-# real third-party sites (Excalidraw, Photopea) in two connection profiles
-# through its home, as the Linux real-site runs did. Third-party sites change
-# and can be slow, so this is dispatched by hand for a given ref and never
-# runs on pull requests or pushes. Anonymous use only: synthetic markers, no
-# sign-in anywhere real.
+# Manual evidence run (W4), never a merge gate: the actual App on Windows
+# opens real third-party sites (Excalidraw, Photopea) in two connection
+# profiles through its home, as the Linux real-site runs did. Third-party
+# sites change and can be slow, so it runs only when asked: dispatched from
+# the default branch for a given ref, or by adding the label
+# `windows-real-sites` to a pull request (which tests that pull request's
+# head commit). No other pull request event and no push runs it.
+# Anonymous use only: synthetic markers, no sign-in anywhere real.
 on:
   workflow_dispatch:
     inputs:
@@ -13,12 +15,14 @@ on:
         description: The takosumi-mobile ref (branch, tag or commit) to test
         required: true
         type: string
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
 
 concurrency:
-  group: takosumi-mobile-windows-real-sites-${{ inputs.ref }}
+  group: takosumi-mobile-windows-real-sites-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
   cancel-in-progress: false
 
 env:
@@ -29,14 +33,18 @@ env:
 
 jobs:
   windows-real-sites:
+    # Only a dispatch, or the `windows-real-sites` label being added.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.label.name == 'windows-real-sites' }}
     runs-on: windows-latest
     timeout-minutes: 150
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+      # The ref under test: the dispatch input, or the labeled pull request's head.
+      TEST_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ env.TEST_REF }}
           path: takosumi-mobile
           persist-credentials: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

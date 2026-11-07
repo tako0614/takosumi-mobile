@@ -1313,16 +1313,19 @@ to 150 s and its watchdog 240 s in this mode
 Anonymous use only: synthetic markers, nothing signs in anywhere real, no
 credential is typed.
 
-**Workflow.** `.github/workflows/windows-real-sites.yml` runs only on
-`workflow_dispatch`, with the takosumi-mobile ref to test as its input. It
-builds like `cef-windows-app` (restoring its caches without saving), trusts
-the fixture CA, runs the Excalidraw and the Photopea cases in separate steps
-(25 minutes each; the second runs even if the first fails), requires each
-step's eight `<site>/<case>` names, exactly eight `PASS case` lines and a
-passed `summary.json`, removes the CA whatever happened and keeps both cases
-and the profiles' browser logs as the artifact `windows-real-sites-cases`.
-GitHub lists a `workflow_dispatch` workflow for dispatch only once its file
-is on the default branch.
+**Workflow.** `.github/workflows/windows-real-sites.yml` runs only when
+asked, and is never a merge gate: dispatched (`workflow_dispatch`, which
+GitHub offers once the file is on the default branch) with the
+takosumi-mobile ref to test as its input, or by adding the label
+`windows-real-sites` to a pull request, which tests that pull request's head
+commit (no other pull request event and no push runs it; it never uses
+`pull_request_target`, and its token reads contents only). It builds like
+`cef-windows-app` (restoring its caches without saving), trusts the fixture
+CA, runs the Excalidraw and the Photopea cases in separate steps (25 minutes
+each; the second runs even if the first fails), requires each step's eight
+`<site>/<case>` names, exactly eight `PASS case` lines and a passed
+`summary.json`, removes the CA whatever happened and keeps both cases and
+the profiles' browser logs as the artifact `windows-real-sites-cases`.
 
 **Not shown by W4:** Photopea's editor entry (the Linux run clicked "Start
 using Photopea"; here its landing counts as ready), the long native alert,

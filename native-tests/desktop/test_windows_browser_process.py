@@ -271,6 +271,21 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
             self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_real_site_workflow_runs_only_when_asked(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        on = re.search(r"^on:\n(.*?)\n(?=\S)", workflow, re.S | re.M).group(1)
+        self.assertEqual(re.findall(r"^  (\w+):", on, re.M), ["workflow_dispatch", "pull_request"])
+        self.assertRegex(on, r"  pull_request:\n    types: \[labeled\]\n?$")
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' || "
+                      "github.event.label.name == 'windows-real-sites' }}", workflow)
+        test_ref = ("github.event_name == 'workflow_dispatch' && inputs.ref || "
+                    "github.event.pull_request.head.sha")
+        self.assertIn(f"TEST_REF: ${{{{ {test_ref} }}}}", workflow)
+        self.assertIn(f"group: takosumi-mobile-windows-real-sites-${{{{ {test_ref} }}}}", workflow)
+        self.assertIn("ref: ${{ env.TEST_REF }}", workflow)
+        self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read$")
+
     def test_the_real_site_workflow_checks_out_the_ci_sibling_revisions(self):
         root = HERE.parents[1] / ".github/workflows"
         refs = [dict(re.findall(r"^  (MOBILE_KIT_SOURCE_REF|TAKOSUMI_SOURCE_REF): (\S+)$", (root / name).read_text(), re.M))
