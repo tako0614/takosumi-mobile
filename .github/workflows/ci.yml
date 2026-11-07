@@ -643,7 +643,8 @@ jobs:
   # native-browser-process-fixture, then windows_browser_process.py runs one
   # case in three launches (first, restart, reset) against its local HTTPS
   # fixture site. The site's disposable CA is trusted on the runner only for
-  # this run. Real sites stay Linux-only. Independent of the other jobs.
+  # this run. Real sites run on Windows only in the manual evidence workflow
+  # windows-real-sites.yml (W4), never here. Independent of the other jobs.
   cef-windows-app:
     runs-on: windows-latest
     timeout-minutes: 120

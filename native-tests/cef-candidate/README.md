@@ -232,7 +232,8 @@ not establish that all retained SDK references or cold-start issues are solved.
 An explicit Linux fixture now connects the existing bundled WebHome and its
 shell-only `app-screen.open` command to a separate CEF process per UUID profile.
 The same driver runs on Windows against a local fixture site; see
-[Windows actual App (W3)](#windows-actual-app-w3).
+[Windows actual App (W3)](#windows-actual-app-w3), and against real sites in
+a manual run: [Windows real sites (W4)](#windows-real-sites-w4-manual-evidence-run).
 Normal builds keep their existing runtime. No shared-kit or remote page IPC is
 added, and installed profiles are not migrated. This is an integration probe,
 not an engine decision or a distributable browser service.
@@ -1274,6 +1275,110 @@ client and flows (sign-in stand-in, samples, a beforeunload cancelled
 through `Page.handleJavaScriptDialog`) also ran once against a private
 headless Chrome and the runner's TLS site on Linux. Windows evidence comes
 only from the CI job.
+
+## Windows real sites (W4, manual evidence run)
+
+The fourth Windows step (W4) takes the actual App on Windows to real
+third-party sites, as the Linux real-site runs (Excalidraw, Photopea) did. It
+is a manual evidence run, not a merge gate: third-party sites change and can
+be slow, so it is not part of `ci.yml`.
+
+**What runs.** `windows_browser_process.py --real-site excalidraw` (or
+`photopea`) runs the W3 first launch with the fixture home's app link
+pointing at `https://excalidraw.com/` (or `https://www.photopea.com/`); there
+is no restart or reset phase. Both profiles sign in to the fixture home as in
+W3, follow the app link at once, and must reach the site's rendered editor,
+which neither a browser error page (another origin) nor the site's own shell
+satisfies: Excalidraw's canvas (`.excalidraw canvas`) without its crash
+screen (`.ErrorSplash`, which also carries the `.excalidraw` class), or
+Photopea's editor start screen ("Open From Computer"). Photopea first serves a
+static landing page, shown even if the editor's code never loads, so the
+observer enters the editor from it with its "Start using Photopea" button, as
+the Linux probe does (`browser-process.mjs`); here the click is a script
+`click()`, not CDP pointer input. Both profiles are fresh (this is the first
+launch, and the reopen reuses the document), so each must show Photopea's
+landing before its editor; an editor without it fails. Each stage (the
+document, then from a landing the editor) has 60 s per profile. The site must load in a secure
+context with no App bridge, in the profile's one window, and
+`separate-profiles` records each profile's site context and how the editor
+was entered. Then, on the real pages:
+
+| Case | What it shows on the real site |
+| --- | --- |
+| `<site>/separate-profiles` | both profiles reach the site through the home; synthetic `localStorage` and script-cookie markers written in each are not seen by the other |
+| `<site>/home-by-window-switch` | Work, covered by Personal, stays `visible` (native occlusion off); the home comes back through the OS window switch |
+| `<site>/reuse-raises-window` | the minimized Work reopened from the home: the same process, window and document (its markers still there), restored, in front and visible |
+| `<site>/quit-cancel-stops` | the App's quit asks Work first; cancelling its (test-added) beforeunload stops the quit with both kept |
+| `<site>/quit-partial-order` | Work closes normally before Personal is asked; Personal's cancel keeps only Personal |
+| `<site>/quit-completes` | the final quit closes Personal; the App exits 0 with normal guard receipts and an empty job |
+| `<site>/no-process-left` | the launch's job ended empty without force |
+| `<site>/no-opener-request` | nothing was handed to the App's opener |
+
+On a real site the page or the browser may cancel the test's beforeunload
+dialog before the observer does: in run 42334571636 Photopea's dialog
+(with a browser-side handler) closed as cancelled (result false, no input)
+0.3 s after it opened, in the same second as 23 ad iframes attached and 22
+detached, and the observer's own cancel was then told that no dialog was
+showing; no guard ended and the quit stopped. The
+mechanism is unknown. On real sites that counts as the cancel for the quit
+outcome only if the page's own `javascriptDialogClosed` for that dialog has
+result false and the profile's guard has not ended; an accept, another
+dialog first or an ended guard fails. Each quit case records
+`dialogClosedBy` (`observer` or `browser`), and every later check (the quit
+stopped, both documents kept, the blocked and cancelled markers, the
+partial order, Work closed first) is unchanged. The W3 local-fixture run
+still requires the observer's own cancel. Both quit cases' dialogs must
+belong to the site's own origin (a cross-origin subframe's would not
+count). After a passed run the runner prints, for both,
+`DIALOG closedBy=<observer|browser> case=<site>/<case>`; the workflow
+requires both lines and emits a warning (not a failure) for `browser`.
+
+A real site's URL is recorded as its origin only (the dialogs, a refused
+dialog, a failed stage's document), since a fragment can carry a key (such
+as Excalidraw's `#room=` and `#json=`); the artifact is kept for 14 days.
+The browsers' own logs (`browser.log`, `cef-native.log`) are kept as they
+are.
+
+The W3 invariants hold: the attested owner of each DevTools port, unchanged
+source and executable hashes, no opener request. After the final quit
+request the observer accepts only a beforeunload that the real site raises on
+its own origin, and records it, so the quit can finish; any other dialog type
+or origin fails the run unanswered (recorded as `finalQuitDialogRefused`). In
+this mode (`TAKOSUMI_BROWSER_PROCESS_REAL_SITE`) the App's first checkpoint
+waits up to 450 s, covering the observer's worst case before it (about 370 s:
+attach and sign-in at 25 s and each real-site stage at 60 s in both
+profiles, plus the window steps; a unit test keeps the two in step), its
+watchdog 540 s, and the runner gives the observer up to 530 s.
+Anonymous use only: synthetic markers, nothing signs in anywhere real, no
+credential is typed.
+
+**Workflow.** `.github/workflows/windows-real-sites.yml` runs only when
+asked, and is never a merge gate: dispatched (`workflow_dispatch`, which
+GitHub offers once the file is on the default branch) with the
+takosumi-mobile ref to test as its input, or by adding the label
+`windows-real-sites` to a pull request, which tests that pull request's head
+commit (no other pull request event and no push runs it; it never uses
+`pull_request_target`, and its token reads contents only). A dispatch runs in
+the default branch's context and cache scope, so it tests only this
+repository's own commits: it refuses a pull request ref (`refs/pull/...`)
+and anything that does not resolve to a commit reachable from one of its
+branches, before building, and checks out the commit it resolved. Fork pull
+requests: use the label, after review. The concurrency group is the job's
+(after its `if`), so a run for another label never enters it and cannot
+cancel a pending real run. It builds like
+`cef-windows-app` (restoring its caches without saving), trusts the fixture
+CA, runs the Excalidraw and the Photopea cases in separate steps (25 minutes
+each; the second runs even if the first fails), requires each step's eight
+`<site>/<case>` names, exactly eight `PASS case` lines, the two `DIALOG`
+lines (warning on a cancel by the page or browser) and a passed
+`summary.json`, removes the CA whatever happened and keeps both cases and
+the profiles' browser logs as the artifact `windows-real-sites-cases`.
+
+**Not shown by W4:** pointer input reaching a real site (Photopea's start
+button is clicked from script; the Linux run used CDP pointer input), the long
+native alert,
+downloads, popups, notifications and the native file chooser on the real
+sites; a real login; and anything W3 does not show (see above).
 
 ## Observations and limits
 

@@ -26,6 +26,14 @@ const SCRIPT_BOUND: Duration = Duration::from_secs(30);
 /// Set once `run_return` returned: the watchdog then has nothing to stop.
 static RETURNED: AtomicBool = AtomicBool::new(false);
 
+/// The W4 real-site run (`TAKOSUMI_BROWSER_PROCESS_REAL_SITE`): third-party
+/// sites load before the observer's checkpoints, so the first checkpoint
+/// waits longer (450 s, browser_process.rs `inspect_bound`) and the watchdog
+/// allows that plus the ordinary 90 s.
+pub(super) fn real_site() -> bool {
+    std::env::var_os("TAKOSUMI_BROWSER_PROCESS_REAL_SITE").is_some()
+}
+
 pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<tauri::Wry>) {
     // Windows has no per-process data directories to point elsewhere: Tauri
     // keeps the App's data, the home's WebView2 profile and the browser
@@ -45,7 +53,7 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     std::thread::Builder::new()
         .name("browser-process-fixture-watchdog".into())
         .spawn(move || {
-            std::thread::sleep(Duration::from_secs(90));
+            std::thread::sleep(Duration::from_secs(if real_site() { 540 } else { 90 }));
             if !RETURNED.load(Ordering::SeqCst) {
                 eprintln!("FAIL: browser App fixture watchdog");
                 handle.exit(1);

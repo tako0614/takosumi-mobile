@@ -28,6 +28,14 @@ session's external-open.log instead of calling ShellExecuteW (the record's
 shape is unit-tested in the plugin). No case chooses to open a link outside,
 and the run requires that log to stay empty (no-opener-request).
 
+With --real-site (W4: excalidraw or photopea) the app home links to that real
+third-party site instead of /app/, and only the first launch runs: both
+profiles open the site through the home, the observer requires its
+readiness, separates synthetic markers, reopens Work and quits in order,
+and the cases are named <site>/<case>. A manual evidence run
+(.github/workflows/windows-real-sites.yml), not part of CI; anonymous only,
+no credential is ever typed.
+
 It prints `PASS case <name>` for each verified case and writes summary.json
 into the case directory, which it never removes.
 """
@@ -52,6 +60,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
 from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, require, tail  # noqa: E402
+from windows_browser_observer import REAL_SITES  # noqa: E402
 
 WINDOWS = os.name == "nt"
 OBSERVER = HERE / "windows_browser_observer.py"
@@ -61,6 +70,12 @@ OBSERVER = HERE / "windows_browser_observer.py"
 APP_STOP_FINISH = 30
 APP_EXIT_WAIT = APP_STOP_FINISH + 15
 OBSERVER_WAIT = 85
+# W4 (--real-site): both profiles load a third-party site before the
+# observer's first checkpoint, and the App's own bounds grow to match
+# (TAKOSUMI_BROWSER_PROCESS_REAL_SITE): its first checkpoint waits 450 s
+# (browser_process.rs) and its watchdog 540 s (browser_process_windows.rs);
+# the observer must end before that watchdog.
+REAL_SITE_OBSERVER_WAIT = 530
 # After the App exited: its WebView2 processes and any other descendant must
 # leave the job within this bound (windows_smoke.py's leftover bound).
 LEFTOVER_WAIT = 10
@@ -82,6 +97,10 @@ OBSERVED_CASES = {
 # link was handed to the App's opener.
 QUIT_CASE = "quit-completes"
 FINAL_CASES = ("no-process-left", "no-opener-request")
+# The first launch's cases whose beforeunload was cancelled: by the observer,
+# or on a real site by the page or browser first (the observation's
+# dialogClosedBy). Printed as one DIALOG line each.
+DIALOG_CASES = ("quit-cancel-stops", "quit-partial-order")
 # The observer's evidence printed to the CI log (bindings and samples stay in
 # browser-observation.json).
 EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder")
@@ -133,7 +152,7 @@ class Site(http.server.BaseHTTPRequestHandler):
         elif path == "/":
             self.send(f"""<!doctype html><title>{user} apps</title>
                 <main data-page="home" data-user="{user}"><h1>{user} apps</h1>
-                <a data-app="editor" href="/app/">Editor</a></main>""")
+                <a data-app="editor" href="{getattr(self.server, 'app_url', '/app/')}">Editor</a></main>""")
         elif path == "/app/" and user:
             self.send(f"""<!doctype html><title>Editor</title>
                 <main data-page="app" data-user="{user}"><h1>Editor</h1><textarea></textarea></main>""")
@@ -162,13 +181,15 @@ class Site(http.server.BaseHTTPRequestHandler):
             requests.append(f"{self.command} {self.path.split('?', 1)[0]} {args[1] if len(args) > 1 else ''}")
 
 
-def start_site(cert, key):
+def start_site(cert, key, app_url="/app/"):
     """The fixture site on 127.0.0.1 (an ephemeral port), served from a thread
-    for the whole run, so every phase reaches the saved connection's origin."""
+    for the whole run, so every phase reaches the saved connection's origin.
+    Its app home links to `app_url`: its own /app/, or (W4) a real site."""
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
     server.requests = []
+    server.app_url = app_url
     # The handshake runs in each request's thread (on its first read), so a
     # stalled client cannot hold up the accepting thread.
     server.socket = tls.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
@@ -361,11 +382,13 @@ def run_phase(args, env, files, before, head, suffix):
             raise
         proof["appPid"] = app.pid
         try:
+            real = ["--real-site", args.real_site] if args.real_site else []
             with create_exclusive(session / f"observer{suffix}.log") as observer:
                 subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
-                                "--app-pid", str(app.pid), "--phase", phase],
-                               env=observer_env, check=True, timeout=OBSERVER_WAIT, stdout=observer,
-                               stderr=subprocess.STDOUT)
+                                "--app-pid", str(app.pid), "--phase", phase, *real],
+                               env=observer_env, check=True,
+                               timeout=REAL_SITE_OBSERVER_WAIT if args.real_site else OBSERVER_WAIT,
+                               stdout=observer, stderr=subprocess.STDOUT)
             execution["appExit"] = app.wait(timeout=APP_EXIT_WAIT)
             require(execution["appExit"] == 0, "The App must exit normally")
             require(read_json(session / f"app-browser-process{suffix}-complete.json")["passed"] is True,
@@ -446,7 +469,11 @@ def main():
                         help="relaunch the App on the same data and verify per-profile state after restart")
     parser.add_argument("--reset", action="store_true",
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
+    parser.add_argument("--real-site", choices=sorted(REAL_SITES),
+                        help="W4: the app home links to this real site; first launch only, cases named <site>/<case>")
     args = parser.parse_args()
+    if args.real_site and (args.restart or args.reset):
+        parser.error("--real-site runs the first launch only")
     if not WINDOWS:
         parser.error("windows_browser_process.py runs on Windows; browser_process.py is the Linux runner")
     for name in ("binary", "browser", "guard", "tls_cert", "tls_key", "tls_ca"):
@@ -456,9 +483,9 @@ def main():
     stored = [directory for directory in app_data(args.data.name) if os.path.lexists(directory)]
     require(not stored, f"App data for this case name already exists: {stored}")
     summary = {"passed": False, "case": str(args.data), "appData": [str(path) for path in app_data(args.data.name)],
-               "cases": [], "phases": []}
+               "cases": [], "phases": [], "realSite": args.real_site}
     args.data.mkdir()
-    args.data.joinpath(".owned-browser-reference").write_text(args.data.name)
+    args.data.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     try:
         run(args, summary)
         summary["passed"] = True
@@ -475,16 +502,39 @@ def main():
     return 0
 
 
+def case_name(args, name):
+    """W3 cases by name; a W4 real-site run prefixes its site."""
+    return f"{args.real_site}/{name}" if args.real_site else name
+
+
+def dialog_lines(args, observation):
+    """`DIALOG closedBy=<observer|browser> case=<name>` for each of a passed
+    first launch's DIALOG_CASES (windows-real-sites.yml warns on `browser`)."""
+    lines = []
+    for name in DIALOG_CASES:
+        closed_by = observation.get("evidence", {}).get(name, {}).get("dialogClosedBy")
+        require(closed_by in ("observer", "browser"), f"The {name} evidence names no dialogClosedBy")
+        lines.append(f"DIALOG closedBy={closed_by} case={case_name(args, name)}")
+    return lines
+
+
+def real_site_cases(site):
+    """The cases a W4 run of `site` prints, in order (the first launch's,
+    its final quit and the run's invariants)."""
+    return [f"{site}/{name}" for name in list(OBSERVED_CASES[""]) + [QUIT_CASE] + list(FINAL_CASES)]
+
+
 def run(args, summary):
     # Everything the App, the observer and the browsers write lives in the
     # session directory, named like the case (its name is the observer's
     # synthetic nonce and the App's data identifier).
     session = args.session = args.data / args.data.name
     session.mkdir()
-    session.joinpath(".owned-browser-reference").write_text(args.data.name)
+    session.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     for name in ("r", "tmp"):
         (session / name).mkdir()
-    server, args.site = start_site(args.tls_cert, args.tls_key)
+    server, args.site = start_site(args.tls_cert, args.tls_key,
+                                   REAL_SITES[args.real_site]["url"] if args.real_site else "/app/")
     summary["site"] = args.site
     try:
         check_site(args.site, args.tls_ca)
@@ -501,6 +551,8 @@ def run(args, summary):
                    TAKOSUMI_BROWSER_PROCESS_SITE=args.site,
                    # The fixture build appends any link it would open outside here.
                    TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(log))
+        if args.real_site:
+            env["TAKOSUMI_BROWSER_PROCESS_REAL_SITE"] = args.real_site
         runtime = args.browser.parent / "libcef.dll"
         require(runtime.is_file(), f"No libcef.dll beside {args.browser}")
         files = sorted(set([args.binary, args.browser, runtime, args.guard] + source_files(REPO)))
@@ -526,20 +578,23 @@ def run(args, summary):
             # Personal (and Work before it) with normal guard receipts.
             print(f"evidence{suffix or '-first'} {evidence(args.session, suffix)}", flush=True)
             for name in expected + ([QUIT_CASE] if not suffix else []):
-                print(f"PASS case {name}", flush=True)
-                summary["cases"].append(name)
+                print(f"PASS case {case_name(args, name)}", flush=True)
+                summary["cases"].append(case_name(args, name))
+            if not suffix:
+                for line in dialog_lines(args, read_json(args.session / "browser-observation.json")):
+                    print(line, flush=True)
         # Every launch ended with its job empty, no forced cleanup and every
         # browser guard's normal receipt (checked per phase above).
-        print(f"PASS case {FINAL_CASES[0]}", flush=True)
-        summary["cases"].append(FINAL_CASES[0])
+        print(f"PASS case {case_name(args, FINAL_CASES[0])}", flush=True)
+        summary["cases"].append(case_name(args, FINAL_CASES[0]))
         # No link was handed to the App's opener over all launches: none of
         # these flows chooses to open one outside (that needs the native
         # context menu, inspected on Linux only).
         opened = read_session(log, 1024 * 1024).decode().splitlines() if os.path.lexists(log) else []
         summary["externalOpens"] = len(opened)
         require(opened == [], f"Expected no request to the opener, saw {len(opened)}")
-        print(f"PASS case {FINAL_CASES[1]}", flush=True)
-        summary["cases"].append(FINAL_CASES[1])
+        print(f"PASS case {case_name(args, FINAL_CASES[1])}", flush=True)
+        summary["cases"].append(case_name(args, FINAL_CASES[1]))
     finally:
         server.shutdown()
         server.server_close()

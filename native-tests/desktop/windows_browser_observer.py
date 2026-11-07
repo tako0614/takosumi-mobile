@@ -50,6 +50,32 @@ LOAD_WAIT = 25
 # (the Linux observer allows 10 s; process teardown is slower here).
 END_WAIT = 20
 RAISE_REFUSED = "Reused browser window was not raised:"
+# W4: real third-party sites behind the fixture home's app link. A site is
+# ready only once its editor has rendered, which neither a browser error page
+# (another origin) nor the site's own shell satisfies: Excalidraw's canvas
+# without its crash screen (`ErrorSplash`, which also carries the `.excalidraw`
+# class), Photopea's editor start screen. Photopea first serves a static
+# landing page (shown even if the editor's code never loads), so the editor is
+# entered from it with its start button (`landing`, `enter`), as the Linux
+# probe does (browser-process.mjs). Anonymous only: nothing signs in, no
+# credential is typed.
+REAL_SITES = {
+    "excalidraw": {"url": "https://excalidraw.com/", "origin": "https://excalidraw.com",
+                   "ready": "Boolean(document.querySelector('.excalidraw canvas') "
+                            "&& !document.querySelector('.ErrorSplash'))"},
+    "photopea": {"url": "https://www.photopea.com/", "origin": "https://www.photopea.com",
+                 "ready": "Boolean(document.body?.innerText.includes('Open From Computer'))",
+                 "landing": "Boolean(document.body?.innerText.includes('Start using Photopea'))",
+                 "enter": "(()=>{const start=[...document.querySelectorAll('button')].find(e=>"
+                          "e.innerText.trim()==='Start using Photopea'&&!e.disabled);"
+                          "if(!start)throw Error('No Photopea start button');start.click();return true})()"},
+}
+# Each stage of a real site in each profile (both profiles load at once): its
+# document (with a landing: landing or editor), then, from a landing, its editor.
+REAL_SITE_WAIT = 60
+# After the final quit request, a remaining real-site page may still ask its
+# own beforeunload; accept it within this bound so the quit can finish.
+FINAL_QUIT_WAIT = 45
 GA_ROOT = 2
 # ShowWindow: minimized without activating another window (the home stays in
 # front for the reopen).
@@ -61,6 +87,9 @@ WS_EX_TOPMOST = 0x8
 # sampled (every OCCLUSION_INTERVAL) for an occlusion update to show up.
 OCCLUSION_WATCH = 1.5
 OCCLUSION_INTERVAL = 0.1
+# How long one foreground change may take to show (each window switch tries
+# twice: SetForegroundWindow, then joined to the foreground thread's input).
+FOREGROUND_WAIT = 2.0
 # Bound on the top-level windows walked for the Z-order evidence.
 Z_ORDER_LIMIT = 4096
 WM_CLOSE = 0x0010
@@ -225,7 +254,7 @@ class Win32:
         return {"timeout": timeout, "idleMs": idle,
                 "active": bool(timeout and idle is not None and idle < timeout)}
 
-    def wait_foreground(self, window, bound=2.0):
+    def wait_foreground(self, window, bound=FOREGROUND_WAIT):
         deadline = time.monotonic() + bound
         while True:
             if self.foreground() == window:
@@ -419,6 +448,14 @@ class WebSocket:
         self.sock.close()
 
 
+class CdpError(Failure):
+    """A DevTools command's error reply; `error` holds its code and message."""
+
+    def __init__(self, text, error):
+        super().__init__(text)
+        self.error = error
+
+
 class Cdp:
     """One browser's DevTools connection. Events are kept (the oldest dropped
     past 4096) and addressed by absolute marks."""
@@ -429,9 +466,14 @@ class Cdp:
         self.events = []
         self.base = 0
         self.closed = None
+        # When each mark was taken (monotonic); events carry their receipt
+        # time as RECEIVED_AT, for dialog_evidence.
+        self.marked_at = {}
 
     def mark(self):
-        return self.base + len(self.events)
+        mark = self.base + len(self.events)
+        self.marked_at[mark] = time.monotonic()
+        return mark
 
     def since(self, mark):
         return self.events[max(0, mark - self.base):]
@@ -445,6 +487,7 @@ class Cdp:
             self.closed = str(error)
             raise Failure(f"DevTools connection of {self.label} ended: {error}") from None
         if "method" in message:
+            message[RECEIVED_AT] = time.monotonic()
             self.events.append(message)
             if len(self.events) > 4096:
                 del self.events[:1024]
@@ -465,7 +508,8 @@ class Cdp:
                 raise Failure(f"CDP timeout {method} ({self.label})")
             if message.get("id") == ident:
                 if "error" in message:
-                    raise Failure(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}")
+                    raise CdpError(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}",
+                                   message["error"])
                 return message.get("result", {})
 
     def wait_event(self, predicate, mark, timeout, what):
@@ -484,6 +528,106 @@ class Cdp:
             pass
 
 
+def url_origin(url):
+    """The origin part (scheme and authority) of a dialog's URL."""
+    return urlsplit(url)._replace(path="", query="", fragment="").geturl()
+
+
+def final_quit_dialog(params, app_origin):
+    """W4: the one dialog the final quit may accept on its own, the real
+    site's beforeunload on that site; any other type or origin fails. Returns
+    what is accepted."""
+    found = {"type": params.get("type"), "origin": url_origin(params.get("url") or "")}
+    require(found["type"] == "beforeunload" and found["origin"] == app_origin,
+            f"At the final quit only a beforeunload of {app_origin} may be accepted, not {found}")
+    return found
+
+
+# Dialog failure evidence (dialog_evidence): the page session's dialog events
+# and its frame lifecycle and navigation events, without text values.
+RECEIVED_AT = "_receivedAt"
+DIALOG_EVENTS = ("Page.javascriptDialogOpening", "Page.javascriptDialogClosed")
+FRAME_EVENTS = ("Page.frameAttached", "Page.frameDetached", "Page.frameStartedLoading", "Page.frameNavigated",
+                "Page.frameRequestedNavigation", "Page.navigatedWithinDocument")
+FRAME_EVIDENCE_LIMIT = 200
+
+
+def dialog_evidence(events, session, start):
+    """From `events` on `session`: each dialog opening (type, origin, browser
+    handler) and closing (result, and whether userInput was absent, empty or
+    present), and each frame lifecycle or navigation event (frame and parent
+    ids, URL origin; the last FRAME_EVIDENCE_LIMIT and their total), with
+    its receipt time in seconds after `start` (the mark's time). No message,
+    prompt, user input or full URL is kept."""
+    dialogs, frames, total = [], [], 0
+    for event in events:
+        method = event.get("method")
+        if event.get("sessionId") != session or method not in DIALOG_EVENTS + FRAME_EVENTS:
+            continue
+        params = event.get("params") or {}
+        entry = {"event": method.split(".", 1)[1]}
+        if start is not None and RECEIVED_AT in event:
+            entry["at"] = round(event[RECEIVED_AT] - start, 3)
+        if method == "Page.javascriptDialogOpening":
+            entry.update(type=params.get("type"), origin=url_origin(params.get("url") or ""),
+                         hasBrowserHandler=params.get("hasBrowserHandler"))
+            dialogs.append(entry)
+            continue
+        if method == "Page.javascriptDialogClosed":
+            entry["result"] = params.get("result")
+            entry["userInput"] = ("absent" if "userInput" not in params
+                                  else "present" if params["userInput"] else "empty")
+            dialogs.append(entry)
+            continue
+        frame = params.get("frame") or {}
+        entry["frameId"] = frame.get("id") or params.get("frameId")
+        parent = frame.get("parentId") or params.get("parentFrameId")
+        if parent:
+            entry["parentId"] = parent
+        url = frame.get("url") or params.get("url")
+        if url:
+            entry["origin"] = url_origin(url)
+        total += 1
+        frames.append(entry)
+    return {"dialogs": dialogs, "frames": frames[-FRAME_EVIDENCE_LIMIT:], "frameEvents": total}
+
+# The DevTools reply to Page.handleJavaScriptDialog when the page has no
+# dialog (any more).
+NO_DIALOG = "No dialog is showing"
+
+
+def browser_closed_dialog(events, opened, session):
+    """W4: the page session's own javascriptDialogClosed for the dialog
+    `opened` (the first dialog event on that session after its opening), or
+    None if none arrived yet. Another dialog opening first is a failure."""
+    after = False
+    for event in events:
+        if event is opened:
+            after = True
+            continue
+        if not after or event.get("sessionId") != session:
+            continue
+        if event.get("method") == "Page.javascriptDialogOpening":
+            raise Failure("Another dialog opened before the first one closed")
+        if event.get("method") == "Page.javascriptDialogClosed":
+            return event
+    require(after, "The dialog's opening is no longer among the kept events")
+    return None
+
+
+def real_site_first_checkpoint(site):
+    """W4: the observer's worst case, from the App's record of both browsers
+    to its first checkpoint (inspect-ready), in a real-site run: attach and
+    sign-in in both profiles (LOAD_WAIT each), each real-site stage in both
+    (REAL_SITE_WAIT each), then two window switches, the occlusion watch and
+    the minimize (two settles). The App's bound for that checkpoint
+    (browser_process.rs `inspect_bound`) covers it with a margin; a unit test
+    keeps the two in step."""
+    stages = 2 if "landing" in REAL_SITES[site] else 1
+    windows = 2 * 2 * FOREGROUND_WAIT + OCCLUSION_WATCH + 2 * SETTLE_WAIT
+    return 2 * LOAD_WAIT + 2 * LOAD_WAIT + 2 * stages * REAL_SITE_WAIT + windows
+
+
 class Page:
     """The one top-level document of a profile's browser, through a flattened
     target session on that browser's own DevTools connection."""
@@ -492,6 +636,9 @@ class Page:
         self.cdp, self.session, self.process, self.target = cdp, session, process, target
         self.native = process["opened"]
         self.window = self.native["windowId"]
+        # The fixture page's context (attach), and in a W4 run the real site's.
+        self.context = self.site_context = None
+        self.site_entry = None
 
     def send(self, method, params=None, timeout=5.0):
         return self.cdp.command(method, params, self.session, timeout)
@@ -510,8 +657,12 @@ class Page:
 # --- Observation ---------------------------------------------------------------
 
 class Observer:
-    def __init__(self, data, site, app_pid, phase, win32=None):
+    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
+        # W4: the app link leads to this real site (None: the fixture's /app/).
+        self.real = REAL_SITES[real_site] if real_site else None
+        self.real_name = real_site
+        self.app_origin = self.real["origin"] if self.real else site
         self.suffix = f"-{phase}" if phase else ""
         self.nonce = data.name
         self.key = f"sumi_app_process_{self.nonce}"
@@ -520,6 +671,9 @@ class Observer:
         self.proof = {"passed": False, "cases": [],
                       "scope": "Disposable Windows actual App/browser process fixture; local fixture site, "
                                "no real login or Push"}
+        if self.real:
+            self.proof["scope"] = (f"Disposable Windows actual App/browser process fixture; local fixture home, "
+                                   f"anonymous {real_site} app, synthetic markers only, no real login")
 
     # Helpers shared with browser-process.mjs's shape.
     def step(self, name, page=None):
@@ -673,8 +827,9 @@ class Observer:
         self.visibility(page, "attach")
         return page
 
-    def sign_in(self, page, user):
-        """The sign-in stand-in, then the app home's app, in this profile."""
+    def sign_in(self, page, user, open_app=True):
+        """The sign-in stand-in, then (with `open_app`) the app home's app, in
+        this profile."""
         self.step(f"{user} sign-in stand-in", page)
         require(page.evaluate("document.querySelector('main')?.dataset.page") == "login",
                 f"A new {user} profile must start signed out")
@@ -685,6 +840,8 @@ class Observer:
             "document.readyState==='complete' && document.querySelector('main')?.dataset.page==='home' "
             f"&& document.querySelector('main')?.dataset.user==={signed}"),
             f"The {user} sign-in did not reach its app home", LOAD_WAIT, tolerate=True)
+        if not open_app:
+            return
         self.step(f"{user} opens the app", page)
         page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
         self.settled(lambda: page.evaluate(
@@ -693,6 +850,103 @@ class Observer:
             f"&& document.querySelector('main')?.dataset.user==={signed}"),
             f"The {user} app did not open", LOAD_WAIT, tolerate=True)
         require(page.pages() == [page.target["targetId"]], f"The {user} app must stay in its one window")
+
+    def site_settled(self, page, test, message):
+        """Until the real site's `test` holds in `page` (REAL_SITE_WAIT); a
+        failure records the document the page was on."""
+        try:
+            self.settled(lambda: page.evaluate(test), message, REAL_SITE_WAIT, tolerate=True)
+        except Failure:
+            try:
+                # The origin only: a real site's URL can carry keys (e.g.
+                # Excalidraw's #room= and #json= fragments).
+                self.proof["siteDocument"] = dict(page.evaluate(
+                    "({origin:location.origin,ready:document.readyState,title:document.title,"
+                    "errorSplash:Boolean(document.querySelector('.ErrorSplash')),"
+                    "body:document.body?.innerText.slice(0,500)})"), profile=page.process["profile"])
+            except Failure as error:
+                self.proof["siteDocument"] = {"profile": page.process["profile"], "error": str(error)}
+            raise
+
+    def open_real_site(self, pages):
+        """W4: from each signed-in app home, follow the app link to the real
+        site in the same window (both start before either is awaited), enter
+        the editor from the site's landing page if it shows one, then require
+        the editor's readiness, its origin in a secure context without an App
+        bridge, and still one page per profile."""
+        on_site = f"location.origin==={json.dumps(self.app_origin)} && document.readyState==='complete'"
+        for page in pages:
+            self.step(f"{page.process['profile']} opens {self.real_name}", page)
+            href = page.evaluate("document.querySelector('a[data-app=editor]')?.href ?? null")
+            require(href == self.real["url"], f"The app home must link to {self.real['url']}, not {href}")
+            page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
+        landing = self.real.get("landing")
+        for page in pages:
+            # "landing": entered with the landing's start button, which every
+            # profile here must take: this runs once, on the first launch's
+            # fresh profiles (no restart or reset phase, and the reopen reuses
+            # the document), so an editor without its landing fails. "direct":
+            # a site without a landing (Excalidraw).
+            page.site_entry = "direct"
+            if not landing:
+                continue
+            self.step(f"{self.real_name} landing or editor", page)
+            self.site_settled(page, f"{on_site} && ({self.real['ready']} || {landing})",
+                              f"{self.real_name} did not load")
+            require(page.evaluate(landing) and not page.evaluate(self.real["ready"]),
+                    f"A fresh profile must show {self.real_name}'s landing before its editor")
+            page.evaluate(self.real["enter"], True)
+            page.site_entry = "landing"
+        for page in pages:
+            self.step(f"{self.real_name} ready", page)
+            self.site_settled(page, f"{on_site} && {self.real['ready']}", f"{self.real_name} did not become ready")
+            context = page.evaluate(
+                "({origin:location.origin,secure:isSecureContext,tauri:typeof __TAURI_INTERNALS__,"
+                "ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc,"
+                "webview2:typeof window.chrome?.webview})")
+            require(context["origin"] == self.app_origin and context["secure"] is True,
+                    f"{self.real_name} must load in a secure context: {context}")
+            for field in ("tauri", "ipc", "wry", "webview2"):
+                require(context[field] == "undefined", f"{self.real_name} must not see the App's {field} bridge")
+            require(page.pages() == [page.target["targetId"]], f"{self.real_name} must stay in its one window")
+            page.site_context = dict(context, entry=page.site_entry)
+
+    def finish_final_quit(self, pages):
+        """W4: after the final quit request, a real site may ask its own
+        beforeunload (the quit then waits for an answer). Accept only that
+        (final_quit_dialog; recorded, as is a refused one) until every
+        remaining profile's guard has ended."""
+        accepted = self.proof["finalQuitDialogsAccepted"] = []
+        marks = {id(page): page.cdp.mark() for page in pages}
+        deadline = time.monotonic() + FINAL_QUIT_WAIT
+        remaining = list(pages)
+        while remaining:
+            require(time.monotonic() < deadline, "The final quit did not end every remaining profile")
+            for page in list(remaining):
+                if self.guard_ended(page.process["guardReceipt"]):
+                    remaining.remove(page)
+                    continue
+                try:
+                    page.cdp.drain(0.2)
+                except Failure:
+                    continue  # its connection closed: the browser is ending
+                for event in page.cdp.since(marks[id(page)]):
+                    if event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session:
+                        try:
+                            dialog = dict(final_quit_dialog(event["params"], self.app_origin),
+                                          profile=page.process["profile"])
+                        except Failure:
+                            self.proof["finalQuitDialogRefused"] = {
+                                "profile": page.process["profile"], "type": event["params"].get("type"),
+                                "origin": url_origin(event["params"].get("url") or "")}
+                            raise
+                        try:
+                            page.send("Page.handleJavaScriptDialog", {"accept": True})
+                        except Failure:
+                            continue  # already closed, or the browser is ending
+                        accepted.append(dialog)
+                marks[id(page)] = page.cdp.mark()
+            time.sleep(0.1)
 
     def visibility(self, page, when):
         """The page's own visibility and focus and Windows' view of its
@@ -718,13 +972,89 @@ class Observer:
             lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
             and event["params"].get("type") == kind, mark, bound, what)
 
-    def cancel_dialog(self, page, mark, what):
+    def cancel_dialog(self, page, mark, what, opened=None, others=()):
         """Cancel the page's open dialog through DevTools and see it closed
-        with result false (which the browser's own close observer reports)."""
-        page.send("Page.handleJavaScriptDialog", {"accept": False})
-        return page.cdp.wait_event(
-            lambda event: event["method"] == "Page.javascriptDialogClosed" and event.get("sessionId") == page.session
-            and event["params"].get("result") is False, mark, SETTLE_WAIT, what)
+        with result false (which the browser's own close observer reports):
+        returns "observer". On a real site (W4) the page or browser may cancel
+        the dialog first (mechanism unknown; run 42334571636): DevTools then
+        answers that no dialog is showing, and that counts as the cancel only
+        if the page's own javascriptDialogClosed for `opened` has result false
+        and the profile's guard has not ended: returns "browser". The
+        local-fixture run requires the observer's cancel. A failure records
+        the evidence of `page` and of each (page, mark) in `others`
+        (dialog_failure) before it goes on."""
+        attempt = time.monotonic()
+        try:
+            try:
+                page.send("Page.handleJavaScriptDialog", {"accept": False})
+            except CdpError as error:
+                if not (self.real and opened is not None and error.error.get("message") == NO_DIALOG):
+                    raise
+                return self.cancelled_by_browser(page, what, opened, attempt, error)
+            page.cdp.wait_event(
+                lambda event: event["method"] == "Page.javascriptDialogClosed"
+                and event.get("sessionId") == page.session and event["params"].get("result") is False,
+                mark, SETTLE_WAIT, what)
+            return "observer"
+        except Failure as error:
+            self.dialog_failure(what, [(page, mark), *others], error, opened, attempt)
+            raise
+
+    def cancelled_by_browser(self, page, what, opened, attempt, error):
+        """W4, after DevTools found no dialog to cancel: the page's own close
+        of `opened` (waited for up to SETTLE_WAIT) must be a cancel (result
+        false) while the profile's guard is still running; recorded under
+        dialogsClosedByBrowser."""
+        deadline = time.monotonic() + SETTLE_WAIT
+        closed = browser_closed_dialog(page.cdp.since(page.cdp.base), opened, page.session)
+        while closed is None:
+            require(time.monotonic() < deadline, f"{what}: {error}, and the dialog's close was not observed")
+            page.cdp.drain(0.1)
+            closed = browser_closed_dialog(page.cdp.since(page.cdp.base), opened, page.session)
+        require(closed["params"].get("result") is False,
+                f"{what}: the dialog was closed with result {closed['params'].get('result')!r}, not cancelled")
+        require(not self.guard_ended(page.process["guardReceipt"]),
+                f"{what}: the profile's guard ended although its dialog was cancelled")
+        self.proof.setdefault("dialogsClosedByBrowser", []).append({
+            "what": what, "profile": page.process["profile"], "error": str(error)[:300],
+            "closedAfterOpening": round(closed[RECEIVED_AT] - opened[RECEIVED_AT], 3)
+            if RECEIVED_AT in closed and RECEIVED_AT in opened else None,
+            "cancelAfterOpening": round(attempt - opened[RECEIVED_AT], 3) if RECEIVED_AT in opened else None})
+        return "browser"
+
+    def dialog_failure(self, what, watched, error, opened=None, attempt=None):
+        """Diagnostics only, after a failed dialog step: for each watched
+        (page, mark), its dialog and frame events since the mark
+        (dialog_evidence), whether its DevTools connection and target are
+        still there, and whether its guard ended (did it leave?) with the
+        receipt; and the time from the dialog's opening to the cancel
+        attempt. Never answers a dialog."""
+        evidence = {"what": what, "error": str(error)[:500], "pages": []}
+        if opened is not None and attempt is not None and RECEIVED_AT in opened:
+            evidence["cancelAfterOpening"] = round(attempt - opened[RECEIVED_AT], 3)
+        self.proof.setdefault("dialogFailures", []).append(evidence)
+        for page, mark in watched:
+            entry = {"profile": page.process["profile"]}
+            evidence["pages"].append(entry)
+            try:
+                try:
+                    page.cdp.drain(0.2)
+                except Failure:
+                    pass  # its connection closed; page.cdp.closed says how
+                entry.update(dialog_evidence(page.cdp.since(mark), page.session, page.cdp.marked_at.get(mark)),
+                             mainFrame=page.target["targetId"], connectionClosed=page.cdp.closed)
+                if page.cdp.closed is None:
+                    try:
+                        entry["targets"] = page.pages()
+                    except Failure as failure:
+                        entry["targets"] = {"error": str(failure)[:300]}
+                receipt = page.process["guardReceipt"]
+                entry["guardEnded"] = self.guard_ended(receipt)
+                if entry["guardEnded"]:
+                    with open(receipt, "rb") as source:
+                        entry["guardReceipt"] = json.loads(source.read())
+            except Exception as failure:  # diagnostics only: keep the original failure
+                entry["evidenceError"] = repr(failure)[:300]
 
     def first_launch(self):
         win = self.win
@@ -736,7 +1066,9 @@ class Observer:
         pages = [self.attach(self.process_of(opened, name)) for name in ("Work", "Personal")]
         work, personal = pages
         for page, user in ((work, "work"), (personal, "personal")):
-            self.sign_in(page, user)
+            self.sign_in(page, user, open_app=self.real is None)
+        if self.real:
+            self.open_real_site(pages)
         self.step("separate initial state")
         key = json.dumps(self.key)
         for index, page in enumerate(pages):
@@ -750,12 +1082,22 @@ class Observer:
         require(expected[0]["storage"] != expected[1]["storage"], "Each profile must keep its own storage")
         require([item["cookie"] for item in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"],
                 "Each profile must see only its own cookie")
-        require([item["user"] for item in expected] == ["work", "personal"],
-                "Each profile must keep its own signed-in session")
+        if self.real:
+            # The sign-in was checked on the fixture home; the real site is
+            # anonymous, so only its origin is the same in both.
+            require([item["origin"] for item in expected] == [self.app_origin] * 2,
+                    f"Both profiles must be on {self.app_origin}")
+        else:
+            require([item["user"] for item in expected] == ["work", "personal"],
+                    "Each profile must keep its own signed-in session")
         require(work.native["nativePid"] != personal.native["nativePid"] and work.window != personal.window,
                 "Each connection must have its own browser process and window")
-        self.case("separate-profiles", {"bindings": [{"native": page.native, "context": page.context}
-                                                     for page in pages]})
+        bindings = [{"native": page.native, "context": page.context} for page in pages]
+        if self.real:
+            # The real site's own context, and how its editor was entered.
+            for binding, page in zip(bindings, pages):
+                binding["siteContext"] = page.site_context
+        self.case("separate-profiles", {"bindings": bindings})
 
         # The home comes back through the OS's window switching (the owner's
         # decision: no in-browser home button). A browser window is in front
@@ -891,16 +1233,17 @@ class Observer:
         self.checkpoint("request-exit")
         self.step("Work beforeunload on sequential quit", work)
         dialog = self.dialog(work, unload, "beforeunload", "The beforeunload dialog did not open")
-        self.proof["dialog"] = {"type": dialog["params"]["type"], "url": dialog["params"].get("url")}
-        require(urlsplit(dialog["params"]["url"])._replace(path="", query="", fragment="").geturl() == self.site,
-                "The dialog must belong to the fixture site")
+        self.proof["dialog"] = {"type": dialog["params"]["type"],
+                                "origin": url_origin(dialog["params"].get("url") or "")}
+        require(self.proof["dialog"]["origin"] == self.app_origin, f"The dialog must belong to {self.app_origin}")
         personal.cdp.drain()
         require(not any(event["method"].startswith("Page.javascriptDialog")
                         for event in personal.cdp.since(personal_mark)),
                 "Personal must not be asked to close before Work agrees")
         require(not self.guard_ended(personal.process["guardReceipt"]),
                 "Personal must still be running during Work's dialog")
-        self.cancel_dialog(work, unload, "Work's beforeunload cancel was not observed")
+        self.proof["dialogClosedBy"] = self.cancel_dialog(work, unload, "Work's beforeunload cancel was not observed",
+                                                          dialog, [(personal, personal_mark)])
         require([self.sample(page) for page in pages] == expected, "A cancelled sequential quit must keep every document")
         self.step("sequential quit stopped at the cancel", work)
         self.checkpoint("cancel-inspected")
@@ -910,23 +1253,36 @@ class Observer:
         require([self.sample(page) for page in pages] == expected, "The documents must survive the cancelled quit")
         work.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
                       "delete window.__sumiBeforeUnload;return true})()")
-        self.case("quit-cancel-stops", {"dialog": self.proof["dialog"]})
+        self.case("quit-cancel-stops", {"dialog": self.proof["dialog"], "dialogClosedBy": self.proof["dialogClosedBy"]})
 
         # The accepted sequential trade-off: Work (oldest) now agrees to leave
         # and closes normally first; Personal cancels, so the quit stops with
         # Work closed and Personal kept.
         self.step("Personal cancels after Work closed", personal)
         personal_unload = personal.cdp.mark()
+        work_unload = work.cdp.mark()
         personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
                           "addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()", True)
         self.checkpoint("request-partial-exit")
-        self.dialog(personal, personal_unload, "beforeunload",
-                    "Personal's beforeunload did not open after Work closed", END_WAIT)
-        # The App drops Work only after its normal receipt, before asking Personal.
-        require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
-        self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
-                                                            "Work must have closed normally")
-        self.cancel_dialog(personal, personal_unload, "Personal's beforeunload cancel was not observed")
+        opened = None
+        try:
+            opened = self.dialog(personal, personal_unload, "beforeunload",
+                                 "Personal's beforeunload did not open after Work closed", END_WAIT)
+            # The App drops Work only after its normal receipt, before asking Personal.
+            require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
+            self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
+                                                                "Work must have closed normally")
+            # As Work's: the dialog is the page's own, not a subframe's.
+            self.proof["partialDialog"] = {"type": opened["params"]["type"],
+                                           "origin": url_origin(opened["params"].get("url") or "")}
+            require(self.proof["partialDialog"]["origin"] == self.app_origin,
+                    f"Personal's dialog must belong to {self.app_origin}")
+        except Failure as error:
+            self.dialog_failure("Personal's beforeunload after Work closed",
+                                [(personal, personal_unload), (work, work_unload)], error)
+            raise
+        closed_by = self.cancel_dialog(personal, personal_unload, "Personal's beforeunload cancel was not observed",
+                                       opened, [(work, work_unload)])
         require(self.sample(personal) == expected[1], "The cancelled Personal must keep its document")
         self.checkpoint("partial-inspected")
         self.proof["partial"] = self.marker("app-browser-process-partial.json")
@@ -934,9 +1290,12 @@ class Observer:
                 "Only Personal remains after Work closed and Personal cancelled")
         personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
                           "delete window.__sumiBeforeUnload;return true})()")
-        self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"]})
+        self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
+                                         "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
         self.step("Personal final exit", personal)
         self.checkpoint("request-final-exit")
+        if self.real:
+            self.finish_final_quit([personal])
         self.proof["passed"] = True
 
     def relaunch(self, kind):
@@ -1008,12 +1367,15 @@ def main():
     parser.add_argument("--site", required=True, help="the fixture site origin")
     parser.add_argument("--app-pid", type=int, required=True)
     parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
+    parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
     args = parser.parse_args()
+    if args.real_site and args.phase:
+        parser.error("--real-site runs the first launch only")
     if os.name != "nt":
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
-    Observer(data, args.site, args.app_pid, args.phase, Win32()).run()
+    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site).run()
 
 
 if __name__ == "__main__":

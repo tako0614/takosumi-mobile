@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -134,6 +135,23 @@ class FakeSocket:
         return json.dumps(self.messages.pop(0))
 
 
+class ReplyingSocket(FakeSocket):
+    """FakeSocket that answers each command from `replies` (method: the
+    reply, or a list of the reply and the events that follow it)."""
+
+    def __init__(self, messages, replies):
+        super().__init__(messages)
+        self.replies = replies
+
+    def send_text(self, text):
+        super().send_text(text)
+        request = self.sent[-1]
+        reply = self.replies[request["method"]]
+        reply, *after = reply if isinstance(reply, list) else [reply]
+        self.messages.append(dict(reply, id=request["id"]))
+        self.messages.extend(after)
+
+
 class CdpTests(unittest.TestCase):
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},
@@ -160,6 +178,219 @@ class CdpTests(unittest.TestCase):
         self.assertEqual(event["params"]["type"], "beforeunload")
         with self.assertRaisesRegex(Failure, "nothing more"):
             cdp.wait_event(lambda e: e["method"] == "Page.javascriptDialogClosed", mark, 0.1, "nothing more")
+
+    def test_the_final_quit_accepts_only_the_sites_own_beforeunload(self):
+        origin = observer.REAL_SITES["excalidraw"]["origin"]
+        self.assertEqual(observer.final_quit_dialog({"type": "beforeunload", "url": "https://excalidraw.com/#x"},
+                                                    origin), {"type": "beforeunload", "origin": origin})
+        for params in ({"type": "alert", "url": "https://excalidraw.com/"},
+                       {"type": "confirm", "url": "https://excalidraw.com/"},
+                       {"type": "beforeunload", "url": "https://evil.example/"},
+                       {"type": "beforeunload", "url": "http://excalidraw.com/"},
+                       {"type": "beforeunload"}):
+            with self.assertRaises(Failure, msg=params):
+                observer.final_quit_dialog(params, origin)
+
+    def test_the_final_quit_refuses_another_dialog_unanswered(self):
+        alert = {"method": "Page.javascriptDialogOpening", "sessionId": "S",
+                 "params": {"type": "alert", "url": "https://excalidraw.com/#json=secret", "message": "x"}}
+        cdp = observer.Cdp(FakeSocket([alert]), "personal")
+        process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": "P",
+                   "guardReceipt": str(HERE / "no-such-receipt.json")}
+        page = observer.Page(cdp, "S", process, {"targetId": "T"})
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "only a beforeunload"):
+            watch.finish_final_quit([page])
+        self.assertEqual(watch.proof["finalQuitDialogsAccepted"], [])
+        self.assertEqual(watch.proof["finalQuitDialogRefused"],
+                         {"profile": "P", "type": "alert", "origin": "https://excalidraw.com"})
+        self.assertNotIn("secret", json.dumps(watch.proof), "only the origin of a real site's URL is kept")
+        self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
+
+    def test_photopea_is_entered_from_its_landing_and_excalidraw_directly(self):
+        class FakePage:
+            def __init__(self, site, profile, editor_first=False):
+                self.site, self.entered, self.clicks = observer.REAL_SITES[site], editor_first, []
+                self.process = {"profile": profile, "opened": {"windowId": 1, "nativePid": 2}}
+                self.native, self.target = self.process["opened"], {"targetId": profile}
+
+            def evaluate(self, expression, gesture=False):
+                site = self.site
+                if "a[data-app=editor]')?.href" in expression:
+                    return site["url"]
+                if expression == site.get("enter"):
+                    self.clicks.append(gesture)
+                    self.entered = True
+                    return True
+                if expression.startswith("({origin:location.origin"):
+                    return {"origin": site["origin"], "secure": True, "tauri": "undefined", "ipc": "undefined",
+                            "wry": "undefined", "webview2": "undefined"}
+                if "landing" in site and expression.endswith(f"({site['ready']} || {site['landing']})"):
+                    return True  # the landing is up
+                if expression == site.get("landing"):
+                    return not self.entered
+                if expression.endswith(site["ready"]):
+                    return self.entered or "landing" not in site
+                return True  # the app link's click
+
+            def pages(self):
+                return [self.target["targetId"]]
+
+        for site, entry, clicks in (("photopea", "landing", [True]), ("excalidraw", "direct", [])):
+            watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site=site)
+            pages = [FakePage(site, "W"), FakePage(site, "P")]
+            watch.open_real_site(pages)
+            for page in pages:
+                self.assertEqual(page.clicks, clicks, site)
+                self.assertEqual(page.site_context["entry"], entry, site)
+                self.assertEqual(page.site_context["origin"], observer.REAL_SITES[site]["origin"])
+        # A fresh Photopea profile whose editor is up without its landing fails.
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="photopea")
+        pages = [FakePage("photopea", "W", editor_first=True), FakePage("photopea", "P")]
+        with self.assertRaisesRegex(Failure, "must show photopea's landing before its editor"):
+            watch.open_real_site(pages)
+        self.assertEqual(pages[0].clicks, [])
+
+    def test_dialog_evidence_keeps_events_and_origins_without_text(self):
+        events = [
+            {"method": "Page.javascriptDialogOpening", "sessionId": "S", "_receivedAt": 10.5,
+             "params": {"type": "beforeunload", "message": "Leave?", "url": "https://www.photopea.com/p?q=1",
+                        "hasBrowserHandler": True, "defaultPrompt": "secret"}},
+            {"method": "Page.frameAttached", "sessionId": "S", "_receivedAt": 10.6,
+             "params": {"frameId": "F2", "parentFrameId": "T"}},
+            {"method": "Page.frameNavigated", "sessionId": "S", "_receivedAt": 10.7,
+             "params": {"frame": {"id": "F2", "parentId": "T", "url": "https://ads.example/x?id=secret"}}},
+            {"method": "Page.frameRequestedNavigation", "sessionId": "S",
+             "params": {"frameId": "F2", "url": "https://ads.example/y#secret", "reason": "other"}},
+            {"method": "Page.javascriptDialogOpening", "sessionId": "OTHER", "params": {"type": "alert"}},
+            {"method": "Page.loadEventFired", "sessionId": "S", "params": {}},
+            {"method": "Page.javascriptDialogClosed", "sessionId": "S", "_receivedAt": 11.0,
+             "params": {"result": True, "userInput": "secret"}},
+            {"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {"result": False, "userInput": ""}},
+        ]
+        evidence = observer.dialog_evidence(events, "S", 10.0)
+        self.assertEqual(evidence["dialogs"], [
+            {"event": "javascriptDialogOpening", "at": 0.5, "type": "beforeunload",
+             "origin": "https://www.photopea.com", "hasBrowserHandler": True},
+            {"event": "javascriptDialogClosed", "at": 1.0, "result": True, "userInput": "present"},
+            {"event": "javascriptDialogClosed", "result": False, "userInput": "empty"}])
+        self.assertEqual(evidence["frames"], [
+            {"event": "frameAttached", "at": 0.6, "frameId": "F2", "parentId": "T"},
+            {"event": "frameNavigated", "at": 0.7, "frameId": "F2", "parentId": "T", "origin": "https://ads.example"},
+            {"event": "frameRequestedNavigation", "frameId": "F2", "origin": "https://ads.example"}])
+        self.assertEqual(evidence["frameEvents"], 3)
+        self.assertNotIn("secret", json.dumps(evidence))
+        self.assertNotIn("Leave?", json.dumps(evidence))
+        many = [{"method": "Page.frameStartedLoading", "sessionId": "S", "params": {"frameId": f"F{index}"}}
+                for index in range(observer.FRAME_EVIDENCE_LIMIT + 50)]
+        evidence = observer.dialog_evidence(many, "S", None)
+        self.assertEqual(len(evidence["frames"]), observer.FRAME_EVIDENCE_LIMIT)
+        self.assertEqual(evidence["frames"][-1]["frameId"], f"F{observer.FRAME_EVIDENCE_LIMIT + 49}")
+        self.assertEqual(evidence["frameEvents"], observer.FRAME_EVIDENCE_LIMIT + 50)
+
+    def test_a_failed_cancel_records_both_pages_and_answers_nothing(self):
+        def page(label, session, events):
+            cdp = observer.Cdp(ReplyingSocket([], {
+                "Page.handleJavaScriptDialog": {"error": {"code": -32602, "message": "No dialog is showing"}},
+                "Target.getTargets": {"result": {"targetInfos": [{"type": "page", "targetId": label}]}}}), label)
+            mark = cdp.mark()
+            cdp.websocket.messages.extend(events)
+            cdp.drain(0.1)
+            process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": label,
+                       "guardReceipt": str(HERE / f"no-such-receipt-{label}.json")}
+            return observer.Page(cdp, session, process, {"targetId": label}), mark
+
+        opening = {"method": "Page.javascriptDialogOpening", "sessionId": "P",
+                   "params": {"type": "beforeunload", "message": "x", "url": "https://www.photopea.com/"}}
+        closed = {"method": "Page.javascriptDialogClosed", "sessionId": "P", "params": {"result": True,
+                                                                                       "userInput": ""}}
+        personal, personal_mark = page("personal", "P", [opening, closed])
+        work, work_mark = page("work", "W", [])
+        # The local-fixture run: only the observer's own cancel counts.
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "")
+        opened = personal.cdp.since(personal_mark)[0]
+        with self.assertRaisesRegex(Failure, "No dialog is showing"):
+            watch.cancel_dialog(personal, personal_mark, "cancel not observed", opened, [(work, work_mark)])
+        [evidence] = watch.proof["dialogFailures"]
+        self.assertEqual(evidence["what"], "cancel not observed")
+        self.assertIn("No dialog is showing", evidence["error"])
+        self.assertGreaterEqual(evidence["cancelAfterOpening"], 0)
+        first, second = evidence["pages"]
+        self.assertEqual([entry["event"] for entry in first["dialogs"]],
+                         ["javascriptDialogOpening", "javascriptDialogClosed"])
+        self.assertEqual(first["dialogs"][1]["result"], True)
+        self.assertEqual((first["profile"], first["mainFrame"], first["targets"], first["guardEnded"]),
+                         ("personal", "personal", ["personal"], False))
+        self.assertEqual((second["profile"], second["dialogs"], second["guardEnded"]), ("work", [], False))
+        # Only the one cancel attempt: no accept, no retry.
+        self.assertEqual([request["method"] for request in personal.cdp.websocket.sent],
+                         ["Page.handleJavaScriptDialog", "Target.getTargets"])
+        self.assertEqual(personal.cdp.websocket.sent[0]["params"], {"accept": False})
+
+    def cancel(self, real_site, events, reply, guard_ended=False):
+        """cancel_dialog on a page whose events since its mark are `events`
+        (the first one is the dialog's opening) and whose cancel gets `reply`."""
+        cdp = observer.Cdp(ReplyingSocket([], {"Page.handleJavaScriptDialog": reply,
+                                               "Target.getTargets": {"result": {"targetInfos": []}}}), "P")
+        mark = cdp.mark()
+        cdp.websocket.messages.extend(events)
+        cdp.drain(0.1)
+        process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": "P",
+                   "guardReceipt": str(HERE / "no-such-receipt.json")}
+        page = observer.Page(cdp, "S", process, {"targetId": "T"})
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site=real_site)
+        watch.guard_ended = lambda receipt: guard_ended
+        try:
+            return watch, watch.cancel_dialog(page, mark, "cancel", cdp.since(mark)[0]), cdp
+        finally:
+            self.sent = [request["method"] for request in cdp.websocket.sent]
+
+    OPENING = {"method": "Page.javascriptDialogOpening", "sessionId": "S",
+               "params": {"type": "beforeunload", "message": "", "url": "https://www.photopea.com/"}}
+    NO_DIALOG = {"error": {"code": -32602, "message": "No dialog is showing"}}
+
+    @staticmethod
+    def closed(result):
+        return {"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {"result": result,
+                                                                                     "userInput": ""}}
+
+    def test_a_cancel_closed_by_the_observer(self):
+        for site in (None, "photopea"):
+            watch, closed_by, _ = self.cancel(site, [self.OPENING], [{"result": {}}, self.closed(False)])
+            self.assertEqual(closed_by, "observer", site)
+            self.assertNotIn("dialogsClosedByBrowser", watch.proof)
+            self.assertEqual(self.sent, ["Page.handleJavaScriptDialog"])
+
+    def test_a_real_site_may_cancel_its_dialog_before_the_observer(self):
+        watch, closed_by, _ = self.cancel("photopea", [self.OPENING, self.closed(False)], self.NO_DIALOG)
+        self.assertEqual(closed_by, "browser")
+        [record] = watch.proof["dialogsClosedByBrowser"]
+        self.assertEqual(record["profile"], "P")
+        self.assertIn("No dialog is showing", record["error"])
+        self.assertGreaterEqual(record["closedAfterOpening"], 0)
+        self.assertNotIn("dialogFailures", watch.proof)
+        self.assertEqual(self.sent, ["Page.handleJavaScriptDialog"])
+        # The close may also arrive just after DevTools' answer.
+        watch, closed_by, _ = self.cancel("photopea", [self.OPENING], [self.NO_DIALOG, self.closed(False)])
+        self.assertEqual(closed_by, "browser")
+
+    def test_only_a_real_sites_own_cancel_of_a_running_profile_counts(self):
+        refused = (
+            # The local-fixture run requires the observer's cancel.
+            (None, [self.OPENING, self.closed(False)], False, "No dialog is showing"),
+            # Accepted, not cancelled.
+            ("photopea", [self.OPENING, self.closed(True)], False, "result True, not cancelled"),
+            # The profile left although its dialog was cancelled.
+            ("photopea", [self.OPENING, self.closed(False)], True, "guard ended"),
+            # Another dialog opened first.
+            ("photopea", [self.OPENING, self.OPENING, self.closed(False)], False, "Another dialog"),
+        )
+        for site, events, guard_ended, message in refused:
+            with self.assertRaisesRegex(Failure, message, msg=message):
+                self.cancel(site, events, self.NO_DIALOG, guard_ended)
+        with mock.patch.object(observer, "SETTLE_WAIT", 0.3):
+            with self.assertRaisesRegex(Failure, "close was not observed"):
+                self.cancel("photopea", [self.OPENING], self.NO_DIALOG)
 
     def test_marks_stay_absolute_when_old_events_are_dropped(self):
         cdp = observer.Cdp(FakeSocket([{"method": f"E{index}"} for index in range(4200)]), "w")
@@ -219,6 +450,11 @@ class SiteTests(unittest.TestCase):
         self.assertIn('data-page="home" data-user="work"', self.request("GET", "/", cookie=session)[2])
         self.assertIn('data-page="app" data-user="work"', self.request("GET", "/app/", cookie=session)[2])
 
+    def test_the_app_home_links_to_the_real_site_of_a_w4_run(self):
+        self.server.app_url = runner.REAL_SITES["excalidraw"]["url"]
+        session = self.request("POST", "/session", "user=personal")[1]["Set-Cookie"].split(";", 1)[0]
+        self.assertIn('<a data-app="editor" href="https://excalidraw.com/">', self.request("GET", "/", cookie=session)[2])
+
     def test_only_the_synthetic_users_and_known_paths(self):
         self.assertEqual(self.request("POST", "/session", "user=admin")[0], 400)
         self.assertEqual(self.request("POST", "/other", "user=work")[0], 404)
@@ -247,13 +483,149 @@ class RunnerTests(unittest.TestCase):
         cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
         cases += list(runner.FINAL_CASES)
         self.assertEqual(len(cases), len(set(cases)))
-        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text()
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         block = re.search(r"\$w3Cases = @\(\n(.*?)\n\s*\)", workflow, re.S)
         count = re.search(r"\$w3Count -ne (\d+)\)", workflow)
         self.assertIsNotNone(block, "The cef-windows-app job lists its required cases")
         self.assertIsNotNone(count, "The cef-windows-app job requires an exact case count")
         self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
         self.assertEqual(int(count.group(1)), len(cases))
+
+    def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
+        for site in sorted(runner.REAL_SITES):
+            block = re.search(r"\$%sCases = @\(\n(.*?)\n\s*\)" % site, workflow, re.S)
+            count = re.search(r"\$%sCount -ne (\d+)\)" % site, workflow)
+            self.assertIsNotNone(block, f"The real-site workflow lists the {site} cases")
+            self.assertIsNotNone(count, f"The real-site workflow counts the {site} cases")
+            cases = runner.real_site_cases(site)
+            self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
+            self.assertEqual(int(count.group(1)), len(cases))
+
+    def test_each_quit_case_names_who_closed_its_dialog(self):
+        class Args:
+            real_site = "photopea"
+        observation = {"evidence": {"quit-cancel-stops": {"dialogClosedBy": "observer"},
+                                    "quit-partial-order": {"dialogClosedBy": "browser"}}}
+        self.assertEqual(runner.dialog_lines(Args, observation),
+                         ["DIALOG closedBy=observer case=photopea/quit-cancel-stops",
+                          "DIALOG closedBy=browser case=photopea/quit-partial-order"])
+        Args.real_site = None
+        self.assertEqual(runner.dialog_lines(Args, observation)[0], "DIALOG closedBy=observer case=quit-cancel-stops")
+        for value in (None, "page"):
+            broken = {"evidence": dict(observation["evidence"], **{"quit-partial-order": {"dialogClosedBy": value}})}
+            with self.assertRaises(Failure):
+                runner.dialog_lines(Args, broken)
+
+    def test_the_real_site_workflow_flags_a_cancel_by_the_page_or_browser(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
+        cases = "|".join(runner.DIALOG_CASES)
+        for site in sorted(runner.REAL_SITES):
+            title = site.capitalize()
+            self.assertIn(f"${site}Dialogs = @(Select-String -Path $log -Pattern "
+                          f"'^DIALOG closedBy=(observer|browser) case={site}/({cases})$')", workflow)
+            self.assertIn(f"if (${site}Dialogs.Count -ne {len(runner.DIALOG_CASES)}) {{ throw", workflow)
+            self.assertIn(f"foreach ($dialog in ${site}Dialogs) {{\n"
+                          f"            if ($dialog.Line -match ' closedBy=browser ') {{ Write-Output "
+                          f"\"::warning title={title} beforeunload closed by the page or browser::", workflow)
+
+    def test_the_real_site_workflow_runs_only_when_asked(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
+        on = re.search(r"^on:\n(.*?)\n(?=\S)", workflow, re.S | re.M).group(1)
+        self.assertEqual(re.findall(r"^  (\w+):", on, re.M), ["workflow_dispatch", "pull_request"])
+        self.assertRegex(on, r"  pull_request:\n    types: \[labeled\]\n?$")
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' || "
+                      "github.event.label.name == 'windows-real-sites' }}", workflow)
+        test_ref = ("github.event_name == 'workflow_dispatch' && inputs.ref || "
+                    "github.event.pull_request.head.sha")
+        self.assertIn(f"TEST_REF: ${{{{ {test_ref} }}}}", workflow)
+        # The concurrency group is the job's, after its `if`: a run for any
+        # other label skips the job and cannot cancel a pending real run.
+        self.assertNotRegex(workflow, r"(?m)^concurrency:")
+        self.assertIn("    if: ${{ github.event_name == 'workflow_dispatch' || "
+                      "github.event.label.name == 'windows-real-sites' }}\n"
+                      "    # On the job, after its `if`: a run for any other label skips the job and\n"
+                      "    # so never enters this group (where it could cancel a pending real run).\n"
+                      "    # A dispatch is keyed on its input, not the commit it resolves to: a job's\n"
+                      "    # group is fixed when it is queued, before any of its steps runs (keying\n"
+                      "    # on the resolved commit would take a separate resolving job).\n"
+                      "    concurrency:\n"
+                      f"      group: takosumi-mobile-windows-real-sites-${{{{ {test_ref} }}}}\n"
+                      "      cancel-in-progress: false\n", workflow)
+        self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read$")
+
+    def test_a_dispatch_tests_only_this_repositorys_commits(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
+        steps = workflow[workflow.index("    steps:\n"):]
+        check = steps.index("      - name: This repository's branches (dispatch)\n"
+                            "        if: ${{ github.event_name == 'workflow_dispatch' }}\n")
+        resolve = steps.index("      - name: Revision under test\n        id: test-ref\n")
+        checkout = steps.index("          ref: ${{ steps.test-ref.outputs.sha }}\n          path: takosumi-mobile\n")
+        self.assertLess(check, resolve)
+        self.assertLess(resolve, checkout)
+        self.assertIn("          fetch-depth: 0\n", steps[check:resolve])
+        script = steps[resolve:checkout]
+        # The input reaches the script only through the environment.
+        self.assertNotIn("${{ inputs.ref }}", workflow)
+        self.assertIn("$ref = $env:TEST_REF", script)
+        self.assertIn("if ($ref -match '^(refs/)?pull/') {", script)
+        self.assertIn("rev-parse --verify --quiet", script)
+        self.assertIn("branch -r --contains $sha", script)
+        self.assertIn('"sha=$env:HEAD_SHA" >> $env:GITHUB_OUTPUT', script)
+        self.assertNotIn("ref: ${{ env.TEST_REF }}", workflow)
+
+    def test_the_real_site_workflow_checks_out_the_ci_sibling_revisions(self):
+        root = HERE.parents[1] / ".github/workflows"
+        refs = [dict(re.findall(r"^  (MOBILE_KIT_SOURCE_REF|TAKOSUMI_SOURCE_REF): (\S+)$",
+                                (root / name).read_text(encoding="utf-8"), re.M))
+                for name in ("ci.yml", "windows-real-sites.yml")]
+        self.assertEqual(len(refs[0]), 2)
+        self.assertEqual(refs[0], refs[1])
+
+    def test_real_sites_are_anonymous_https_roots_with_a_readiness_signal(self):
+        for site, entry in observer.REAL_SITES.items():
+            self.assertTrue(entry["url"].startswith("https://") and entry["url"].endswith("/"), site)
+            self.assertEqual(entry["url"].rstrip("/"), entry["origin"])
+            self.assertTrue(entry["ready"])
+            self.assertEqual("landing" in entry, "enter" in entry, site)
+
+    def test_the_real_site_bounds_cover_the_observers_worst_case(self):
+        tests = HERE.parents[1] / "src-tauri/tests/desktop"
+        inspect = re.search(r"if shell::real_site\(\) \{\s*return Duration::from_secs\((\d+)\);",
+                            (tests / "browser_process.rs").read_text(encoding="utf-8"))
+        watchdog = re.search(r"from_secs\(if real_site\(\) \{ (\d+) \} else \{ (\d+) \}\)",
+                             (tests / "browser_process_windows.rs").read_text(encoding="utf-8"))
+        self.assertIsNotNone(inspect, "browser_process.rs names the real-site first-checkpoint bound")
+        self.assertIsNotNone(watchdog, "browser_process_windows.rs names the real-site watchdog")
+        inspect = int(inspect.group(1))
+        real_watchdog, watchdog = (int(value) for value in watchdog.groups())
+        worst = max(observer.real_site_first_checkpoint(site) for site in observer.REAL_SITES)
+        self.assertEqual(worst, 4 * observer.LOAD_WAIT + 4 * observer.REAL_SITE_WAIT
+                         + 4 * observer.FOREGROUND_WAIT + observer.OCCLUSION_WATCH + 2 * observer.SETTLE_WAIT)
+        # A margin for the DevTools commands between the bounded waits.
+        self.assertGreaterEqual(inspect, max(worst + 60, worst * 1.15))
+        # The observer gets past that checkpoint and still ends before the
+        # App's watchdog, which keeps the ordinary 90 s for the rest.
+        self.assertGreater(runner.REAL_SITE_OBSERVER_WAIT, inspect)
+        self.assertGreater(real_watchdog, runner.REAL_SITE_OBSERVER_WAIT)
+        self.assertGreaterEqual(real_watchdog - inspect, watchdog)
+        self.assertGreater(watchdog, runner.OBSERVER_WAIT)
+
+    def test_real_site_readiness_needs_the_rendered_editor(self):
+        # Excalidraw's crash screen also carries `.excalidraw`; Photopea's
+        # static landing shows even if the editor's code never loads.
+        excalidraw = observer.REAL_SITES["excalidraw"]["ready"]
+        self.assertIn("document.querySelector('.excalidraw canvas')", excalidraw)
+        self.assertIn("!document.querySelector('.ErrorSplash')", excalidraw)
+        photopea = observer.REAL_SITES["photopea"]
+        self.assertNotIn("Start using Photopea", photopea["ready"])
+        self.assertIn("Open From Computer", photopea["ready"])
+        self.assertIn("Start using Photopea", photopea["landing"])
+        probe = (HERE / "browser-process.mjs").read_text(encoding="utf-8")
+        self.assertIn("document.querySelector('.excalidraw canvas')!==null && "
+                      "!document.querySelector('.ErrorSplash')", probe)
+        self.assertNotIn("Boolean(document.querySelector('.excalidraw'))", probe)
 
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.
