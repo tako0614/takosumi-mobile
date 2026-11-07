@@ -571,7 +571,10 @@ both; nothing is staged or packaged.
 
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"   # the first build downloads the Windows distribution here
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+# From native-tests\cef-candidate: its .cargo\config.toml links the C runtime statically.
+Push-Location native-tests\cef-candidate
+cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
 python -B native-tests/cef-candidate/windows_smoke.py --browser <target>\debug\takosumi-cef-browser-process.exe --work C:\absolute\owned\cases
 ```
 
@@ -1252,7 +1255,9 @@ sites).
 
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
 bun run build
 cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls
@@ -1487,7 +1492,7 @@ later step; the CI installers are debug builds. Authenticode, SmartScreen
 reputation, updates and real devices remain operator inputs, as listed in the
 control repo's `docs/takosumi/app-release-inputs.md`.
 
-**Layout.** `scripts/stage-windows-cef.mjs --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
+**Layout.** `scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
 copies into `src-tauri/target/windows-cef/cef/`, the same `cef/` layout the
 Linux bundle uses: `takosumi-cef-browser-process.exe`,
 `takosumi-browser-guard.exe`, `libcef.dll`, `chrome_elf.dll` (which
@@ -1497,11 +1502,21 @@ Linux bundle uses: `takosumi-cef-browser-process.exe`,
 `dxcompiler.dll`, `dxil.dll`) and SwiftShader (`vk_swiftshader.dll`, its ICD
 file, `vulkan-1.dll`) when present. It never stages the import library, the
 sandbox library, CEF's bootstrap executables or SDK build inputs (they are
-named in the manifest), and stops at a DLL it does not know rather than leave
-a possible dependency out. Both executables must be x86-64 PE files; a
-browser with the fixture inspection seam is refused unless `--fixture`, whose
-stage (`src-tauri/target/windows-cef-fixture/`) never goes to the package
-path. Files are copied, never linked, and `stage.json` beside the stage lists
+named in the manifest), and stops at any entry it neither stages nor knows
+as ignorable (`README.txt`, `LICENSE.txt`) rather than leave a possible
+dependency or resource out. Both executables must be x86-64 PE files, and
+every staged executable and DLL may import at load time only Windows system
+DLLs (an explicit list plus the `api-ms-win-*`/`ext-ms-win-*` API sets) or
+files staged beside it; the manifest records each one's imports. The browser
+and guard therefore link the C runtime statically: Cargo builds them from
+`native-tests/cef-candidate`, whose `.cargo/config.toml` sets
+`+crt-static` for `x86_64-pc-windows-msvc` (like the `/MT` CEF wrapper), so
+an installed App needs no Visual C++ redistributable (`VCRUNTIME140.dll`,
+which a clean Windows lacks), and a build without it is refused at staging.
+A package stage must say `--unsandboxed-candidate`, so an unsandboxed
+installer is never made by accident; a browser with the fixture inspection
+seam is refused unless `--fixture`, whose stage
+(`src-tauri/target/windows-cef-fixture/`) never goes to the package path. Files are copied, never linked, and `stage.json` beside the stage lists
 each one's size and SHA-256. `src-tauri/tauri.windows-cef.conf.json` maps the
 stage to the NSIS bundle's `cef/` and installs per user (`installMode:
 currentUser`, by default into `%LOCALAPPDATA%\Takosumi`);
@@ -1512,8 +1527,10 @@ GUI-subsystem program (no console window when launched normally); a debug
 build keeps its console.
 
 ```powershell
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
-node scripts/stage-windows-cef.mjs --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
+node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
 bunx tauri build --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
 ```
 

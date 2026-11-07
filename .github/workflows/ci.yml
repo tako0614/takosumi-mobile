@@ -485,8 +485,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-cef
-          key: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
-          restore-keys: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
+          # crt: built with the static C runtime since W6 (a new key, so the
+          # cache is saved once with it).
+          key: cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -504,11 +508,14 @@ jobs:
           rustc --version
           cargo --version
           python --version
+      # From native-tests/cef-candidate, whose .cargo/config.toml links the
+      # C runtime statically (no VCRUNTIME140.dll needed on a clean Windows).
       - name: Build takosumi-cef-browser-process (product, unsandboxed candidate) and takosumi-browser-guard
         id: build
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
@@ -559,11 +566,12 @@ jobs:
       - name: Guard self-tests (Windows)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
-          cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
+          cargo test --locked --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
           if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed$' -Quiet)) { throw 'Not all thirteen guard self-tests ran' }
       # The App's adapter on Windows with the product browser and the guard
@@ -629,9 +637,10 @@ jobs:
       - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate)
         id: fixture-build
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
       - name: Browser smoke (page load and window reuse)
         if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
         timeout-minutes: 15
@@ -719,8 +728,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
-          restore-keys: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -738,12 +749,13 @@ jobs:
           rustc --version
           cargo --version
           python --version
+      # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
       - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
         id: browser-build
-        working-directory: takosumi-mobile
+        working-directory: takosumi-mobile/native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Line tables keep panics' locations while the App's debug build (and
       # its cache) stays small.
       - name: Build the App with native-browser-process-fixture
@@ -913,8 +925,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
-          restore-keys: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -941,12 +955,16 @@ jobs:
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
-          cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
-          if ($LASTEXITCODE -ne 0) { throw "The product browser build failed (exit $LASTEXITCODE)" }
+          # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The product browser build failed (exit $built)" }
           $cef = @(Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
           if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:CEF_PATH, found $($cef.Count)" }
           "W6_CEF=$($cef[0].FullName)" >> $env:GITHUB_ENV
-          node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug"
+          node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug"
           if ($LASTEXITCODE -ne 0) { throw "The product stage failed (exit $LASTEXITCODE)" }
       - name: Build and stage the fixture browser
         id: fixture-stage
@@ -955,8 +973,11 @@ jobs:
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
-          cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
-          if ($LASTEXITCODE -ne 0) { throw "The fixture browser build failed (exit $LASTEXITCODE)" }
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The fixture browser build failed (exit $built)" }
           node scripts/stage-windows-cef.mjs --fixture --cef $env:W6_CEF --bin "$env:CARGO_TARGET_DIR\debug"
           if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
       # Both installers share Tauri's bundle path, so each is copied aside

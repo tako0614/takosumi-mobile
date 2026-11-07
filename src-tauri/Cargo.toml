@@ -18,8 +18,8 @@ tauri-build = { version = "2", features = [] }
 # Linux product path: each connection opens in its own guarded CEF browser
 # process, found in the bundle's `cef/` resources (see
 # native-tests/cef-candidate/README.md, "Linux packaging"). No fixture driver.
-# Windows compiles the same adapter for the unsandboxed test candidate
-# ("Windows browser process"); nothing is packaged for Windows yet.
+# Windows builds the same adapter with the unsandboxed test candidate, packaged
+# only as an unsigned NSIS test installer (README "Windows packaging (W6)").
 desktop-cef = ["tauri-plugin-app-screen/desktop-process-experiment"]
 # Explicit actual-App fixture: the real home drives the per-profile CEF
 # browser (tests/desktop/browser_process.rs) on Linux and Windows; never

@@ -161,8 +161,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
-          restore-keys: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -182,10 +184,10 @@ jobs:
           python --version
       - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
         id: browser-build
-        working-directory: takosumi-mobile
+        working-directory: takosumi-mobile/native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Line tables keep panics' locations while the App's debug build (and
       # its cache) stays small.
       - name: Build the App with native-browser-process-fixture
