@@ -20,6 +20,8 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
 #[cfg(target_os = "linux")]
+mod gtk_initial_load;
+#[cfg(target_os = "linux")]
 mod gtk_navigation;
 #[cfg(all(
     any(target_os = "linux", windows, target_os = "macos"),
@@ -623,6 +625,13 @@ fn create_screen(
         if !is_popup {
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
             note_fixture_target(&label, &start);
+            // A first navigation WebKitGTK starts and then drops (no commit,
+            // no failure) is issued once more.
+            #[cfg(target_os = "linux")]
+            {
+                use wry::WebViewExtUnix;
+                gtk_initial_load::watch(&view.webview(), &label, &start);
+            }
             let loaded = view.load_url(&start);
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
             note_fixture_view(
