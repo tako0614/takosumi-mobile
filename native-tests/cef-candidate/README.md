@@ -1935,8 +1935,9 @@ command line only); AppContainer or LPAC renderers.
 
 ## macOS browser process (M1)
 
-Status: implemented on 2026-11-07; the macOS evidence is the CI run of this
-change (`cef-macos`). This Linux host cannot build or link for macOS: the
+Status: implemented on 2026-11-07. CI at `a8e4b08` (run 42380247099) passed
+9/9: both `cef-macos` smokes passed, every renderer was in the seatbelt
+sandbox and the browser process was not (by design). This Linux host cannot build or link for macOS: the
 browser, the helper and the App were type-checked and linted for
 `aarch64-apple-darwin` here (`cargo clippy` with `cef/dox`, which skips
 cef-dll-sys's build script; no Apple SDK is needed for that), nothing was
@@ -1999,7 +2000,15 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   `TakosumiCefApplication` (`mac_front.rs`: the `NSApplication` subclass with
   CEF's protocols, the regular activation policy) and runs the browser. A
   quit from the system (`terminate:`) is only reported: the App owns the
-  browser's lifetime.
+  browser's lifetime. objc2 adds a protocol to the class only when the
+  runtime knows it and skips a missing one silently, so
+  `install_application` requires `CrAppProtocol` and `CrAppControlProtocol`
+  to exist and the class to conform to both, and takes `sharedApplication`
+  as a plain `NSApplication` before checking it is this class (it panics,
+  naming the reason, otherwise). `sendEvent:` restores the handling flag
+  with a drop guard (also when an Objective-C exception unwinds through
+  it), and the raise holds the NSWindow retained while it sends it
+  messages.
 - `helper_main.rs` (new executable `takosumi-cef-browser-helper`): enters the
   seatbelt sandbox, loads the framework and runs the process type CEF asked
   for, as CEF's own helper and cef-rs's cefsimple helper do. No application
@@ -2025,19 +2034,31 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   window number (`macOS: browser <id> created: …` on standard error), and
   on macOS sends `opened` only once the window is there, looking again every
   25 ms on the UI thread (`post_delayed_task`); it logs when it appeared
-  (`… window after <ms> ms: …`). Until then the screen counts as opening, as
-  before its creation (a Shutdown is answered CloseBlocked), and a screen
-  closed meanwhile stops the wait. The wait has no bound of its own: the
-  parent's wait for `opened` bounds it (the smoke's `--open-timeout`, 120 s;
-  in the App the adapter's 20 s for an Open reply), whose timeout is the
-  existing error path. The raise resolves the window again each time.
+  (`… window after <ms> ms: …`). At `a8e4b08` the log showed the handle null
+  at `on_after_created` and the window (a `BridgedContentView` in an
+  NSWindow) 181 and 244 ms later. Until then the screen counts as opening,
+  as before its creation (a Shutdown is answered CloseBlocked). Every end
+  of the wait without `opened` answers the Open with an error and stops
+  counting the screen as opening (`src/window_wait.rs` decides, pure, with
+  tests that `cef-macos` runs): the screen closed meanwhile (also through
+  the end of the App's input, whose close_all closes every screen,
+  this one included); the browser is stopping (the screen is closed; the
+  refusal every late request gets); or no window within 15 s (the screen
+  is closed). 15 s is shorter than the adapter's 20 s wait for an Open
+  reply, so the App gets that answer rather than a timeout that would leave
+  the browser in doubt, and about 60 times what the window took in CI. A
+  look that cannot be posted ends the wait the same way. The raise resolves
+  the window again each time.
 - `scripts/bundle-macos-cef.mjs --cef <cef_macos_aarch64> --bin <target>/debug --out <dir> [--fixture]`
   writes `<dir>/takosumi-cef-browser-process.app` (the layout above; each
   helper app holds a copy of the helper executable under its own name; the
   framework is copied with its symbolic links as links, refusing a link that
-  is absolute or leaves the framework) and `<dir>/bundle.json` (each file's
-  size, mode and SHA-256, each link's target, the architecture, the CEF
-  distribution record). The browser, the helper and the framework's library
+  is absolute, dangling, or, resolved on the source side through every link
+  on its way, leaves the framework, such as `R -> .` with `esc -> R/../x`;
+  a file with a setuid, setgid or sticky bit is refused; every check runs
+  before anything is written) and `<dir>/bundle.json` (each file's size,
+  mode as copied and SHA-256, the six Info.plist files included, each
+  link's target, the architecture, the CEF distribution record). The browser, the helper and the framework's library
   must be 64-bit Mach-O files of one architecture (the framework may be
   universal), the framework's sandbox library must be there, and a browser
   with the fixture inspection seam is refused unless `--fixture`. Nothing is
@@ -2056,13 +2077,19 @@ python3 -B native-tests/cef-candidate/windows_smoke.py --browser /absolute/owned
 the bundle directly, with the App's switches and `--use-mock-keychain` (so
 Chromium never asks the login keychain, whose prompt would block an
 unattended run; the App's adapter on macOS still has to decide how cookies
-are encrypted), `TMPDIR` in its case, in its own session and process group.
+are encrypted), `TMPDIR` in its case and `MallocNanoZone=0` (CEF asks for
+the nano allocator off; the bundle's `LSEnvironment` applies only to a
+LaunchServices launch, so a direct launch, the smoke's and in M2 the App
+adapter's, must set it itself; the `a8e4b08` logs held no nano-zone
+warning before), in its own session and process group.
 It requires the boot `opened` reply (cache path, native pid), `closed` and
 `stopped` after the shutdown, exit code 0, and no process left: none in the
 process group and none of the browser's descendants, recorded by parent pid
-from `ps` before the shutdown, still alive within 10 s (macOS has no Job
+from `ps` before the shutdown with their command lines, still there as the
+same process (same id and command line) within 10 s (macOS has no Job
 Objects, and a descendant that outlives the browser is reparented to
-launchd, so the tree alone would lose it). With `--expect-sandbox` it
+launchd, so the tree alone would lose it). A failed run's cleanup kills
+only those, so an id the system reused is never killed. With `--expect-sandbox` it
 requires at least one renderer (`--type=renderer`) among the descendants,
 each in the seatbelt sandbox (`sandbox_check(pid, NULL, 0)` from libSystem
 answers 1) and without `--no-sandbox`, and no `--no-sandbox` for the
