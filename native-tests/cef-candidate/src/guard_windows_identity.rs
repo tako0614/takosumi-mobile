@@ -8,15 +8,13 @@
 //! one line to its standard error, the browser's log (`browser.log`):
 //!
 //! `takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid",
-//! "image","type","utilitySubType"?,"exit"}...],"enteredAfterList":M}`
+//! "image","type","utilitySubType"?,"exit"}...],"enteredAfterList":M,
+//! "endedByThemselves":K}`
 //!
 //! for the processes it counted as forced, with each one's exit code after
-//! the termination (`0xE0007462`, or `running`), read with
-//! `GetExitCodeProcess` once the drain's existing settle has ended: the job
-//! can report a process gone just before its handle is signaled, while its
-//! exit code is already set. The browser's console host (`conhost.exe`,
-//! type `none`) is in the job too and is listed whenever it was still
-//! there. A failed read is
+//! the termination (`0xE0007462`, or `running`) as the count read it
+//! (`final_exit`), and how many listed processes ended by themselves (any
+//! other exit code) at the boundary. A failed read is
 //! `"type":"unknown"` (or `"image":"unknown"`) with the error's name. The
 //! receipt is unchanged, so it keeps the Linux guard's contract.
 
@@ -31,7 +29,6 @@ pub(super) const FORCED_DIAGNOSTIC: &str = "takosumi-browser-guard: forced-clean
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
     fn QueryFullProcessImageNameW(
         process: *mut c_void,
         flags: u32,
@@ -172,19 +169,6 @@ fn command_line(handle: &OwnedHandle) -> Result<String, String> {
     Err("CommandLineKeptGrowing".into())
 }
 
-/// `GetExitCodeProcess` reports this while a process runs.
-const STILL_ACTIVE: u32 = 259;
-
-/// A process's exit code if it is set, without waiting for its handle to be
-/// signaled; None while it still runs (or reads as STILL_ACTIVE), or if the
-/// read fails.
-pub(super) fn exit_status(handle: &OwnedHandle) -> Option<u32> {
-    let mut code = 0u32;
-    // SAFETY: a live process handle and a valid result pointer.
-    let read = unsafe { GetExitCodeProcess(handle.as_raw_handle().cast(), &mut code) };
-    (read != 0 && code != STILL_ACTIVE).then_some(code)
-}
-
 /// One forced process of the diagnostic line.
 pub(super) fn entry(pid: u32, identity: &Identity, exit: Option<u32>) -> serde_json::Value {
     let mut entry = serde_json::json!({
@@ -214,13 +198,19 @@ pub(super) fn entry(pid: u32, identity: &Identity, exit: Option<u32>) -> serde_j
 }
 
 /// Write the diagnostic line, in one write, to the guard's standard error.
-pub(super) fn report(forced: u32, processes: Vec<serde_json::Value>, entered_after_list: u32) {
+pub(super) fn report(
+    forced: u32,
+    processes: Vec<serde_json::Value>,
+    entered_after_list: u32,
+    ended_by_themselves: u32,
+) {
     let line = format!(
         "{FORCED_DIAGNOSTIC}{}\n",
         serde_json::json!({
             "forced": forced,
             "processes": processes,
             "enteredAfterList": entered_after_list,
+            "endedByThemselves": ended_by_themselves,
         })
     );
     let _ = io::stderr().lock().write_all(line.as_bytes());

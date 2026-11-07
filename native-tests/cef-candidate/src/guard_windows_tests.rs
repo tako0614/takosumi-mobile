@@ -420,6 +420,14 @@ fn a_lingering_descendant_is_terminated_with_the_job() {
     assert_eq!(named["image"], image.as_ref(), "{diagnostic}");
     assert_eq!(named["type"], "none", "{diagnostic}");
     assert_eq!(named["exit"], "0xE0007462", "{diagnostic}");
+    // Only what the termination ended (or what still ran after it) counts.
+    for entry in diagnostic["processes"].as_array().unwrap() {
+        assert!(
+            entry["exit"] == "0xE0007462" || entry["exit"] == "running",
+            "{diagnostic}"
+        );
+    }
+    assert!(diagnostic["endedByThemselves"].is_u64(), "{diagnostic}");
     assert!(
         !stderr.contains("--standin"),
         "no command line may be written: {stderr:?}"
@@ -459,20 +467,36 @@ fn a_process_that_ends_just_before_the_termination_is_not_forced() {
     // (after 3 s); the guard under test holds its list of the job and lets
     // everything in it end before it terminates the job. None of them ended
     // with the forced exit code, so nothing counts as forced.
+    // The count is taken as soon as the job reports itself empty, when a
+    // process that just ended (exit code 0) may not have its handle signaled
+    // yet: its exit code, read with GetExitCodeProcess, says it ended by
+    // itself.
     let case = Case::new("terminate-late");
     let mut command = case.guard(&["linger-for", "3"]);
     command.env("TAKOSUMI_GUARD_FAULT_TERMINATE_LATE", "1");
+    command.stderr(Stdio::piped());
     let mut guard = case.start(command);
     let lines = Lines::of(&mut guard);
     let line = lines.next(Duration::from_secs(10)).unwrap();
     assert!(line.starts_with("linger "), "{line}");
     let status = finish(&mut guard, Duration::from_secs(20));
     let proof = case.receipt();
+    let mut stderr = String::new();
+    guard
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
     assert_eq!(status.code(), Some(0), "{proof}");
     assert!(clean(&proof), "{proof}");
     assert_eq!(proof["rootExit"], 0);
     assert_eq!(proof["complete"], true);
     assert_eq!(proof["forcedCleanup"], 0, "nothing was ended by the drain");
+    assert!(
+        !stderr.contains(identity::FORCED_DIAGNOSTIC),
+        "nothing forced, so no diagnostic line: {stderr:?}"
+    );
     case.assert_nothing_left();
 }
 

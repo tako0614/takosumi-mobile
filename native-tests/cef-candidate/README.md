@@ -741,7 +741,13 @@ job's total and then its process list, and holds each listed process open;
 afterwards it counts the listed processes that ended with that exit code
 (or still run), plus every process that entered the job after the total was
 read (counted as forced, so none is missed; one entering between the two
-reads may count twice). A listed process that was already gone when opened
+reads may count twice). The exit code is `GetExitCodeProcess`'s, read from
+the held handle after the drain's settle: Windows sets it before the job
+drops the process and signals the handle a little later, so the zero wait on
+the handle the count used before read a process that had just ended by
+itself as still running and counted it as forced (`STILL_ACTIVE` counts as an
+exit code only once the handle is signaled). A listed process with any other
+exit code, or that was already gone when opened
 ended by itself and is not counted (an id reused by an unrelated process
 between the list and the open can only add a count, never hide one). Any other failure to attribute an end
 is recorded in `cleanupErrors` as `ForcedCleanupUnknown`, which makes the
@@ -765,16 +771,12 @@ only the `--type=` and `--utility-sub-type=` values, from
 `PROCESS_QUERY_LIMITED_INFORMATION` handle it already holds (Windows 8.1 and
 later). After the count it writes one line to its standard error, the
 profile's `browser.log`:
-`takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M}`,
+`takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M,"endedByThemselves":K}`,
 for the processes it counted as forced, with each one's exit code after the
-termination (`0xE0007462`, or `running`). The exit code is read with
-`GetExitCodeProcess` where the count is taken, after the drain's existing
-settle and without waiting for the handle: the job can report a process gone
-just before its handle is signaled (self-test run 42342260817 read both as
-`running` that way), while its exit code is already set. The browser's
-console host (`conhost.exe`) is in the job too and is listed whenever it was
-still there. `type` is `none` for a process
-without one (the browser process itself, the console host) and `unknown`,
+termination (`0xE0007462`, or `running`), read as the count reads it (see
+above), and how many listed processes ended by themselves at the boundary.
+`type` is `none` for a process
+without one (the browser process itself) and `unknown`,
 with the error's name, if the read failed; a value outside
 `[A-Za-z0-9._-]{1,64}` reads `invalid`. The full command line never leaves
 the reading function (`guard_windows_identity.rs`; the parser,
@@ -797,6 +799,22 @@ it is intermittent. Which processes were forced, and why they outlived the
 0.5 s after the browser's exit, is unknown; the diagnostic above is there to
 tell renderers from profile-writing helpers. The drain's budgets and the
 App's refusal of any forced cleanup are unchanged.
+
+**Finding: the forced counts were inflated (run 42343580278, 8044abe).**
+With the diagnostic, the next real-site run failed Photopea the same way,
+and Work's line named 57 "forced" processes: 52 `renderer` and 4 `unknown`
+(NTSTATUS `0xC000010A`, the process was already terminating when read), all
+with exit code `0x00000000`, and one `conhost.exe` with `0xE0007462`. So 56
+of the 57 had ended by themselves with code 0; they were counted only
+because the count read the exit with a zero wait on the handle, which can
+still read a process as running just after the job has dropped it (the
+self-test of 8044abe showed the same race for the diagnostic's own read).
+The only real kill was the browser's console host. The earlier counts
+(483dbe4: 12 of 57) were therefore inflated the same way. Repair: the
+count now reads `GetExitCodeProcess` (above), the same read the diagnostic
+shows, so the two cannot disagree. The budgets, the receipt fields
+and the App's refusal of any forced cleanup are unchanged: a real kill still
+makes the receipt abnormal for the App.
 
 **Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
 thread owns one kill-on-close Job Object for the App and starts every guard

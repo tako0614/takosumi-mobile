@@ -28,9 +28,13 @@
 //! in the job to end by themselves, then `TerminateJobObject` (each process
 //! still in the job ends with the exit code `FORCED_EXIT`), then up to 2 s for
 //! the job to empty. Forced cleanup counts the processes that were in the job
-//! before the termination and ended with `FORCED_EXIT`, plus any that entered
-//! the job after that list was read; one whose end cannot be attributed is a
-//! cleanup error (the receipt is then not normal), never a guess. The completion proof is the job's
+//! before the termination and ended with `FORCED_EXIT` (or still run after
+//! it), plus any that entered the job after that list was read; one whose end
+//! cannot be attributed is a cleanup error (the receipt is then not normal),
+//! never a guess. The exit code is `GetExitCodeProcess`'s, which is set before
+//! the job drops the process; the process's handle is signaled only a little
+//! later, so a zero wait on it would read a process that ended by itself just
+//! then as still running (run 42343580278 counted 56 such as forced). The completion proof is the job's
 //! `ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
 //! browser exited.
 //!
@@ -77,6 +81,28 @@ use tauri_plugin_app_screen::windows_job::{
     STOP_EVENT_ENV,
 };
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
+}
+
+/// A held process's exit code after the drain's settle, or None while it
+/// still runs. `GetExitCodeProcess` has the code as soon as the process has
+/// ended, before its handle is signaled (and before the job drops it).
+/// `STILL_ACTIVE` is also a code a program can return: it counts as one only
+/// once the handle is signaled.
+fn final_exit(handle: &OwnedHandle) -> io::Result<Option<u32>> {
+    let mut code = 0u32;
+    // SAFETY: a live process handle and a valid result pointer.
+    if unsafe { GetExitCodeProcess(handle.as_raw_handle().cast(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if code != STILL_ACTIVE {
+        return Ok(Some(code));
+    }
+    exit_code(handle)
+}
+
 /// Natural end, then the job is terminated and may take this long to empty.
 const NATURAL: Duration = Duration::from_millis(500);
 const FORCED: Duration = Duration::from_secs(2);
@@ -92,6 +118,8 @@ const MAX_RUNNING_FAULTS: u32 = 8;
 const FORCED_EXIT: u32 = 0xE000_7462;
 /// `OpenProcess` of an id no process has any more.
 const ERROR_INVALID_PARAMETER: i32 = 87;
+/// `GetExitCodeProcess` while a process runs (also a possible exit code).
+const STILL_ACTIVE: u32 = 259;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Called by `guard_entry.rs` on Windows.
@@ -323,8 +351,10 @@ impl Run {
     /// Forced cleanup, counted exactly: the listed processes that ended with
     /// `FORCED_EXIT` (one still running after the termination was also told
     /// to end), and every process that entered the job after the total was
-    /// read. A listed process that had already gone before it could be
-    /// opened ended by itself. Any other failure leaves the count unknown:
+    /// read; their exit codes are read with `final_exit`, as the diagnostic
+    /// shows them. A listed process with any other exit code, or that had
+    /// already gone before it could be opened, ended by itself. Any other
+    /// failure leaves the count unknown:
     /// it is recorded in `cleanupErrors`, which makes the receipt abnormal,
     /// as a failed signal does on Linux. The forced processes are then named
     /// on the guard's standard error (`identity::report`, diagnostics only).
@@ -335,25 +365,18 @@ impl Run {
         before: io::Result<(u32, u32)>,
     ) {
         let mut named = Vec::new();
+        let mut by_themselves = 0;
         for ((pid, handle), who) in held.into_iter().zip(&identities) {
-            // The diagnostic's exit code is read without waiting for the
-            // handle (identity::exit_status): the job can report a process
-            // gone just before its handle is signaled, when `exit_code`
-            // still reads it as running. The count is unchanged.
-            let (ended, status) = match handle {
-                Ok(handle) => (exit_code(&handle), identity::exit_status(&handle)),
-                Err(error) => (Err(error), None),
-            };
-            match ended {
+            match handle.and_then(|handle| final_exit(&handle)) {
                 Ok(Some(FORCED_EXIT)) => {
                     self.forced += 1;
                     named.push(identity::entry(pid, who, Some(FORCED_EXIT)));
                 }
                 Ok(None) => {
                     self.forced += 1;
-                    named.push(identity::entry(pid, who, status));
+                    named.push(identity::entry(pid, who, None));
                 }
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => by_themselves += 1,
                 Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => {}
                 Err(error) => {
                     self.cleanup_errors
@@ -373,7 +396,7 @@ impl Run {
             }
         }
         if self.forced > 0 {
-            identity::report(self.forced, named, entered);
+            identity::report(self.forced, named, entered, by_themselves);
         }
     }
 
