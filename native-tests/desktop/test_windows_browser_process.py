@@ -502,6 +502,21 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
             self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_guards_forced_cleanup_lines_are_collected(self):
+        line = ('{"forced":2,"processes":[{"pid":7,"exit":"0xE0007462","image":"x.exe","type":"utility",'
+                '"utilitySubType":"network.mojom.NetworkService"}],"enteredAfterList":1}')
+        text = "\n".join(["[1:2:ERROR:x.cc(1)] unrelated", runner.GUARD_DIAGNOSTIC + line,
+                          "partial " + runner.GUARD_DIAGNOSTIC + "{not json", ""])
+        found = runner.guard_diagnostics(text)
+        self.assertEqual(found[0]["forced"], 2)
+        self.assertEqual(found[0]["processes"][0]["utilitySubType"], "network.mojom.NetworkService")
+        self.assertEqual(found[1], {"unparsed": "{not json"})
+        self.assertEqual(runner.guard_diagnostics("nothing here\n"), [])
+        # The same prefix as the guard writes.
+        rust = (HERE.parents[1] / "native-tests/cef-candidate/src/guard_windows_identity.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
+
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:
             real_site = "photopea"

@@ -753,6 +753,45 @@ lists the process ids still in the job (`JobObjectBasicProcessIdList`) and
 included). A process the browser has started outside its tree through a
 system service (COM, WMI, the task scheduler) is not in the job.
 
+**Forced-cleanup diagnostic.** A forced cleanup makes the App keep the
+profile, but the receipt does not say what was forced: only renderers
+(their state is in memory) or a helper that writes the profile, such as the
+network or storage service (an integrity concern). So when the drain reaches
+the termination, the guard reads, for each listed process and just before
+terminating (a terminated process's command line is gone with its address
+space), its image file name (never the path) and its Chromium process type:
+only the `--type=` and `--utility-sub-type=` values, from
+`NtQueryInformationProcess(ProcessCommandLineInformation)` on the
+`PROCESS_QUERY_LIMITED_INFORMATION` handle it already holds (Windows 8.1 and
+later). After the count it writes one line to its standard error, the
+profile's `browser.log`:
+`takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M}`,
+for the processes it counted as forced, with each one's exit code after the
+termination (`0xE0007462`, or `running`). `type` is `none` for a process
+without one (the browser process itself, the console host) and `unknown`,
+with the error's name, if the read failed; a value outside
+`[A-Za-z0-9._-]{1,64}` reads `invalid`. The full command line never leaves
+the reading function (`guard_windows_identity.rs`; the parser,
+`process_type.rs`, is unit-tested with quotes, spaces and backslashes). The
+receipt keeps the Linux guard's fields, and the budgets, the count and the
+exit status are unchanged; the reads add a few milliseconds between the
+listing and the termination. `windows_browser_process.py` collects these
+lines from every profile's `browser.log` into each launch's evidence
+(`execution.json`, `browserGuards`, with the receipt) and prints them with
+the receipts when a launch fails. The Linux guard does not emit the line.
+
+**Open: forced cleanup after a normal browser exit (cause unknown).** The
+real-site run of 483dbe4 (run 42339893587, Photopea, the merged W4 head)
+failed at `quit-partial-order`: Work's browser exited 0 and its guard's
+receipt was complete with `observed` 57 but `forcedCleanup` 12, so the App,
+as designed, kept the profile ("Browser close remains incomplete: Browser
+descendants did not close normally; profile retained") and stopped the
+sequential quit before asking Personal. Run 4ed2519 passed the same flow, so
+it is intermittent. Which processes were forced, and why they outlived the
+0.5 s after the browser's exit, is unknown; the diagnostic above is there to
+tell renderers from profile-writing helpers. The drain's budgets and the
+App's refusal of any forced cleanup are unchanged.
+
 **Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
 thread owns one kill-on-close Job Object for the App and starts every guard
 inside it (suspended, assigned, resumed). The guard is started
