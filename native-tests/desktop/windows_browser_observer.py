@@ -78,6 +78,13 @@ class Placement(ctypes.Structure):  # WINDOWPLACEMENT
                 ("maxY", ctypes.c_int32), ("normal", Rect)]
 
 
+class GuiThreadInfo(ctypes.Structure):  # GUITHREADINFO
+    _fields_ = [("cbSize", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("hwndActive", ctypes.c_void_p),
+                ("hwndFocus", ctypes.c_void_p), ("hwndCapture", ctypes.c_void_p),
+                ("hwndMenuOwner", ctypes.c_void_p), ("hwndMoveSize", ctypes.c_void_p),
+                ("hwndCaret", ctypes.c_void_p), ("rcCaret", Rect)]
+
+
 class LastInput(ctypes.Structure):  # LASTINPUTINFO
     _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
 
@@ -112,6 +119,8 @@ class Win32:
             (self.user32, "GetWindow", handle, [handle, ctypes.c_uint]),
             (self.user32, "GetWindowLongPtrW", ctypes.c_ssize_t, [handle, ctypes.c_int]),
             (self.user32, "GetLastInputInfo", boolean, [ctypes.POINTER(LastInput)]),
+            (self.user32, "GetGUIThreadInfo", boolean, [dword, ctypes.POINTER(GuiThreadInfo)]),
+            (self.user32, "GetClassNameW", ctypes.c_int, [handle, ctypes.c_wchar_p, ctypes.c_int]),
             (self.kernel32, "GetTickCount", dword, []),
             (self.kernel32, "GetCurrentThreadId", dword, []),
             (self.iphlpapi, "GetExtendedTcpTable", dword, [ctypes.c_void_p, ctypes.POINTER(dword), boolean,
@@ -179,6 +188,25 @@ class Win32:
         topmost = {name: bool(self.user32.GetWindowLongPtrW(handle, GWL_EXSTYLE) & WS_EX_TOPMOST)
                    for name, handle in named.items()}
         return {"positions": positions, "topmost": topmost, "visibleAbove": above[:16], "walked": len(order)}
+
+    def class_name(self, window):
+        buffer = ctypes.create_unicode_buffer(256)
+        return buffer.value if window and self.user32.GetClassNameW(window, buffer, 256) else None
+
+    def thread_focus(self, window):
+        """The keyboard focus of the GUI thread that owns `window`, read
+        across processes (GetGUIThreadInfo): its active and focus windows,
+        the focus window's class (Chrome_RenderWidgetHostHWND is web
+        contents; anything else is the browser's own UI) and whether the
+        active window is `window`."""
+        info = GuiThreadInfo(cbSize=ctypes.sizeof(GuiThreadInfo))
+        thread = self.owner(window)[1]
+        if not thread or not self.user32.GetGUIThreadInfo(thread, ctypes.byref(info)):
+            return {"error": f"GetGUIThreadInfo failed ({ctypes.get_last_error()})"}
+        focus, active = info.hwndFocus or 0, info.hwndActive or 0
+        return {"hwndFocus": focus, "focusClass": self.class_name(focus), "hwndActive": active,
+                "activeIsWindow": active == window,
+                "focusInWebContents": self.class_name(focus) == "Chrome_RenderWidgetHostHWND"}
 
     def foreground_lock(self):
         """Windows' foreground lock: its timeout and the time since the last
@@ -809,19 +837,25 @@ class Observer:
             evidence["visibility"] = "visible"
         except Failure:
             evidence["visibility"] = "hidden"
-        # The browser gives keyboard focus again once the window is restored
-        # and in front (process_main.rs), so the page must report it.
+        # The browser asks for keyboard focus again once the window is
+        # restored and in front (process_main.rs), so the page must report
+        # it. The owning GUI thread's own focus record says where focus went
+        # otherwise: the web contents, or the browser's UI.
         try:
             self.settled(lambda: work.evaluate("document.hasFocus()") is True, "no focus")
             evidence["focus"] = True
         except Failure:
             evidence["focus"] = False
+        evidence["threadFocus"] = win.thread_focus(work.window)
+        # Kept in the observation even when a check below fails.
+        self.proof.setdefault("evidence", {})["reuse-raises-window"] = evidence
         self.visibility(work, "after-reuse")
         self.visibility(personal, "after-reuse")
         self.proof["zOrder"]["after-reuse"] = win.z_order(named)
         require(evidence["visibility"] == "visible",
                 "Reopened Work's page stayed hidden after the raise restored its minimized window")
-        require(evidence["focus"], "Reopened Work's page has no keyboard focus although its window is in front")
+        require(evidence["focus"], "Reopened Work's page has no keyboard focus although its window is in front "
+                f"(its GUI thread's focus: {json.dumps(evidence['threadFocus'])})")
         self.case("reuse-raises-window", evidence)
 
         # Chrome's real beforeunload path needs sticky user activation. CDP's
