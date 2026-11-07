@@ -555,7 +555,7 @@ jobs:
         run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP"
       # The Windows guard (Job Objects) with stand-in browsers: the self-test
       # binary re-executes itself as the guard and as the browser. A selection
-      # that runs fewer than all eleven cases fails.
+      # that runs fewer than all thirteen cases fails.
       - name: Guard self-tests (Windows)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
@@ -565,7 +565,7 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
           cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 11 passed; 0 failed$' -Quiet)) { throw 'Not all eleven guard self-tests ran' }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed$' -Quiet)) { throw 'Not all thirteen guard self-tests ran' }
       # The App's adapter on Windows with the product browser and the guard
       # built above: the plugin's Windows unit tests, then the two ignored
       # tests that start a profile through Process::spawn and the creation

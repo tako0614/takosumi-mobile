@@ -101,6 +101,13 @@ FINAL_CASES = ("no-process-left", "no-opener-request")
 # or on a real site by the page or browser first (the observation's
 # dialogClosedBy). Printed as one DIALOG line each.
 DIALOG_CASES = ("quit-cancel-stops", "quit-partial-order")
+# The Windows guard's forced-cleanup diagnostic (guard_windows_identity.rs):
+# one line in the profile's browser.log (the guard's standard error) whenever
+# its drain reached the termination, naming what it forced by image file name
+# and Chromium process type. The log is the profile's, appended to by every
+# launch, so each launch keeps only its own guards' lines (`guardPid`).
+GUARD_DIAGNOSTIC = "takosumi-browser-guard: forced-cleanup "
+BROWSER_LOG_TAIL = 4 * 1024 * 1024
 # The observer's evidence printed to the CI log (bindings and samples stay in
 # browser-observation.json).
 EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder")
@@ -111,6 +118,7 @@ WINDOWS_SOURCES = (
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/src/process_main.rs",
     "native-tests/cef-candidate/src/guard_entry.rs", "native-tests/cef-candidate/src/guard_windows.rs",
+    "native-tests/cef-candidate/src/guard_windows_identity.rs", "native-tests/cef-candidate/src/process_type.rs",
     "native-tests/cef-candidate/windows/takosumi-cef-browser-process.exe.manifest",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs", "src-tauri/src/lib.rs",
     "src-tauri/src/main.rs", "src-tauri/tests/desktop/browser_process.rs",
@@ -338,10 +346,55 @@ def evidence(session, suffix):
     return json.dumps(digest, separators=(",", ":"))
 
 
+def guard_diagnostics(text, guard_pid=None):
+    """The guard's forced-cleanup lines in a browser log, parsed: with
+    `guard_pid`, only that guard's. One that does not parse is kept as
+    `unparsed` (at most 500 characters), since it cannot be attributed."""
+    found = []
+    for line in text.splitlines():
+        index = line.find(GUARD_DIAGNOSTIC)
+        if index < 0:
+            continue
+        payload = line[index + len(GUARD_DIAGNOSTIC):]
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            found.append({"unparsed": payload[:500]})
+            continue
+        if guard_pid is None or (isinstance(parsed, dict) and parsed.get("guardPid") == guard_pid):
+            found.append(parsed)
+    return found
+
+
+def guard_records(session, suffix):
+    """Each browser process of a phase: its profile, its guard's pid and
+    receipt, and that guard's own forced-cleanup lines from the profile's
+    browser.log (`forcedCleanupLines`; the receipt's `forcedCleanup` is the
+    count)."""
+    marker = session / (f"app-browser-process{suffix}-open.json" if suffix else "app-browser-process-open.json")
+    records = []
+    for process in read_json(marker)["processes"]:
+        log = tail(Path(process["directory"]) / "browser.log", BROWSER_LOG_TAIL)
+        record = {"profile": process["profile"], "guardPid": process["pid"],
+                  "forcedCleanupLines": guard_diagnostics(log, process["pid"])}
+        try:
+            record["receipt"] = read_json(Path(process["guardReceipt"]))
+        except (OSError, ValueError, Failure) as error:
+            record["receipt"] = f"unreadable: {error}"
+        records.append(record)
+    return records
+
+
 def tails(session, suffix):
     """Logs of a failed phase, for the CI log."""
     print(f"----- evidence{suffix} -----", file=sys.stderr)
     print(evidence(session, suffix), file=sys.stderr)
+    print(f"----- browser guards{suffix}: receipt and forced-cleanup diagnostics -----", file=sys.stderr)
+    try:
+        for record in guard_records(session, suffix):
+            print(json.dumps(record, separators=(",", ":")), file=sys.stderr)
+    except (OSError, ValueError, KeyError, Failure) as error:
+        print(f"<unavailable: {error}>", file=sys.stderr)
     names = [f"app{suffix}.log", f"observer{suffix}.log", f"browser-observation{suffix}.json"]
     for name in names:
         print(f"----- tail of {session / name} -----", file=sys.stderr)
@@ -428,6 +481,13 @@ def run_phase(args, env, files, before, head, suffix):
                 proof["cleanupError"] = str(error)
             finally:
                 job.close()
+                # Every guard has ended: its receipt and what, if anything,
+                # its drain forced (diagnostics only). app-execution.json's
+                # browserGuards keeps the receipts a passed launch checked.
+                try:
+                    proof["guardRecords"] = guard_records(session, suffix)
+                except (OSError, ValueError, KeyError, Failure) as error:
+                    proof["guardRecordsError"] = f"{type(error).__name__}: {error}"
                 try:
                     proof["artifactsAfter"] = {str(file): digest(file) for file in files}
                     proof["sourceHeadAfter"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO,

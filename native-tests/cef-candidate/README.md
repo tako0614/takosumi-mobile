@@ -639,9 +639,14 @@ effect there. On Windows:
   Otherwise Windows flashes the taskbar button and the browser prints
   `Reused browser window was not raised: Windows refused the foreground change`
   to stderr, as it does for an X11 refusal.
-- **Console.** The executable keeps the console subsystem. The App starts the
-  guard, and the guard the browser, with `CREATE_NO_WINDOW` (W2), so neither
-  opens a console window.
+- **Console.** Since W5 the executable is a GUI-subsystem program on Windows
+  (`windows_subsystem = "windows"` in `process_main.rs`, Windows only): it and
+  its CEF helpers, which run the same executable, get no console and so no
+  console host, and its standard handles stay the ones its parent passes
+  explicitly (the JSON-lines pipes, the log). Until then it kept the console
+  subsystem and was started with `CREATE_NO_WINDOW` (W2), so no console
+  window opened, but a windowless console host ran with it (see the W5
+  finding under the guard).
 
 **Smoke harness.** `windows_smoke.py` uses only the Python 3 standard library
 (`ctypes` for Win32) and runs on both OSes. It creates a new case directory
@@ -717,14 +722,13 @@ breakaway, reserves the receipt (`CREATE_NEW`, never through a link), and
 starts the browser in the job before it runs any code: created
 `CREATE_SUSPENDED | CREATE_NO_WINDOW` with the guard's own stdin, stdout and
 stderr (the App's control pipe, reply pipe and log), assigned, then resumed.
-`CREATE_NO_WINDOW` gives the browser a console without a window, and with it
-a windowless console host (`conhost.exe`) child in the guard's job. CEF's
-helper processes run the same console program and share that one hidden
-console. Started detached (`DETACHED_PROCESS`, no console), each helper would
-instead get a new console of its own, possibly a visible one, and a console
-host each, so the browser keeps its hidden console. `observed` therefore also
-counts that console host, and the drain waits for it like any other process
-in the job. It then waits, without polling or a lifetime cap, for the browser's exit or a
+Since W5 the browser is a GUI-subsystem program, so it and its CEF helpers
+have no console and no console host, and `CREATE_NO_WINDOW` has no effect on
+it. Until then `CREATE_NO_WINDOW` gave the console browser a console without
+a window, with a windowless console host (`conhost.exe`) child in the guard's
+job that `observed` counted and the drain had to end (CEF's helpers shared
+that one hidden console; started detached, each would have got a console of
+its own). It then waits, without polling or a lifetime cap, for the browser's exit or a
 stop request. A stop request is the App setting a manual-reset named event
 (`Local\takosumi-browser-guard-stop-<App pid>-<runtime>-<nanos>`) that the App
 created (an existing name is refused) and named in
@@ -741,7 +745,20 @@ job's total and then its process list, and holds each listed process open;
 afterwards it counts the listed processes that ended with that exit code
 (or still run), plus every process that entered the job after the total was
 read (counted as forced, so none is missed; one entering between the two
-reads may count twice). A listed process that was already gone when opened
+reads may count twice). Since W5 each listed process is classified by one
+pure rule (`classify`, a self-test checks its truth table) from the held
+handle after the drain's settle: whether the handle is signaled, read first,
+then the `GetExitCodeProcess` code. `FORCED_EXIT` is forced; `STILL_ACTIVE`
+with the handle unsignaled (still running) is forced; any other code ended by
+itself (Windows sets the code before the job drops the process and signals
+the handle a little later, so the zero wait on the handle the count used
+before read a process that had just ended by itself as still running and
+counted it as forced); a failed read is unknown. A `STILL_ACTIVE`,
+unsignaled process when the settle found the job empty is given up to 50 ms
+to be signaled, never past the end of the drain's existing 2 s forced budget
+(so the drain's outer bound is unchanged); with a job not found empty it
+counts as forced, a rare over-count on the safe side. A listed process with
+any other exit code, or that was already gone when opened
 ended by itself and is not counted (an id reused by an unrelated process
 between the list and the open can only add a count, never hide one). Any other failure to attribute an end
 is recorded in `cleanupErrors` as `ForcedCleanupUnknown`, which makes the
@@ -753,10 +770,77 @@ lists the process ids still in the job (`JobObjectBasicProcessIdList`) and
 included). A process the browser has started outside its tree through a
 system service (COM, WMI, the task scheduler) is not in the job.
 
+**Forced-cleanup diagnostic.** A forced cleanup makes the App keep the
+profile, but the receipt does not say what was forced: only renderers
+(their state is in memory) or a helper that writes the profile, such as the
+network or storage service (an integrity concern). So when the drain reaches
+the termination, the guard reads, for each listed process and just before
+terminating (a terminated process's command line is gone with its address
+space), its image file name (never the path) and its Chromium process type:
+only the `--type=` and `--utility-sub-type=` values, from
+`NtQueryInformationProcess(ProcessCommandLineInformation)` on the
+`PROCESS_QUERY_LIMITED_INFORMATION` handle it already holds (Windows 8.1 and
+later). After the count it writes one line to its standard error, the
+profile's `browser.log`:
+`takosumi-browser-guard: forced-cleanup {"guardPid":G,"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M,"endedByThemselves":K,"identifyMs":T}`,
+naming the processes it counted as forced, with each one's exit code after
+the termination (`0xE0007462`, or `running`) as the count classified it (see
+above), how many listed processes ended by themselves at the boundary, and
+how long the identification took. It is written whenever the drain reaches
+the termination, also when nothing was forced; `guardPid` names the guard,
+since `browser.log` is the profile's and later launches append to it. The
+identification runs between the list and the termination, so the effective
+natural window is 0.5 s plus `identifyMs`.
+`type` is `none` for a process
+without one (the browser process itself) and `unknown`,
+with the error's name, if the read failed; a value outside
+`[A-Za-z0-9._-]{1,64}` reads `invalid`. The full command line never leaves
+the reading function (`guard_windows_identity.rs`; the parser,
+`process_type.rs`, is unit-tested with quotes, spaces and backslashes). The
+receipt keeps the Linux guard's fields, and the budgets and the exit status
+are unchanged; the count changed with the classification above (6302b33).
+`windows_browser_process.py` collects the lines of each launch's own guards
+(by `guardPid`) from every profile's `browser.log` into the launch's
+evidence (`execution.json`, `guardRecords`: each guard's receipt and its
+`forcedCleanupLines`) and prints them when a launch fails. The Linux guard
+does not emit the line.
+
+**Forced cleanup after a normal browser exit (closed by the finding
+below).** The real-site run of 483dbe4 (run 42339893587, Photopea, the merged
+W4 head)
+failed at `quit-partial-order`: Work's browser exited 0 and its guard's
+receipt was complete with `observed` 57 but `forcedCleanup` 12, so the App,
+as designed, kept the profile ("Browser close remains incomplete: Browser
+descendants did not close normally; profile retained") and stopped the
+sequential quit before asking Personal. Run 4ed2519 passed the same flow, so
+it is intermittent. At the time it was open which processes were forced;
+the diagnostic above was added to tell renderers from profile-writing
+helpers, and the next run answered it.
+
+**Finding: the forced counts were inflated (run 42343580278, 8044abe).**
+With the diagnostic, the next real-site run failed Photopea the same way,
+and Work's line named 57 "forced" processes: 52 `renderer` and 4 `unknown`
+(NTSTATUS `0xC000010A`, the process was already terminating when read), all
+with exit code `0x00000000`, and one `conhost.exe` with `0xE0007462`. So 56
+of the 57 had ended by themselves with code 0; they were counted only
+because the count read the exit with a zero wait on the handle, which can
+still read a process as running just after the job has dropped it (the
+self-test of 8044abe showed the same race for the diagnostic's own read).
+The only real kill was the browser's console host. The earlier count
+(483dbe4: 12 of 57) was likely inflated by the same mechanism (unconfirmed:
+that run had no diagnostic). Two repairs:
+the count now reads `GetExitCodeProcess` (above), the same read the
+diagnostic shows, so the two cannot disagree; and the browser has no console
+host to end any more (`takosumi-cef-browser-process` is a Windows
+GUI-subsystem program, see the W1 notes). The budgets, the receipt fields
+and the App's refusal of any forced cleanup are unchanged: a real kill still
+makes the receipt abnormal for the App.
+
 **Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
 thread owns one kill-on-close Job Object for the App and starts every guard
 inside it (suspended, assigned, resumed). The guard is started
-`DETACHED_PROCESS`: it needs no console, so it has no console host either;
+`DETACHED_PROCESS`: it needs no console, so it has no console host (nor does
+the browser, a GUI-subsystem program);
 its standard handles are the pipes and log passed explicitly. Jobs nest, so a
 browser is in its guard's job and, through it, in the App's. When the App
 process ends, however it ends, the system closes the App's job and ends every
@@ -837,17 +921,22 @@ no receipt. The spawner thread drops the job when every requester is gone
 **CI.** The `cef-windows` job builds the product browser and the guard
 together, keeps the W1 manifest check and both smoke runs, and adds two steps.
 `Guard self-tests (Windows)` runs `cargo test --bin takosumi-browser-guard`
-(eleven cases in `src/guard_windows_tests.rs`; the self-test binary is its
+(thirteen cases in `src/guard_windows_tests.rs`; the self-test binary is its
 own stand-in browser, and each case starts the guard detached inside a fresh
 kill-on-close job as the App does): a normal end, a non-zero exit, the pipes
 reaching the browser without the stop event, a lingering descendant
 terminated with the job, a job that empties just as the natural budget ends,
 a descendant that ends by itself after the process list was read but before
-the termination (not counted as forced; self-test-only injections,
+the termination (not counted as forced, and named among those that ended by
+themselves in the diagnostic line; self-test-only injections,
 `TAKOSUMI_GUARD_FAULT_LATE_EMPTY` and `TAKOSUMI_GUARD_FAULT_TERMINATE_LATE`,
 produce these two orders, which timing alone cannot produce on demand), a
 stop request, the App's job ending guard and browser, a pending stop, the
-refusals and a browser that cannot start. Cases that require the App's job
+refusals, a browser that cannot start, the forced-cleanup diagnostic's
+process type parser, and the forced count's classification truth table (the
+lingering case also checks that the diagnostic line names the descendant
+killed by the termination).
+Cases that require the App's job
 to be empty afterwards wait at most 3 s for processes whose exit is already
 under way (the stand-ins that must be ended sleep 60 s) and name every
 process still there with its image. `App adapter with the built
@@ -868,15 +957,17 @@ through `Process::spawn`, waits for the creation reply through
 20 s; the time is printed), restates the parent, image and cache checks
 against Windows' records, holds the browser's direct children open and
 requires at least one running CEF helper (running the browser's own
-executable) and its console host (`conhost.exe`), and Chromium's `lockfile`
+executable) and no console host (`conhost.exe`) anywhere in the guard's
+process tree (the guard is detached, the browser and its helpers are a
+GUI-subsystem program), and Chromium's `lockfile`
 in the profile's cache root held, reopens the same key and requires the same
 native browser and window, shuts down through `Process::shutdown` and
 requires a normal receipt (complete, `rootExit` 0, no forced cleanup, the
-job empty, and `observed` at least the browser plus the console hosts and
-helpers held, so a helper outside the guard's job leaves it short), the
+job empty, and `observed` at least the browser plus the helpers held, so a
+helper outside the guard's job leaves it short), the
 `lockfile` released and the runtime directory's removal.
 `windows_adapter_ending_the_app_job_ends_guard_and_browser` starts a
-profile, holds a running CEF helper and the console host open (a helper that
+profile, holds a running CEF helper open (a helper that
 then ends by itself has still ended), records the guard's process tree,
 drops the App's spawner (closing the App's job) and requires every process
 held to end within 15 s, naming each survivor with its image, and no normal
@@ -929,8 +1020,9 @@ check waits a short, stated bound and names what is left.
   request ends a browser that stopped reading). A pending write exists only
   after a write timed out, which can happen before the 20 s bound when an
   earlier write settled close to its own deadline.
-- `observed` includes the browser's console host, so it is one higher than
-  on Linux for the same browser.
+- Until W5 `observed` included the browser's console host, so it was one
+  higher than on Linux for the same browser; the GUI-subsystem browser has
+  none.
 
 ## Windows actual App (W3)
 

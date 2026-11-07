@@ -502,6 +502,25 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
             self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_guards_forced_cleanup_lines_are_collected(self):
+        ours = ('{"guardPid":41,"forced":2,"processes":[{"pid":7,"exit":"0xE0007462","image":"x.exe",'
+                '"type":"utility","utilitySubType":"network.mojom.NetworkService"}],"enteredAfterList":1,'
+                '"endedByThemselves":3,"identifyMs":4}')
+        earlier = '{"guardPid":40,"forced":0,"processes":[],"enteredAfterList":0,"endedByThemselves":5,"identifyMs":2}'
+        text = "\n".join(["[1:2:ERROR:x.cc(1)] unrelated", runner.GUARD_DIAGNOSTIC + earlier,
+                          runner.GUARD_DIAGNOSTIC + ours, "partial " + runner.GUARD_DIAGNOSTIC + "{not json", ""])
+        found = runner.guard_diagnostics(text, 41)
+        self.assertEqual([entry.get("guardPid") for entry in found], [41, None])
+        self.assertEqual(found[0]["processes"][0]["utilitySubType"], "network.mojom.NetworkService")
+        self.assertEqual(found[1], {"unparsed": "{not json"})
+        self.assertEqual([entry.get("guardPid") for entry in runner.guard_diagnostics(text)], [40, 41, None])
+        self.assertEqual(runner.guard_diagnostics("nothing here\n", 41), [])
+        # The same prefix as the guard writes.
+        rust = (HERE.parents[1] / "native-tests/cef-candidate/src/guard_windows_identity.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
+        self.assertIn('"guardPid": std::process::id(),', rust)
+
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:
             real_site = "photopea"

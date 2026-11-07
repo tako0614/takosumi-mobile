@@ -10,15 +10,14 @@
 //! parent-death signal. The guard refuses to run outside any job.
 //!
 //! The guard creates a kill-on-close Job Object of its own (no breakaway) and
-//! starts the browser in it before it runs any code (created suspended with
-//! a console that has no window, assigned, resumed), passing its own standard
-//! input, output and error: the App's control pipe, reply pipe and log. Every
-//! process the browser starts is then in the guard's job, and so is the
-//! windowless console host (`conhost.exe`) Windows starts for the browser's
-//! console: CEF's helpers are console programs too and share that console
-//! rather than each getting a new one. `observed` counts that host, and the
-//! drain waits for it like any other process in the job. The App starts the
-//! guard itself detached from any console, so it has no console host. It waits for the
+//! starts the browser in it before it runs any code (created suspended,
+//! assigned, resumed), passing its own standard input, output and error: the
+//! App's control pipe, reply pipe and log. Every process the browser starts
+//! is then in the guard's job. The browser is a GUI-subsystem program, so
+//! neither it nor its CEF helpers (the same executable) have a console or a
+//! console host; `CREATE_NO_WINDOW` stays, and would only matter for a
+//! console program. The App starts the guard itself detached from any
+//! console, so it has no console host either. It waits for the
 //! browser to exit or for a stop request: the App sets a named event it
 //! created and passed in `TAKOSUMI_BROWSER_GUARD_STOP_EVENT` (removed from
 //! the browser's environment). There is no lifetime cap and no polling while
@@ -28,11 +27,19 @@
 //! in the job to end by themselves, then `TerminateJobObject` (each process
 //! still in the job ends with the exit code `FORCED_EXIT`), then up to 2 s for
 //! the job to empty. Forced cleanup counts the processes that were in the job
-//! before the termination and ended with `FORCED_EXIT`, plus any that entered
-//! the job after that list was read; one whose end cannot be attributed is a
-//! cleanup error (the receipt is then not normal), never a guess. The completion proof is the job's
-//! `ActiveProcesses == 0` (`JobObjectBasicAccountingInformation`) after the
-//! browser exited.
+//! before the termination and ended with `FORCED_EXIT` (or still run after
+//! it), plus any that entered the job after that list was read; one whose end
+//! cannot be attributed is a cleanup error (the receipt is then not normal),
+//! never a guess. Each listed process is classified (`classify`) from whether
+//! its handle is signaled, read first, and then its `GetExitCodeProcess` code,
+//! which Windows sets before the job drops the process and before it signals
+//! the handle: a zero wait on the handle alone read a process that had just
+//! ended by itself as still running (run 42343580278 counted 56 such as
+//! forced). Since 6302b33 the count is taken that way. Between the list and
+//! the termination the guard also identifies each listed process (below), so
+//! the effective natural window is 0.5 s plus that time (`identifyMs`). The
+//! completion proof is the job's `ActiveProcesses == 0`
+//! (`JobObjectBasicAccountingInformation`) after the browser exited.
 //!
 //! Receipt, written once after the drain, with the Linux guard's fields:
 //! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
@@ -47,9 +54,22 @@
 //! `forcedCleanup == 0`. A refusal before the receipt exists exits 2 and
 //! starts nothing.
 //!
+//! Diagnostics (`guard_windows_identity.rs`): when the drain reaches the
+//! termination, the guard reads each listed process's image file name and
+//! Chromium process type just before it, and afterwards writes one
+//! `takosumi-browser-guard: forced-cleanup {...}` line to its standard error
+//! naming the processes it counted as forced (none, if all ended by
+//! themselves). The bounds, the receipt's fields and the exit status are
+//! unchanged by them.
+//!
 //! Not covered: a process that the browser has created outside its tree
 //! through a system service (COM, WMI, the task scheduler) is not in the job,
 //! as on Linux a process started by a session manager is not a descendant.
+
+#[path = "guard_windows_identity.rs"]
+mod identity;
+#[path = "process_type.rs"]
+mod process_type;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -61,9 +81,67 @@ use std::path::Path;
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 use tauri_plugin_app_screen::windows_job::{
-    exit_code, in_job, open_process, spawn_in, wait_any, Event, Job, CREATE_NO_WINDOW,
-    STOP_EVENT_ENV,
+    in_job, open_process, spawn_in, wait_any, Event, Job, CREATE_NO_WINDOW, STOP_EVENT_ENV,
 };
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
+}
+
+/// How a listed process ended, for the forced count.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// Ended by the termination, or still running after it.
+    Forced,
+    /// Ended by itself, with any other exit code.
+    ByItself,
+    /// Its exit code could not be read.
+    Unknown,
+}
+
+/// The forced count's rule, from a held process's exit code (None: the read
+/// failed) and whether its handle was signaled before the code was read.
+/// `FORCED_EXIT` is the termination's. `STILL_ACTIVE` is what Windows reports
+/// while a process runs, but also a code a program can return: it is the
+/// latter only once the handle is signaled. Any other code is final (Windows
+/// sets it before the handle is signaled), so the process ended by itself.
+fn classify(code: Option<u32>, signaled: bool) -> Ended {
+    match code {
+        None => Ended::Unknown,
+        Some(FORCED_EXIT) => Ended::Forced,
+        Some(STILL_ACTIVE) if !signaled => Ended::Forced,
+        Some(_) => Ended::ByItself,
+    }
+}
+
+fn exit_code_now(handle: &OwnedHandle) -> io::Result<u32> {
+    let mut code = 0u32;
+    // SAFETY: a live process handle and a valid result pointer.
+    if unsafe { GetExitCodeProcess(handle.as_raw_handle().cast(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(code)
+}
+
+fn signaled(handle: &OwnedHandle, within: Duration) -> io::Result<bool> {
+    Ok(wait_any(&[handle.as_raw_handle()], Some(within))?.is_some())
+}
+
+/// A held process's state for `classify`: whether its handle is signaled,
+/// read first (so a code read afterwards is never older than it), then its
+/// exit code. A `STILL_ACTIVE` code with the handle unsignaled while the job
+/// was already seen empty is the moment just before Windows signals an ended
+/// process: its handle is then given up to `grace` and both are read again.
+fn exit_read(handle: &OwnedHandle, grace: Duration) -> io::Result<(u32, bool)> {
+    let first = signaled(handle, Duration::ZERO)?;
+    let code = exit_code_now(handle)?;
+    if code == STILL_ACTIVE && !first && !grace.is_zero() {
+        let later = signaled(handle, grace)?;
+        return Ok((exit_code_now(handle)?, later));
+    }
+    Ok((code, first))
+}
 
 /// Natural end, then the job is terminated and may take this long to empty.
 const NATURAL: Duration = Duration::from_millis(500);
@@ -80,6 +158,12 @@ const MAX_RUNNING_FAULTS: u32 = 8;
 const FORCED_EXIT: u32 = 0xE000_7462;
 /// `OpenProcess` of an id no process has any more.
 const ERROR_INVALID_PARAMETER: i32 = 87;
+/// `GetExitCodeProcess` while a process runs (also a possible exit code).
+const STILL_ACTIVE: u32 = 259;
+/// The longest the count gives one `STILL_ACTIVE`, unsignaled process in an
+/// empty job to be signaled; it also never runs past the end of the drain's
+/// existing 2 s forced budget (`count_forced`).
+const SIGNAL_GRACE: Duration = Duration::from_millis(50);
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Called by `guard_entry.rs` on Windows.
@@ -240,7 +324,11 @@ impl Run {
 
     /// Wait up to `budget` for the browser to exit and the job to empty.
     fn settle_within(&mut self, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
+        self.settle_until(Instant::now() + budget)
+    }
+
+    /// Wait until `deadline` for the browser to exit and the job to empty.
+    fn settle_until(&mut self, deadline: Instant) -> bool {
         loop {
             if self.settled() {
                 return true;
@@ -292,48 +380,92 @@ impl Run {
             .into_iter()
             .map(|pid| (pid, open_process(pid)))
             .collect();
+        // Diagnostics only: who each one is, read while it still runs. This
+        // lengthens the natural window by its time (`identifyMs`).
+        let identifying = Instant::now();
+        let identities: Vec<identity::Identity> = held
+            .iter()
+            .map(|(_, handle)| identity::identify(handle))
+            .collect();
+        let identify_ms = identifying.elapsed().as_millis();
         if injected("TERMINATE_LATE") {
             self.wait_empty();
         }
         if let Err(error) = self.job.terminate(FORCED_EXIT) {
             self.cleanup_errors.insert(fault(&error));
         }
-        let empty = self.settle_within(FORCED);
-        self.count_forced(held, before);
+        let forced_end = Instant::now() + FORCED;
+        let empty = self.settle_until(forced_end);
+        self.count_forced(
+            held,
+            identities,
+            before,
+            empty.then_some(forced_end),
+            identify_ms,
+        );
         empty
     }
 
-    /// Forced cleanup, counted exactly: the listed processes that ended with
-    /// `FORCED_EXIT` (one still running after the termination was also told
-    /// to end), and every process that entered the job after the total was
-    /// read. A listed process that had already gone before it could be
-    /// opened ended by itself. Any other failure leaves the count unknown:
-    /// it is recorded in `cleanupErrors`, which makes the receipt abnormal,
-    /// as a failed signal does on Linux.
+    /// Forced cleanup, counted exactly: the listed processes `classify` finds
+    /// forced (ended by the termination, or still running after it), and
+    /// every process that entered the job after the total was read. A listed
+    /// process with any other exit code, or that had already gone before it
+    /// could be opened, ended by itself. A failed read leaves the count
+    /// unknown: it is recorded in `cleanupErrors`, which makes the receipt
+    /// abnormal, as a failed signal does on Linux. `empty_until` is the end
+    /// of the drain's forced budget when its settle found the job empty:
+    /// only then may a `STILL_ACTIVE`, unsignaled process get `SIGNAL_GRACE`,
+    /// and never past that end, so the drain's outer bound is unchanged (with
+    /// a job not found empty, such a process counts as forced, which can only
+    /// over-count, on the safe side). The result is written on the guard's
+    /// standard error (`identity::report`, diagnostics only).
     fn count_forced(
         &mut self,
         held: Vec<(u32, io::Result<OwnedHandle>)>,
+        identities: Vec<identity::Identity>,
         before: io::Result<(u32, u32)>,
+        empty_until: Option<Instant>,
+        identify_ms: u128,
     ) {
-        for (_, handle) in held {
-            let ended = handle.and_then(|handle| exit_code(&handle));
-            match ended {
-                Ok(Some(FORCED_EXIT)) | Ok(None) => self.forced += 1,
-                Ok(Some(_)) => {}
-                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => {}
-                Err(error) => {
-                    self.cleanup_errors
-                        .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
+        let mut named = Vec::new();
+        let mut by_themselves = 0;
+        for ((pid, handle), who) in held.into_iter().zip(&identities) {
+            let grace = empty_until.map_or(Duration::ZERO, |end| {
+                SIGNAL_GRACE.min(end.saturating_duration_since(Instant::now()))
+            });
+            let read = handle.and_then(|handle| exit_read(&handle, grace));
+            let (code, signaled) = match &read {
+                Ok((code, signaled)) => (Some(*code), *signaled),
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => continue,
+                Err(_) => (None, false),
+            };
+            match classify(code, signaled) {
+                Ended::Forced => {
+                    self.forced += 1;
+                    let exit = code.filter(|code| *code != STILL_ACTIVE);
+                    named.push(identity::entry(pid, who, exit));
+                }
+                Ended::ByItself => by_themselves += 1,
+                Ended::Unknown => {
+                    if let Err(error) = read {
+                        self.cleanup_errors
+                            .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
+                    }
                 }
             }
         }
+        let mut entered = 0;
         match (before, self.job.processes()) {
-            (Ok((before, _)), Ok((after, _))) => self.forced += after.saturating_sub(before),
+            (Ok((before, _)), Ok((after, _))) => {
+                entered = after.saturating_sub(before);
+                self.forced += entered;
+            }
             (Err(error), _) | (_, Err(error)) => {
                 self.cleanup_errors
                     .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
             }
         }
+        identity::report(self.forced, named, entered, by_themselves, identify_ms);
     }
 
     /// Self-test only: wait (bounded) until the job is empty.

@@ -2740,20 +2740,17 @@ mod windows_tests {
 
     /// The browser's direct children, each held open before it is examined
     /// (so its id cannot name another process meanwhile): CEF helpers run
-    /// the browser's own executable; console hosts are `conhost.exe`, which
-    /// Windows starts for the browser's windowless console. Only helpers
-    /// still running when held count. Waits up to 30 s for the first helper
-    /// (the page's renderer, if not already the GPU or a utility process).
+    /// the browser's own executable. Only helpers still running when held
+    /// count. Waits up to 30 s for the first helper (the page's renderer, if
+    /// not already the GPU or a utility process).
     struct Children {
         helpers: Vec<(u32, std::os::windows::io::OwnedHandle)>,
-        hosts: Vec<(u32, std::os::windows::io::OwnedHandle)>,
     }
     fn children(native_pid: u32, program: &Path) -> Children {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut found = Children {
                 helpers: Vec::new(),
-                hosts: Vec::new(),
             };
             for pid in windows::tree_of(native_pid) {
                 let Some(handle) = windows::waitable(pid) else {
@@ -2762,17 +2759,10 @@ mod windows_tests {
                 if pid == native_pid || windows::parent_of(pid) != Some(native_pid) {
                     continue;
                 }
-                let image = windows::image_of(pid);
-                if image.as_deref() == Some(program) {
-                    if matches!(crate::windows_job::exit_code(&handle), Ok(None)) {
-                        found.helpers.push((pid, handle));
-                    }
-                } else if image
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("conhost.exe"))
+                if windows::image_of(pid).as_deref() == Some(program)
+                    && matches!(crate::windows_job::exit_code(&handle), Ok(None))
                 {
-                    found.hosts.push((pid, handle));
+                    found.helpers.push((pid, handle));
                 }
             }
             if !found.helpers.is_empty() || Instant::now() >= deadline {
@@ -2780,6 +2770,22 @@ mod windows_tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Every console host (`conhost.exe`) anywhere in `root`'s process tree.
+    /// Windows starts one for a console program; the guard is started
+    /// detached and the browser and its helpers are a GUI-subsystem program,
+    /// so there must be none.
+    fn console_hosts(root: u32) -> Vec<u32> {
+        windows::tree_of(root)
+            .into_iter()
+            .filter(|pid| {
+                windows::image_of(*pid)
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("conhost.exe"))
+            })
+            .collect()
     }
 
     /// A fresh view of `root`'s process tree for a failure message: each
@@ -2837,20 +2843,22 @@ mod windows_tests {
         let tree = windows::tree_of(process.child.id());
         let children = children(native_pid, &located.program);
         let ids = |held: &[(u32, _)]| held.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
+        let hosts = console_hosts(process.child.id());
         println!(
-            "guard tree while open: {tree:?}; CEF helpers: {:?}; console hosts: {:?}",
-            ids(&children.helpers),
-            ids(&children.hosts)
+            "guard tree while open: {tree:?}; CEF helpers: {:?}; console hosts: {hosts:?}",
+            ids(&children.helpers)
         );
         assert!(
             !children.helpers.is_empty(),
             "no CEF helper below the browser:\n{}",
             describe(native_pid, &located.program)
         );
+        // No console host anywhere below the guard: the guard is detached,
+        // and the browser and its helpers are a GUI-subsystem program.
         assert!(
-            !children.hosts.is_empty(),
-            "no console host below the browser:\n{}",
-            describe(native_pid, &located.program)
+            hosts.is_empty(),
+            "console host(s) {hosts:?} in the guard's tree (a console program?):\n{}",
+            describe(process.child.id(), &located.program)
         );
         // CEF's process singleton holds the profile's lockfile while the
         // browser runs: what clear_profile's refusal relies on.
@@ -2902,17 +2910,14 @@ mod windows_tests {
             receipt["kernelNoChildren"], true,
             "the guard's job is empty"
         );
-        // The browser, its console host(s) and the helpers held while it ran
-        // were all in the guard's job: a helper outside it would leave the
-        // count short, since the browser and its console host alone make
-        // two.
-        let expected = 1 + children.hosts.len() + children.helpers.len();
+        // The browser and the helpers held while it ran were all in the
+        // guard's job: a helper outside it would leave the count short.
+        let expected = 1 + children.helpers.len();
         let observed = receipt["observed"].as_u64().unwrap();
         assert!(
             observed >= expected as u64,
-            "the guard's job counted {observed} processes, fewer than the browser, \
-             {} console host(s) and {} CEF helper(s)",
-            children.hosts.len(),
+            "the guard's job counted {observed} processes, fewer than the browser and \
+             {} CEF helper(s)",
             children.helpers.len()
         );
         assert!(process
@@ -2973,7 +2978,6 @@ mod windows_tests {
             );
         }
         handles.extend(children.helpers);
-        handles.extend(children.hosts);
         // The App side ends: its spawner closes the App's Job Object, as the
         // App process's end does.
         drop(parent);
