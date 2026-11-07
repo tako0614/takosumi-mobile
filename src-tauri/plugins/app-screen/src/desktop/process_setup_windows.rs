@@ -113,9 +113,11 @@ pub(in crate::desktop) fn locate(plan: Plan, identity: &Identity) -> Result<Loca
 
 /// Before each spawn: every executable located in the bundle directory must
 /// still be a plain file directly in that plain directory, at the same
-/// canonical path, so the installation cannot have been changed to lead
-/// elsewhere since the App started. (Only the moment between this check and
-/// the process creation remains.)
+/// canonical path. Links, junctions, moves and deletions since the App
+/// started are refused; an in-place overwrite of a plain file (or a file
+/// moved back in its place) is not detected, since nothing holds the files
+/// open, and the moment between this check and the process creation
+/// remains.
 pub(in crate::desktop) fn recheck(
     bundle: Option<&Path>,
     program: &Path,

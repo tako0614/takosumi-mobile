@@ -1560,9 +1560,10 @@ junction or other reparse point) whose canonical path lies directly in that
 directory, itself a plain directory: a link or junction cannot make anything
 outside the installation stand in for them. The same checks run again
 before each browser is started (the same canonical paths, still plain files
-in the plain directory), so a change to the installation after the App
-started is refused; only the moment between that check and the process
-creation remains. A fixture override (`fixture-overrides` builds only) only
+in the plain directory): links, junctions, moves and deletions after the App
+started are refused. An in-place overwrite of a plain file is not detected
+(nothing holds the files open), and the moment between that check and the
+process creation remains. A fixture override (`fixture-overrides` builds only) only
 has to resolve to a file, and an executable left to the bundle beside an
 override is still checked. The
 runtime root stays `<app cache>\cef` (`%LOCALAPPDATA%\<identifier>\cef`),
