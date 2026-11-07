@@ -10,9 +10,9 @@
 //! App is that window's `windowNumber`.
 use cef::application_mac::{CefAppProtocol, CrAppControlProtocol, CrAppProtocol};
 use objc2::{
-    define_class, extern_methods, msg_send,
+    define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Bool, NSObjectProtocol},
+    runtime::{AnyObject, AnyProtocol, Bool, NSObjectProtocol},
     sel, ClassType, DefinedClass, MainThreadMarker,
 };
 use objc2_app_kit::{NSApp, NSApplication, NSEvent};
@@ -22,6 +22,19 @@ use std::{cell::Cell, ffi::c_void};
 #[derive(Default)]
 pub struct ApplicationIvars {
     handling_send_event: Cell<Bool>,
+}
+
+/// Puts the handling flag back to what it was when dropped, also when an
+/// Objective-C exception unwinds out of `sendEvent:`.
+struct RestoreHandling<'a> {
+    flag: &'a Cell<Bool>,
+    previous: Bool,
+}
+
+impl Drop for RestoreHandling<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.previous);
+    }
 }
 
 define_class!(
@@ -35,14 +48,10 @@ define_class!(
     impl TakosumiCefApplication {
         #[unsafe(method(sendEvent:))]
         unsafe fn send_event(&self, event: &NSEvent) {
-            let was_sending = self.ivars().handling_send_event.get();
-            if !was_sending.as_bool() {
-                self.ivars().handling_send_event.set(Bool::YES);
-            }
+            let flag = &self.ivars().handling_send_event;
+            let _restore = RestoreHandling { flag, previous: flag.get() };
+            flag.set(Bool::YES);
             let _: () = msg_send![super(self), sendEvent: event];
-            if !was_sending.as_bool() {
-                self.ivars().handling_send_event.set(Bool::NO);
-            }
         }
 
         /// Cocoa's quit (the Dock menu, logout) would end the process with
@@ -72,24 +81,40 @@ define_class!(
     unsafe impl CefAppProtocol for TakosumiCefApplication {}
 );
 
-impl TakosumiCefApplication {
-    extern_methods! {
-        #[unsafe(method(sharedApplication))]
-        fn shared_application() -> Retained<Self>;
-    }
-}
+/// Chromium's protocols the shared application must conform to. objc2
+/// registers a class's protocols only when the runtime knows them (they are
+/// registered with the framework, loaded before this), and skips a missing
+/// one silently, so `install_application` checks them by name.
+const PROTOCOLS: [&std::ffi::CStr; 2] = [c"CrAppProtocol", c"CrAppControlProtocol"];
 
 /// Make `TakosumiCefApplication` the shared application (before anything
 /// else touches `NSApp`, and before CefInitialize), with the regular
-/// activation policy of an app with windows. Panics off the main thread or
-/// when another class already is the shared application.
+/// activation policy of an app with windows. Panics, naming the reason, off
+/// the main thread, when another class already is the shared application,
+/// or when the class does not conform to Chromium's protocols.
 pub fn install_application() {
     let mtm = MainThreadMarker::new().expect("The browser starts on the main thread");
-    let _ = TakosumiCefApplication::shared_application();
+    let class = TakosumiCefApplication::class();
+    for name in PROTOCOLS {
+        let protocol = AnyProtocol::get(name).unwrap_or_else(|| {
+            panic!("The Objective-C runtime has no {name:?}: is the CEF framework loaded?")
+        });
+        assert!(
+            class.conforms_to(protocol),
+            "TakosumiCefApplication does not conform to {name:?}"
+        );
+    }
+    // `sharedApplication` answers the existing NSApplication when one was
+    // made before: it is taken as an NSApplication, then checked.
+    let shared: Retained<NSApplication> = unsafe { msg_send![class, sharedApplication] };
+    assert!(
+        shared.isKindOfClass(class),
+        "NSApp was created before the browser's application class"
+    );
     let app = NSApp(mtm);
     assert!(
-        app.isKindOfClass(TakosumiCefApplication::class()),
-        "NSApp was created before the browser's application class"
+        app.isKindOfClass(class),
+        "NSApp is not the browser's application class"
     );
     // NSApplicationActivationPolicyRegular.
     let _: Bool = unsafe { msg_send![&app, setActivationPolicy: 0isize] };
@@ -154,8 +179,12 @@ pub fn describe(handle: *mut c_void) -> String {
 /// is not checked here.
 pub fn raise(handle: *mut c_void) -> Result<(), &'static str> {
     let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
-    // Resolved now: the window holding the browser can change.
+    // Resolved now (the window holding the browser can change), and held
+    // while it is sent the messages below.
     let window = window_of(handle).ok_or("the browser view has no window")?;
+    let window = unsafe { Retained::retain(std::ptr::from_ref(window).cast_mut()) }
+        .ok_or("the browser view has no window")?;
+    let window = &*window;
     let nil: Option<&AnyObject> = None;
     unsafe {
         let miniaturized: Bool = msg_send![window, isMiniaturized];
