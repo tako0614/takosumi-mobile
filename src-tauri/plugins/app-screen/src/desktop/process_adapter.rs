@@ -3255,14 +3255,17 @@ mod macos_tests {
 
     #[test]
     fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
+        // On macOS tauri's mock App has no resource directory, so the
+        // packaged browser cannot even be named (CI run 42389517653 showed
+        // this reason); installing must not fail.
         let app = tauri::test::mock_app();
         install(app.handle()).unwrap();
         assert!(app.try_state::<Backend>().is_none());
         let reason = unavailable(app.handle()).expect("an unavailable reason");
-        assert!(
-            reason.starts_with("The desktop browser is unavailable: ")
-                && reason.contains("Browser process executable is unavailable"),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "The desktop browser is unavailable: The App's resource directory is unavailable; \
+             its browser cannot be found."
         );
         assert!(!super::super::capabilities_of(app.handle()).clear_profile);
     }
