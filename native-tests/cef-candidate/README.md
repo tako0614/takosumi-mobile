@@ -1797,82 +1797,92 @@ observer and smoke unit tests.
 
 **Exit codes.** `process_main::run` returns the process's exit code (a CEF
 helper's from `execute_process`, the browser's 0, or 1 when a request
-failed). The DLL's `RunWinMain` returns it to the bootstrap, which returns it
-from its `wWinMain`, so the bootstrap's teardown runs (its comment: the
-sandbox broker's cleanup is an `_onexit` handler that runs after `wWinMain`
-returns); a panic reaching `RunWinMain` is caught and returned as 101. The
-executable (Linux, the unsandboxed candidate) exits with a non-zero code and
-returns from `main` on 0, as before. The stage refuses a client DLL that does
-not export `RunWinMain` (a library built without `windows-sandbox` is empty).
-The crate declares `rust-version = "1.89"` (its path dependency, the App's
-plugin, needs it).
+failed). A CEF helper's `RunWinMain` returns it to the bootstrap, which
+returns it from its `wWinMain`. The sandboxed browser process does not come
+back: once CefShutdown has returned it ends itself with `ExitProcess` and
+that code (below). A panic reaching `RunWinMain` is caught and returned to
+the bootstrap as 101, so its teardown then runs; for a panic before
+CefShutdown (rare) that teardown may end in 7014 when sandboxed targets
+remain. The executable (Linux, the unsandboxed candidate) exits with a
+non-zero code and returns from `main` on 0, as before. The stage refuses a
+client DLL that does not export `RunWinMain` (a library built without
+`windows-sandbox` is empty). The crate declares `rust-version = "1.89"` (its
+path dependency, the App's plugin, needs it).
 
-**Broker teardown and the orderly end** (round 3). Returning the exit code
-to the bootstrap (above) made Photopea's sequential quit fail in the W4 run
-of `0f6fa36` (run 42366574526): Work's guard receipt had `rootExit` 7014
-(`complete`, nothing forced, 92 processes observed in its job over the
-run), so the App stopped the quit as an abnormal end before asking
-Personal. The same flow passed at `c67a29c` (run 42363524297), with the
-sandbox, when the browser still ended with `std::process::exit`. From
-Chromium 154.0.8037.98's sources (the locked CEF 154.0.34): 7014 is
-`SBOX_FATAL_BROKER_SHUTDOWN_HUNG`, "Broker terminated in shutdown"
-(`sandbox/win/src/sandbox_types.h`). The broker lives in the bootstrap
-(`content::InitializeSandboxInfo` in `bootstrap_win.cc`) as a
-`SingletonBase` whose `_onexit` handler deletes it; in an executable that
-runs after `wWinMain` returns (`win_utils.h`), so only since the browser
-returns to the bootstrap. `std::process::exit` calls `ExitProcess`, which
-skips the executable's `_onexit` table, so the destructor never ran before.
-`BrokerServicesBase::~BrokerServicesBase` (`broker_services.cc`) posts
-`THREAD_CTRL_QUIT` to its job-event thread and, if that thread has not
-ended within 5000 ms, calls `TerminateProcess(GetCurrentProcess(),
-SBOX_FATAL_BROKER_SHUTDOWN_HUNG)`. The thread handles queued packets in
-order; on the quit it returns and destroys every job tracker still listed,
-one per sandboxed target whose job has not yet reported
-`JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` (which removes a tracker as soon as its
-last process is gone). Each `~JobTracker` terminates the job, and
-`~PolicyBase` destroys its `TargetProcess`, whose destructor waits up to
-50 ms for the process, terminates it and resets its IPC server, which
-unregisters its thread-pool waits with `UnregisterWaitEx(...,
-INVALID_HANDLE_VALUE)` and so blocks on any callback in flight; one tracker
-after another. CefShutdown does not wait for its children to end: Chromium
-terminates renderers with `Process::Terminate(RESULT_CODE_NORMAL_EXIT,
-false)` (`child_process_launcher_helper_win.cc`) and deletes the other child
-hosts (`BrowserChildProcessHostImpl::TerminateAll`). So a heavy page, with
-many site-isolated ad frames (each a renderer) and utilities, leaves many
-targets still ending when the bootstrap's teardown starts, and destroying
-their trackers one by one outlasts the 5 s on a loaded runner. (The exact
-per-target time on the runner was not measured.)
+**How the browser ends after CefShutdown** (rounds 3 and 4). Three runs of
+Photopea's sequential quit (W4), whose page leaves dozens of sandboxed
+targets (site-isolated ad frames, each a renderer, and utilities):
 
-The browser now ends in order (`src/children_windows.rs`, Windows only):
-after CefShutdown and before returning to the bootstrap it takes a Toolhelp
-process snapshot, opens each process whose parent id is its own and that
-was created after it (an older process whose parent id merely names a
-reused id is not a child) with `SYNCHRONIZE`, and waits for each to end,
-looking again until none runs or 10 s have passed. Every sandboxed target is
-such a child (the broker creates them). Their jobs then report their last
-process gone before the quit is posted, so the broker's thread finds no
-tracker left to tear down. The bound fits the App's existing budget: a
-browser that answered `stopped` has 30 s (`STOP_FINISH`) to end with its
-guard's normal receipt; after `stopped` come CefShutdown, this wait (at most
-10 s), the broker's teardown (at most 5 s by its own bound) and the guard's
-drain (0.5 s natural, at most 2 s forced), leaving 12.5 s for CefShutdown.
-No bound of the App or the guard changed, nor the App's policy (a non-zero
-`rootExit` is abnormal). The browser then writes one line to its standard
-error (the guard's `browser.log`):
-`takosumi-cef-browser-process: shutdown {"pid":…,"children":…,"remaining":…,"unopened":…,"waitedMs":…,"boundMs":10000,"exitCode":…}`
-(children still running after CefShutdown, those left at the bound, those
-it could not open, the wait's length, and the code it returns; a 7014 after
-it would show in the guard receipt's `rootExit`). The W3 runner keeps it per
-profile in each launch's `execution*.json` (`guardRecords[].browserShutdown`),
-in each phase of `summary.json` (`shutdown`, with the receipt's `rootExit`)
+- `c67a29c` (run 42363524297): the browser ended with `std::process::exit`
+  (`ExitProcess`) after CefShutdown; Photopea passed 16/16.
+- `0f6fa36` (run 42366574526): the browser returned its code to the
+  bootstrap (round 2). Work's guard receipt had `rootExit` 7014 (`complete`,
+  nothing forced, 92 processes observed), so the App stopped the quit as an
+  abnormal end before asking Personal.
+- `7e90bfb` (run 42368077968): before returning, the browser waited for its
+  children: `{"children":65,"remaining":0,"waitedMs":7548,"boundMs":10000,"exitCode":0}`,
+  receipt `rootExit` 0, nothing forced, 77 observed; no 7014, but Work's end
+  then took so long that Personal's beforeunload did not open within the
+  observer's 20 s (`END_WAIT`), which stays as it is.
+
+From Chromium 154.0.8037.98's sources (the locked CEF 154.0.34):
+
+- Returning to the bootstrap runs the sandbox broker's teardown. The broker
+  lives in the bootstrap (`content::InitializeSandboxInfo` in
+  `bootstrap_win.cc`) as a `SingletonBase`, whose `_onexit` handler deletes
+  it once `wWinMain` returns (`sandbox/win/src/win_utils.h`);
+  `ExitProcess` skips an executable's `_onexit` handlers.
+  `BrokerServicesBase::~BrokerServicesBase` (`broker_services.cc`) posts
+  `THREAD_CTRL_QUIT` to its job-event thread and, if that thread has not
+  ended within 5000 ms, calls `TerminateProcess(GetCurrentProcess(),
+  SBOX_FATAL_BROKER_SHUTDOWN_HUNG)`, 7014, "Broker terminated in shutdown"
+  (`sandbox_types.h`). On the quit the thread destroys every job tracker
+  still listed (one per target whose job has not reported
+  `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO`), one after another: `~JobTracker`
+  terminates the job and `~TargetProcess` waits up to 50 ms for the process,
+  terminates it and resets its IPC server, which unregisters its waits with
+  `UnregisterWaitEx(..., INVALID_HANDLE_VALUE)` and so blocks on any
+  callback in flight. CefShutdown does not wait for its children: Chromium
+  terminates renderers with `Process::Terminate(RESULT_CODE_NORMAL_EXIT,
+  false)` (`child_process_launcher_helper_win.cc`) and deletes the other
+  child hosts (`BrowserChildProcessHostImpl::TerminateAll`). So on a heavy
+  page that ordered cleanup takes seconds: past the 5 s (7014), and waiting
+  for the children first took 7.5 s.
+- Every target's job ends with the broker: `BrokerServicesBase` creates a
+  job for each target (`PolicyBase::InitJob`, from `PreSpawnTarget` on the
+  way to `SpawnTargetAsync`), and
+  `Job::Init` (`sandbox/win/src/job.cc`) sets
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` for every job level (`kLockdown`,
+  `kLimitedUser` and `kInteractive` fall through to `kUnprotected`, which
+  sets it). The broker holds the job handles; when its process ends, the
+  kernel closes them and ends the targets still in those jobs.
+- CefShutdown has already shut the browser down and flushed the profile
+  before it returns, so ending the process then skips nothing that writes
+  data.
+
+So once CefShutdown has returned, the sandboxed browser ends with
+`ExitProcess` and the run's exit code (`src/children_windows.rs`, Windows
+only), as at `c67a29c`, and the kernel ends the remaining targets through
+their jobs; the guard then sees them end. There is no wait: just before
+ending, the browser counts its child processes still running (a Toolhelp
+snapshot; a child is a process whose parent id is its own and that was
+created after it; no wait) and writes one line to its standard error (the
+guard's `browser.log`):
+`takosumi-cef-browser-process: shutdown {"pid":…,"children":…,"unopened":…,"end":"exit-process","exitCode":…}`
+(`unopened`: children it could not open to tell). The unsandboxed candidate
+writes the same line with `"end":"return"` and returns its code as before;
+Linux is unchanged. Unsandboxed child processes, if any, are not in a
+sandbox job; they end on their own once their connection to the browser is
+gone, and the guard's drain covers the rest as before. No bound of the App,
+the guard or the observer changed, nor the App's policy (a non-zero
+`rootExit` is abnormal). The W3 runner keeps the line per profile in each
+launch's `execution*.json` (`guardRecords[].browserShutdown`), in each
+phase of `summary.json` (`shutdown`, with the guard receipt's `rootExit`)
 and prints it to the CI log (`shutdown-first`, `shutdown-restart`, ...); the
-W1 smoke records it in its summary (`shutdown`). Chromium itself has no API
-that makes the targets end before the broker's teardown; waiting for the
-process's own children is the direct way to meet the destructor's
-precondition. The CI job `cef-windows` builds the module's tests with
-`rustc` alone and runs them on Windows: the pure parts, and the wait for the
-test binary's own children (it re-executes itself as them): children that
-end, the bound, and none.
+W1 smoke records it in its summary (`shutdown`). The CI job `cef-windows`
+builds the module's tests with `rustc` alone and runs all five on Windows:
+the pure parts, and the count of the test binary's own children (it
+re-executes itself as them), running and ended.
 
 **Not shown:** Authenticode signing (every PE file under `cef\` with the
 same certificate), SmartScreen, a release build, real devices and other
