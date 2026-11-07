@@ -246,6 +246,10 @@ pub(super) struct Located {
 pub(super) fn locate(plan: Plan, euid: u32) -> Result<Located> {
     let program = existing_file(&plan.program, "Browser process executable is unavailable.")?;
     let guard = existing_file(&plan.guard, "Browser guard is unavailable.")?;
+    // macOS: the browser's socket directory is the system's per-user
+    // temporary directory; one too long for the socket is refused here.
+    #[cfg(target_os = "macos")]
+    super::process_macos::browser_temp_dir()?;
     let runtime = match plan.runtime {
         Runtime::Given(path) => private_runtime(&path, euid)?,
         Runtime::Search(candidates) => search(&candidates, euid)?,
@@ -398,9 +402,10 @@ fn private_runtime(path: &Path, euid: u32) -> Result<PathBuf> {
 /// Chromium's temporary singleton socket under a browser's runtime directory
 /// must fit `sockaddr_un` (108 bytes including the terminator). Linux only:
 /// Chromium on Windows keeps no socket there, and on macOS (whose limit is
-/// 104) the browser keeps the system's per-user `TMPDIR` for it, not the
-/// runtime directory (the App's cache directory is too long for one), so
-/// any runtime directory fits.
+/// 104) the browser's `TMPDIR` is the system's per-user temporary directory,
+/// not the runtime directory (the App's cache directory is too long for
+/// one), so any runtime directory fits; `locate` checks that directory
+/// instead (`process_macos::browser_temp_dir`).
 #[cfg(target_os = "linux")]
 pub(super) fn socket_path_fits(runtime: &Path) -> bool {
     runtime

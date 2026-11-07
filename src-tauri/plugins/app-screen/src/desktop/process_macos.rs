@@ -2,7 +2,7 @@
 //! M2): the identity checks on a browser's `opened` reply, Chromium's profile
 //! lock and the external-link opener. The rest is POSIX and shared with
 //! Linux. libproc (`proc_pidinfo`, `proc_pidpath`) through libc.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What the kernel says about one process: its parent and start time
 /// (microseconds since the epoch); `None` when no such process exists.
@@ -93,6 +93,47 @@ pub(super) fn process_exists(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The system's per-user temporary directory (`confstr`,
+/// `_CS_DARWIN_USER_TEMP_DIR`, such as `/var/folders/…/T/`), which the
+/// browser gets as `TMPDIR` whatever the App's own environment says.
+/// Chromium keeps its process-singleton socket there, at
+/// `<dir>/org.chromium.Chromium.XXXXXX/SingletonSocket`, which must fit
+/// `sockaddr_un` (104 bytes on macOS, its terminator included); a directory
+/// too long for it is refused with that reason.
+pub(super) fn browser_temp_dir() -> crate::Result<PathBuf> {
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: the buffer's length is passed; confstr terminates what fits.
+    let needed = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if needed <= 1 || needed > buffer.len() {
+        return Err(crate::Error::InvalidRequest(
+            "The system's per-user temporary directory is unavailable.",
+        ));
+    }
+    buffer.truncate(needed - 1);
+    use std::os::unix::ffi::OsStringExt;
+    let directory = PathBuf::from(std::ffi::OsString::from_vec(buffer));
+    if !directory.is_absolute() || !singleton_socket_fits(&directory) {
+        return Err(crate::Error::InvalidRequest(
+            "The system's per-user temporary directory is too long for the browser's singleton socket.",
+        ));
+    }
+    Ok(directory)
+}
+
+/// Whether Chromium's singleton socket under `temp` fits `sockaddr_un`.
+pub(super) fn singleton_socket_fits(temp: &Path) -> bool {
+    temp.join("org.chromium.Chromium.XXXXXX/SingletonSocket")
+        .as_os_str()
+        .len()
+        < 104
 }
 
 /// The person's default browser through `/usr/bin/open`, in its own process

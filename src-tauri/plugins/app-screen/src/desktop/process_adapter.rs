@@ -872,6 +872,19 @@ impl Process {
                 if libc::getppid() as u32 != app {
                     return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
+                // macOS: the guard starts with its stop signals blocked, so a
+                // stop sent before it watches for one stays pending (it
+                // unblocks them itself; the browser gets an empty mask).
+                #[cfg(target_os = "macos")]
+                {
+                    let mut stops: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut stops);
+                    libc::sigaddset(&mut stops, libc::SIGTERM);
+                    libc::sigaddset(&mut stops, libc::SIGINT);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &stops, std::ptr::null_mut()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
@@ -915,10 +928,17 @@ impl Process {
             private_directory(&runtime.join("tmp"))?;
             command.env("TMPDIR", runtime.join("tmp"));
         }
-        // macOS: the allowlist below, the system's per-user TMPDIR (Chromium's
-        // singleton socket must fit 104 bytes, which the App's cache
-        // directory would not), and the nano allocator off, as CEF asks: its
-        // bundle's LSEnvironment applies only to a LaunchServices launch.
+        // macOS: the allowlist below; TMPDIR, the system's per-user
+        // temporary directory read from the system, not the App's
+        // environment (Chromium's singleton socket must fit 104 bytes, which
+        // the App's cache directory would not; checked there); and the nano
+        // allocator off, as CEF asks: its bundle's LSEnvironment applies only
+        // to a LaunchServices launch. HOME stays the person's own: every
+        // Chromium profile file is in the profile's cache path, and Cocoa
+        // looks up ~/Library through the account, not HOME, so a
+        // per-profile HOME would not separate the browser bundle's shared
+        // macOS state (its defaults domain, saved window state) and is not
+        // known to be safe for CEF; that sharing is a known limit.
         #[cfg(target_os = "macos")]
         {
             for key in MACOS_ENVIRONMENT {
@@ -926,6 +946,7 @@ impl Process {
                     command.env(key, value);
                 }
             }
+            command.env("TMPDIR", macos::browser_temp_dir()?);
             command.env("MallocNanoZone", "0");
         }
         #[cfg(windows)]
@@ -1406,6 +1427,15 @@ impl Process {
         require_normal_guard(&proof)
     }
 }
+/// A guard's receipt shows a normal end: the browser exited 0, nothing was
+/// forced or failed, and `complete` and `kernelNoChildren` hold with nothing
+/// `remaining`. What those two mean depends on the guard: on Linux the
+/// child subreaper's wait answered `ECHILD` (a kernel proof that no
+/// descendant is left), on Windows the job's accounting shows no process;
+/// on macOS they mean no survivor among the processes the guard observed
+/// (its process group, and the descendants it recorded by pid and start
+/// time). A process the browser started through launchd or XPC, and a
+/// double fork faster than the guard's observation, are outside that.
 fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
     if proof["rootExit"] == 0
         && proof["complete"] == true
@@ -3120,11 +3150,11 @@ const WINDOWS_ENVIRONMENT: &[&str] = &[
     "PROCESSOR_ARCHITECTURE",
 ];
 /// macOS (M2): the App's environment the browser keeps: its search path,
-/// identity, locale, home (Cocoa and CEF read it) and the system's per-user
-/// `TMPDIR`. `MallocNanoZone=0` is added. Nothing else passes.
+/// identity, locale and home (Cocoa and CEF read it). `TMPDIR` (from the
+/// system) and `MallocNanoZone=0` are added. Nothing else passes.
 #[cfg(target_os = "macos")]
 const MACOS_ENVIRONMENT: &[&str] = &[
-    "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TMPDIR",
+    "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "HOME",
 ];
 fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> Result<Child> {
     let (reply, spawned) = mpsc::sync_channel(1);
@@ -3332,6 +3362,65 @@ mod macos_tests {
         assert!(macos::same_path("/a/b", Path::new("/a/b")));
         assert!(!macos::same_path("/a//b", Path::new("/a/b")));
         assert!(!hostname().is_empty());
+        // The browser's TMPDIR: the system's per-user directory, short
+        // enough for Chromium's singleton socket; a longer one is refused.
+        let temp = macos::browser_temp_dir().expect("the per-user temporary directory");
+        assert!(temp.is_absolute() && temp.is_dir(), "{}", temp.display());
+        assert!(macos::singleton_socket_fits(&temp));
+        assert!(!macos::singleton_socket_fits(
+            &Path::new("/").join("a".repeat(60))
+        ));
+        assert!(macos::singleton_socket_fits(
+            &Path::new("/").join("a".repeat(57))
+        ));
+    }
+
+    #[test]
+    fn a_foreign_hosts_lock_refuses_and_a_killed_holders_lock_is_stale() {
+        let root = std::env::temp_dir().join(format!("sumi-lock-mac-{}", std::process::id()));
+        let profile = "33333333-3333-4333-8333-333333333333";
+        let cache = root.join(profile).join("cef-profiles");
+        private_directory(&cache.join(profile)).unwrap();
+        std::fs::write(cache.join(profile).join("Cookies"), b"x").unwrap();
+        let lock = cache.join("SingletonLock");
+        let link = |target: String| {
+            let _ = std::fs::remove_file(&lock);
+            std::os::unix::fs::symlink(target, &lock).unwrap();
+        };
+        // A pid that names no process here (ended and reaped).
+        let mut ended = Command::new("/usr/bin/true").spawn().unwrap();
+        let gone = ended.id();
+        ended.wait().unwrap();
+        // Another host's lock cannot be checked from here: it is held, even
+        // with a pid that is free on this host; this host's is stale.
+        link(format!("elsewhere.example-{gone}"));
+        let foreign = singleton_live(&cache);
+        let foreign_refused = clear_site_data(&root, profile);
+        link(format!("{}-{gone}", hostname()));
+        let local_stale = !singleton_live(&cache);
+        // A holder on this host killed with SIGKILL leaves its lock behind:
+        // held while it runs, stale once it is gone, and the clear then
+        // proceeds with the lock still in place.
+        let mut holder = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        link(format!("{}-{}", hostname(), holder.id()));
+        let held = singleton_live(&cache);
+        let held_refused = clear_site_data(&root, profile);
+        let kept = cache.join(profile).join("Cookies").exists();
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        let after_kill = singleton_live(&cache);
+        let cleared = clear_site_data(&root, profile);
+        let gone_cache = !cache.exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(foreign && local_stale && held && kept && !after_kill);
+        for refused in [foreign_refused, held_refused] {
+            match refused {
+                Err(Error::InvalidRequest(message)) => assert_eq!(message, STILL_OPEN),
+                other => panic!("{other:?}"),
+            }
+        }
+        cleared.unwrap();
+        assert!(gone_cache);
     }
 
     fn built(key: &str) -> PathBuf {
@@ -3538,8 +3627,10 @@ mod macos_tests {
     }
 
     /// The stand-in App of the death case: started by that case with AS_APP
-    /// set, it opens a profile and waits to be killed. Without AS_APP (any
-    /// ordinary run) it does nothing.
+    /// set, it opens a profile, hands a copy of the browser's input to a
+    /// holder process (so the App's death does not end that input, and the
+    /// browser cannot stop on its end) and waits to be killed. Without AS_APP
+    /// it does nothing; CI skips it (`--skip`), so it is never counted.
     #[test]
     #[ignore = "the stand-in App of macos_adapter_the_apps_death_ends_guard_and_browser"]
     fn app_stand_in_for_the_death_case() {
@@ -3555,10 +3646,39 @@ mod macos_tests {
             "22222222-2222-4222-8222-222222222222",
         );
         let native_pid = process.opened["nativePid"].as_u64().unwrap();
+        use std::os::fd::AsRawFd;
+        let input = process
+            .input
+            .as_ref()
+            .expect("the browser's input")
+            .as_raw_fd();
+        // The holder gets the input as descriptor 100 (dup2 clears its
+        // close-on-exec flag) and only sleeps.
+        assert_ne!(input, 100);
+        let mut holder = Command::new("/bin/sleep");
+        holder
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only dup2 between fork and exec.
+        unsafe {
+            holder.pre_exec(move || {
+                if libc::dup2(input, 100) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // Never waited for: this stand-in App is killed, and the death
+        // case ends the holder.
+        #[allow(clippy::zombie_processes)]
+        let holder = holder.spawn().unwrap();
         println!(
-            "app-stand-in guard {} browser {native_pid} receipt {}",
+            "app-stand-in guard {} browser {native_pid} receipt {} holder {}",
             process.child.id(),
-            process.guard_receipt.display()
+            process.guard_receipt.display(),
+            holder.id()
         );
         std::thread::sleep(Duration::from_secs(120));
         drop(process);
@@ -3598,11 +3718,20 @@ mod macos_tests {
         let guard: u32 = words[2].parse().unwrap();
         let browser: u32 = words[4].parse().unwrap();
         let receipt = PathBuf::from(words[6]);
+        let holder: u32 = words[8].parse().unwrap();
         let tree = descendants(guard);
-        // The App dies at once, without any cleanup of its own.
+        // The App dies at once, without any cleanup of its own. The
+        // browser's input stays open in the holder, so only the guard's
+        // kqueue watch on the App can end the tree.
         app.kill().unwrap();
         app.wait().unwrap();
         let left = ended(&[guard, browser]);
+        // The holder (the stand-in App's /bin/sleep, now launchd's child)
+        // is ended here, before any assertion.
+        if macos::image_of(holder).as_deref() == Some(Path::new("/bin/sleep")) {
+            // SAFETY: the stand-in App's own holder, checked just above.
+            unsafe { libc::kill(holder as i32, libc::SIGKILL) };
+        }
         assert!(
             left.is_empty(),
             "the guard or the browser outlived the App: {left:?}"
@@ -3619,6 +3748,15 @@ mod macos_tests {
         assert_eq!(proof["kernelNoChildren"], true, "{proof}");
         assert!(
             proof["remaining"].as_array().is_some_and(Vec::is_empty),
+            "{proof}"
+        );
+        // Ended by the guard's kill, not by its input: the browser by
+        // SIGKILL, and it at least counted as forced.
+        assert_eq!(proof["rootExit"], -libc::SIGKILL, "{proof}");
+        assert!(
+            proof["forcedCleanup"]
+                .as_u64()
+                .is_some_and(|forced| forced >= 1),
             "{proof}"
         );
     }
