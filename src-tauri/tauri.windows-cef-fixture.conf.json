@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "target/windows-cef-fixture/cef/": "cef/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "none"
+      }
+    }
+  }
+}
