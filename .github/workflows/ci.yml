@@ -1134,14 +1134,38 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP 'w6-evidence'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')
-          function Copy-Evidence([System.IO.FileInfo]$file, [string]$target) {
-            if ($never -contains $file.Extension.ToLowerInvariant()) { return }
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-            Copy-Item -LiteralPath $file.FullName -Destination $target
+          $text = @('.json', '.log', '.txt', '.html', '.md')
+          $skipped = [System.Collections.Generic.List[string]]::new()
+          # An executable, a library or an archive by its first bytes (MZ,
+          # ELF, ZIP), whatever its name says.
+          function Test-Binary([string]$path) {
+            $head = [byte[]]::new(4)
+            $stream = [System.IO.File]::OpenRead($path)
+            try { $read = $stream.Read($head, 0, 4) } finally { $stream.Dispose() }
+            if ($read -ge 2 -and $head[0] -eq 0x4D -and $head[1] -eq 0x5A) { return $true }
+            if ($read -ge 4 -and $head[0] -eq 0x7F -and $head[1] -eq 0x45 -and $head[2] -eq 0x4C -and $head[3] -eq 0x46) { return $true }
+            if ($read -ge 4 -and $head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 0x03 -and $head[3] -eq 0x04) { return $true }
+            return $false
+          }
+          # One copier for everything: never by extension or content, only
+          # the allowed extensions where given; a failed copy is logged and
+          # the rest go on.
+          function Copy-Evidence([System.IO.FileInfo]$file, [string]$target, [string[]]$allowed) {
+            try {
+              $extension = $file.Extension.ToLowerInvariant()
+              if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) -or (Test-Binary $file.FullName)) {
+                $skipped.Add($file.FullName)
+                return
+              }
+              New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+              Copy-Item -LiteralPath $file.FullName -Destination $target
+            } catch {
+              $skipped.Add("$($file.FullName) (copy failed: $($_.Exception.Message))")
+            }
           }
           foreach ($pattern in @('w6-*.json', 'w6-*.log')) {
             foreach ($file in @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -File -Filter $pattern)) {
-              Copy-Evidence $file (Join-Path $out $file.Name)
+              Copy-Evidence $file (Join-Path $out $file.Name) $text
             }
           }
           $stages = @{
@@ -1149,24 +1173,29 @@ jobs:
             'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'
           }
           foreach ($name in $stages.Keys) {
-            if (Test-Path -LiteralPath $stages[$name] -PathType Leaf) { Copy-Evidence (Get-Item -LiteralPath $stages[$name]) (Join-Path $out $name) }
+            if (Test-Path -LiteralPath $stages[$name] -PathType Leaf) { Copy-Evidence (Get-Item -LiteralPath $stages[$name]) (Join-Path $out $name) $text }
           }
-          if ($env:W6_CASE -and (Test-Path -LiteralPath $env:W6_CASE -PathType Container)) {
-            $case = (Get-Item -LiteralPath $env:W6_CASE).FullName.TrimEnd('\')
-            foreach ($file in @(Get-ChildItem -LiteralPath $case -Recurse -File)) {
-              Copy-Evidence $file (Join-Path (Join-Path $out 'case') $file.FullName.Substring($case.Length + 1))
+          # The packaged case and the installed browser's smoke case: text only.
+          $trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }
+          foreach ($name in $trees.Keys) {
+            $tree = $trees[$name]
+            if (-not $tree -or -not (Test-Path -LiteralPath $tree -PathType Container)) { continue }
+            $tree = (Get-Item -LiteralPath $tree).FullName.TrimEnd('\')
+            foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -File)) {
+              Copy-Evidence $file (Join-Path (Join-Path $out $name) $file.FullName.Substring($tree.Length + 1)) $text
             }
           }
           $profiles = if ($env:W6_APP_DATA) { Join-Path $env:W6_APP_DATA 'browser-process-experiment' } else { '' }
           if ($profiles -and (Test-Path -LiteralPath $profiles -PathType Container)) {
             foreach ($profile in @(Get-ChildItem -LiteralPath $profiles -Directory)) {
               foreach ($file in @(Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log')) {
-                Copy-Evidence $file (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $file.Name)
+                Copy-Evidence $file (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $file.Name) $text
               }
             }
           }
+          foreach ($path in $skipped) { "skipped: $path" }
           $kept = @(Get-ChildItem -LiteralPath $out -Recurse -File)
-          "Gathered $($kept.Count) evidence files"
+          "Gathered $($kept.Count) evidence files, skipped $($skipped.Count)"
       - name: Keep the W6 evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

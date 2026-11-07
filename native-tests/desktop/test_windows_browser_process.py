@@ -547,12 +547,25 @@ class RunnerTests(unittest.TestCase):
         gather = job[job.index("- name: Gather the W6 evidence"):job.index("- name: Keep the W6 evidence")]
         self.assertIn("if: ${{ always() }}", gather)
         self.assertIn("$never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')", gather)
+        self.assertIn("$text = @('.json', '.log', '.txt', '.html', '.md')", gather)
         self.assertEqual(gather.count("Copy-Item"), 1, "every copy goes through Copy-Evidence")
-        self.assertIn("if ($never -contains $file.Extension.ToLowerInvariant()) { return }", gather)
+        self.assertIn("if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) "
+                      "-or (Test-Binary $file.FullName)) {", gather)
+        # MZ, ELF and ZIP by content; a failed copy is logged, not fatal.
+        for magic in ("$head[0] -eq 0x4D -and $head[1] -eq 0x5A",
+                      "$head[0] -eq 0x7F -and $head[1] -eq 0x45 -and $head[2] -eq 0x4C -and $head[3] -eq 0x46",
+                      "$head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 0x03 -and $head[3] -eq 0x04"):
+            self.assertIn(magic, gather)
+        self.assertIn("} catch {\n              $skipped.Add(", gather)
+        self.assertIn('foreach ($path in $skipped) { "skipped: $path" }', gather)
+        # Every source passes the text allowlist.
+        self.assertEqual(gather.count("Copy-Evidence $file") + gather.count("Copy-Evidence (Get-Item"),
+                         gather.count(" $text\n") + gather.count(" $text }"))
         sources = ["foreach ($pattern in @('w6-*.json', 'w6-*.log'))",
                    "'product-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef/stage.json'",
                    "'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'",
-                   "Get-ChildItem -LiteralPath $case -Recurse -File",
+                   "$trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }",
+                   "Get-ChildItem -LiteralPath $tree -Recurse -File",
                    "Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log'"]
         for source in sources:
             self.assertIn(source, gather)

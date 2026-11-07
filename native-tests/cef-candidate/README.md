@@ -1600,8 +1600,12 @@ removed them; the check now waits for all three). What remains is reported, not 
 directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime
 root and browser profiles, and the fixture's per-case
 `com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any). The
-artifact keeps only reports, logs, the stage manifests and the packaged case,
-gathered into one directory, never an installer or a binary.
+artifact keeps only reports, logs, the stage manifests, the packaged case
+and the installed browser's smoke case, gathered into one directory: text
+files only (`.json`, `.log`, `.txt`, `.html`, `.md`), never anything that is
+an executable, a library or an archive by its name or its first bytes (MZ,
+ELF, ZIP); each skipped file and failed copy is logged, and one failure does
+not stop the rest.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows
