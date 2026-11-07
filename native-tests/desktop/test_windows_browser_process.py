@@ -981,8 +981,8 @@ class RunnerTests(unittest.TestCase):
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = workflow[workflow.index("\n  cef-macos:\n"):]
         self.assertIn("    runs-on: macos-latest\n    timeout-minutes: 75\n", job)
-        self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper\n",
-                      job)
+        self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper "
+                      "--bin takosumi-browser-guard\n", job)
         self.assertIn('node scripts/bundle-macos-cef.mjs --cef "$cef" --bin "$CARGO_TARGET_DIR/debug" '
                       '--out "$RUNNER_TEMP/m1-product"\n', job)
         self.assertIn("cargo build --locked --features fixture-inspection --bin takosumi-cef-browser-process)\n", job)
@@ -1007,6 +1007,55 @@ class RunnerTests(unittest.TestCase):
         source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
         self.assertIn('rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"\n', job)
         self.assertIn(f"grep -q '^test result: ok\\. {source.count('#[test]')} passed; 0 failed'", job)
+
+    def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
+        """M2: cef-macos runs every macOS guard self-test, then the adapter's
+        macOS tests (the ignored ones included) with the built guard and the
+        bundled product browser, and requires each of them by name."""
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-macos:\n"):]
+        # The guard's self-tests: exactly the cases its runner lists.
+        source = (HERE.parents[1] / "native-tests/cef-candidate/src/guard_macos_tests.rs").read_text(encoding="utf-8")
+        listed = re.search(r"const TESTS: &\[Test\] = tests!\[\n(.*?)\n\];", source, re.S)
+        self.assertIsNotNone(listed, "the macOS guard's runner lists its cases")
+        cases = re.findall(r"^\s+([a-z_]+),$", listed.group(1), re.M)
+        self.assertEqual(len(cases), len(set(cases)))
+        for case in cases:
+            self.assertIn(f"fn {case}() {{", source)
+        guard = job[job.index("- name: Guard self-tests (macOS)"):]
+        guard = guard[:guard.index("\n      - name:")]
+        self.assertIn('cargo test --locked --bin takosumi-browser-guard | tee "$log"\n', guard)
+        self.assertIn('test "${PIPESTATUS[0]}" = 0 ||', guard)
+        self.assertIn(f"grep -q '^test result: ok\\. {len(cases)} passed; 0 failed$' \"$log\"", guard)
+        # The adapter's macOS tests: the built guard and the bundled browser,
+        # every test of the module by name and the exact count.
+        adapter = job[job.index("- name: App adapter with the built guard and bundled browser (Process API)"):]
+        adapter = adapter[:adapter.index("\n      - name:")]
+        self.assertIn('export TAKOSUMI_MACOS_GUARD="$CARGO_TARGET_DIR/debug/takosumi-browser-guard"\n', adapter)
+        self.assertIn('export TAKOSUMI_MACOS_BROWSER="$RUNNER_TEMP/m1-product/takosumi-cef-browser-process.app/'
+                      'Contents/MacOS/takosumi-cef-browser-process"\n', adapter)
+        self.assertIn("if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}", adapter)
+        self.assertIn("cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features "
+                      "desktop-process-experiment --lib -- macos_tests --include-ignored --test-threads 1 "
+                      '--show-output | tee "$log"\n', adapter)
+        self.assertNotIn("fixture-overrides", adapter)
+        plugin = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_adapter.rs").read_text(
+            encoding="utf-8")
+        module = plugin[plugin.index("\nmod macos_tests {\n"):]
+        tests = re.findall(r"^    #\[test\]\n(?:    #\[ignore = \"[^\"]*\"\]\n)?    fn ([a-z_]+)\(\)", module, re.M)
+        self.assertEqual(len(tests), module.count("#[test]"))
+        required = re.findall(r"^\s+desktop::process_adapter::macos_tests::([a-z_]+)(?: \\|;)", adapter, re.M)
+        self.assertEqual(required, tests)
+        self.assertIn('grep -qF "test $name ... ok" "$log"', adapter)
+        self.assertIn(f"grep -q '^test result: ok\\. {len(tests)} passed; 0 failed; 0 ignored' \"$log\"", adapter)
+        # The real opener is never started: the tests' open_externally only
+        # records the link.
+        self.assertIn("#[cfg(test)]\nfn open_externally(url: &str) {\n    OPENED.lock().unwrap().push(url.to_owned());\n}",
+                      plugin)
+        upload = job[job.index("name: cef-macos-smoke"):]
+        for path in ("m2-*-tests.log", "sumi-m2-*/profiles/*/browser.log", "sumi-m2-*/profiles/*/cef-native.log",
+                     "sumi-m2-*/rt/*/guard.json"):
+            self.assertIn(f"${{{{ runner.temp }}}}/{path}\n", upload)
 
     def test_the_app_runs_take_a_staged_sandboxed_browser(self):
         """W7: the W3 job and the W4 real-site workflow stage the sandboxed
