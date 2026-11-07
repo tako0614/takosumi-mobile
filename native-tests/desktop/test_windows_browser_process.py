@@ -193,7 +193,7 @@ class CdpTests(unittest.TestCase):
 
     def test_the_final_quit_refuses_another_dialog_unanswered(self):
         alert = {"method": "Page.javascriptDialogOpening", "sessionId": "S",
-                 "params": {"type": "alert", "url": "https://excalidraw.com/", "message": "x"}}
+                 "params": {"type": "alert", "url": "https://excalidraw.com/#json=secret", "message": "x"}}
         cdp = observer.Cdp(FakeSocket([alert]), "personal")
         process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": "P",
                    "guardReceipt": str(HERE / "no-such-receipt.json")}
@@ -202,13 +202,15 @@ class CdpTests(unittest.TestCase):
         with self.assertRaisesRegex(Failure, "only a beforeunload"):
             watch.finish_final_quit([page])
         self.assertEqual(watch.proof["finalQuitDialogsAccepted"], [])
-        self.assertEqual(watch.proof["finalQuitDialogRefused"]["type"], "alert")
+        self.assertEqual(watch.proof["finalQuitDialogRefused"],
+                         {"profile": "P", "type": "alert", "origin": "https://excalidraw.com"})
+        self.assertNotIn("secret", json.dumps(watch.proof), "only the origin of a real site's URL is kept")
         self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
 
     def test_photopea_is_entered_from_its_landing_and_excalidraw_directly(self):
         class FakePage:
-            def __init__(self, site, profile):
-                self.site, self.entered, self.clicks = observer.REAL_SITES[site], False, []
+            def __init__(self, site, profile, editor_first=False):
+                self.site, self.entered, self.clicks = observer.REAL_SITES[site], editor_first, []
                 self.process = {"profile": profile, "opened": {"windowId": 1, "nativePid": 2}}
                 self.native, self.target = self.process["opened"], {"targetId": profile}
 
@@ -242,6 +244,12 @@ class CdpTests(unittest.TestCase):
                 self.assertEqual(page.clicks, clicks, site)
                 self.assertEqual(page.site_context["entry"], entry, site)
                 self.assertEqual(page.site_context["origin"], observer.REAL_SITES[site]["origin"])
+        # A fresh Photopea profile whose editor is up without its landing fails.
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="photopea")
+        pages = [FakePage("photopea", "W", editor_first=True), FakePage("photopea", "P")]
+        with self.assertRaisesRegex(Failure, "must show photopea's landing before its editor"):
+            watch.open_real_site(pages)
+        self.assertEqual(pages[0].clicks, [])
 
     def test_dialog_evidence_keeps_events_and_origins_without_text(self):
         events = [
@@ -494,6 +502,33 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
             self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_each_quit_case_names_who_closed_its_dialog(self):
+        class Args:
+            real_site = "photopea"
+        observation = {"evidence": {"quit-cancel-stops": {"dialogClosedBy": "observer"},
+                                    "quit-partial-order": {"dialogClosedBy": "browser"}}}
+        self.assertEqual(runner.dialog_lines(Args, observation),
+                         ["DIALOG closedBy=observer case=photopea/quit-cancel-stops",
+                          "DIALOG closedBy=browser case=photopea/quit-partial-order"])
+        Args.real_site = None
+        self.assertEqual(runner.dialog_lines(Args, observation)[0], "DIALOG closedBy=observer case=quit-cancel-stops")
+        for value in (None, "page"):
+            broken = {"evidence": dict(observation["evidence"], **{"quit-partial-order": {"dialogClosedBy": value}})}
+            with self.assertRaises(Failure):
+                runner.dialog_lines(Args, broken)
+
+    def test_the_real_site_workflow_flags_a_cancel_by_the_page_or_browser(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
+        cases = "|".join(runner.DIALOG_CASES)
+        for site in sorted(runner.REAL_SITES):
+            title = site.capitalize()
+            self.assertIn(f"${site}Dialogs = @(Select-String -Path $log -Pattern "
+                          f"'^DIALOG closedBy=(observer|browser) case={site}/({cases})$')", workflow)
+            self.assertIn(f"if (${site}Dialogs.Count -ne {len(runner.DIALOG_CASES)}) {{ throw", workflow)
+            self.assertIn(f"foreach ($dialog in ${site}Dialogs) {{\n"
+                          f"            if ($dialog.Line -match ' closedBy=browser ') {{ Write-Output "
+                          f"\"::warning title={title} beforeunload closed by the page or browser::", workflow)
+
     def test_the_real_site_workflow_runs_only_when_asked(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         on = re.search(r"^on:\n(.*?)\n(?=\S)", workflow, re.S | re.M).group(1)
@@ -512,6 +547,9 @@ class RunnerTests(unittest.TestCase):
                       "github.event.label.name == 'windows-real-sites' }}\n"
                       "    # On the job, after its `if`: a run for any other label skips the job and\n"
                       "    # so never enters this group (where it could cancel a pending real run).\n"
+                      "    # A dispatch is keyed on its input, not the commit it resolves to: a job's\n"
+                      "    # group is fixed when it is queued, before any of its steps runs (keying\n"
+                      "    # on the resolved commit would take a separate resolving job).\n"
                       "    concurrency:\n"
                       f"      group: takosumi-mobile-windows-real-sites-${{{{ {test_ref} }}}}\n"
                       "      cancel-in-progress: false\n", workflow)

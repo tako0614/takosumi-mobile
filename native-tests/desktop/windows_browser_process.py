@@ -97,6 +97,10 @@ OBSERVED_CASES = {
 # link was handed to the App's opener.
 QUIT_CASE = "quit-completes"
 FINAL_CASES = ("no-process-left", "no-opener-request")
+# The first launch's cases whose beforeunload was cancelled: by the observer,
+# or on a real site by the page or browser first (the observation's
+# dialogClosedBy). Printed as one DIALOG line each.
+DIALOG_CASES = ("quit-cancel-stops", "quit-partial-order")
 # The observer's evidence printed to the CI log (bindings and samples stay in
 # browser-observation.json).
 EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder")
@@ -503,6 +507,17 @@ def case_name(args, name):
     return f"{args.real_site}/{name}" if args.real_site else name
 
 
+def dialog_lines(args, observation):
+    """`DIALOG closedBy=<observer|browser> case=<name>` for each of a passed
+    first launch's DIALOG_CASES (windows-real-sites.yml warns on `browser`)."""
+    lines = []
+    for name in DIALOG_CASES:
+        closed_by = observation.get("evidence", {}).get(name, {}).get("dialogClosedBy")
+        require(closed_by in ("observer", "browser"), f"The {name} evidence names no dialogClosedBy")
+        lines.append(f"DIALOG closedBy={closed_by} case={case_name(args, name)}")
+    return lines
+
+
 def real_site_cases(site):
     """The cases a W4 run of `site` prints, in order (the first launch's,
     its final quit and the run's invariants)."""
@@ -565,6 +580,9 @@ def run(args, summary):
             for name in expected + ([QUIT_CASE] if not suffix else []):
                 print(f"PASS case {case_name(args, name)}", flush=True)
                 summary["cases"].append(case_name(args, name))
+            if not suffix:
+                for line in dialog_lines(args, read_json(args.session / "browser-observation.json")):
+                    print(line, flush=True)
         # Every launch ended with its job empty, no forced cleanup and every
         # browser guard's normal receipt (checked per phase above).
         print(f"PASS case {case_name(args, FINAL_CASES[0])}", flush=True)

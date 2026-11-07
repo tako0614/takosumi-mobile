@@ -1295,8 +1295,10 @@ Photopea's editor start screen ("Open From Computer"). Photopea first serves a
 static landing page, shown even if the editor's code never loads, so the
 observer enters the editor from it with its "Start using Photopea" button, as
 the Linux probe does (`browser-process.mjs`); here the click is a script
-`click()`, not CDP pointer input. Each stage (the document, then from a
-landing the editor) has 60 s per profile. The site must load in a secure
+`click()`, not CDP pointer input. Both profiles are fresh (this is the first
+launch, and the reopen reuses the document), so each must show Photopea's
+landing before its editor; an editor without it fails. Each stage (the
+document, then from a landing the editor) has 60 s per profile. The site must load in a secure
 context with no App bridge, in the profile's one window, and
 `separate-profiles` records each profile's site context and how the editor
 was entered. Then, on the real pages:
@@ -1325,7 +1327,17 @@ dialog first or an ended guard fails. Each quit case records
 `dialogClosedBy` (`observer` or `browser`), and every later check (the quit
 stopped, both documents kept, the blocked and cancelled markers, the
 partial order, Work closed first) is unchanged. The W3 local-fixture run
-still requires the observer's own cancel.
+still requires the observer's own cancel. Both quit cases' dialogs must
+belong to the site's own origin (a cross-origin subframe's would not
+count). After a passed run the runner prints, for both,
+`DIALOG closedBy=<observer|browser> case=<site>/<case>`; the workflow
+requires both lines and emits a warning (not a failure) for `browser`.
+
+A real site's URL is recorded as its origin only (the dialogs, a refused
+dialog, a failed stage's document), since a fragment can carry a key (such
+as Excalidraw's `#room=` and `#json=`); the artifact is kept for 14 days.
+The browsers' own logs (`browser.log`, `cef-native.log`) are kept as they
+are.
 
 The W3 invariants hold: the attested owner of each DevTools port, unchanged
 source and executable hashes, no opener request. After the final quit
@@ -1357,7 +1369,8 @@ cancel a pending real run. It builds like
 `cef-windows-app` (restoring its caches without saving), trusts the fixture
 CA, runs the Excalidraw and the Photopea cases in separate steps (25 minutes
 each; the second runs even if the first fails), requires each step's eight
-`<site>/<case>` names, exactly eight `PASS case` lines and a passed
+`<site>/<case>` names, exactly eight `PASS case` lines, the two `DIALOG`
+lines (warning on a cancel by the page or browser) and a passed
 `summary.json`, removes the CA whatever happened and keeps both cases and
 the profiles' browser logs as the artifact `windows-real-sites-cases`.
 

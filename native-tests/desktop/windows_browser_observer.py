@@ -858,8 +858,10 @@ class Observer:
             self.settled(lambda: page.evaluate(test), message, REAL_SITE_WAIT, tolerate=True)
         except Failure:
             try:
+                # The origin only: a real site's URL can carry keys (e.g.
+                # Excalidraw's #room= and #json= fragments).
                 self.proof["siteDocument"] = dict(page.evaluate(
-                    "({url:location.href,ready:document.readyState,title:document.title,"
+                    "({origin:location.origin,ready:document.readyState,title:document.title,"
                     "errorSplash:Boolean(document.querySelector('.ErrorSplash')),"
                     "body:document.body?.innerText.slice(0,500)})"), profile=page.process["profile"])
             except Failure as error:
@@ -880,17 +882,21 @@ class Observer:
             page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
         landing = self.real.get("landing")
         for page in pages:
-            # "landing": entered with the landing's start button; "direct":
-            # the editor came up without it (no landing, or the site skipped it).
+            # "landing": entered with the landing's start button, which every
+            # profile here must take: this runs once, on the first launch's
+            # fresh profiles (no restart or reset phase, and the reopen reuses
+            # the document), so an editor without its landing fails. "direct":
+            # a site without a landing (Excalidraw).
             page.site_entry = "direct"
             if not landing:
                 continue
             self.step(f"{self.real_name} landing or editor", page)
             self.site_settled(page, f"{on_site} && ({self.real['ready']} || {landing})",
                               f"{self.real_name} did not load")
-            if not page.evaluate(self.real["ready"]) and page.evaluate(landing):
-                page.evaluate(self.real["enter"], True)
-                page.site_entry = "landing"
+            require(page.evaluate(landing) and not page.evaluate(self.real["ready"]),
+                    f"A fresh profile must show {self.real_name}'s landing before its editor")
+            page.evaluate(self.real["enter"], True)
+            page.site_entry = "landing"
         for page in pages:
             self.step(f"{self.real_name} ready", page)
             self.site_settled(page, f"{on_site} && {self.real['ready']}", f"{self.real_name} did not become ready")
@@ -932,7 +938,7 @@ class Observer:
                         except Failure:
                             self.proof["finalQuitDialogRefused"] = {
                                 "profile": page.process["profile"], "type": event["params"].get("type"),
-                                "url": event["params"].get("url")}
+                                "origin": url_origin(event["params"].get("url") or "")}
                             raise
                         try:
                             page.send("Page.handleJavaScriptDialog", {"accept": True})
@@ -1227,9 +1233,9 @@ class Observer:
         self.checkpoint("request-exit")
         self.step("Work beforeunload on sequential quit", work)
         dialog = self.dialog(work, unload, "beforeunload", "The beforeunload dialog did not open")
-        self.proof["dialog"] = {"type": dialog["params"]["type"], "url": dialog["params"].get("url")}
-        require(url_origin(dialog["params"]["url"]) == self.app_origin,
-                f"The dialog must belong to {self.app_origin}")
+        self.proof["dialog"] = {"type": dialog["params"]["type"],
+                                "origin": url_origin(dialog["params"].get("url") or "")}
+        require(self.proof["dialog"]["origin"] == self.app_origin, f"The dialog must belong to {self.app_origin}")
         personal.cdp.drain()
         require(not any(event["method"].startswith("Page.javascriptDialog")
                         for event in personal.cdp.since(personal_mark)),
@@ -1266,6 +1272,11 @@ class Observer:
             require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
             self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
                                                                 "Work must have closed normally")
+            # As Work's: the dialog is the page's own, not a subframe's.
+            self.proof["partialDialog"] = {"type": opened["params"]["type"],
+                                           "origin": url_origin(opened["params"].get("url") or "")}
+            require(self.proof["partialDialog"]["origin"] == self.app_origin,
+                    f"Personal's dialog must belong to {self.app_origin}")
         except Failure as error:
             self.dialog_failure("Personal's beforeunload after Work closed",
                                 [(personal, personal_unload), (work, work_unload)], error)
@@ -1279,7 +1290,8 @@ class Observer:
                 "Only Personal remains after Work closed and Personal cancelled")
         personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
                           "delete window.__sumiBeforeUnload;return true})()")
-        self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"], "dialogClosedBy": closed_by})
+        self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
+                                         "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
         self.step("Personal final exit", personal)
         self.checkpoint("request-final-exit")
         if self.real:
