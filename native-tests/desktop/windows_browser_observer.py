@@ -87,6 +87,9 @@ WS_EX_TOPMOST = 0x8
 # sampled (every OCCLUSION_INTERVAL) for an occlusion update to show up.
 OCCLUSION_WATCH = 1.5
 OCCLUSION_INTERVAL = 0.1
+# How long one foreground change may take to show (each window switch tries
+# twice: SetForegroundWindow, then joined to the foreground thread's input).
+FOREGROUND_WAIT = 2.0
 # Bound on the top-level windows walked for the Z-order evidence.
 Z_ORDER_LIMIT = 4096
 WM_CLOSE = 0x0010
@@ -251,7 +254,7 @@ class Win32:
         return {"timeout": timeout, "idleMs": idle,
                 "active": bool(timeout and idle is not None and idle < timeout)}
 
-    def wait_foreground(self, window, bound=2.0):
+    def wait_foreground(self, window, bound=FOREGROUND_WAIT):
         deadline = time.monotonic() + bound
         while True:
             if self.foreground() == window:
@@ -523,6 +526,19 @@ def final_quit_dialog(params, app_origin):
     require(found["type"] == "beforeunload" and found["origin"] == app_origin,
             f"At the final quit only a beforeunload of {app_origin} may be accepted, not {found}")
     return found
+
+
+def real_site_first_checkpoint(site):
+    """W4: the observer's worst case, from the App's record of both browsers
+    to its first checkpoint (inspect-ready), in a real-site run: attach and
+    sign-in in both profiles (LOAD_WAIT each), each real-site stage in both
+    (REAL_SITE_WAIT each), then two window switches, the occlusion watch and
+    the minimize (two settles). The App's bound for that checkpoint
+    (browser_process.rs `inspect_bound`) covers it with a margin; a unit test
+    keeps the two in step."""
+    stages = 2 if "landing" in REAL_SITES[site] else 1
+    windows = 2 * 2 * FOREGROUND_WAIT + OCCLUSION_WATCH + 2 * SETTLE_WAIT
+    return 2 * LOAD_WAIT + 2 * LOAD_WAIT + 2 * stages * REAL_SITE_WAIT + windows
 
 
 class Page:

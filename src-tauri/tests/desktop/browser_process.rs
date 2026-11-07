@@ -109,13 +109,17 @@ async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
     ready(view,&format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')")).await
 }
 /// How long the first launch waits for the observer's first checkpoint: 30 s,
-/// as on Linux. The Windows real-site run (W4,
-/// `TAKOSUMI_BROWSER_PROCESS_REAL_SITE`) loads a third-party site in both
-/// profiles before it.
+/// as on Linux. In the Windows real-site run (W4,
+/// `TAKOSUMI_BROWSER_PROCESS_REAL_SITE`) the observer first attaches and signs
+/// in to both profiles (25 s each), then loads the third-party site in both:
+/// its document and, from a landing page, its editor (60 s each). With its
+/// window steps that is up to about 370 s (windows_browser_observer.py
+/// `real_site_first_checkpoint`), so the App waits 450 s; a unit test keeps
+/// the two in step.
 fn inspect_bound() -> Duration {
     #[cfg(windows)]
     if shell::real_site() {
-        return Duration::from_secs(150);
+        return Duration::from_secs(450);
     }
     Duration::from_secs(30)
 }

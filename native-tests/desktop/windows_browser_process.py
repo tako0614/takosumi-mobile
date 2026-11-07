@@ -72,8 +72,10 @@ APP_EXIT_WAIT = APP_STOP_FINISH + 15
 OBSERVER_WAIT = 85
 # W4 (--real-site): both profiles load a third-party site before the
 # observer's first checkpoint, and the App's own bounds grow to match
-# (TAKOSUMI_BROWSER_PROCESS_REAL_SITE, browser_process.rs).
-REAL_SITE_OBSERVER_WAIT = 230
+# (TAKOSUMI_BROWSER_PROCESS_REAL_SITE): its first checkpoint waits 450 s
+# (browser_process.rs) and its watchdog 540 s (browser_process_windows.rs);
+# the observer must end before that watchdog.
+REAL_SITE_OBSERVER_WAIT = 530
 # After the App exited: its WebView2 processes and any other descendant must
 # leave the job within this bound (windows_smoke.py's leftover bound).
 LEFTOVER_WAIT = 10

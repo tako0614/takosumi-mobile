@@ -326,6 +326,28 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(entry["ready"])
             self.assertEqual("landing" in entry, "enter" in entry, site)
 
+    def test_the_real_site_bounds_cover_the_observers_worst_case(self):
+        tests = HERE.parents[1] / "src-tauri/tests/desktop"
+        inspect = re.search(r"if shell::real_site\(\) \{\s*return Duration::from_secs\((\d+)\);",
+                            (tests / "browser_process.rs").read_text())
+        watchdog = re.search(r"from_secs\(if real_site\(\) \{ (\d+) \} else \{ (\d+) \}\)",
+                             (tests / "browser_process_windows.rs").read_text())
+        self.assertIsNotNone(inspect, "browser_process.rs names the real-site first-checkpoint bound")
+        self.assertIsNotNone(watchdog, "browser_process_windows.rs names the real-site watchdog")
+        inspect = int(inspect.group(1))
+        real_watchdog, watchdog = (int(value) for value in watchdog.groups())
+        worst = max(observer.real_site_first_checkpoint(site) for site in observer.REAL_SITES)
+        self.assertEqual(worst, 4 * observer.LOAD_WAIT + 4 * observer.REAL_SITE_WAIT
+                         + 4 * observer.FOREGROUND_WAIT + observer.OCCLUSION_WATCH + 2 * observer.SETTLE_WAIT)
+        # A margin for the DevTools commands between the bounded waits.
+        self.assertGreaterEqual(inspect, max(worst + 60, worst * 1.15))
+        # The observer gets past that checkpoint and still ends before the
+        # App's watchdog, which keeps the ordinary 90 s for the rest.
+        self.assertGreater(runner.REAL_SITE_OBSERVER_WAIT, inspect)
+        self.assertGreater(real_watchdog, runner.REAL_SITE_OBSERVER_WAIT)
+        self.assertGreaterEqual(real_watchdog - inspect, watchdog)
+        self.assertGreater(watchdog, runner.OBSERVER_WAIT)
+
     def test_real_site_readiness_needs_the_rendered_editor(self):
         # Excalidraw's crash screen also carries `.excalidraw`; Photopea's
         # static landing shows even if the editor's code never loads.

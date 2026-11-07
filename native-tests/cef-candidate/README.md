@@ -1316,9 +1316,12 @@ The W3 invariants hold: the attested owner of each DevTools port, unchanged
 source and executable hashes, no opener request. After the final quit
 request the observer accepts only a beforeunload that the real site raises on
 its own origin, and records it, so the quit can finish; any other dialog type
-or origin fails the run unanswered (recorded as `finalQuitDialogRefused`). The App's first checkpoint waits up
-to 150 s and its watchdog 240 s in this mode
-(`TAKOSUMI_BROWSER_PROCESS_REAL_SITE`), and the observer up to 230 s.
+or origin fails the run unanswered (recorded as `finalQuitDialogRefused`). In
+this mode (`TAKOSUMI_BROWSER_PROCESS_REAL_SITE`) the App's first checkpoint
+waits up to 450 s, covering the observer's worst case before it (about 370 s:
+attach and sign-in at 25 s and each real-site stage at 60 s in both
+profiles, plus the window steps; a unit test keeps the two in step), its
+watchdog 540 s, and the runner gives the observer up to 530 s.
 Anonymous use only: synthetic markers, nothing signs in anywhere real, no
 credential is typed.
 
