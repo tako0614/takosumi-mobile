@@ -22,6 +22,12 @@ use tauri_plugin_app_screen::{
     OpenRequest,
 };
 
+/// Windows: the orderly end after CefShutdown (wait for the browser's own
+/// child processes before returning to CEF's bootstrap; W7).
+#[cfg(windows)]
+#[path = "children_windows.rs"]
+mod children_windows;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
     Idle,
@@ -1115,7 +1121,9 @@ fn is_final(directory: &Path) -> bool {
 /// Returns the process's exit code: a helper's from `execute_process`, the
 /// browser's 0, or 1 when a request failed. The caller ends the process with
 /// it (the executable) or returns it to the bootstrap (the DLL), so the
-/// bootstrap's own teardown runs.
+/// bootstrap's own teardown runs. On Windows the browser first waits, after
+/// CefShutdown, for its child processes to end (`children_windows`), so the
+/// sandbox broker's teardown finds no target still ending.
 pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     const {
         assert!(cfg!(any(target_os = "linux", windows)));
@@ -1206,5 +1214,8 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     });
     drop(app);
     shutdown();
-    i32::from(failed)
+    let code = i32::from(failed);
+    #[cfg(windows)]
+    children_windows::finish(code);
+    code
 }
