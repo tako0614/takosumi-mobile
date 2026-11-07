@@ -97,8 +97,9 @@ jobs:
           swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests 2>&1 | tee "$RUNNER_TEMP/app-screen-swift-test.log"
           grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/app-screen-swift-test.log"
       # The image's mirror has crawled for most of the job's budget; bound one
-      # attempt, then retry once against archive.ubuntu.com (sources rewritten
-      # only for the retry). The package list is unchanged.
+      # attempt, then retry once with archive.ubuntu.com first (the image's
+      # mirror list, or plain sources, rewritten only for the retry). The
+      # package list is unchanged.
       - name: System libraries for Tauri on Linux
         timeout-minutes: 8
         shell: bash
@@ -106,15 +107,33 @@ jobs:
           packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev"
           attempt() {
             # update and install within $1 seconds, apt retrying each download
-            timeout --kill-after=15 "$1" sudo bash -c "apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends $packages"
+            options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
           }
           if ! attempt 200; then
-            echo "::warning::apt-get through the image's mirror failed or took over 200 s; retrying once against archive.ubuntu.com"
+            switched=""
+            # ubuntu-24.04 images point ubuntu.sources at this mirror list
+            # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
+            # first and drop the Azure entry.
+            mirrors=/etc/apt/apt-mirrors.txt
+            if [[ -f "$mirrors" ]]; then
+              { printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n'
+                grep -v -E '^[^[:space:]]*(azure\.archive|//archive)\.ubuntu\.com' "$mirrors" || true; } > "$RUNNER_TEMP/apt-mirrors.txt"
+              sudo cp "$RUNNER_TEMP/apt-mirrors.txt" "$mirrors"
+              switched="$mirrors"
+            fi
+            # Sources that name an archive.ubuntu.com mirror directly.
             for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              if [[ -f "$sources" ]]; then
+              if [[ -f "$sources" ]] && grep -q -E 'https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu' "$sources"; then
                 sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+                switched="$switched $sources"
               fi
             done
+            if [[ -n "$switched" ]]; then
+              echo "::warning::apt-get failed or took over 200 s; retrying once with archive.ubuntu.com first in:$switched"
+            else
+              echo "::warning::apt-get failed or took over 200 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+            fi
             # An attempt ended during unpacking leaves dpkg to finish first.
             sudo dpkg --configure -a
             attempt 200
@@ -247,8 +266,9 @@ jobs:
       - run: bun run build
         working-directory: takosumi-mobile
       # The image's mirror has crawled for most of the job's budget; bound one
-      # attempt, then retry once against archive.ubuntu.com (sources rewritten
-      # only for the retry). The package list is unchanged.
+      # attempt, then retry once with archive.ubuntu.com first (the image's
+      # mirror list, or plain sources, rewritten only for the retry). The
+      # package list is unchanged.
       - name: Linux desktop SDK and isolated test tools
         if: runner.os == 'Linux'
         timeout-minutes: 8
@@ -257,15 +277,33 @@ jobs:
           packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11"
           attempt() {
             # update and install within $1 seconds, apt retrying each download
-            timeout --kill-after=15 "$1" sudo bash -c "apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends $packages"
+            options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
           }
           if ! attempt 200; then
-            echo "::warning::apt-get through the image's mirror failed or took over 200 s; retrying once against archive.ubuntu.com"
+            switched=""
+            # ubuntu-24.04 images point ubuntu.sources at this mirror list
+            # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
+            # first and drop the Azure entry.
+            mirrors=/etc/apt/apt-mirrors.txt
+            if [[ -f "$mirrors" ]]; then
+              { printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n'
+                grep -v -E '^[^[:space:]]*(azure\.archive|//archive)\.ubuntu\.com' "$mirrors" || true; } > "$RUNNER_TEMP/apt-mirrors.txt"
+              sudo cp "$RUNNER_TEMP/apt-mirrors.txt" "$mirrors"
+              switched="$mirrors"
+            fi
+            # Sources that name an archive.ubuntu.com mirror directly.
             for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              if [[ -f "$sources" ]]; then
+              if [[ -f "$sources" ]] && grep -q -E 'https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu' "$sources"; then
                 sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+                switched="$switched $sources"
               fi
             done
+            if [[ -n "$switched" ]]; then
+              echo "::warning::apt-get failed or took over 200 s; retrying once with archive.ubuntu.com first in:$switched"
+            else
+              echo "::warning::apt-get failed or took over 200 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+            fi
             # An attempt ended during unpacking leaves dpkg to finish first.
             sudo dpkg --configure -a
             attempt 200
