@@ -672,6 +672,59 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(Failure):
                 runner.normal(dict(receipt, **{field: value}))
 
+    def test_processes_left_in_the_apps_job_are_described(self):
+        """Diagnostics: each leftover's pid, image, parent pid and creation
+        time (no command line), in the receipt and the failure message."""
+        import calendar
+        import windows_smoke as smoke
+        self.assertIsNone(smoke.filetime_iso(0))
+        self.assertIsNone(smoke.filetime_iso(None))
+        self.assertEqual(smoke.filetime_iso(smoke.FILETIME_UNIX_EPOCH), "1970-01-01T00:00:00.000Z")
+        unix = calendar.timegm((2026, 11, 7, 11, 49, 40, 0, 0, 0))
+        self.assertEqual(smoke.filetime_iso(smoke.FILETIME_UNIX_EPOCH + unix * 10**7 + 1_239_999),
+                         "2026-11-07T11:49:40.123Z")
+        records = [{"pid": 4120, "image": "msedgewebview2.exe", "parent": 3900, "created": "2026-11-07T11:49:40.123Z"},
+                   {"pid": 4188, "image": None, "parent": None, "created": None}]
+        self.assertEqual(smoke.describe_processes(records),
+                         "4120 msedgewebview2.exe (parent 3900, created 2026-11-07T11:49:40.123Z); "
+                         "4188 ? (parent ?, created ?)")
+        self.assertEqual(smoke.describe_processes([]), "")
+
+        class Tree:
+            def __init__(self, kernel32, root):
+                pass
+
+            def entries(self):
+                return [(4120, 3900, "msedgewebview2.exe"), (3900, 1, "takosumi-mobile.exe")]
+
+            def created(self, pid):
+                return {4120: smoke.FILETIME_UNIX_EPOCH}.get(pid)
+
+        with mock.patch.object(smoke, "ProcessTree", Tree):
+            self.assertEqual(smoke.process_records(None, [4120, 4188]), [
+                {"pid": 4120, "image": "msedgewebview2.exe", "parent": 3900, "created": "1970-01-01T00:00:00.000Z"},
+                {"pid": 4188, "image": None, "parent": None, "created": None}])
+
+        class Job:
+            kernel32 = None
+
+            def processes(self):
+                return 7, 2
+
+        with mock.patch.object(runner, "LEFTOVER_WAIT", 0), mock.patch.object(runner, "job_pids", lambda job: [4120, 4188]), \
+                mock.patch.object(runner, "process_records", lambda kernel32, pids: records):
+            receipt = runner.session_receipt(Job(), 0)
+        self.assertEqual((receipt["remaining"], receipt["remainingProcesses"], receipt["observed"]),
+                         ([4120, 4188], records, 7))
+        with self.assertRaisesRegex(Failure, "The App's job must have no remaining child: 4120 msedgewebview2.exe "
+                                             r"\(parent 3900, created 2026-11-07T11:49:40.123Z\); 4188 \?"):
+            runner.normal(receipt, "The App's job")
+        with mock.patch.object(runner, "process_records", mock.Mock(side_effect=OSError("denied"))):
+            self.assertEqual(runner.leftover_records(Job(), [1]), {"remainingProcessesError": "denied"})
+        # A guard receipt has no descriptions: the ids as before.
+        with self.assertRaisesRegex(Failure, r"The guard must have no remaining child: \[4\]"):
+            runner.normal({"rootExit": 0, "complete": True, "kernelNoChildren": False, "remaining": [4]})
+
     def test_the_ci_job_requires_exactly_the_runner_cases(self):
         cases = [name for phase in ("", "restart", "reset") for name in runner.OBSERVED_CASES[phase]]
         cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)

@@ -49,6 +49,7 @@ case directory is never removed.
 """
 import argparse
 import ctypes
+import datetime
 import hashlib
 import json
 import os
@@ -449,7 +450,9 @@ class ProcessTree:
         finally:
             self.kernel32.CloseHandle(process)
 
-    def pairs(self):
+    def entries(self):
+        """Every process's (pid, parent pid, image file name), from a
+        Toolhelp snapshot."""
         snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snapshot in (None, INVALID_HANDLE_VALUE):
             raise last_error("CreateToolhelp32Snapshot")
@@ -458,12 +461,15 @@ class ProcessTree:
             entry = ProcessEntry(dwSize=ctypes.sizeof(ProcessEntry))
             more = self.kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
             while more:
-                found.append((entry.th32ProcessID, entry.th32ParentProcessID))
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
                 entry.dwSize = ctypes.sizeof(ProcessEntry)
                 more = self.kernel32.Process32NextW(snapshot, ctypes.byref(entry))
             return found
         finally:
             self.kernel32.CloseHandle(snapshot)
+
+    def pairs(self):
+        return [(pid, parent) for pid, parent, _ in self.entries()]
 
     def process_ids(self):
         times = {}
@@ -474,6 +480,46 @@ class ProcessTree:
             return times[pid]
 
         return [self.root] + descendant_pids(self.pairs(), self.root, created)
+
+
+# FILETIME ticks (100 ns since 1601-01-01 UTC) at the Unix epoch.
+FILETIME_UNIX_EPOCH = 116444736000000000
+
+
+def filetime_iso(value):
+    """A FILETIME (100 ns ticks since 1601-01-01, UTC) as ISO 8601 UTC with
+    milliseconds, or None for none (0 or None)."""
+    if not value:
+        return None
+    moment = (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+              + datetime.timedelta(microseconds=(value - FILETIME_UNIX_EPOCH) // 10))
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def describe_processes(records):
+    """Processes for a failure message, one after another: pid, image file
+    name, parent pid and creation time (`?` for what is unknown); no
+    command line."""
+    unknown = lambda value: "?" if value is None else value
+    return "; ".join(f"{record.get('pid')} {unknown(record.get('image'))} (parent {unknown(record.get('parent'))}, "
+                     f"created {unknown(record.get('created'))})" for record in records)
+
+
+def process_records(kernel32, pids):
+    """Windows: each of `pids` with its image file name and parent pid (a
+    Toolhelp process snapshot) and its creation time (GetProcessTimes, ISO
+    8601 UTC); None for what cannot be read (a process gone meanwhile). No
+    command line is read."""
+    tree = ProcessTree(kernel32, 0)
+    try:
+        listed = {pid: (parent, image) for pid, parent, image in tree.entries()}
+    except OSError:
+        listed = {}
+    records = []
+    for pid in pids:
+        parent, image = listed.get(pid, (None, None))
+        records.append({"pid": pid, "image": image, "parent": parent, "created": filetime_iso(tree.created(pid))})
+    return records
 
 
 def sandbox_evidence(job, browser_pid, deadline):

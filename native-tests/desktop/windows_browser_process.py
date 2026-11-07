@@ -72,7 +72,8 @@ from urllib.parse import parse_qs
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
-from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, browser_shutdown, require, tail  # noqa: E402
+from windows_smoke import (CREATE_SUSPENDED, Failure, WindowsJob, browser_shutdown, describe_processes,  # noqa: E402
+                           process_records, require, tail)
 from windows_browser_observer import REAL_SITES  # noqa: E402
 
 WINDOWS = os.name == "nt"
@@ -242,7 +243,8 @@ def normal(receipt, what="The guard"):
     require(type(receipt["rootExit"]) is int and receipt["rootExit"] == 0 and receipt["complete"] is True,
             f"{what} root must exit normally and completely")
     require(receipt["kernelNoChildren"] is True and receipt["remaining"] == [],
-            f"{what} must have no remaining child: {receipt['remaining']}")
+            f"{what} must have no remaining child: "
+            f"{describe_processes(receipt['remainingProcesses']) if receipt.get('remainingProcesses') else receipt['remaining']}")
     require(type(receipt["forcedCleanup"]) is int and receipt["forcedCleanup"] == 0 and receipt["cleanupErrors"] == [],
             f"{what} must not require forced cleanup")
     require(receipt["error"] is None, f"{what} must not report an error")
@@ -342,9 +344,22 @@ def session_receipt(job, app_exit):
             break
         time.sleep(0.25)
     remaining = job_pids(job) if active else []
-    return {"rootExit": app_exit, "complete": True, "kernelNoChildren": active == 0, "remaining": remaining or [],
-            "forcedCleanup": 0, "cleanupErrors": [] if remaining is not None else ["JobProcessListUnavailable"],
-            "error": None, "observed": total}
+    receipt = {"rootExit": app_exit, "complete": True, "kernelNoChildren": active == 0, "remaining": remaining or [],
+               "forcedCleanup": 0, "cleanupErrors": [] if remaining is not None else ["JobProcessListUnavailable"],
+               "error": None, "observed": total}
+    if remaining:
+        receipt.update(leftover_records(job, remaining))
+    return receipt
+
+
+def leftover_records(job, pids):
+    """Diagnostics only, for processes left in the App's job: each one's
+    image, parent pid and creation time (`remainingProcesses`; no command
+    line), or why they could not be read."""
+    try:
+        return {"remainingProcesses": process_records(job.kernel32, pids)}
+    except (OSError, ValueError) as error:
+        return {"remainingProcessesError": str(error)}
 
 
 def evidence(session, suffix):
@@ -538,6 +553,8 @@ def run_phase(args, env, files, before, head, suffix):
                     app.wait(timeout=10)
                 total, active = job.processes()
                 proof.setdefault("sessionJob", {"observed": total, "remaining": job_pids(job) or []})
+                if active and "remainingProcesses" not in proof["sessionJob"]:
+                    proof["sessionJob"].update(leftover_records(job, proof["sessionJob"]["remaining"]))
                 if active:
                     proof["passed"] = False
                     proof["sessionJob"]["forcedCleanup"] = active

@@ -20,7 +20,9 @@ this script owns: its top-level window must appear, the App must stay up for
 `--seconds`, must not report its browser unavailable (the bundled browser,
 guard and runtime root resolved without environment variables) and must have
 its runtime root `<app cache>\\cef`. WM_CLOSE to its window must end it with
-exit code 0, and the job must then empty.
+exit code 0, and the job must then empty; processes left in it are
+reported (`leftovers`: pid, image, parent pid, creation time; no command
+line).
 
 uninstall requires the installer's per-user uninstall key and Start menu
 shortcut for --product to exist, runs its uninstaller silently, waits until
@@ -43,7 +45,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[0] / "cef-candidate"))
-from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, require  # noqa: E402
+from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, describe_processes, process_records, require  # noqa: E402
 
 WINDOWS = os.name == "nt"
 DETACHED_PROCESS = 0x8
@@ -64,6 +66,18 @@ IDENTIFIER = "com.takosumi"
 
 
 # --- Pure helpers (unit-tested on any OS) ----------------------------------------
+
+def leftover_message(value):
+    """The smoke's failure when processes stayed in the App's job: how many
+    and, when they could be read, each one's pid, image, parent and creation
+    time."""
+    message = f"{value['jobActive']} processes were left in the App's job"
+    if value.get("leftovers"):
+        return f"{message}: {describe_processes(value['leftovers'])}"
+    if value.get("leftoversError"):
+        return f"{message} (not described: {value['leftoversError']})"
+    return message
+
 
 def installer_command(installer, directory):
     """NSIS silent install into `directory`. `/D=` must come last and is never
@@ -269,6 +283,13 @@ def smoke(args, value):
             while job.processes()[1] and time.monotonic() < deadline:
                 time.sleep(0.25)
             value["jobObserved"], value["jobActive"] = job.processes()
+            if value["jobActive"]:
+                # Diagnostics only: what was left (image, parent, creation
+                # time; no command line).
+                try:
+                    value["leftovers"] = process_records(job.kernel32, job.process_ids())
+                except (OSError, ValueError) as error:
+                    value["leftoversError"] = str(error)
         finally:
             if app.poll() is None:
                 app.terminate()
@@ -277,7 +298,7 @@ def smoke(args, value):
     require(not value["browserUnavailable"], f"The App reported its browser unavailable (see {args.log})")
     require(value["runtimeRoot"], f"The App did not create its runtime root {runtime}")
     require(value["exit"] == 0, f"The App exited with {value['exit']} after WM_CLOSE")
-    require(value["jobActive"] == 0, f"{value['jobActive']} processes were left in the App's job")
+    require(value["jobActive"] == 0, leftover_message(value))
 
 
 def uninstall(args, value):
