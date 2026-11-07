@@ -930,8 +930,9 @@ impl Process {
         }
         // macOS: the allowlist below; TMPDIR, the system's per-user
         // temporary directory read from the system, not the App's
-        // environment (Chromium's singleton socket must fit 104 bytes, which
-        // the App's cache directory would not; checked there); and the nano
+        // environment (informational: Chromium's NSTemporaryDirectory prefers
+        // that directory anyway; its singleton socket there must fit 104
+        // bytes, checked by browser_temp_dir); and the nano
         // allocator off, as CEF asks: its bundle's LSEnvironment applies only
         // to a LaunchServices launch. HOME stays the person's own: every
         // Chromium profile file is in the profile's cache path, and Cocoa
@@ -3367,11 +3368,13 @@ mod macos_tests {
         let temp = macos::browser_temp_dir().expect("the per-user temporary directory");
         assert!(temp.is_absolute() && temp.is_dir(), "{}", temp.display());
         assert!(macos::singleton_socket_fits(&temp));
-        assert!(!macos::singleton_socket_fits(
-            &Path::new("/").join("a".repeat(60))
-        ));
+        // "/<n a>/.com.takosumi.cef-browser.XXXXXX/SingletonSocket" is n + 50
+        // bytes: it fits up to n = 53.
         assert!(macos::singleton_socket_fits(
-            &Path::new("/").join("a".repeat(57))
+            &Path::new("/").join("a".repeat(53))
+        ));
+        assert!(!macos::singleton_socket_fits(
+            &Path::new("/").join("a".repeat(54))
         ));
     }
 

@@ -96,12 +96,15 @@ pub(super) fn process_exists(pid: u32) -> bool {
 }
 
 /// The system's per-user temporary directory (`confstr`,
-/// `_CS_DARWIN_USER_TEMP_DIR`, such as `/var/folders/…/T/`), which the
-/// browser gets as `TMPDIR` whatever the App's own environment says.
-/// Chromium keeps its process-singleton socket there, at
-/// `<dir>/org.chromium.Chromium.XXXXXX/SingletonSocket`, which must fit
-/// `sockaddr_un` (104 bytes on macOS, its terminator included); a directory
-/// too long for it is refused with that reason.
+/// `_CS_DARWIN_USER_TEMP_DIR`, such as `/var/folders/…/T/`). On macOS
+/// Chromium takes its temporary directory from `NSTemporaryDirectory()`,
+/// which prefers this one (only `MAC_CHROMIUM_TMPDIR` overrides it), so
+/// the `TMPDIR` the browser is given is informational: this directory is
+/// where its process-singleton socket goes, at
+/// `<dir>/.<base bundle id>.XXXXXX/SingletonSocket` (base's macOS
+/// temporary-file template), which must fit `sockaddr_un` (104 bytes on
+/// macOS, its terminator included). A directory too long for it is refused
+/// with that reason.
 pub(super) fn browser_temp_dir() -> crate::Result<PathBuf> {
     let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
     // SAFETY: the buffer's length is passed; confstr terminates what fits.
@@ -128,12 +131,21 @@ pub(super) fn browser_temp_dir() -> crate::Result<PathBuf> {
     Ok(directory)
 }
 
-/// Whether Chromium's singleton socket under `temp` fits `sockaddr_un`.
+/// The browser bundle's identifier (`scripts/bundle-macos-cef.mjs`,
+/// `IDENTIFIER`), which base takes as its bundle id, and Chromium's own
+/// default; the socket check uses the longer.
+const BROWSER_BUNDLE_ID: &str = "com.takosumi.cef-browser";
+const CHROMIUM_BUNDLE_ID: &str = "org.chromium.Chromium";
+
+/// Whether Chromium's singleton socket under `temp`
+/// (`<temp>/.<bundle id>.XXXXXX/SingletonSocket`) fits `sockaddr_un`.
 pub(super) fn singleton_socket_fits(temp: &Path) -> bool {
-    temp.join("org.chromium.Chromium.XXXXXX/SingletonSocket")
-        .as_os_str()
-        .len()
-        < 104
+    [BROWSER_BUNDLE_ID, CHROMIUM_BUNDLE_ID].iter().all(|id| {
+        temp.join(format!(".{id}.XXXXXX/SingletonSocket"))
+            .as_os_str()
+            .len()
+            < 104
+    })
 }
 
 /// The person's default browser through `/usr/bin/open`, in its own process
