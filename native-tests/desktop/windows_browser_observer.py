@@ -57,6 +57,10 @@ SW_SHOWMINNOACTIVE = 7
 GW_HWNDNEXT = 2
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x8
+# After Personal is switched to the front, how long Work's visibility is
+# sampled (every OCCLUSION_INTERVAL) for an occlusion update to show up.
+OCCLUSION_WATCH = 1.5
+OCCLUSION_INTERVAL = 0.1
 # Bound on the top-level windows walked for the Z-order evidence.
 Z_ORDER_LIMIT = 4096
 WM_CLOSE = 0x0010
@@ -767,6 +771,18 @@ class Observer:
         # Work. So the covered Work must report `visible` here, and the cover
         # must be real for that to mean anything.
         named = {"home": home, "work": work.window, "personal": personal.window}
+        # If Personal was only now switched to the front, an occlusion update
+        # could take a moment: watch Work's page through that window of time.
+        route = switch["precondition"]["route"]
+        samples = []
+        if route != "already":
+            deadline = time.monotonic() + OCCLUSION_WATCH
+            while time.monotonic() < deadline:
+                samples.append(work.evaluate("document.visibilityState"))
+                time.sleep(OCCLUSION_INTERVAL)
+            require("hidden" not in samples,
+                    f"Work, covered by Personal, read hidden after the switch ({samples}): Chromium's native "
+                    "occlusion is not off")
         covered = self.visibility(work, "personal-in-front")
         front = self.proof["visibility"]["personal-in-front"][0]["window"].get("rect")
         under = covered["window"].get("rect")
@@ -780,6 +796,8 @@ class Observer:
         require(covered.get("visibility") == "visible",
                 "Work, covered by Personal, reports hidden: Chromium's native occlusion is not off")
         switch["coveredWorkVisible"] = True
+        switch["coveredWorkRoute"] = route
+        switch["coveredWorkSamples"] = len(samples)
         switch["home"] = win.switch_to(home, "The home window")
         require(win.foreground() == home and win.visible(home), "The home window must be in front and visible")
         switch["lockTimeout"] = win.lock_timeout()
