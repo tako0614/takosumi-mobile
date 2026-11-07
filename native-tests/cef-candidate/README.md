@@ -1119,7 +1119,7 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
 | `home-by-window-switch` | with Personal's window in front and covering Work (Personal's rectangle contains Work's, Personal above Work in the Z-order), Work's page reports `visible`, so Chromium's native occlusion is really off; then an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
-| `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` and has keyboard focus (`document.hasFocus()`) within 10 s, and the browser logged no raise refusal. The lock before and after the raise, the App's grant result, the Z-order around the reuse and both pages' visibility are recorded; whether the grant was needed is not shown |
+| `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` and has keyboard focus (`document.hasFocus()`) within 10 s, and the browser logged no raise refusal. The focus record of Work's GUI thread (`GetGUIThreadInfo`: focus window and its class, active window), the lock before and after the raise, the App's grant result, the Z-order around the reuse and both pages' visibility are recorded; whether the grant was needed is not shown |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
 | `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
@@ -1218,8 +1218,20 @@ raise to restore it and make its page visible again.
 jobs with the ten cases. Its evidence showed Work restored and in front
 after the reuse but its page without keyboard focus: the browser gave focus
 before the raise, while the window was still minimized. On Windows it now
-gives focus again after a successful raise, and `reuse-raises-window`
-requires the page to report it. The same run showed the observer taking the
+asks for focus again after a successful raise, and `reuse-raises-window`
+requires the page to report it.
+
+**Fifth CI run (W3).** Run 42316597299 (head `08bae06`): the occlusion-off
+check passed (Work, covered by Personal, reported `visible`), but after the
+reuse Work, visible and in front, still reported no focus although the
+browser had called `set_focus` again right after the raise in the same
+task. The cause is unknown: Chrome-style windows may return focus to their
+own UI on activation, or the call may come before Windows has processed the
+activation. The browser now requests focus from a task posted behind the
+raise (no timer), and the observer records the focus record of Work's GUI
+thread, so the next run shows whether focus went to the web contents
+(`Chrome_RenderWidgetHostHWND`) or to the browser's own UI. Focus stays
+required; if the browser's UI keeps it, it becomes a documented gap. The same run showed the observer taking the
 foreground without a grant (see "Foreground").
 
 **2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
