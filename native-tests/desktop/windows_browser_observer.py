@@ -458,9 +458,14 @@ class Cdp:
         self.events = []
         self.base = 0
         self.closed = None
+        # When each mark was taken (monotonic); events carry their receipt
+        # time as RECEIVED_AT, for dialog_evidence.
+        self.marked_at = {}
 
     def mark(self):
-        return self.base + len(self.events)
+        mark = self.base + len(self.events)
+        self.marked_at[mark] = time.monotonic()
+        return mark
 
     def since(self, mark):
         return self.events[max(0, mark - self.base):]
@@ -474,6 +479,7 @@ class Cdp:
             self.closed = str(error)
             raise Failure(f"DevTools connection of {self.label} ended: {error}") from None
         if "method" in message:
+            message[RECEIVED_AT] = time.monotonic()
             self.events.append(message)
             if len(self.events) > 4096:
                 del self.events[:1024]
@@ -527,6 +533,54 @@ def final_quit_dialog(params, app_origin):
             f"At the final quit only a beforeunload of {app_origin} may be accepted, not {found}")
     return found
 
+
+# Dialog failure evidence (dialog_evidence): the page session's dialog events
+# and its frame lifecycle and navigation events, without text values.
+RECEIVED_AT = "_receivedAt"
+DIALOG_EVENTS = ("Page.javascriptDialogOpening", "Page.javascriptDialogClosed")
+FRAME_EVENTS = ("Page.frameAttached", "Page.frameDetached", "Page.frameStartedLoading", "Page.frameNavigated",
+                "Page.frameRequestedNavigation", "Page.navigatedWithinDocument")
+FRAME_EVIDENCE_LIMIT = 200
+
+
+def dialog_evidence(events, session, start):
+    """From `events` on `session`: each dialog opening (type, origin, browser
+    handler) and closing (result, and whether userInput was absent, empty or
+    present), and each frame lifecycle or navigation event (frame and parent
+    ids, URL origin; the last FRAME_EVIDENCE_LIMIT and their total), with
+    its receipt time in seconds after `start` (the mark's time). No message,
+    prompt, user input or full URL is kept."""
+    dialogs, frames, total = [], [], 0
+    for event in events:
+        method = event.get("method")
+        if event.get("sessionId") != session or method not in DIALOG_EVENTS + FRAME_EVENTS:
+            continue
+        params = event.get("params") or {}
+        entry = {"event": method.split(".", 1)[1]}
+        if start is not None and RECEIVED_AT in event:
+            entry["at"] = round(event[RECEIVED_AT] - start, 3)
+        if method == "Page.javascriptDialogOpening":
+            entry.update(type=params.get("type"), origin=url_origin(params.get("url") or ""),
+                         hasBrowserHandler=params.get("hasBrowserHandler"))
+            dialogs.append(entry)
+            continue
+        if method == "Page.javascriptDialogClosed":
+            entry["result"] = params.get("result")
+            entry["userInput"] = ("absent" if "userInput" not in params
+                                  else "present" if params["userInput"] else "empty")
+            dialogs.append(entry)
+            continue
+        frame = params.get("frame") or {}
+        entry["frameId"] = frame.get("id") or params.get("frameId")
+        parent = frame.get("parentId") or params.get("parentFrameId")
+        if parent:
+            entry["parentId"] = parent
+        url = frame.get("url") or params.get("url")
+        if url:
+            entry["origin"] = url_origin(url)
+        total += 1
+        frames.append(entry)
+    return {"dialogs": dialogs, "frames": frames[-FRAME_EVIDENCE_LIMIT:], "frameEvents": total}
 
 def real_site_first_checkpoint(site):
     """W4: the observer's worst case, from the App's record of both browsers
@@ -879,13 +933,55 @@ class Observer:
             lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
             and event["params"].get("type") == kind, mark, bound, what)
 
-    def cancel_dialog(self, page, mark, what):
+    def cancel_dialog(self, page, mark, what, opened=None, others=()):
         """Cancel the page's open dialog through DevTools and see it closed
-        with result false (which the browser's own close observer reports)."""
-        page.send("Page.handleJavaScriptDialog", {"accept": False})
-        return page.cdp.wait_event(
-            lambda event: event["method"] == "Page.javascriptDialogClosed" and event.get("sessionId") == page.session
-            and event["params"].get("result") is False, mark, SETTLE_WAIT, what)
+        with result false (which the browser's own close observer reports).
+        If either fails, the evidence of `page` and of each (page, mark) in
+        `others` is recorded (dialog_failure) before the failure goes on."""
+        attempt = time.monotonic()
+        try:
+            page.send("Page.handleJavaScriptDialog", {"accept": False})
+            return page.cdp.wait_event(
+                lambda event: event["method"] == "Page.javascriptDialogClosed"
+                and event.get("sessionId") == page.session and event["params"].get("result") is False,
+                mark, SETTLE_WAIT, what)
+        except Failure as error:
+            self.dialog_failure(what, [(page, mark), *others], error, opened, attempt)
+            raise
+
+    def dialog_failure(self, what, watched, error, opened=None, attempt=None):
+        """Diagnostics only, after a failed dialog step: for each watched
+        (page, mark), its dialog and frame events since the mark
+        (dialog_evidence), whether its DevTools connection and target are
+        still there, and whether its guard ended (did it leave?) with the
+        receipt; and the time from the dialog's opening to the cancel
+        attempt. Never answers a dialog."""
+        evidence = {"what": what, "error": str(error)[:500], "pages": []}
+        if opened is not None and attempt is not None and RECEIVED_AT in opened:
+            evidence["cancelAfterOpening"] = round(attempt - opened[RECEIVED_AT], 3)
+        self.proof.setdefault("dialogFailures", []).append(evidence)
+        for page, mark in watched:
+            entry = {"profile": page.process["profile"]}
+            evidence["pages"].append(entry)
+            try:
+                try:
+                    page.cdp.drain(0.2)
+                except Failure:
+                    pass  # its connection closed; page.cdp.closed says how
+                entry.update(dialog_evidence(page.cdp.since(mark), page.session, page.cdp.marked_at.get(mark)),
+                             mainFrame=page.target["targetId"], connectionClosed=page.cdp.closed)
+                if page.cdp.closed is None:
+                    try:
+                        entry["targets"] = page.pages()
+                    except Failure as failure:
+                        entry["targets"] = {"error": str(failure)[:300]}
+                receipt = page.process["guardReceipt"]
+                entry["guardEnded"] = self.guard_ended(receipt)
+                if entry["guardEnded"]:
+                    with open(receipt, "rb") as source:
+                        entry["guardReceipt"] = json.loads(source.read())
+            except Exception as failure:  # diagnostics only: keep the original failure
+                entry["evidenceError"] = repr(failure)[:300]
 
     def first_launch(self):
         win = self.win
@@ -1073,7 +1169,8 @@ class Observer:
                 "Personal must not be asked to close before Work agrees")
         require(not self.guard_ended(personal.process["guardReceipt"]),
                 "Personal must still be running during Work's dialog")
-        self.cancel_dialog(work, unload, "Work's beforeunload cancel was not observed")
+        self.cancel_dialog(work, unload, "Work's beforeunload cancel was not observed", dialog,
+                           [(personal, personal_mark)])
         require([self.sample(page) for page in pages] == expected, "A cancelled sequential quit must keep every document")
         self.step("sequential quit stopped at the cancel", work)
         self.checkpoint("cancel-inspected")
@@ -1090,16 +1187,24 @@ class Observer:
         # Work closed and Personal kept.
         self.step("Personal cancels after Work closed", personal)
         personal_unload = personal.cdp.mark()
+        work_unload = work.cdp.mark()
         personal.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
                           "addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()", True)
         self.checkpoint("request-partial-exit")
-        self.dialog(personal, personal_unload, "beforeunload",
-                    "Personal's beforeunload did not open after Work closed", END_WAIT)
-        # The App drops Work only after its normal receipt, before asking Personal.
-        require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
-        self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
-                                                            "Work must have closed normally")
-        self.cancel_dialog(personal, personal_unload, "Personal's beforeunload cancel was not observed")
+        opened = None
+        try:
+            opened = self.dialog(personal, personal_unload, "beforeunload",
+                                 "Personal's beforeunload did not open after Work closed", END_WAIT)
+            # The App drops Work only after its normal receipt, before asking Personal.
+            require(self.guard_ended(work.process["guardReceipt"]), "Work must have closed before Personal is asked")
+            self.proof["workClosedFirst"] = self.normal_receipt(work.process["guardReceipt"],
+                                                                "Work must have closed normally")
+        except Failure as error:
+            self.dialog_failure("Personal's beforeunload after Work closed",
+                                [(personal, personal_unload), (work, work_unload)], error)
+            raise
+        self.cancel_dialog(personal, personal_unload, "Personal's beforeunload cancel was not observed", opened,
+                           [(work, work_unload)])
         require(self.sample(personal) == expected[1], "The cancelled Personal must keep its document")
         self.checkpoint("partial-inspected")
         self.proof["partial"] = self.marker("app-browser-process-partial.json")

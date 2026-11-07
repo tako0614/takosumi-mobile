@@ -134,6 +134,19 @@ class FakeSocket:
         return json.dumps(self.messages.pop(0))
 
 
+class ReplyingSocket(FakeSocket):
+    """FakeSocket that answers each command from `replies` (method: reply)."""
+
+    def __init__(self, messages, replies):
+        super().__init__(messages)
+        self.replies = replies
+
+    def send_text(self, text):
+        super().send_text(text)
+        request = self.sent[-1]
+        self.messages.append(dict(self.replies[request["method"]], id=request["id"]))
+
+
 class CdpTests(unittest.TestCase):
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},
@@ -224,6 +237,81 @@ class CdpTests(unittest.TestCase):
                 self.assertEqual(page.clicks, clicks, site)
                 self.assertEqual(page.site_context["entry"], entry, site)
                 self.assertEqual(page.site_context["origin"], observer.REAL_SITES[site]["origin"])
+
+    def test_dialog_evidence_keeps_events_and_origins_without_text(self):
+        events = [
+            {"method": "Page.javascriptDialogOpening", "sessionId": "S", "_receivedAt": 10.5,
+             "params": {"type": "beforeunload", "message": "Leave?", "url": "https://www.photopea.com/p?q=1",
+                        "hasBrowserHandler": True, "defaultPrompt": "secret"}},
+            {"method": "Page.frameAttached", "sessionId": "S", "_receivedAt": 10.6,
+             "params": {"frameId": "F2", "parentFrameId": "T"}},
+            {"method": "Page.frameNavigated", "sessionId": "S", "_receivedAt": 10.7,
+             "params": {"frame": {"id": "F2", "parentId": "T", "url": "https://ads.example/x?id=secret"}}},
+            {"method": "Page.frameRequestedNavigation", "sessionId": "S",
+             "params": {"frameId": "F2", "url": "https://ads.example/y#secret", "reason": "other"}},
+            {"method": "Page.javascriptDialogOpening", "sessionId": "OTHER", "params": {"type": "alert"}},
+            {"method": "Page.loadEventFired", "sessionId": "S", "params": {}},
+            {"method": "Page.javascriptDialogClosed", "sessionId": "S", "_receivedAt": 11.0,
+             "params": {"result": True, "userInput": "secret"}},
+            {"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {"result": False, "userInput": ""}},
+        ]
+        evidence = observer.dialog_evidence(events, "S", 10.0)
+        self.assertEqual(evidence["dialogs"], [
+            {"event": "javascriptDialogOpening", "at": 0.5, "type": "beforeunload",
+             "origin": "https://www.photopea.com", "hasBrowserHandler": True},
+            {"event": "javascriptDialogClosed", "at": 1.0, "result": True, "userInput": "present"},
+            {"event": "javascriptDialogClosed", "result": False, "userInput": "empty"}])
+        self.assertEqual(evidence["frames"], [
+            {"event": "frameAttached", "at": 0.6, "frameId": "F2", "parentId": "T"},
+            {"event": "frameNavigated", "at": 0.7, "frameId": "F2", "parentId": "T", "origin": "https://ads.example"},
+            {"event": "frameRequestedNavigation", "frameId": "F2", "origin": "https://ads.example"}])
+        self.assertEqual(evidence["frameEvents"], 3)
+        self.assertNotIn("secret", json.dumps(evidence))
+        self.assertNotIn("Leave?", json.dumps(evidence))
+        many = [{"method": "Page.frameStartedLoading", "sessionId": "S", "params": {"frameId": f"F{index}"}}
+                for index in range(observer.FRAME_EVIDENCE_LIMIT + 50)]
+        evidence = observer.dialog_evidence(many, "S", None)
+        self.assertEqual(len(evidence["frames"]), observer.FRAME_EVIDENCE_LIMIT)
+        self.assertEqual(evidence["frames"][-1]["frameId"], f"F{observer.FRAME_EVIDENCE_LIMIT + 49}")
+        self.assertEqual(evidence["frameEvents"], observer.FRAME_EVIDENCE_LIMIT + 50)
+
+    def test_a_failed_cancel_records_both_pages_and_answers_nothing(self):
+        def page(label, session, events):
+            cdp = observer.Cdp(ReplyingSocket([], {
+                "Page.handleJavaScriptDialog": {"error": {"code": -32602, "message": "No dialog is showing"}},
+                "Target.getTargets": {"result": {"targetInfos": [{"type": "page", "targetId": label}]}}}), label)
+            mark = cdp.mark()
+            cdp.websocket.messages.extend(events)
+            cdp.drain(0.1)
+            process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": label,
+                       "guardReceipt": str(HERE / f"no-such-receipt-{label}.json")}
+            return observer.Page(cdp, session, process, {"targetId": label}), mark
+
+        opening = {"method": "Page.javascriptDialogOpening", "sessionId": "P",
+                   "params": {"type": "beforeunload", "message": "x", "url": "https://www.photopea.com/"}}
+        closed = {"method": "Page.javascriptDialogClosed", "sessionId": "P", "params": {"result": True,
+                                                                                       "userInput": ""}}
+        personal, personal_mark = page("personal", "P", [opening, closed])
+        work, work_mark = page("work", "W", [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="photopea")
+        opened = personal.cdp.since(personal_mark)[0]
+        with self.assertRaisesRegex(Failure, "No dialog is showing"):
+            watch.cancel_dialog(personal, personal_mark, "cancel not observed", opened, [(work, work_mark)])
+        [evidence] = watch.proof["dialogFailures"]
+        self.assertEqual(evidence["what"], "cancel not observed")
+        self.assertIn("No dialog is showing", evidence["error"])
+        self.assertGreaterEqual(evidence["cancelAfterOpening"], 0)
+        first, second = evidence["pages"]
+        self.assertEqual([entry["event"] for entry in first["dialogs"]],
+                         ["javascriptDialogOpening", "javascriptDialogClosed"])
+        self.assertEqual(first["dialogs"][1]["result"], True)
+        self.assertEqual((first["profile"], first["mainFrame"], first["targets"], first["guardEnded"]),
+                         ("personal", "personal", ["personal"], False))
+        self.assertEqual((second["profile"], second["dialogs"], second["guardEnded"]), ("work", [], False))
+        # Only the one cancel attempt: no accept, no retry.
+        self.assertEqual([request["method"] for request in personal.cdp.websocket.sent],
+                         ["Page.handleJavaScriptDialog", "Target.getTargets"])
+        self.assertEqual(personal.cdp.websocket.sent[0]["params"], {"accept": False})
 
     def test_marks_stay_absolute_when_old_events_are_dropped(self):
         cdp = observer.Cdp(FakeSocket([{"method": f"E{index}"} for index in range(4200)]), "w")
