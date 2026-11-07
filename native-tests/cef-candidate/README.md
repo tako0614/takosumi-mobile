@@ -1042,10 +1042,13 @@ case predates W3: when the person closes the last window (no `shutdown`, so
 no `stopped`), a request posted just before the gate closed could still run
 before the loop ended, and an Open then raised the pending count and the
 exit check panicked (exit 101). The browser now marks itself `quitting` when
-the last window has gone and refuses such a request with the usual "Stale
-command or browser stopping" error; an end of input then closes nothing.
-The admission rule is a pure function with a unit test, run on its own
-locally (the browser binary's tests need libcef to link). The test now prints `browser.log` (the
+the last window has gone and refuses an Open or Close then with the usual
+"Stale command or browser stopping" error, while a Shutdown posted just
+before is answered `stopped` (once), so the App's quit completes on the
+first try; an end of input then closes nothing. The admission rule is a pure
+function with unit tests, run on their own locally (the browser binary's
+tests need libcef to link, so CI does not run them). The test now prints
+`browser.log` (the
 browser's stderr, where a panic message lands) and the tail of
 `cef-native.log` when the reopen or shutdown fails or the receipt is
 abnormal, so a recurrence names its cause.
@@ -1118,7 +1121,7 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | Case | What it requires |
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
-| `home-by-window-switch` | with Personal's window in front and covering Work (Personal's rectangle contains Work's, Personal above Work in the Z-order), Work's page reports `visible`, so Chromium's native occlusion is really off; then an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
+| `home-by-window-switch` | with Personal's window in front and covering Work (Personal's rectangle contains Work's, Personal above Work in the Z-order), Work's page reports `visible`, so Chromium's native occlusion is really off (when Personal was only now switched to the front, Work's visibility is sampled for 1.5 s and must never read `hidden`); then an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
 | `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` within 10 s, and the browser logged no raise refusal. Keyboard focus is a known gap, recorded but not required: `document.hasFocus()` and the focus record of Work's GUI thread (`GetGUIThreadInfo`: focus window and its class, active window; it must be captured), with the lock before and after the raise, the App's grant result, the Z-order around the reuse and both pages' visibility are recorded; whether the grant was needed is not shown |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
