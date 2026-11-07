@@ -22,14 +22,16 @@
 // takosumi-cef-browser-helper (native-tests/cef-candidate: `cargo build
 // --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper`).
 // The bundle is `<out>/takosumi-cef-browser-process.app`; it and
-// `<out>/bundle.json` (each file's size and SHA-256, each symbolic link's
-// target, the architecture) must not exist yet: nothing is replaced or
-// removed.
+// `<out>/bundle.json` (each file's size, mode and SHA-256, the six
+// Info.plist files among them, each symbolic link's target, the
+// architecture) must not exist yet: nothing is replaced or removed, and
+// every check runs before anything is written.
 //
 // Every helper app holds a copy of the same helper executable under its
 // own name; CEF finds them by the browser executable's name. The framework
-// is copied with its symbolic links as links, and a link that is absolute or
-// leaves the framework stops the bundle. The browser, the helper and the
+// is copied with its symbolic links as links; a link that is absolute,
+// dangling or, resolved through every link on its way, leaves the framework
+// stops the bundle, as does a file with a setuid, setgid or sticky bit. The browser, the helper and the
 // framework's library must be 64-bit Mach-O files of one architecture (the
 // framework may be universal). The framework's `Libraries/libcef_sandbox.dylib`
 // must be there: each helper enters the seatbelt sandbox from it.
@@ -219,35 +221,67 @@ function requireFile(file, what) {
 }
 
 /**
- * Copy `source` (a directory) to `target` (new), keeping symbolic links as
- * links: each must be relative and stay inside `root` (the framework).
- * Returns the copied entries for the manifest.
+ * Check the framework tree before anything is written and return what to
+ * copy, in order (each directory before its entries). A symbolic link must
+ * be relative, resolve (no dangling link) and, resolved on the source side
+ * through every link on its way (`realpath`), stay inside the framework:
+ * a chain such as `R -> .` with `esc -> R/../x` resolves outside although
+ * its text does not. A file with a setuid, setgid or sticky bit is refused;
+ * the copied mode is the file's permission bits (`mode & 0o777`).
  */
-function copyTree(source, target, root, prefix, entries) {
-  mkdirSync(target);
+function scanTree(source, realRoot, prefix, plan) {
   for (const name of readdirSync(source).sort()) {
     const from = path.join(source, name);
-    const to = path.join(target, name);
     const relative = path.posix.join(prefix, name);
     const info = lstatSync(from);
     if (info.isSymbolicLink()) {
       const link = readlinkSync(from);
-      const resolved = path.resolve(path.dirname(from), link);
-      if (path.isAbsolute(link) || !(resolved === root || resolved.startsWith(root + path.sep))) {
-        usage(`${from} links outside the framework (${link})`);
+      if (path.isAbsolute(link)) usage(`${from} links outside the framework (${link})`);
+      let real;
+      try {
+        real = realpathSync(from);
+      } catch {
+        usage(`${from} is a dangling link (${link})`);
       }
-      symlinkSync(link, to);
-      entries.push({ path: relative, link });
+      if (!(real === realRoot || real.startsWith(realRoot + path.sep))) usage(`${from} links outside the framework (${link})`);
+      plan.push({ kind: "link", from, relative, link });
     } else if (info.isDirectory()) {
-      copyTree(from, to, root, relative, entries);
+      plan.push({ kind: "directory", relative });
+      scanTree(from, realRoot, relative, plan);
     } else if (info.isFile()) {
-      copyFileSync(from, to, constants.COPYFILE_EXCL);
-      chmodSync(to, info.mode & 0o7777);
-      entries.push({ path: relative, size: info.size, sha256: sha256(to), mode: (info.mode & 0o777).toString(8) });
+      if (info.mode & 0o7000) {
+        usage(`${from} has a setuid, setgid or sticky bit (mode ${(info.mode & 0o7777).toString(8)})`);
+      }
+      plan.push({ kind: "file", from, relative, mode: info.mode & 0o777 });
     } else {
       usage(`${from} is neither a file, a directory nor a link`);
     }
   }
+  return plan;
+}
+
+/** Copy a checked plan (scanTree) under `base` and record each entry. */
+function copyPlan(plan, base, entries) {
+  for (const item of plan) {
+    const to = path.join(base, ...item.relative.split("/"));
+    if (item.kind === "directory") {
+      mkdirSync(to);
+    } else if (item.kind === "link") {
+      symlinkSync(item.link, to);
+      entries.push({ path: item.relative, link: item.link });
+    } else {
+      copyFileSync(item.from, to, constants.COPYFILE_EXCL);
+      chmodSync(to, item.mode);
+      entries.push({ path: item.relative, size: statSync(to).size, sha256: sha256(to), mode: item.mode.toString(8) });
+    }
+  }
+}
+
+/** Write a new Info.plist and record it. */
+function writePlist(file, relative, text, entries) {
+  writeFileSync(file, text, { flag: "wx" });
+  const info = statSync(file);
+  entries.push({ path: relative, size: info.size, sha256: sha256(file), mode: (info.mode & 0o777).toString(8) });
 }
 
 function copyExecutable(source, target, relative, entries) {
@@ -297,20 +331,27 @@ function main() {
     );
   }
 
+  // Every check of the framework runs before anything is written, so a
+  // refusal never leaves a partial bundle.
+  const frameworkPlan = scanTree(framework, realpathSync(framework), `Contents/Frameworks/${FRAMEWORK}`, []);
+
   const entries = [];
   const contents = path.join(app, "Contents");
   mkdirSync(path.join(contents, "MacOS"), { recursive: true });
-  mkdirSync(path.join(contents, "Frameworks"));
-  writeFileSync(path.join(contents, "Info.plist"), infoPlist(BROWSER, IDENTIFIER, false), { flag: "wx" });
+  mkdirSync(path.join(contents, "Frameworks", FRAMEWORK), { recursive: true });
+  writePlist(path.join(contents, "Info.plist"), "Contents/Info.plist", infoPlist(BROWSER, IDENTIFIER, false), entries);
   copyExecutable(browser, path.join(contents, "MacOS", BROWSER), `Contents/MacOS/${BROWSER}`, entries);
-  copyTree(framework, path.join(contents, "Frameworks", FRAMEWORK), framework, `Contents/Frameworks/${FRAMEWORK}`, entries);
+  copyPlan(frameworkPlan, app, entries);
   for (const { suffix, identifier } of HELPERS) {
     const name = `${BROWSER} Helper${suffix}`;
     const helperContents = path.join(contents, "Frameworks", `${name}.app`, "Contents");
     mkdirSync(path.join(helperContents, "MacOS"), { recursive: true });
-    writeFileSync(path.join(helperContents, "Info.plist"), infoPlist(name, `${IDENTIFIER}.${identifier}`, true), {
-      flag: "wx",
-    });
+    writePlist(
+      path.join(helperContents, "Info.plist"),
+      `Contents/Frameworks/${name}.app/Contents/Info.plist`,
+      infoPlist(name, `${IDENTIFIER}.${identifier}`, true),
+      entries,
+    );
     copyExecutable(helper, path.join(helperContents, "MacOS", name), `Contents/Frameworks/${name}.app/Contents/MacOS/${name}`, entries);
   }
 
