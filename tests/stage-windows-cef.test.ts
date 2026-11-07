@@ -101,6 +101,8 @@ function distribution(extra: Record<string, Buffer | string> = {}) {
     "vk_swiftshader.dll": peWithImports(["KERNEL32.dll", "gdi32.dll"]),
     "CREDITS.html": "<html>credits</html>",
     "libcef.lib": "import library",
+    "bootstrap.exe": peWithImports(["KERNEL32.dll", "ntdll.dll"], {}, "bootstrap"),
+    "bootstrapc.exe": peWithImports(["KERNEL32.dll"], {}, "bootstrapc"),
     "README.txt": "readme",
     "archive.json": JSON.stringify({ name: "cef_binary_test_windows64_minimal.tar.bz2" }),
     "include/cef_base.h": CEF_BASE_H,
@@ -109,6 +111,8 @@ function distribution(extra: Record<string, Buffer | string> = {}) {
     ...extra,
   };
   for (const [name, content] of Object.entries(files)) writeFileSync(path.join(cef, name), content);
+  // The sandboxed browser (the client DLL), the unsandboxed candidate and the guard.
+  writeFileSync(path.join(bin, "takosumi_cef_browser.dll"), peWithImports(["KERNEL32.dll", "libcef.dll"], {}, "client"));
   writeFileSync(path.join(bin, "takosumi-cef-browser-process.exe"), peWithImports(["KERNEL32.dll", "libcef.dll"]));
   writeFileSync(path.join(bin, "takosumi-browser-guard.exe"), peWithImports(["KERNEL32.dll", "ntdll.dll"]));
   return { base, cef, bin, out: path.join(base, "out") };
@@ -119,7 +123,7 @@ function stage(args: string[], script = SCRIPT, runtime = process.execPath) {
 }
 
 const sha256 = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
-const product = ["--unsandboxed-candidate"];
+const product: string[] = [];
 
 describe("windows-cef-pe", () => {
   test("reads a PE file's load-time imports", () => {
@@ -189,14 +193,21 @@ describe("stage-windows-cef", () => {
     expect(manifest.kind).toBe("takosumi.windows-cef-stage@v1");
     expect(manifest.fixture).toBe(false);
     expect(manifest.inspectionSeam).toBe(false);
-    expect(manifest.sandbox).toContain("unsandboxed");
-    expect(manifest.unsandboxedCandidate).toBe(true);
+    // The sandboxed browser: CEF's bootstrap under the browser's name and
+    // the client DLL beside it, under the same name.
+    expect(manifest.sandbox).toContain("bootstrap.exe");
+    expect(manifest.unsandboxedCandidate).toBe(false);
+    const staged = (name: string) => readFileSync(path.join(out, "cef", name));
+    expect(staged("takosumi-cef-browser-process.exe")).toEqual(readFileSync(path.join(cef, "bootstrap.exe")));
+    expect(staged("takosumi-cef-browser-process.dll")).toEqual(readFileSync(path.join(bin, "takosumi_cef_browser.dll")));
+    expect(manifest.imports["takosumi-cef-browser-process.dll"]).toEqual(["KERNEL32.dll", "libcef.dll"]);
     expect(manifest.imports["takosumi-browser-guard.exe"]).toEqual(["KERNEL32.dll", "ntdll.dll"]);
     expect(manifest.cef.archive.name).toBe("cef_binary_test_windows64_minimal.tar.bz2");
     expect(manifest.cefLicense).toEqual({ notice: "CEF-LICENSE.txt", from: "include/cef_base.h" });
     expect(manifest.files.map((file: { path: string }) => file.path).sort()).toEqual(
       [
         "takosumi-cef-browser-process.exe",
+        "takosumi-cef-browser-process.dll",
         "takosumi-browser-guard.exe",
         "libcef.dll",
         "chrome_elf.dll",
@@ -219,6 +230,43 @@ describe("stage-windows-cef", () => {
     expect(manifest.notStaged).toContain("libcef.lib (import library (SDK build input))");
     expect(manifest.notStaged).toContain("include (SDK build input)");
     expect(manifest.notStaged).toContain("README.txt (distribution documentation)");
+    expect(manifest.notStaged).toContain(
+      "bootstrapc.exe (CEF's console bootstrap; the browser is a Windows-subsystem program)",
+    );
+    expect(manifest.notStaged.join("\n")).not.toContain("bootstrap.exe (");
+  });
+
+  test("the unsandboxed candidate is staged for a fixture only", () => {
+    const { cef, bin, out } = distribution();
+    const refused = stage(["--cef", cef, "--bin", bin, "--out", out, "--unsandboxed-candidate"]);
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain("for a fixture only");
+    const fixture = stage(["--cef", cef, "--bin", bin, "--out", out, "--fixture", "--unsandboxed-candidate"]);
+    expect(fixture.status).toBe(0);
+    const manifest = JSON.parse(readFileSync(path.join(out, "stage.json"), "utf8"));
+    expect(manifest.unsandboxedCandidate).toBe(true);
+    expect(manifest.sandbox).toContain("none");
+    const paths = manifest.files.map((file: { path: string }) => file.path);
+    expect(paths).not.toContain("takosumi-cef-browser-process.dll");
+    expect(readFileSync(path.join(out, "cef", "takosumi-cef-browser-process.exe"))).toEqual(
+      readFileSync(path.join(bin, "takosumi-cef-browser-process.exe")),
+    );
+    expect(manifest.notStaged).toContain(
+      "bootstrap.exe (CEF's sandbox bootstrap, staged as the browser only for the sandboxed browser)",
+    );
+  });
+
+  test("the sandboxed browser needs the client DLL and the bootstrap", () => {
+    const noClient = distribution();
+    rmSync(path.join(noClient.bin, "takosumi_cef_browser.dll"));
+    const missing = stage(["--cef", noClient.cef, "--bin", noClient.bin, "--out", noClient.out]);
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain("takosumi_cef_browser.dll");
+    const noBootstrap = distribution();
+    rmSync(path.join(noBootstrap.cef, "bootstrap.exe"));
+    const absent = stage(["--cef", noBootstrap.cef, "--bin", noBootstrap.bin, "--out", noBootstrap.out]);
+    expect(absent.status).toBe(2);
+    expect(absent.stderr).toContain("bootstrap.exe");
   });
 
   test("keeps CEF's license: its LICENSE.txt, CREDITS.html naming it, or nothing staged", () => {
@@ -238,13 +286,6 @@ describe("stage-windows-cef", () => {
     const refused = stage(["--cef", unlicensed.cef, "--bin", unlicensed.bin, "--out", unlicensed.out, ...product]);
     expect(refused.status).toBe(2);
     expect(refused.stderr).toContain("no CEF license notice");
-  });
-
-  test("a package stage must name the unsandboxed candidate", () => {
-    const { cef, bin, out } = distribution();
-    const refused = stage(["--cef", cef, "--bin", bin, "--out", out]);
-    expect(refused.status).toBe(2);
-    expect(refused.stderr).toContain("--unsandboxed-candidate");
   });
 
   test("runs its checks when started through a symbolic link", () => {
@@ -277,7 +318,7 @@ describe("stage-windows-cef", () => {
   test("refuses a fixture browser for a package and accepts it for a fixture stage", () => {
     const { cef, bin, out } = distribution();
     writeFileSync(
-      path.join(bin, "takosumi-cef-browser-process.exe"),
+      path.join(bin, "takosumi_cef_browser.dll"),
       peWithImports(["KERNEL32.dll", "libcef.dll"], {}, "TAKOSUMI_BROWSER_PROCESS_INSPECT"),
     );
     const refused = stage(["--cef", cef, "--bin", bin, "--out", out, ...product]);
