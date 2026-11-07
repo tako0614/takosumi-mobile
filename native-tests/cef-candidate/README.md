@@ -876,7 +876,7 @@ no receipt. The spawner thread drops the job when every requester is gone
 **CI.** The `cef-windows` job builds the product browser and the guard
 together, keeps the W1 manifest check and both smoke runs, and adds two steps.
 `Guard self-tests (Windows)` runs `cargo test --bin takosumi-browser-guard`
-(eleven cases in `src/guard_windows_tests.rs`; the self-test binary is its
+(twelve cases in `src/guard_windows_tests.rs`; the self-test binary is its
 own stand-in browser, and each case starts the guard detached inside a fresh
 kill-on-close job as the App does): a normal end, a non-zero exit, the pipes
 reaching the browser without the stop event, a lingering descendant
@@ -886,7 +886,9 @@ the termination (not counted as forced; self-test-only injections,
 `TAKOSUMI_GUARD_FAULT_LATE_EMPTY` and `TAKOSUMI_GUARD_FAULT_TERMINATE_LATE`,
 produce these two orders, which timing alone cannot produce on demand), a
 stop request, the App's job ending guard and browser, a pending stop, the
-refusals and a browser that cannot start. Cases that require the App's job
+refusals, a browser that cannot start and the forced-cleanup diagnostic's
+process type parser (the lingering case also checks the diagnostic line).
+Cases that require the App's job
 to be empty afterwards wait at most 3 s for processes whose exit is already
 under way (the stand-ins that must be ended sleep 60 s) and name every
 process still there with its image. `App adapter with the built
