@@ -97,10 +97,33 @@ fn maybe_quit() {
         quit_message_loop();
     }
 }
-/// Whether a control request may run: newer than the last one, and the
-/// browser neither stopping (`shutdown`) nor quitting after its last window.
-fn admits(last_id: u64, id: u64, stopping: bool) -> bool {
-    id > last_id && !stopping
+/// What a control request gets.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// It runs.
+    Run,
+    /// The browser already has no window left and is quitting: a shutdown
+    /// is answered `stopped` at once (it is what the parent asked for).
+    Stopped,
+    /// "Stale command or browser stopping".
+    Refuse,
+}
+/// The admission of a request (`shutdown`: whether it is a Shutdown), by its
+/// id against the last one, whether a shutdown is already recorded, and
+/// whether the browser is quitting after the person closed its last window.
+/// While quitting, an Open or Close must not start anything (the pending
+/// count would trip the exit check), but a Shutdown posted just before is
+/// answered `stopped`, as it was before `quitting` existed.
+fn admission(shutdown: bool, id: u64, last_id: u64, recorded: bool, quitting: bool) -> Admission {
+    if id <= last_id || recorded {
+        Admission::Refuse
+    } else if !quitting {
+        Admission::Run
+    } else if shutdown {
+        Admission::Stopped
+    } else {
+        Admission::Refuse
+    }
 }
 fn close_all(id: Option<u64>, failed: bool) {
     let browsers = with_state(|state| {
@@ -763,23 +786,34 @@ fn dispatch(bytes: Option<&[u8]>) {
         }
     };
     let id = request.id();
-    let allowed = with_state(|state| {
-        // A request posted just before the last window went (the person
-        // closed it, so no `shutdown` is set) must not start a browser
-        // after `maybe_quit`: the pending count would trip the exit check.
-        if !admits(
-            state.last_id,
+    let shutdown = matches!(request, Request::Shutdown { .. });
+    let admitted = with_state(|state| {
+        let admitted = admission(
+            shutdown,
             id,
-            state.shutdown.is_some() || state.quitting,
-        ) {
-            return false;
+            state.last_id,
+            state.shutdown.is_some(),
+            state.quitting,
+        );
+        if admitted != Admission::Refuse {
+            state.last_id = id;
         }
-        state.last_id = id;
-        true
+        if admitted == Admission::Stopped {
+            // Answered once: a later Shutdown finds it recorded.
+            state.shutdown = Some(id);
+        }
+        admitted
     });
-    if !allowed {
-        error(id, "Stale command or browser stopping");
-        return;
+    match admitted {
+        Admission::Run => {}
+        Admission::Stopped => {
+            reply(Reply::Stopped { id });
+            return;
+        }
+        Admission::Refuse => {
+            error(id, "Stale command or browser stopping");
+            return;
+        }
     }
     match request {
         Request::Open { id, payload } => open(id, payload),
@@ -908,13 +942,37 @@ fn with_feature(current: &str, feature: &str) -> String {
 }
 #[cfg(test)]
 mod control_tests {
+    use super::{admission, Admission};
+
     #[test]
-    fn only_a_newer_request_runs_and_never_while_stopping_or_quitting() {
-        assert!(super::admits(0, 1, false));
-        assert!(super::admits(4, 5, false));
-        assert!(!super::admits(5, 5, false));
-        assert!(!super::admits(5, 4, false));
-        assert!(!super::admits(4, 5, true));
+    fn a_newer_request_runs_while_the_browser_has_windows() {
+        assert_eq!(admission(false, 1, 0, false, false), Admission::Run);
+        assert_eq!(admission(true, 5, 4, false, false), Admission::Run);
+    }
+
+    #[test]
+    fn a_stale_request_or_one_after_a_recorded_shutdown_is_refused() {
+        for shutdown in [false, true] {
+            for quitting in [false, true] {
+                assert_eq!(
+                    admission(shutdown, 5, 5, false, quitting),
+                    Admission::Refuse
+                );
+                assert_eq!(
+                    admission(shutdown, 4, 5, false, quitting),
+                    Admission::Refuse
+                );
+                assert_eq!(admission(shutdown, 6, 5, true, quitting), Admission::Refuse);
+            }
+        }
+    }
+
+    #[test]
+    fn while_quitting_only_a_shutdown_is_answered_and_it_is_stopped() {
+        // The person closed the last window; the parent's quit arrives next.
+        assert_eq!(admission(true, 6, 5, false, true), Admission::Stopped);
+        // An Open or a Close must not start anything then.
+        assert_eq!(admission(false, 6, 5, false, true), Admission::Refuse);
     }
 }
 #[cfg(test)]
