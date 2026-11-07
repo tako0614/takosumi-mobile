@@ -1,7 +1,7 @@
 // The pure parts of scripts/stage-windows-cef.mjs (W6), kept in their own
 // module so tests import them without running the staging script: which
-// DLLs a PE file imports at load time, read as the Windows loader reads them,
-// and which of those a clean Windows provides.
+// DLLs a PE file imports at load time and which names it exports, read as
+// the Windows loader reads them, and which DLLs a clean Windows provides.
 
 /**
  * Windows system DLLs a staged file may import at load time (lower case):
@@ -45,16 +45,16 @@ export function systemDll(name) {
 }
 
 /**
- * The DLL names a PE file imports at load time (its import directory; the
- * delay-loaded ones are loaded on first use and not listed), read through
- * `read(offset, length)`, which returns a Buffer (shorter at the end of the
- * file). As the loader maps the image: a section's file data starts at its
- * PointerToRawData rounded down to 0x200, and its bytes past SizeOfRawData
+ * A PE image read through `read(offset, length)`, which returns a Buffer
+ * (shorter at the end of the file), as the loader maps it: `directory(index)`
+ * is a data directory's RVA (0 when absent) and `mapped(rva, length)` reads
+ * the mapped image, where a section's file data starts at its
+ * PointerToRawData rounded down to 0x200 and its bytes past SizeOfRawData
  * read as zero, whatever the file holds there. An image without an optional
- * header, with an unknown one or with a malformed import directory throws;
- * one with no import directory imports nothing.
+ * header or with an unknown one throws; the section table is read on first
+ * use.
  */
-export function peImports(read) {
+function peImage(read) {
   const dos = read(0, 64);
   if (dos.length < 64 || dos.toString("latin1", 0, 2) !== "MZ") throw new Error("no MZ header");
   const pe = dos.readUInt32LE(0x3c);
@@ -70,44 +70,99 @@ export function peImports(read) {
   const directories = magic === 0x20b ? 112 : magic === 0x10b ? 96 : -1;
   if (directories < 0 || optionalSize < directories) throw new Error(`unknown optional header 0x${magic.toString(16)}`);
   const count = optional.readUInt32LE(directories - 4);
-  if (count < 2 || optionalSize < directories + 16) return [];
-  const importRva = optional.readUInt32LE(directories + 8);
-  if (importRva === 0) return [];
-  const table = read(pe + 24 + optionalSize, sectionCount * 40);
-  if (table.length < sectionCount * 40) throw new Error("truncated section table");
-  const sections = [];
-  for (let index = 0; index < sectionCount; index += 1) {
-    const base = index * 40;
-    sections.push({
-      virtualSize: table.readUInt32LE(base + 8),
-      virtualAddress: table.readUInt32LE(base + 12),
-      rawSize: table.readUInt32LE(base + 16),
-      rawOffset: table.readUInt32LE(base + 20) & ~0x1ff,
-    });
-  }
-  // `length` bytes of the mapped image at `rva`, zero past the section's file data.
-  const mapped = (rva, length) => {
-    const section = sections.find(
-      ({ virtualAddress, virtualSize, rawSize }) =>
-        rva >= virtualAddress && rva < virtualAddress + Math.max(virtualSize, rawSize),
-    );
-    if (!section) throw new Error(`RVA 0x${rva.toString(16)} lies in no section`);
-    const within = rva - section.virtualAddress;
-    const bytes = Buffer.alloc(length);
-    const available = Math.max(0, Math.min(length, section.rawSize - within));
-    if (available > 0) read(section.rawOffset + within, available).copy(bytes);
-    return bytes;
+  let sections;
+  const sectionTable = () => {
+    if (sections) return sections;
+    const table = read(pe + 24 + optionalSize, sectionCount * 40);
+    if (table.length < sectionCount * 40) throw new Error("truncated section table");
+    sections = [];
+    for (let index = 0; index < sectionCount; index += 1) {
+      const base = index * 40;
+      sections.push({
+        virtualSize: table.readUInt32LE(base + 8),
+        virtualAddress: table.readUInt32LE(base + 12),
+        rawSize: table.readUInt32LE(base + 16),
+        rawOffset: table.readUInt32LE(base + 20) & ~0x1ff,
+      });
+    }
+    return sections;
   };
+  return {
+    directory(index) {
+      if (count < index + 1 || optionalSize < directories + 8 * (index + 1)) return 0;
+      return optional.readUInt32LE(directories + 8 * index);
+    },
+    // `length` bytes of the mapped image at `rva`, zero past the section's file data.
+    mapped(rva, length) {
+      const section = sectionTable().find(
+        ({ virtualAddress, virtualSize, rawSize }) =>
+          rva >= virtualAddress && rva < virtualAddress + Math.max(virtualSize, rawSize),
+      );
+      if (!section) throw new Error(`RVA 0x${rva.toString(16)} lies in no section`);
+      const within = rva - section.virtualAddress;
+      const bytes = Buffer.alloc(length);
+      const available = Math.max(0, Math.min(length, section.rawSize - within));
+      if (available > 0) read(section.rawOffset + within, available).copy(bytes);
+      return bytes;
+    },
+  };
+}
+
+/** A NUL-terminated name of at most `limit` bytes at `rva`; throws when empty or unterminated. */
+function mappedName(image, rva, limit, what) {
+  const raw = image.mapped(rva, limit);
+  const end = raw.indexOf(0);
+  if (end <= 0) throw new Error(`unterminated or empty ${what} name`);
+  return raw.toString("latin1", 0, end);
+}
+
+/**
+ * The DLL names a PE file imports at load time (its import directory; the
+ * delay-loaded ones are loaded on first use and not listed), read through
+ * `read(offset, length)` as the loader maps the image (see peImage). An
+ * image without an optional header, with an unknown one or with a malformed
+ * import directory throws; one with no import directory imports nothing.
+ */
+export function peImports(read) {
+  const image = peImage(read);
+  const importRva = image.directory(1);
+  if (importRva === 0) return [];
   const names = [];
   for (let index = 0; index < 4096; index += 1) {
-    const descriptor = mapped(importRva + index * 20, 20);
+    const descriptor = image.mapped(importRva + index * 20, 20);
     if (descriptor.every((byte) => byte === 0)) return names;
-    const raw = mapped(descriptor.readUInt32LE(12), 260);
-    const end = raw.indexOf(0);
-    if (end <= 0) throw new Error("unterminated or empty import name");
-    names.push(raw.toString("latin1", 0, end));
+    names.push(mappedName(image, descriptor.readUInt32LE(12), 260, "import"));
   }
   throw new Error("import directory without an end");
+}
+
+/**
+ * The names a PE file exports (its export directory's name table, each
+ * name's function RVA non-zero), read like peImports. An image with no
+ * export directory exports nothing; a malformed one throws. W7: the client
+ * DLL CEF's bootstrap loads must export `RunWinMain`.
+ */
+export function peExports(read) {
+  const image = peImage(read);
+  const exportRva = image.directory(0);
+  if (exportRva === 0) return [];
+  const header = image.mapped(exportRva, 40);
+  const functions = header.readUInt32LE(20);
+  const count = header.readUInt32LE(24);
+  if (count > 65536 || functions > 65536) throw new Error("export directory too large");
+  if (count === 0) return [];
+  const addresses = image.mapped(header.readUInt32LE(28), functions * 4);
+  const names = image.mapped(header.readUInt32LE(32), count * 4);
+  const ordinals = image.mapped(header.readUInt32LE(36), count * 2);
+  const exported = [];
+  for (let index = 0; index < count; index += 1) {
+    const ordinal = ordinals.readUInt16LE(index * 2);
+    if (ordinal >= functions || addresses.readUInt32LE(ordinal * 4) === 0) {
+      throw new Error(`export name ${index} names no function`);
+    }
+    exported.push(mappedName(image, names.readUInt32LE(index * 4), 4096, "export"));
+  }
+  return exported;
 }
 
 /**

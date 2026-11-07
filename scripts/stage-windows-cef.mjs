@@ -29,7 +29,9 @@
 // distribution, staged as takosumi-cef-browser-process.exe, sets the sandbox
 // up and loads takosumi-cef-browser-process.dll from beside it, the browser
 // built with the cef-candidate feature `windows-sandbox` (`--lib`, built as
-// takosumi_cef_browser.dll); see native-tests/cef-candidate/src/browser_dll.rs.
+// takosumi_cef_browser.dll), which must export RunWinMain (a library built
+// without the feature is empty and is refused); see
+// native-tests/cef-candidate/src/browser_dll.rs.
 // The unsandboxed test candidate (the browser executable built with
 // `windows-unsandboxed-candidate`) can still be staged, for a fixture only
 // (`--fixture --unsandboxed-candidate`); the manifest records which.
@@ -69,7 +71,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { cefLicenseFromHeader, peImports, systemDll } from "./windows-cef-pe.mjs";
+import { cefLicenseFromHeader, peExports, peImports, systemDll } from "./windows-cef-pe.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_OUT = path.join(REPO, "src-tauri", "target", "windows-cef");
@@ -177,10 +179,11 @@ function peMachine(file) {
   }
 }
 
-function importsOf(file) {
+/** `parse(read)` (peImports or peExports) over a file's bytes. */
+function readPe(file, parse) {
   const handle = openSync(file, "r");
   try {
-    return peImports((offset, length) => {
+    return parse((offset, length) => {
       const buffer = Buffer.alloc(length);
       return buffer.subarray(0, readSync(handle, buffer, 0, length, offset));
     });
@@ -265,6 +268,19 @@ function main() {
   }
   plan.push([GUARD, requireFile(path.join(bin, GUARD), `built ${GUARD}`)]);
   for (const [, source] of plan) requirePe(source);
+  // The bootstrap calls the client DLL's RunWinMain; a library built without
+  // windows-sandbox is empty and exports nothing.
+  if (!options.unsandboxed) {
+    let exported;
+    try {
+      exported = readPe(code, peExports);
+    } catch (error) {
+      usage(`${code}: unreadable export table (${error.message})`);
+    }
+    if (!exported.includes("RunWinMain")) {
+      usage(`${code} exports no RunWinMain (exports: ${exported.join(", ") || "none"}); build it with --features windows-sandbox --lib`);
+    }
+  }
   const inspectionSeam = readFileSync(code).includes(INSPECTION_SEAM);
   const browser = code;
   if (inspectionSeam && !options.fixture) {
@@ -332,7 +348,7 @@ function main() {
     if (!/\.(exe|dll)$/i.test(name)) continue;
     let names;
     try {
-      names = importsOf(source);
+      names = readPe(source, peImports);
     } catch (error) {
       usage(`${source}: unreadable import table (${error.message})`);
     }
