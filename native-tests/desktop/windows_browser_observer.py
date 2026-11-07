@@ -732,6 +732,26 @@ class Observer:
         self.step("home through OS window switching")
         switch = {"precondition": win.switch_to(personal.window, "Personal's window", change=False)}
         self.visibility(personal, "personal-in-front")
+        # Native occlusion is off in the Windows browser (process_main.rs).
+        # With it on, Work covered by Personal at the same rectangle reported
+        # `hidden` (run 42298520970); a renamed or ignored feature would bring
+        # that back silently, since the reuse below starts from a minimized
+        # Work. So the covered Work must report `visible` here, and the cover
+        # must be real for that to mean anything.
+        named = {"home": home, "work": work.window, "personal": personal.window}
+        covered = self.visibility(work, "personal-in-front")
+        front = self.proof["visibility"]["personal-in-front"][0]["window"].get("rect")
+        under = covered["window"].get("rect")
+        order = self.proof.setdefault("zOrder", {})["personal-in-front"] = win.z_order(named)
+        require(front and under and front[0] <= under[0] and front[1] <= under[1] and front[2] >= under[2]
+                and front[3] >= under[3] and order["positions"]["personal"] is not None
+                and order["positions"]["work"] is not None
+                and order["positions"]["personal"] < order["positions"]["work"],
+                f"Personal does not cover Work (rects {front} over {under}, Z-order {order['positions']}), so "
+                "Work's visibility would not show native occlusion off")
+        require(covered.get("visibility") == "visible",
+                "Work, covered by Personal, reports hidden: Chromium's native occlusion is not off")
+        switch["coveredWorkVisible"] = True
         switch["home"] = win.switch_to(home, "The home window")
         require(win.foreground() == home and win.visible(home), "The home window must be in front and visible")
         switch["lockTimeout"] = win.lock_timeout()
@@ -755,8 +775,7 @@ class Observer:
                           "cannot show it visible again") from None
         require(win.foreground() == home, f"The home must stay in front while Work is minimized ({win.foreground()})")
         self.visibility(work, "before-reuse")
-        named = {"home": home, "work": work.window, "personal": personal.window}
-        self.proof.setdefault("zOrder", {})["before-reuse"] = win.z_order(named)
+        self.proof["zOrder"]["before-reuse"] = win.z_order(named)
         self.checkpoint("inspect-ready")
 
         self.step("home reopens Work")
@@ -771,16 +790,18 @@ class Observer:
         require(work.pages() == [work.target["targetId"]], "Reopening must not open another window")
         refusals = self.raise_refusals(work)
         require(refusals == [], f"Work's browser refused the raise: {refusals}")
-        # The raise came from a browser that was not in front while the home
-        # was. With Windows' foreground lock active, that needs the right the
-        # App passed on (AllowSetForegroundWindow); without the lock it would
-        # prove nothing about it.
+        # The raise came from a browser that was not in front, while the home
+        # was and Windows' foreground lock was active. That is the condition
+        # recorded here, not proof that the App's grant was needed: in run
+        # 42312377621 the observer, which has no grant, took the foreground
+        # from the home with a plain SetForegroundWindow under the same lock.
+        # The App's own AllowSetForegroundWindow result is recorded with it.
         lock = switch["lock"]
-        require(lock["active"],
-                f"Windows' foreground lock is not active here ({lock}), so the raise cannot show the App's "
-                "foreground grant at work")
+        require(lock["active"], f"Windows' foreground lock is not active here ({lock})")
+        work_after = next(item for item in resumed["after"] if item["profile"] == work.process["profile"])
         evidence = {"window": work.window, "foreground": win.foreground(), "homeRoute": switch["home"]["route"],
-                    "lock": lock, "minimizedBefore": True}
+                    "lockBefore": lock, "lockAfter": win.foreground_lock(),
+                    "foregroundGrantAccepted": work_after.get("foregroundGrant"), "minimizedBefore": True}
         # The page was hidden while minimized; the raise restored the window,
         # so the page must report visible again.
         try:
@@ -788,11 +809,19 @@ class Observer:
             evidence["visibility"] = "visible"
         except Failure:
             evidence["visibility"] = "hidden"
+        # The browser gives keyboard focus again once the window is restored
+        # and in front (process_main.rs), so the page must report it.
+        try:
+            self.settled(lambda: work.evaluate("document.hasFocus()") is True, "no focus")
+            evidence["focus"] = True
+        except Failure:
+            evidence["focus"] = False
         self.visibility(work, "after-reuse")
         self.visibility(personal, "after-reuse")
         self.proof["zOrder"]["after-reuse"] = win.z_order(named)
         require(evidence["visibility"] == "visible",
                 "Reopened Work's page stayed hidden after the raise restored its minimized window")
+        require(evidence["focus"], "Reopened Work's page has no keyboard focus although its window is in front")
         self.case("reuse-raises-window", evidence)
 
         # Chrome's real beforeunload path needs sticky user activation. CDP's
