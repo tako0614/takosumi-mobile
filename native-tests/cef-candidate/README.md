@@ -232,7 +232,8 @@ not establish that all retained SDK references or cold-start issues are solved.
 An explicit Linux fixture now connects the existing bundled WebHome and its
 shell-only `app-screen.open` command to a separate CEF process per UUID profile.
 The same driver runs on Windows against a local fixture site; see
-[Windows actual App (W3)](#windows-actual-app-w3).
+[Windows actual App (W3)](#windows-actual-app-w3), and against real sites in
+a manual run: [Windows real sites (W4)](#windows-real-sites-w4-manual-evidence-run).
 Normal builds keep their existing runtime. No shared-kit or remote page IPC is
 added, and installed profiles are not migrated. This is an integration probe,
 not an engine decision or a distributable browser service.
@@ -1274,6 +1275,59 @@ client and flows (sign-in stand-in, samples, a beforeunload cancelled
 through `Page.handleJavaScriptDialog`) also ran once against a private
 headless Chrome and the runner's TLS site on Linux. Windows evidence comes
 only from the CI job.
+
+## Windows real sites (W4, manual evidence run)
+
+The fourth Windows step (W4) takes the actual App on Windows to real
+third-party sites, as the Linux real-site runs (Excalidraw, Photopea) did. It
+is a manual evidence run, not a merge gate: third-party sites change and can
+be slow, so it is not part of `ci.yml`.
+
+**What runs.** `windows_browser_process.py --real-site excalidraw` (or
+`photopea`) runs the W3 first launch with the fixture home's app link
+pointing at `https://excalidraw.com/` (or `https://www.photopea.com/`); there
+is no restart or reset phase. Both profiles sign in to the fixture home as in
+W3, follow the app link at once, and must reach the site's readiness signal
+within 60 s: the Excalidraw editor root (`.excalidraw`), or Photopea's
+landing or editor text, the signals the Linux probes use
+(`browser-process.mjs`). The site must load in a secure context with no App
+bridge, in the profile's one window. Then, on the real pages:
+
+| Case | What it shows on the real site |
+| --- | --- |
+| `<site>/separate-profiles` | both profiles reach the site through the home; synthetic `localStorage` and script-cookie markers written in each are not seen by the other |
+| `<site>/home-by-window-switch` | Work, covered by Personal, stays `visible` (native occlusion off); the home comes back through the OS window switch |
+| `<site>/reuse-raises-window` | the minimized Work reopened from the home: the same process, window and document (its markers still there), restored, in front and visible |
+| `<site>/quit-cancel-stops` | the App's quit asks Work first; cancelling its (test-added) beforeunload stops the quit with both kept |
+| `<site>/quit-partial-order` | Work closes normally before Personal is asked; Personal's cancel keeps only Personal |
+| `<site>/quit-completes` | the final quit closes Personal; the App exits 0 with normal guard receipts and an empty job |
+| `<site>/no-process-left` | the launch's job ended empty without force |
+| `<site>/no-opener-request` | nothing was handed to the App's opener |
+
+The W3 invariants hold: the attested owner of each DevTools port, unchanged
+source and executable hashes, no opener request. After the final quit
+request the observer accepts any beforeunload a real site raises on its own,
+and records it, so the quit can finish. The App's first checkpoint waits up
+to 150 s and its watchdog 240 s in this mode
+(`TAKOSUMI_BROWSER_PROCESS_REAL_SITE`), and the observer up to 230 s.
+Anonymous use only: synthetic markers, nothing signs in anywhere real, no
+credential is typed.
+
+**Workflow.** `.github/workflows/windows-real-sites.yml` runs only on
+`workflow_dispatch`, with the takosumi-mobile ref to test as its input. It
+builds like `cef-windows-app` (restoring its caches without saving), trusts
+the fixture CA, runs the Excalidraw and the Photopea cases in separate steps
+(25 minutes each; the second runs even if the first fails), requires each
+step's eight `<site>/<case>` names, exactly eight `PASS case` lines and a
+passed `summary.json`, removes the CA whatever happened and keeps both cases
+and the profiles' browser logs as the artifact `windows-real-sites-cases`.
+GitHub lists a `workflow_dispatch` workflow for dispatch only once its file
+is on the default branch.
+
+**Not shown by W4:** Photopea's editor entry (the Linux run clicked "Start
+using Photopea"; here its landing counts as ready), the long native alert,
+downloads, popups, notifications and the native file chooser on the real
+sites; a real login; and anything W3 does not show (see above).
 
 ## Observations and limits
 
