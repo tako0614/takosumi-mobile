@@ -674,8 +674,15 @@ fn open(id: u64, payload: OpenRequest) {
         host.set_focus(1);
         // set_focus only moves keyboard focus inside the browser. A window
         // covered by another profile stays hidden unless it is raised.
-        if let Err(problem) = raise(&host) {
-            eprintln!("Reused browser window was not raised: {problem}");
+        match raise(&host) {
+            Err(problem) => eprintln!("Reused browser window was not raised: {problem}"),
+            // Windows: focus given while the window was still minimized does
+            // not reach the page once it is restored and in front (the page
+            // reported `hasFocus()` false in CI); give it again now.
+            #[cfg(windows)]
+            Ok(()) => host.set_focus(1),
+            #[cfg(not(windows))]
+            Ok(()) => {}
         }
         opened(id, payload.key, &browser);
         return;
