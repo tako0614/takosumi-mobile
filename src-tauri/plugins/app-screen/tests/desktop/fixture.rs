@@ -901,6 +901,9 @@ struct PendingDocument {
 /// is recorded.
 struct LoadTrail {
     started: std::time::Instant,
+    /// `fixture_clock` when the wait began, to line these up with the view
+    /// and navigation records.
+    began: u128,
     events: RefCell<std::collections::VecDeque<String>>,
 }
 
@@ -916,9 +919,10 @@ impl LoadTrail {
     fn summary(&self) -> String {
         let events = self.events.borrow();
         format!(
-            "[{}] (at +{}ms)",
+            "[{}] (at +{}ms; wait began at t={}ms)",
             events.iter().cloned().collect::<Vec<_>>().join("; "),
-            self.started.elapsed().as_millis()
+            self.started.elapsed().as_millis(),
+            self.began
         )
     }
 
@@ -957,6 +961,7 @@ fn after_document_load(
 ) {
     let trail = Rc::new(LoadTrail {
         started: std::time::Instant::now(),
+        began: fixture_clock(),
         events: RefCell::new(std::collections::VecDeque::new()),
     });
     let pending = Rc::new(PendingDocument {
@@ -977,7 +982,7 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
     // replace. Check the native document first, including across process swaps.
     if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
         if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, events={}", pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary());
+            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, events={}", gtk::prelude::WidgetExt::widget_name(&view), pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary());
             end_trail(&view, &pending);
             pending.app.exit(1);
         } else {
@@ -1002,7 +1007,7 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
             let callback = pending.callback.borrow_mut().take();
             if let Some(next) = callback { next(); }
         } else if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}, events={}", pending.uri, pending.nonce, native.uri(), native.is_loading(), pending.trail.summary());
+            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}, events={}", gtk::prelude::WidgetExt::widget_name(&native), pending.uri, pending.nonce, native.uri(), native.is_loading(), pending.trail.summary());
             end_trail(&native, &pending);
             pending.app.exit(1);
         } else {

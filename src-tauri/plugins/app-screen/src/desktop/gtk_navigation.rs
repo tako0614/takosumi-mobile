@@ -32,7 +32,7 @@ pub(super) fn install(view: &webkit2gtk::WebView, popup: bool) {
     // The factory omits Wry's URL-only navigation callback on GTK. Its earlier
     // handler otherwise consumes the decision before a download can be chosen.
     // Install this before the first site load, including related popup views.
-    view.connect_decide_policy(move |_, decision, kind| {
+    view.connect_decide_policy(move |_view, decision, kind| {
         if kind != PolicyDecisionType::NavigationAction {
             return false;
         }
@@ -49,12 +49,19 @@ pub(super) fn install(view: &webkit2gtk::WebView, popup: bool) {
             .unwrap_or(Route::Block);
         #[cfg(feature = "desktop-fixture")]
         eprintln!(
-            "fixture GTK navigation: scheme={}, route={selected:?}, user_gesture={}, popup={popup}",
+            "fixture GTK navigation: t={}ms, view={}, scheme={}, route={selected:?}, decision={}, user_gesture={}, popup={popup}",
+            super::fixture_clock(),
+            _view.widget_name(),
             source
                 .as_deref()
                 .and_then(|raw| tauri::Url::parse(raw).ok())
                 .map(|url| url.scheme().to_owned())
                 .unwrap_or_else(|| "invalid".into()),
+            match selected {
+                Route::Page => "use",
+                Route::Download => "download",
+                Route::Block => "ignore",
+            },
             action.is_some_and(|action| action.is_user_gesture()),
         );
         match selected {

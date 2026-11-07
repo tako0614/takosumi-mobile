@@ -48,6 +48,43 @@ pub(crate) mod browser_probe;
 mod macos;
 
 static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
+
+/// Fixture diagnostics only: milliseconds since the first call, on a
+/// monotonic clock shared by the GTK fixture's view and load records.
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+pub(crate) fn fixture_clock() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+}
+
+/// Fixture diagnostics only: name the GTK view after its window label (read
+/// back by the navigation record) and log when it is created, realized and
+/// mapped. Nothing here changes what the view does.
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+fn trace_fixture_view(label: &str, popup: bool, view: &webkit2gtk::WebView) {
+    use gtk::prelude::*;
+    view.set_widget_name(label);
+    eprintln!(
+        "fixture GTK view: t={}ms label={label} event=created popup={popup}",
+        fixture_clock()
+    );
+    for (signal, event) in [("realize", "realized"), ("map", "mapped")] {
+        let label = label.to_owned();
+        let handler = move |_: &webkit2gtk::WebView| {
+            eprintln!(
+                "fixture GTK view: t={}ms label={label} event={event}",
+                fixture_clock()
+            );
+        };
+        match signal {
+            "realize" => view.connect_realize(handler),
+            _ => view.connect_map(handler),
+        };
+    }
+}
 const MAX_WINDOWS: usize = 48;
 
 struct Screen {
@@ -440,6 +477,8 @@ fn create_screen(
             use wry::WebViewBuilderExtUnix;
             let container = window.default_vbox().map_err(failure)?;
             let view = builder.build_gtk(&container).map_err(failure)?;
+            #[cfg(feature = "desktop-fixture")]
+            trace_fixture_view(&label, is_popup, &wry::WebViewExtUnix::webview(&view));
             container.show_all();
             view
         };
@@ -462,7 +501,14 @@ fn create_screen(
             .transpose()?;
         let native_handlers = native_close_handler(&view, &window)?;
         if !is_popup {
-            view.load_url(&start).map_err(failure)?;
+            let loaded = view.load_url(&start);
+            #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+            eprintln!(
+                "fixture GTK view: t={}ms label={label} event=initial-load-requested accepted={} target={start}",
+                fixture_clock(),
+                loaded.is_ok()
+            );
+            loaded.map_err(failure)?;
         }
         #[cfg(target_os = "linux")]
         let response = {
