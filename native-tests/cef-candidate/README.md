@@ -1933,6 +1933,150 @@ network and utility processes (only renderers are checked); the job,
 desktop and restricting-SID restrictions individually (integrity level and
 command line only); AppContainer or LPAC renderers.
 
+## macOS browser process (M1)
+
+Status: implemented on 2026-11-07; the macOS evidence is the CI run of this
+change (`cef-macos`). This Linux host cannot build or link for macOS: the
+browser, the helper and the App were type-checked and linted for
+`aarch64-apple-darwin` here (`cargo clippy` with `cef/dox`, which skips
+cef-dll-sys's build script; no Apple SDK is needed for that), nothing was
+linked or run. The first macOS step mirrors W1: the per-profile browser
+builds and runs on macOS on its own, started by the smoke harness.
+
+**How CEF 154 runs on macOS** (CEF's GeneralUsage "macOS", and what the
+locked cef 154.5.0 and cef-dll-sys crates provide):
+
+- **Bundle.** The browser is an app bundle: `Contents/MacOS/<name>` (the
+  browser process), `Contents/Frameworks/Chromium Embedded Framework.framework`
+  (CEF itself, with its resources, locales and `Libraries/`), and the helper
+  apps in `Contents/Frameworks`. cef-dll-sys downloads the macOS distribution
+  (`cef_binary_<version>_macosarm64_minimal`) into `CEF_PATH/<version>/cef_macos_aarch64`
+  (its Release directory, holding the framework, plus `include`, `libcef_dll`
+  and `cmake`) and builds `libcef_dll_wrapper`; on macOS it links only AppKit
+  and the wrapper, not the framework, and copies nothing beside the
+  executable: assembling the bundle is the embedder's job.
+- **Helpers.** CEF starts every subprocess from a helper app named after the
+  browser executable: `<name> Helper.app` (utilities, such as the network
+  service), `<name> Helper (GPU).app`, `(Renderer)`, `(Plugin)` and
+  `(Alerts)`, each `Contents/MacOS/<name> Helper…`, an `LSUIElement` app
+  without a Dock icon. The browser executable itself never runs a
+  subprocess on macOS.
+- **Library loader.** The browser and each helper load the framework
+  themselves before any CEF call (`cef_load_library`, CefScopedLibraryLoader
+  in C++): the wrapper's macOS loader (`libcef_dll_dylib.cc`) resolves every
+  CEF function from the loaded framework. cef-rs's
+  `cef::library_loader::LibraryLoader` does it from `../Frameworks` (the
+  browser) or `../../..` (a helper, from inside its own app).
+- **NSApplication.** The browser process's shared `NSApplication` must
+  implement CEF's `CefAppProtocol` (`isHandlingSendEvent` /
+  `setHandlingSendEvent:`) and exist before CefInitialize; cef-rs provides
+  the protocols (`cef::application_mac`), its cefsimple example the
+  subclass.
+- **Info.plist.** `CFBundleExecutable`, `CFBundleIdentifier`,
+  `CFBundlePackageType` `APPL`, the version keys, `LSMinimumSystemVersion`,
+  `LSEnvironment` with `MallocNanoZone` `0` (as CEF asks),
+  `NSHighResolutionCapable`, `NSSupportsAutomaticGraphicsSwitching`, the
+  usage descriptions macOS requires before a page may ask for the camera,
+  microphone, Bluetooth or a passkey, and `LSUIElement` for the helpers.
+- **Sandbox.** The helpers run in the macOS seatbelt sandbox, which each
+  helper enters itself before it loads the framework: CEF 154 ships it as
+  `Libraries/libcef_sandbox.dylib` inside the framework
+  (`cef_sandbox_initialize`, CefScopedSandboxContext in C++; a process type
+  that is not sandboxed returns at once); cef-rs's `cef::sandbox::Sandbox`
+  loads it from the helper's place in the bundle. The browser process is
+  not sandboxed.
+- **cef-rs's tooling.** `cef::build_util::mac` and its `bundle-cef-app`
+  binary build such a bundle through `cargo build`; they need cef's
+  `build-util` feature (with cargo_metadata, plist, clap), which this crate
+  does not enable (`default-features = false`). Nothing blocked the route
+  without forking the crates.
+
+**Route.** The same browser source (`process_main.rs`) builds for macOS, and
+the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
+
+- `browser_main.rs` on macOS loads the framework from the bundle (exit 2,
+  with the reason, when the executable is not in one), installs
+  `TakosumiCefApplication` (`mac_front.rs`: the `NSApplication` subclass with
+  CEF's protocols, the regular activation policy) and runs the browser. A
+  quit from the system (`terminate:`) is only reported: the App owns the
+  browser's lifetime.
+- `helper_main.rs` (new executable `takosumi-cef-browser-helper`): enters the
+  seatbelt sandbox, loads the framework and runs the process type CEF asked
+  for, as CEF's own helper and cef-rs's cefsimple helper do. No application
+  code runs in a helper. On every other OS it refuses to run (exit 2).
+- `process_main.rs` on macOS: the cache path CEF reports and the profile
+  directory compare exactly (as on Windows; the parent passes the final
+  path, `/private/var/…` rather than the `/var` link); the window id in
+  `opened` is the `windowNumber` of the NSWindow holding CEF's view;
+  reopening a live screen raises that window (`mac_front::raise`: restore
+  when minimized, `activate` on macOS 14 and later or
+  `activateIgnoringOtherApps:`, `makeKeyAndOrderFront:`,
+  `orderFrontRegardless`); CEF's own sandbox setting is on unless the
+  parent passes `--no-sandbox`. Linux and Windows are unchanged.
+- `scripts/bundle-macos-cef.mjs --cef <cef_macos_aarch64> --bin <target>/debug --out <dir> [--fixture]`
+  writes `<dir>/takosumi-cef-browser-process.app` (the layout above; each
+  helper app holds a copy of the helper executable under its own name; the
+  framework is copied with its symbolic links as links, refusing a link that
+  is absolute or leaves the framework) and `<dir>/bundle.json` (each file's
+  size, mode and SHA-256, each link's target, the architecture, the CEF
+  distribution record). The browser, the helper and the framework's library
+  must be 64-bit Mach-O files of one architecture (the framework may be
+  universal), the framework's sandbox library must be there, and a browser
+  with the fixture inspection seam is refused unless `--fixture`. Nothing is
+  signed: the Rust linker's ad-hoc signatures only (Apple silicon requires
+  one), the framework as CEF distributes it.
+
+```bash
+cd native-tests/cef-candidate
+CEF_PATH=/absolute/owned/cef cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper
+cd ../..
+node scripts/bundle-macos-cef.mjs --cef /absolute/owned/cef/154.0.34/cef_macos_aarch64 --bin "$CARGO_TARGET_DIR/debug" --out /absolute/owned/m1
+python3 -B native-tests/cef-candidate/windows_smoke.py --browser /absolute/owned/m1/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process --work /absolute/owned/cases --expect-sandbox
+```
+
+**Smoke** (`windows_smoke.py`, now also macOS). It runs the executable inside
+the bundle directly, with the App's switches and `--use-mock-keychain` (so
+Chromium never asks the login keychain, whose prompt would block an
+unattended run; the App's adapter on macOS still has to decide how cookies
+are encrypted), `TMPDIR` in its case, in its own session and process group.
+It requires the boot `opened` reply (cache path, native pid), `closed` and
+`stopped` after the shutdown, exit code 0, and no process left: none in the
+process group and none of the browser's descendants, recorded by parent pid
+from `ps` before the shutdown, still alive within 10 s (macOS has no Job
+Objects, and a descendant that outlives the browser is reparented to
+launchd, so the tree alone would lose it). With `--expect-sandbox` it
+requires at least one renderer (`--type=renderer`) among the descendants,
+each in the seatbelt sandbox (`sandbox_check(pid, NULL, 0)` from libSystem
+answers 1) and without `--no-sandbox`, and no `--no-sandbox` for the
+browser; the summary records it as `sandbox`. `--expect-load` (a
+`fixture-inspection` build) requires the main-frame load marker; `--reuse`
+requires the same browser and window id back and no raise refusal on the
+browser's standard error. Whether the reused window became the active one
+is not checked on macOS: activation there is cooperative (macOS 14 and
+later may decline it), so the raise is not verified beyond the calls.
+
+**CI** (`cef-macos`, `macos-latest` arm64, 75 min). It reads the locked
+cef-dll-sys version, restores the CEF distribution and compiler caches
+(keys of their own), installs Ninja when the image lacks it, builds
+`takosumi-cef-browser-process` and `takosumi-cef-browser-helper`
+(`--locked`, `CEF_PATH=$RUNNER_TEMP/cef`), lists the distribution's
+framework in the log, bundles them (`m1-product`), runs the smoke with
+`--expect-sandbox`, then builds the `fixture-inspection` browser, bundles it
+with `--fixture` (`m1-fixture`) and runs the smoke with
+`--expect-load --reuse --expect-sandbox`. The artifact `cef-macos-smoke`
+keeps the summaries, their top-level logs and both `bundle.json`; no
+binary. ci.yml now has seven jobs (nine runs with the `desktop` matrix).
+
+**Remains after M1:** the guard on macOS (M2: no pidfds or Job Objects; a
+process group with kqueue's process events and a descendant check), the
+App's adapter and the actual App fixture on macOS, packaging (the browser
+bundle inside the App's `.app`, a `.dmg`), Developer ID signing of every
+Mach-O file (the framework, its libraries, the helpers; hardened runtime and
+the entitlements Chromium's helpers need, such as JIT for the renderer) and
+notarization (release inputs), the login keychain decision, Intel Macs
+(`x86_64-apple-darwin`; the bundler accepts it, CI does not run it), older
+macOS versions and real devices.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,

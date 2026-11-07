@@ -83,6 +83,9 @@ NSIS installers that bundle the browser, the guard and the CEF runtime under
 [Windows actual App (W3)](native-tests/cef-candidate/README.md#windows-actual-app-w3),
 [Windows packaging (W6)](native-tests/cef-candidate/README.md#windows-packaging-w6)
 and [Windows sandbox (W7)](native-tests/cef-candidate/README.md#windows-sandbox-w7).
+On macOS the per-profile browser builds as an app bundle with its helper apps
+and runs on its own in CI; see
+[macOS browser process (M1)](native-tests/cef-candidate/README.md#macos-browser-process-m1).
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
