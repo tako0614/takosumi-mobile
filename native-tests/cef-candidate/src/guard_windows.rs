@@ -336,7 +336,14 @@ impl Run {
     ) {
         let mut named = Vec::new();
         for ((pid, handle), who) in held.into_iter().zip(&identities) {
-            let ended = handle.and_then(|handle| exit_code(&handle));
+            // The diagnostic's exit code is read without waiting for the
+            // handle (identity::exit_status): the job can report a process
+            // gone just before its handle is signaled, when `exit_code`
+            // still reads it as running. The count is unchanged.
+            let (ended, status) = match handle {
+                Ok(handle) => (exit_code(&handle), identity::exit_status(&handle)),
+                Err(error) => (Err(error), None),
+            };
             match ended {
                 Ok(Some(FORCED_EXIT)) => {
                     self.forced += 1;
@@ -344,7 +351,7 @@ impl Run {
                 }
                 Ok(None) => {
                     self.forced += 1;
-                    named.push(identity::entry(pid, who, None));
+                    named.push(identity::entry(pid, who, status));
                 }
                 Ok(Some(_)) => {}
                 Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => {}

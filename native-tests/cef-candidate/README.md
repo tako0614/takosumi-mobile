@@ -767,7 +767,13 @@ later). After the count it writes one line to its standard error, the
 profile's `browser.log`:
 `takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M}`,
 for the processes it counted as forced, with each one's exit code after the
-termination (`0xE0007462`, or `running`). `type` is `none` for a process
+termination (`0xE0007462`, or `running`). The exit code is read with
+`GetExitCodeProcess` where the count is taken, after the drain's existing
+settle and without waiting for the handle: the job can report a process gone
+just before its handle is signaled (self-test run 42342260817 read both as
+`running` that way), while its exit code is already set. The browser's
+console host (`conhost.exe`) is in the job too and is listed whenever it was
+still there. `type` is `none` for a process
 without one (the browser process itself, the console host) and `unknown`,
 with the error's name, if the read failed; a value outside
 `[A-Za-z0-9._-]{1,64}` reads `invalid`. The full command line never leaves
