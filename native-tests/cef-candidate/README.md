@@ -1312,6 +1312,21 @@ was entered. Then, on the real pages:
 | `<site>/no-process-left` | the launch's job ended empty without force |
 | `<site>/no-opener-request` | nothing was handed to the App's opener |
 
+On a real site the page or the browser may cancel the test's beforeunload
+dialog before the observer does: in run 42334571636 Photopea's dialog
+(with a browser-side handler) closed as cancelled (result false, no input)
+0.3 s after it opened, in the same second as 23 ad iframes attached and 22
+detached, and the observer's own cancel was then told that no dialog was
+showing; no guard ended and the quit stopped. The
+mechanism is unknown. On real sites that counts as the cancel for the quit
+outcome only if the page's own `javascriptDialogClosed` for that dialog has
+result false and the profile's guard has not ended; an accept, another
+dialog first or an ended guard fails. Each quit case records
+`dialogClosedBy` (`observer` or `browser`), and every later check (the quit
+stopped, both documents kept, the blocked and cancelled markers, the
+partial order, Work closed first) is unchanged. The W3 local-fixture run
+still requires the observer's own cancel.
+
 The W3 invariants hold: the attested owner of each DevTools port, unchanged
 source and executable hashes, no opener request. After the final quit
 request the observer accepts only a beforeunload that the real site raises on

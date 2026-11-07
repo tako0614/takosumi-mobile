@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -135,7 +136,8 @@ class FakeSocket:
 
 
 class ReplyingSocket(FakeSocket):
-    """FakeSocket that answers each command from `replies` (method: reply)."""
+    """FakeSocket that answers each command from `replies` (method: the
+    reply, or a list of the reply and the events that follow it)."""
 
     def __init__(self, messages, replies):
         super().__init__(messages)
@@ -144,7 +146,10 @@ class ReplyingSocket(FakeSocket):
     def send_text(self, text):
         super().send_text(text)
         request = self.sent[-1]
-        self.messages.append(dict(self.replies[request["method"]], id=request["id"]))
+        reply = self.replies[request["method"]]
+        reply, *after = reply if isinstance(reply, list) else [reply]
+        self.messages.append(dict(reply, id=request["id"]))
+        self.messages.extend(after)
 
 
 class CdpTests(unittest.TestCase):
@@ -293,7 +298,8 @@ class CdpTests(unittest.TestCase):
                                                                                        "userInput": ""}}
         personal, personal_mark = page("personal", "P", [opening, closed])
         work, work_mark = page("work", "W", [])
-        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="photopea")
+        # The local-fixture run: only the observer's own cancel counts.
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "")
         opened = personal.cdp.since(personal_mark)[0]
         with self.assertRaisesRegex(Failure, "No dialog is showing"):
             watch.cancel_dialog(personal, personal_mark, "cancel not observed", opened, [(work, work_mark)])
@@ -312,6 +318,71 @@ class CdpTests(unittest.TestCase):
         self.assertEqual([request["method"] for request in personal.cdp.websocket.sent],
                          ["Page.handleJavaScriptDialog", "Target.getTargets"])
         self.assertEqual(personal.cdp.websocket.sent[0]["params"], {"accept": False})
+
+    def cancel(self, real_site, events, reply, guard_ended=False):
+        """cancel_dialog on a page whose events since its mark are `events`
+        (the first one is the dialog's opening) and whose cancel gets `reply`."""
+        cdp = observer.Cdp(ReplyingSocket([], {"Page.handleJavaScriptDialog": reply,
+                                               "Target.getTargets": {"result": {"targetInfos": []}}}), "P")
+        mark = cdp.mark()
+        cdp.websocket.messages.extend(events)
+        cdp.drain(0.1)
+        process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": "P",
+                   "guardReceipt": str(HERE / "no-such-receipt.json")}
+        page = observer.Page(cdp, "S", process, {"targetId": "T"})
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site=real_site)
+        watch.guard_ended = lambda receipt: guard_ended
+        try:
+            return watch, watch.cancel_dialog(page, mark, "cancel", cdp.since(mark)[0]), cdp
+        finally:
+            self.sent = [request["method"] for request in cdp.websocket.sent]
+
+    OPENING = {"method": "Page.javascriptDialogOpening", "sessionId": "S",
+               "params": {"type": "beforeunload", "message": "", "url": "https://www.photopea.com/"}}
+    NO_DIALOG = {"error": {"code": -32602, "message": "No dialog is showing"}}
+
+    @staticmethod
+    def closed(result):
+        return {"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {"result": result,
+                                                                                     "userInput": ""}}
+
+    def test_a_cancel_closed_by_the_observer(self):
+        for site in (None, "photopea"):
+            watch, closed_by, _ = self.cancel(site, [self.OPENING], [{"result": {}}, self.closed(False)])
+            self.assertEqual(closed_by, "observer", site)
+            self.assertNotIn("dialogsClosedByBrowser", watch.proof)
+            self.assertEqual(self.sent, ["Page.handleJavaScriptDialog"])
+
+    def test_a_real_site_may_cancel_its_dialog_before_the_observer(self):
+        watch, closed_by, _ = self.cancel("photopea", [self.OPENING, self.closed(False)], self.NO_DIALOG)
+        self.assertEqual(closed_by, "browser")
+        [record] = watch.proof["dialogsClosedByBrowser"]
+        self.assertEqual(record["profile"], "P")
+        self.assertIn("No dialog is showing", record["error"])
+        self.assertGreaterEqual(record["closedAfterOpening"], 0)
+        self.assertNotIn("dialogFailures", watch.proof)
+        self.assertEqual(self.sent, ["Page.handleJavaScriptDialog"])
+        # The close may also arrive just after DevTools' answer.
+        watch, closed_by, _ = self.cancel("photopea", [self.OPENING], [self.NO_DIALOG, self.closed(False)])
+        self.assertEqual(closed_by, "browser")
+
+    def test_only_a_real_sites_own_cancel_of_a_running_profile_counts(self):
+        refused = (
+            # The local-fixture run requires the observer's cancel.
+            (None, [self.OPENING, self.closed(False)], False, "No dialog is showing"),
+            # Accepted, not cancelled.
+            ("photopea", [self.OPENING, self.closed(True)], False, "result True, not cancelled"),
+            # The profile left although its dialog was cancelled.
+            ("photopea", [self.OPENING, self.closed(False)], True, "guard ended"),
+            # Another dialog opened first.
+            ("photopea", [self.OPENING, self.OPENING, self.closed(False)], False, "Another dialog"),
+        )
+        for site, events, guard_ended, message in refused:
+            with self.assertRaisesRegex(Failure, message, msg=message):
+                self.cancel(site, events, self.NO_DIALOG, guard_ended)
+        with mock.patch.object(observer, "SETTLE_WAIT", 0.3):
+            with self.assertRaisesRegex(Failure, "close was not observed"):
+                self.cancel("photopea", [self.OPENING], self.NO_DIALOG)
 
     def test_marks_stay_absolute_when_old_events_are_dropped(self):
         cdp = observer.Cdp(FakeSocket([{"method": f"E{index}"} for index in range(4200)]), "w")
