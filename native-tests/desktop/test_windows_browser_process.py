@@ -710,9 +710,8 @@ class MacSmokeTests(unittest.TestCase):
         self.assertEqual(none["problems"], ["no renderer process was found"])
 
     def test_a_recorded_descendant_still_alive_is_a_leftover(self):
-        """Platform neutral: os.kill, os.killpg and alive are stand-ins, so no
-        real process is signalled (on Windows os.kill(pid, 0) would send
-        CTRL_C_EVENT)."""
+        """Platform neutral: `ps` and os.killpg are stand-ins, so no real
+        process is looked at or signalled."""
         import windows_smoke as smoke
 
         def no_group(pid, signal_number):
@@ -721,51 +720,39 @@ class MacSmokeTests(unittest.TestCase):
         session = smoke.Browser.__new__(smoke.Browser)
         session.job = None
         session.process = type("Process", (), {"pid": 500})()
-        session.descendants = [501, 502]
-        living = {502}
+        helper = "/b.app/Contents/Frameworks/b Helper (Renderer).app/Contents/MacOS/b Helper (Renderer) --type=renderer"
+        session.descendants = [(501, "/b.app/x --type=gpu-process"), (502, helper)]
+        rows = [(502, 1, helper)]  # an orphan: its parent is launchd now
         with mock.patch.object(smoke, "MACOS", True), mock.patch.object(smoke, "LEFTOVER_WAIT", 0), \
                 mock.patch.object(smoke.os, "killpg", no_group, create=True), \
-                mock.patch.object(smoke, "alive", lambda pid: pid in living):
+                mock.patch.object(smoke, "ps_rows", lambda: rows):
             self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": [502]}, False))
-            living.clear()
+            rows[:] = [(502, 1, "/usr/bin/reused --other")]  # the id now names another process
             self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": []}, True))
 
-    def test_alive_signals_only_on_posix_and_reads_the_answer(self):
+    def test_only_a_descendant_still_the_same_process_is_killed(self):
         import windows_smoke as smoke
-        sent = []
+        recorded = [(501, "/b x --type=gpu-process"), (502, "/b y --type=renderer"), (503, "/b z --type=utility")]
+        rows = [(501, 500, "/b x --type=gpu-process"), (502, 1, "/b y --type=renderer"),
+                (503, 77, "/usr/bin/somebody-else")]
+        self.assertEqual(smoke.surviving(recorded, rows), [501, 502])
+        self.assertEqual(smoke.surviving(recorded, []), [])
+        killed = []
 
-        def windows_error(code, message):
-            # As Windows raises it (OSError's winerror argument is only
-            # honoured there, so the attribute is set by hand).
-            error = OSError(22, message)
-            error.winerror = code
-            return error
+        def kill(pid, signal_number):
+            killed.append((pid, signal_number))
 
-        def kill(answer):
-            def send(pid, signal_number):
-                sent.append((pid, signal_number))
-                if answer is not None:
-                    raise answer
-            return send
-
-        with mock.patch.object(smoke, "POSIX", True):
-            with mock.patch.object(smoke.os, "kill", kill(None)):
-                self.assertTrue(smoke.alive(7))
-            with mock.patch.object(smoke.os, "kill", kill(ProcessLookupError(3, "No such process"))):
-                self.assertFalse(smoke.alive(8))
-            with mock.patch.object(smoke.os, "kill", kill(PermissionError(1, "Operation not permitted"))):
-                self.assertTrue(smoke.alive(9))
-            # As Windows answers an id it does not know: WinError 87.
-            with mock.patch.object(smoke.os, "kill", kill(windows_error(87, "The parameter is incorrect"))):
-                self.assertFalse(smoke.alive(10))
-            with mock.patch.object(smoke.os, "kill", kill(windows_error(5, "Access is denied"))):
-                with self.assertRaises(OSError):
-                    smoke.alive(11)
-        self.assertEqual(sent, [(7, 0), (8, 0), (9, 0), (10, 0), (11, 0)])
-        # Not POSIX: never signalled.
-        with mock.patch.object(smoke, "POSIX", False), mock.patch.object(smoke.os, "kill", kill(None)):
-            self.assertFalse(smoke.alive(12))
-        self.assertEqual(sent[-1], (11, 0))
+        session = smoke.Browser.__new__(smoke.Browser)
+        session.job = None
+        session.descendants = recorded
+        session.process = mock.Mock(pid=500)
+        with mock.patch.object(smoke.os, "killpg", lambda pid, number: None, create=True), \
+                mock.patch.object(smoke.os, "kill", kill), \
+                mock.patch.object(smoke.signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(smoke, "ps_rows", lambda: rows):
+            session.end_all()
+        self.assertEqual(killed, [(501, 9), (502, 9)])
+        session.process.wait.assert_called_once()
 
 
 def main_source():
@@ -1016,6 +1003,10 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(".app\n", upload)
         self.assertNotIn("target-cef", upload)
         self.assertNotIn("codesign", job)
+        # The window wait's decisions run, every test of them.
+        source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
+        self.assertIn('rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"\n', job)
+        self.assertIn(f"grep -q '^test result: ok\\. {source.count('#[test]')} passed; 0 failed'", job)
 
     def test_the_app_runs_take_a_staged_sandboxed_browser(self):
         """W7: the W3 job and the W4 real-site workflow stage the sandboxed

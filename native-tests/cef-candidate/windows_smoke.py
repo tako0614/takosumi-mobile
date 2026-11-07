@@ -19,7 +19,9 @@ its own session and process group (macOS has no Job Objects: before the
 shutdown it also records the browser's descendants by parent pid, and each
 must have ended afterwards, since an orphan is reparented to launchd). On
 macOS the browser also gets `--use-mock-keychain`, so Chromium never asks the
-login keychain (a prompt would block an unattended run). It then requires,
+login keychain (a prompt would block an unattended run), and
+`MallocNanoZone=0` in its environment, as CEF asks (the bundle's
+LSEnvironment applies only to a LaunchServices launch). It then requires,
 each within a bound:
 
 1. an `opened` reply for the boot request's key and profile, whose cache path
@@ -33,8 +35,9 @@ each within a bound:
 4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
    a `stopped` reply for N and process exit code 0;
 5. no process left: none still in the Job Object (Windows) or the process
-   group (Linux, macOS), and none of the recorded descendants alive (macOS),
-   within 10 s of the exit;
+   group (Linux, macOS), and none of the recorded descendants still there
+   as the same process (macOS: same id and command line in `ps`, so a reused
+   id is neither counted nor killed), within 10 s of the exit;
 6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
    shutdown: at least one renderer process in the job, each without
    `--no-sandbox` and with a token integrity level of Low or Untrusted,
@@ -81,7 +84,6 @@ MAX_PACKET_BYTES = 64 * 1024  # browser_process::MAX_PACKET_BYTES
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
 MACOS = sys.platform == "darwin"
-POSIX = os.name == "posix"
 LIBRARY = "libcef.dll" if WINDOWS else "libcef.so"
 # macOS (M1): what the app bundle's Contents/Frameworks must hold (its
 # `--runtime`): CEF's framework and the helper apps CEF starts its processes
@@ -476,25 +478,14 @@ def seatbelt_evidence(browser_pid, deadline, tree=posix_tree, sandboxed=seatbelt
     return evidence
 
 
-def alive(pid):
-    """POSIX (the macOS path): whether a process id still names a process
-    (also a zombie), by signal 0. Never asked on Windows, where
-    `os.kill(pid, 0)` would send CTRL_C_EVENT instead: there it answers
-    False without calling it. An id Windows rejects
-    (ERROR_INVALID_PARAMETER) also counts as gone."""
-    if not POSIX:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError as error:
-        if getattr(error, "winerror", None) == ERROR_INVALID_PARAMETER:
-            return False
-        raise
-    return True
+def surviving(recorded, rows):
+    """Of the recorded (pid, command line) descendants, the ids still
+    naming the same process in `rows` (`ps`): same id and same command line,
+    so an id the system reused for another process never counts, and is
+    never signalled. An orphan keeps its command line (its parent id becomes
+    launchd's); one that ended is gone or shows another command."""
+    commands = {pid: command for pid, _, command in rows}
+    return [pid for pid, command in recorded if commands.get(pid) == command]
 
 
 def browser_shutdown(text, pid=None):
@@ -842,8 +833,9 @@ class Browser:
                 self.process.wait()
                 self.job.close()
                 raise
-        # macOS: the browser's descendants recorded before the shutdown, each
-        # of which must have ended afterwards (an orphan leaves the tree).
+        # macOS: the browser's descendants recorded before the shutdown, as
+        # (pid, command line), each of which must have ended afterwards (an
+        # orphan leaves the tree, its command line stays).
         self.descendants = []
         self.lines = queue.Queue()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -916,9 +908,11 @@ class Browser:
                 self.unsolicited(event)
 
     def record_descendants(self):
-        """macOS: remember the browser's descendants now (by parent pid)."""
-        self.descendants = [pid for pid, _ in posix_tree(self.process.pid) if pid != self.process.pid]
-        return self.descendants
+        """macOS: remember the browser's descendants now (by parent pid),
+        with their command lines; returns their ids."""
+        self.descendants = [(pid, command) for pid, command in posix_tree(self.process.pid)
+                            if pid != self.process.pid]
+        return [pid for pid, _ in self.descendants]
 
     def leftovers(self):
         """Processes still owned after the browser exited, waiting up to
@@ -939,7 +933,7 @@ class Browser:
                     done = True
                 result = {"groupAlive": not done}
                 if MACOS:
-                    remaining = [pid for pid in self.descendants if alive(pid)]
+                    remaining = surviving(self.descendants, ps_rows())
                     result["descendantsAlive"] = remaining
                     done = done and not remaining
             if done or time.monotonic() >= deadline:
@@ -956,7 +950,9 @@ class Browser:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                for pid in self.descendants:
+                # Only the recorded descendants `ps` still shows as the same
+                # process (id and command line): a reused id is never killed.
+                for pid in surviving(self.descendants, ps_rows()) if self.descendants else []:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
@@ -1082,6 +1078,10 @@ def main():
         elif MACOS:
             require(len(str(case / "tmp") + SOCKET_SUFFIX) < SOCKET_LIMIT, "Case path too long for Chromium's socket")
             env["TMPDIR"] = str(case / "tmp")
+            # CEF asks for the nano allocator off; its Info.plist's
+            # LSEnvironment applies only to a LaunchServices launch, not to
+            # this direct one (nor to the App's adapter, M2).
+            env["MallocNanoZone"] = "0"
             # No --no-sandbox: the helpers enter the seatbelt sandbox
             # themselves. The mock keychain keeps Chromium off the login
             # keychain, whose prompt would block an unattended run.
