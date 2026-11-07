@@ -745,13 +745,20 @@ job's total and then its process list, and holds each listed process open;
 afterwards it counts the listed processes that ended with that exit code
 (or still run), plus every process that entered the job after the total was
 read (counted as forced, so none is missed; one entering between the two
-reads may count twice). The exit code is `GetExitCodeProcess`'s, read from
-the held handle after the drain's settle: Windows sets it before the job
-drops the process and signals the handle a little later, so the zero wait on
-the handle the count used before read a process that had just ended by
-itself as still running and counted it as forced (`STILL_ACTIVE` counts as an
-exit code only once the handle is signaled). A listed process with any other
-exit code, or that was already gone when opened
+reads may count twice). Since W5 each listed process is classified by one
+pure rule (`classify`, a self-test checks its truth table) from the held
+handle after the drain's settle: whether the handle is signaled, read first,
+then the `GetExitCodeProcess` code. `FORCED_EXIT` is forced; `STILL_ACTIVE`
+with the handle unsignaled (still running) is forced; any other code ended by
+itself (Windows sets the code before the job drops the process and signals
+the handle a little later, so the zero wait on the handle the count used
+before read a process that had just ended by itself as still running and
+counted it as forced); a failed read is unknown. A `STILL_ACTIVE`,
+unsignaled process when the settle found the job empty is given up to 50 ms
+to be signaled, never past the end of the drain's existing 2 s forced budget
+(so the drain's outer bound is unchanged); with a job not found empty it
+counts as forced, a rare over-count on the safe side. A listed process with
+any other exit code, or that was already gone when opened
 ended by itself and is not counted (an id reused by an unrelated process
 between the list and the open can only add a count, never hide one). Any other failure to attribute an end
 is recorded in `cleanupErrors` as `ForcedCleanupUnknown`, which makes the
@@ -775,34 +782,40 @@ only the `--type=` and `--utility-sub-type=` values, from
 `PROCESS_QUERY_LIMITED_INFORMATION` handle it already holds (Windows 8.1 and
 later). After the count it writes one line to its standard error, the
 profile's `browser.log`:
-`takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M,"endedByThemselves":K}`,
-for the processes it counted as forced, with each one's exit code after the
-termination (`0xE0007462`, or `running`), read as the count reads it (see
-above), and how many listed processes ended by themselves at the boundary.
+`takosumi-browser-guard: forced-cleanup {"guardPid":G,"forced":N,"processes":[{"pid","image","type","utilitySubType"?,"exit"}],"enteredAfterList":M,"endedByThemselves":K,"identifyMs":T}`,
+naming the processes it counted as forced, with each one's exit code after
+the termination (`0xE0007462`, or `running`) as the count classified it (see
+above), how many listed processes ended by themselves at the boundary, and
+how long the identification took. It is written whenever the drain reaches
+the termination, also when nothing was forced; `guardPid` names the guard,
+since `browser.log` is the profile's and later launches append to it. The
+identification runs between the list and the termination, so the effective
+natural window is 0.5 s plus `identifyMs`.
 `type` is `none` for a process
 without one (the browser process itself) and `unknown`,
 with the error's name, if the read failed; a value outside
 `[A-Za-z0-9._-]{1,64}` reads `invalid`. The full command line never leaves
 the reading function (`guard_windows_identity.rs`; the parser,
 `process_type.rs`, is unit-tested with quotes, spaces and backslashes). The
-receipt keeps the Linux guard's fields, and the budgets, the count and the
-exit status are unchanged; the reads add a few milliseconds between the
-listing and the termination. `windows_browser_process.py` collects these
-lines from every profile's `browser.log` into each launch's evidence
-(`execution.json`, `browserGuards`, with the receipt) and prints them with
-the receipts when a launch fails. The Linux guard does not emit the line.
+receipt keeps the Linux guard's fields, and the budgets and the exit status
+are unchanged; the count changed with the classification above (6302b33).
+`windows_browser_process.py` collects the lines of each launch's own guards
+(by `guardPid`) from every profile's `browser.log` into the launch's
+evidence (`execution.json`, `guardRecords`: each guard's receipt and its
+`forcedCleanupLines`) and prints them when a launch fails. The Linux guard
+does not emit the line.
 
-**Open: forced cleanup after a normal browser exit (cause unknown).** The
-real-site run of 483dbe4 (run 42339893587, Photopea, the merged W4 head)
+**Forced cleanup after a normal browser exit (closed by the finding
+below).** The real-site run of 483dbe4 (run 42339893587, Photopea, the merged
+W4 head)
 failed at `quit-partial-order`: Work's browser exited 0 and its guard's
 receipt was complete with `observed` 57 but `forcedCleanup` 12, so the App,
 as designed, kept the profile ("Browser close remains incomplete: Browser
 descendants did not close normally; profile retained") and stopped the
 sequential quit before asking Personal. Run 4ed2519 passed the same flow, so
-it is intermittent. Which processes were forced, and why they outlived the
-0.5 s after the browser's exit, is unknown; the diagnostic above is there to
-tell renderers from profile-writing helpers. The drain's budgets and the
-App's refusal of any forced cleanup are unchanged.
+it is intermittent. At the time it was open which processes were forced;
+the diagnostic above was added to tell renderers from profile-writing
+helpers, and the next run answered it.
 
 **Finding: the forced counts were inflated (run 42343580278, 8044abe).**
 With the diagnostic, the next real-site run failed Photopea the same way,
@@ -813,8 +826,9 @@ of the 57 had ended by themselves with code 0; they were counted only
 because the count read the exit with a zero wait on the handle, which can
 still read a process as running just after the job has dropped it (the
 self-test of 8044abe showed the same race for the diagnostic's own read).
-The only real kill was the browser's console host. The earlier counts
-(483dbe4: 12 of 57) were therefore inflated the same way. Two repairs:
+The only real kill was the browser's console host. The earlier count
+(483dbe4: 12 of 57) was likely inflated by the same mechanism (unconfirmed:
+that run had no diagnostic). Two repairs:
 the count now reads `GetExitCodeProcess` (above), the same read the
 diagnostic shows, so the two cannot disagree; and the browser has no console
 host to end any more (`takosumi-cef-browser-process` is a Windows
@@ -907,18 +921,21 @@ no receipt. The spawner thread drops the job when every requester is gone
 **CI.** The `cef-windows` job builds the product browser and the guard
 together, keeps the W1 manifest check and both smoke runs, and adds two steps.
 `Guard self-tests (Windows)` runs `cargo test --bin takosumi-browser-guard`
-(twelve cases in `src/guard_windows_tests.rs`; the self-test binary is its
+(thirteen cases in `src/guard_windows_tests.rs`; the self-test binary is its
 own stand-in browser, and each case starts the guard detached inside a fresh
 kill-on-close job as the App does): a normal end, a non-zero exit, the pipes
 reaching the browser without the stop event, a lingering descendant
 terminated with the job, a job that empties just as the natural budget ends,
 a descendant that ends by itself after the process list was read but before
-the termination (not counted as forced; self-test-only injections,
+the termination (not counted as forced, and named among those that ended by
+themselves in the diagnostic line; self-test-only injections,
 `TAKOSUMI_GUARD_FAULT_LATE_EMPTY` and `TAKOSUMI_GUARD_FAULT_TERMINATE_LATE`,
 produce these two orders, which timing alone cannot produce on demand), a
 stop request, the App's job ending guard and browser, a pending stop, the
-refusals, a browser that cannot start and the forced-cleanup diagnostic's
-process type parser (the lingering case also checks the diagnostic line).
+refusals, a browser that cannot start, the forced-cleanup diagnostic's
+process type parser, and the forced count's classification truth table (the
+lingering case also checks that the diagnostic line names the descendant
+killed by the termination).
 Cases that require the App's job
 to be empty afterwards wait at most 3 s for processes whose exit is already
 under way (the stand-ins that must be ended sleep 60 s) and name every

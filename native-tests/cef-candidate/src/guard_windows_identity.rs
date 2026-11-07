@@ -7,14 +7,18 @@
 //! command line is gone with its address space. After the count it writes
 //! one line to its standard error, the browser's log (`browser.log`):
 //!
-//! `takosumi-browser-guard: forced-cleanup {"forced":N,"processes":[{"pid",
-//! "image","type","utilitySubType"?,"exit"}...],"enteredAfterList":M,
-//! "endedByThemselves":K}`
+//! `takosumi-browser-guard: forced-cleanup {"guardPid":G,"forced":N,
+//! "processes":[{"pid","image","type","utilitySubType"?,"exit"}...],
+//! "enteredAfterList":M,"endedByThemselves":K,"identifyMs":T}`
 //!
 //! for the processes it counted as forced, with each one's exit code after
-//! the termination (`0xE0007462`, or `running`) as the count read it
-//! (`final_exit`), and how many listed processes ended by themselves (any
-//! other exit code) at the boundary. A failed read is
+//! the termination (`0xE0007462`, or `running`) as the count classified it
+//! (`classify`), how many listed processes ended by themselves (any other
+//! exit code), and how long the identification took (`identifyMs`, which
+//! lengthens the natural window). It is written whenever the drain reaches
+//! the termination, so with no forced process too; `guardPid` names this
+//! guard, since the log is the profile's and later launches append to it.
+//! A failed read is
 //! `"type":"unknown"` (or `"image":"unknown"`) with the error's name. The
 //! receipt is unchanged, so it keeps the Linux guard's contract.
 
@@ -203,14 +207,17 @@ pub(super) fn report(
     processes: Vec<serde_json::Value>,
     entered_after_list: u32,
     ended_by_themselves: u32,
+    identify_ms: u128,
 ) {
     let line = format!(
         "{FORCED_DIAGNOSTIC}{}\n",
         serde_json::json!({
+            "guardPid": std::process::id(),
             "forced": forced,
             "processes": processes,
             "enteredAfterList": entered_after_list,
             "endedByThemselves": ended_by_themselves,
+            "identifyMs": identify_ms as u64,
         })
     );
     let _ = io::stderr().lock().write_all(line.as_bytes());
