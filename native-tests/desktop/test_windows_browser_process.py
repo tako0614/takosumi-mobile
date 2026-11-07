@@ -187,6 +187,44 @@ class CdpTests(unittest.TestCase):
         self.assertEqual(watch.proof["finalQuitDialogRefused"]["type"], "alert")
         self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
 
+    def test_photopea_is_entered_from_its_landing_and_excalidraw_directly(self):
+        class FakePage:
+            def __init__(self, site, profile):
+                self.site, self.entered, self.clicks = observer.REAL_SITES[site], False, []
+                self.process = {"profile": profile, "opened": {"windowId": 1, "nativePid": 2}}
+                self.native, self.target = self.process["opened"], {"targetId": profile}
+
+            def evaluate(self, expression, gesture=False):
+                site = self.site
+                if "a[data-app=editor]')?.href" in expression:
+                    return site["url"]
+                if expression == site.get("enter"):
+                    self.clicks.append(gesture)
+                    self.entered = True
+                    return True
+                if expression.startswith("({origin:location.origin"):
+                    return {"origin": site["origin"], "secure": True, "tauri": "undefined", "ipc": "undefined",
+                            "wry": "undefined", "webview2": "undefined"}
+                if "landing" in site and expression.endswith(f"({site['ready']} || {site['landing']})"):
+                    return True  # the landing is up
+                if expression == site.get("landing"):
+                    return not self.entered
+                if expression.endswith(site["ready"]):
+                    return self.entered or "landing" not in site
+                return True  # the app link's click
+
+            def pages(self):
+                return [self.target["targetId"]]
+
+        for site, entry, clicks in (("photopea", "landing", [True]), ("excalidraw", "direct", [])):
+            watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site=site)
+            pages = [FakePage(site, "W"), FakePage(site, "P")]
+            watch.open_real_site(pages)
+            for page in pages:
+                self.assertEqual(page.clicks, clicks, site)
+                self.assertEqual(page.site_context["entry"], entry, site)
+                self.assertEqual(page.site_context["origin"], observer.REAL_SITES[site]["origin"])
+
     def test_marks_stay_absolute_when_old_events_are_dropped(self):
         cdp = observer.Cdp(FakeSocket([{"method": f"E{index}"} for index in range(4200)]), "w")
         cdp.drain(5)
