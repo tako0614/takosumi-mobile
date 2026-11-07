@@ -50,6 +50,22 @@ LOAD_WAIT = 25
 # (the Linux observer allows 10 s; process teardown is slower here).
 END_WAIT = 20
 RAISE_REFUSED = "Reused browser window was not raised:"
+# W4: real third-party sites behind the fixture home's app link, with the
+# readiness the Linux probes use (browser-process.mjs `contentOf`): the
+# Excalidraw editor's root, or Photopea's landing or editor. Anonymous only:
+# nothing signs in, no credential is typed.
+REAL_SITES = {
+    "excalidraw": {"url": "https://excalidraw.com/", "origin": "https://excalidraw.com",
+                   "ready": "Boolean(document.querySelector('.excalidraw'))"},
+    "photopea": {"url": "https://www.photopea.com/", "origin": "https://www.photopea.com",
+                 "ready": "(document.body?.innerText.includes('Start using Photopea')"
+                          " || document.body?.innerText.includes('Open From Computer'))"},
+}
+# A real site's first load and its readiness (both profiles load at once).
+REAL_SITE_WAIT = 60
+# After the final quit request, a remaining real-site page may still ask its
+# own beforeunload; accept it within this bound so the quit can finish.
+FINAL_QUIT_WAIT = 45
 GA_ROOT = 2
 # ShowWindow: minimized without activating another window (the home stays in
 # front for the reopen).
@@ -510,8 +526,12 @@ class Page:
 # --- Observation ---------------------------------------------------------------
 
 class Observer:
-    def __init__(self, data, site, app_pid, phase, win32=None):
+    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
+        # W4: the app link leads to this real site (None: the fixture's /app/).
+        self.real = REAL_SITES[real_site] if real_site else None
+        self.real_name = real_site
+        self.app_origin = self.real["origin"] if self.real else site
         self.suffix = f"-{phase}" if phase else ""
         self.nonce = data.name
         self.key = f"sumi_app_process_{self.nonce}"
@@ -520,6 +540,9 @@ class Observer:
         self.proof = {"passed": False, "cases": [],
                       "scope": "Disposable Windows actual App/browser process fixture; local fixture site, "
                                "no real login or Push"}
+        if self.real:
+            self.proof["scope"] = (f"Disposable Windows actual App/browser process fixture; local fixture home, "
+                                   f"anonymous {real_site} app, synthetic markers only, no real login")
 
     # Helpers shared with browser-process.mjs's shape.
     def step(self, name, page=None):
@@ -673,8 +696,9 @@ class Observer:
         self.visibility(page, "attach")
         return page
 
-    def sign_in(self, page, user):
-        """The sign-in stand-in, then the app home's app, in this profile."""
+    def sign_in(self, page, user, open_app=True):
+        """The sign-in stand-in, then (with `open_app`) the app home's app, in
+        this profile."""
         self.step(f"{user} sign-in stand-in", page)
         require(page.evaluate("document.querySelector('main')?.dataset.page") == "login",
                 f"A new {user} profile must start signed out")
@@ -685,6 +709,8 @@ class Observer:
             "document.readyState==='complete' && document.querySelector('main')?.dataset.page==='home' "
             f"&& document.querySelector('main')?.dataset.user==={signed}"),
             f"The {user} sign-in did not reach its app home", LOAD_WAIT, tolerate=True)
+        if not open_app:
+            return
         self.step(f"{user} opens the app", page)
         page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
         self.settled(lambda: page.evaluate(
@@ -693,6 +719,70 @@ class Observer:
             f"&& document.querySelector('main')?.dataset.user==={signed}"),
             f"The {user} app did not open", LOAD_WAIT, tolerate=True)
         require(page.pages() == [page.target["targetId"]], f"The {user} app must stay in its one window")
+
+    def open_real_site(self, pages):
+        """W4: from each signed-in app home, follow the app link to the real
+        site in the same window (both start before either is awaited), then
+        require the site's readiness, its origin in a secure context without
+        an App bridge, and still one page per profile."""
+        for page in pages:
+            self.step(f"{page.process['profile']} opens {self.real_name}", page)
+            href = page.evaluate("document.querySelector('a[data-app=editor]')?.href ?? null")
+            require(href == self.real["url"], f"The app home must link to {self.real['url']}, not {href}")
+            page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
+        for page in pages:
+            self.step(f"{self.real_name} ready", page)
+            try:
+                self.settled(lambda: page.evaluate(
+                    f"location.origin==={json.dumps(self.app_origin)} && document.readyState==='complete' "
+                    f"&& {self.real['ready']}"), f"{self.real_name} did not become ready", REAL_SITE_WAIT,
+                    tolerate=True)
+            except Failure:
+                try:
+                    self.proof["siteDocument"] = page.evaluate(
+                        "({url:location.href,ready:document.readyState,title:document.title,"
+                        "body:document.body?.innerText.slice(0,500)})")
+                except Failure as error:
+                    self.proof["siteDocument"] = {"error": str(error)}
+                raise
+            context = page.evaluate(
+                "({origin:location.origin,secure:isSecureContext,tauri:typeof __TAURI_INTERNALS__,"
+                "ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc,"
+                "webview2:typeof window.chrome?.webview})")
+            require(context["origin"] == self.app_origin and context["secure"] is True,
+                    f"{self.real_name} must load in a secure context: {context}")
+            for field in ("tauri", "ipc", "wry", "webview2"):
+                require(context[field] == "undefined", f"{self.real_name} must not see the App's {field} bridge")
+            require(page.pages() == [page.target["targetId"]], f"{self.real_name} must stay in its one window")
+            page.site_context = context
+
+    def finish_final_quit(self, pages):
+        """W4: after the final quit request, a real site may ask its own
+        beforeunload (the quit then waits for an answer). Accept any such
+        dialog (recorded) until every remaining profile's guard has ended."""
+        accepted, marks = [], {id(page): page.cdp.mark() for page in pages}
+        deadline = time.monotonic() + FINAL_QUIT_WAIT
+        remaining = list(pages)
+        while remaining:
+            require(time.monotonic() < deadline, "The final quit did not end every remaining profile")
+            for page in list(remaining):
+                if self.guard_ended(page.process["guardReceipt"]):
+                    remaining.remove(page)
+                    continue
+                try:
+                    page.cdp.drain(0.2)
+                except Failure:
+                    continue  # its connection closed: the browser is ending
+                for event in page.cdp.since(marks[id(page)]):
+                    if event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session:
+                        try:
+                            page.send("Page.handleJavaScriptDialog", {"accept": True})
+                        except Failure:
+                            continue  # already closed, or the browser is ending
+                        accepted.append({"profile": page.process["profile"], "type": event["params"].get("type")})
+                marks[id(page)] = page.cdp.mark()
+            time.sleep(0.1)
+        self.proof["finalQuitDialogsAccepted"] = accepted
 
     def visibility(self, page, when):
         """The page's own visibility and focus and Windows' view of its
@@ -736,7 +826,9 @@ class Observer:
         pages = [self.attach(self.process_of(opened, name)) for name in ("Work", "Personal")]
         work, personal = pages
         for page, user in ((work, "work"), (personal, "personal")):
-            self.sign_in(page, user)
+            self.sign_in(page, user, open_app=self.real is None)
+        if self.real:
+            self.open_real_site(pages)
         self.step("separate initial state")
         key = json.dumps(self.key)
         for index, page in enumerate(pages):
@@ -750,8 +842,14 @@ class Observer:
         require(expected[0]["storage"] != expected[1]["storage"], "Each profile must keep its own storage")
         require([item["cookie"] for item in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"],
                 "Each profile must see only its own cookie")
-        require([item["user"] for item in expected] == ["work", "personal"],
-                "Each profile must keep its own signed-in session")
+        if self.real:
+            # The sign-in was checked on the fixture home; the real site is
+            # anonymous, so only its origin is the same in both.
+            require([item["origin"] for item in expected] == [self.app_origin] * 2,
+                    f"Both profiles must be on {self.app_origin}")
+        else:
+            require([item["user"] for item in expected] == ["work", "personal"],
+                    "Each profile must keep its own signed-in session")
         require(work.native["nativePid"] != personal.native["nativePid"] and work.window != personal.window,
                 "Each connection must have its own browser process and window")
         self.case("separate-profiles", {"bindings": [{"native": page.native, "context": page.context}
@@ -892,8 +990,8 @@ class Observer:
         self.step("Work beforeunload on sequential quit", work)
         dialog = self.dialog(work, unload, "beforeunload", "The beforeunload dialog did not open")
         self.proof["dialog"] = {"type": dialog["params"]["type"], "url": dialog["params"].get("url")}
-        require(urlsplit(dialog["params"]["url"])._replace(path="", query="", fragment="").geturl() == self.site,
-                "The dialog must belong to the fixture site")
+        require(urlsplit(dialog["params"]["url"])._replace(path="", query="", fragment="").geturl()
+                == self.app_origin, f"The dialog must belong to {self.app_origin}")
         personal.cdp.drain()
         require(not any(event["method"].startswith("Page.javascriptDialog")
                         for event in personal.cdp.since(personal_mark)),
@@ -937,6 +1035,8 @@ class Observer:
         self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"]})
         self.step("Personal final exit", personal)
         self.checkpoint("request-final-exit")
+        if self.real:
+            self.finish_final_quit([personal])
         self.proof["passed"] = True
 
     def relaunch(self, kind):
@@ -1008,12 +1108,15 @@ def main():
     parser.add_argument("--site", required=True, help="the fixture site origin")
     parser.add_argument("--app-pid", type=int, required=True)
     parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
+    parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
     args = parser.parse_args()
+    if args.real_site and args.phase:
+        parser.error("--real-site runs the first launch only")
     if os.name != "nt":
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
-    Observer(data, args.site, args.app_pid, args.phase, Win32()).run()
+    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site).run()
 
 
 if __name__ == "__main__":

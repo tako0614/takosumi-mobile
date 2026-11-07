@@ -219,6 +219,11 @@ class SiteTests(unittest.TestCase):
         self.assertIn('data-page="home" data-user="work"', self.request("GET", "/", cookie=session)[2])
         self.assertIn('data-page="app" data-user="work"', self.request("GET", "/app/", cookie=session)[2])
 
+    def test_the_app_home_links_to_the_real_site_of_a_w4_run(self):
+        self.server.app_url = runner.REAL_SITES["excalidraw"]["url"]
+        session = self.request("POST", "/session", "user=personal")[1]["Set-Cookie"].split(";", 1)[0]
+        self.assertIn('<a data-app="editor" href="https://excalidraw.com/">', self.request("GET", "/", cookie=session)[2])
+
     def test_only_the_synthetic_users_and_known_paths(self):
         self.assertEqual(self.request("POST", "/session", "user=admin")[0], 400)
         self.assertEqual(self.request("POST", "/other", "user=work")[0], 404)
@@ -254,6 +259,12 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNotNone(count, "The cef-windows-app job requires an exact case count")
         self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
         self.assertEqual(int(count.group(1)), len(cases))
+
+    def test_real_sites_are_anonymous_https_roots_with_a_readiness_signal(self):
+        for site, entry in observer.REAL_SITES.items():
+            self.assertTrue(entry["url"].startswith("https://") and entry["url"].endswith("/"), site)
+            self.assertEqual(entry["url"].rstrip("/"), entry["origin"])
+            self.assertTrue(entry["ready"])
 
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.
