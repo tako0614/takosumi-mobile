@@ -1589,9 +1589,12 @@ once (`windows_package.py smoke`): on a runner where it has no runtime root
 yet, with no `TAKOSUMI_` or `WEBVIEW2_` variable, inside a kill-on-close
 job, its window must appear, it must stay up for 8 s, must not report its
 browser unavailable and must have created its runtime root; `WM_CLOSE` must
-end it with exit code 0 and the job must empty. Each uninstall must remove
-the installation directory, its per-user uninstall key and its Start menu
-shortcut and leave no process running from it (run 42351529951 read the key
+end it with exit code 0 and the job must empty. Each uninstall first
+requires the per-user uninstall key and the Start menu shortcut of the
+productName its installer was built with (read from its Tauri config) to
+exist, so their absence afterwards is the uninstaller's doing; it must then
+remove the installation directory, that key and that shortcut and leave no
+process running from it (run 42351529951 read the key
 and shortcut right after the directory went, before the uninstaller had
 removed them; the check now waits for all three). What remains is reported, not removed: the App's data
 directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime

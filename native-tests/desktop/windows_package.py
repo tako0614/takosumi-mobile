@@ -22,9 +22,10 @@ guard and runtime root resolved without environment variables) and must have
 its runtime root `<app cache>\\cef`. WM_CLOSE to its window must end it with
 exit code 0, and the job must then empty.
 
-uninstall runs the installer's uninstaller silently, waits until the
-installation directory, its per-user uninstall key and its Start menu
-shortcut are gone and no process runs from it, and reports what remains of
+uninstall requires the installer's per-user uninstall key and Start menu
+shortcut for --product to exist, runs its uninstaller silently, waits until
+the installation directory, the key and the shortcut are gone and no
+process runs from it, and reports what remains of
 the App on the machine (its data directories), without removing any of it.
 
 Each command prints one JSON report line and writes it to --report; it never
@@ -97,6 +98,14 @@ def remains(roots, listed):
     root, the entries `listed(root)` names (the product's and the fixture's
     identifiers)."""
     return [str(Path(root) / name) for root in roots for name in sorted(listed(Path(root)))]
+
+
+def require_installed_entries(product, key, shortcut):
+    """Before an uninstall: the installer's per-user uninstall key and Start
+    menu shortcut for `product` must exist, so their absence afterwards means
+    the uninstaller removed them."""
+    require(key, f"No uninstall key for {product} before the uninstall: the check would pass vacuously")
+    require(shortcut, f"No Start menu shortcut for {product} before the uninstall: the check would pass vacuously")
 
 
 def identified(names):
@@ -277,12 +286,15 @@ def uninstall(args, value):
     require(uninstaller.is_file(), f"No uninstaller at {uninstaller}")
     running = processes_under(directory)
     require(not running, f"Processes still run from the installation: {running}")
+    local, roaming = Path(os.environ["LOCALAPPDATA"]), Path(os.environ["APPDATA"])
+    shortcut = roaming / "Microsoft/Windows/Start Menu/Programs" / f"{args.product}.lnk"
+    value.update(product=args.product, uninstallKeyBefore=uninstall_key(args.product),
+                 startMenuShortcutBefore=shortcut.exists())
+    require_installed_entries(args.product, value["uninstallKeyBefore"], value["startMenuShortcutBefore"])
     started = time.monotonic()
     # The NSIS uninstaller copies itself to the temp directory and runs from
     # there, so its own process ends at once: wait for its work instead.
     code = subprocess.run([str(uninstaller), "/S"], timeout=UNINSTALL_WAIT, check=False).returncode
-    local, roaming = Path(os.environ["LOCALAPPDATA"]), Path(os.environ["APPDATA"])
-    shortcut = roaming / "Microsoft/Windows/Start Menu/Programs" / f"{args.product}.lnk"
     # The directory goes first; its uninstall key and Start menu shortcut a
     # moment later (run 42351529951 read them right after the directory).
     while (os.path.lexists(directory) or uninstall_key(args.product) or shortcut.exists()) \
@@ -294,7 +306,7 @@ def uninstall(args, value):
                  processesFromInstallation=[image for _, image in processes_under(directory)],
                  dataRemaining=remains([local, roaming], lambda root: identified(
                      [entry.name for entry in os.scandir(root)]) if root.is_dir() else []),
-                 product=args.product, uninstallKey=uninstall_key(args.product),
+                 uninstallKey=uninstall_key(args.product),
                  startMenuShortcut=shortcut.exists())
     require(code == 0, f"The uninstaller exited with {code}")
     require(value["installationGone"], f"The installation directory remains: {left[:20]}")
@@ -333,8 +345,9 @@ def main():
     removing = commands.add_parser("uninstall", help="silent uninstall, then what remains")
     removing.add_argument("--dir", required=True)
     removing.add_argument("--report", required=True)
-    removing.add_argument("--product", default=PRODUCT,
-                          help="the installer's productName (its uninstall key and Start menu shortcut)")
+    removing.add_argument("--product", required=True,
+                          help="the installer's productName, as its Tauri config gives it (the uninstall key and "
+                               "the Start menu shortcut, which must exist before and be gone after)")
     args = parser.parse_args()
     if not WINDOWS:
         parser.error("windows_package.py runs on Windows")

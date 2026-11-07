@@ -508,7 +508,17 @@ class RunnerTests(unittest.TestCase):
         # uninstall key and shortcut (the fixture has its own productName).
         self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe"',
                       job)
-        self.assertIn('--report "$env:RUNNER_TEMP\\w6-fixture-uninstall.json" --product TakosumiFixture', job)
+        # Each uninstall names the productName its installer was built with.
+        for report, config in (("w6-fixture-uninstall.json", "src-tauri/tauri.windows-cef-fixture.conf.json"),
+                               ("w6-uninstall.json", "src-tauri/tauri.windows-cef.conf.json")):
+            line = next(line for line in job.splitlines() if f'--report "$env:RUNNER_TEMP\\{report}"' in line)
+            self.assertTrue(line.rstrip().endswith("--product $product"), line)
+            before = job[:job.index(line)]
+            self.assertTrue(before.rstrip().endswith("(Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json)"
+                                                     ".productName }"), before[-300:])
+            self.assertIn(f"$product = (Get-Content -Raw {config} | ConvertFrom-Json).productName",
+                          before[before.rindex("- name:"):])
+        self.assertNotIn("--product TakosumiFixture", job)
         overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
             encoding="utf-8"))
         self.assertEqual((overlay["productName"], overlay["identifier"]),

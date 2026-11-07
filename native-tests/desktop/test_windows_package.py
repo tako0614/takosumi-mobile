@@ -45,6 +45,12 @@ class InstallTests(unittest.TestCase):
 
 
 class UninstallTests(unittest.TestCase):
+    def test_a_missing_key_or_shortcut_before_the_uninstall_fails(self):
+        package.require_installed_entries("Takosumi", True, True)
+        for key, shortcut in ((False, True), (True, False), (False, False)):
+            with self.assertRaisesRegex(Failure, "vacuously"):
+                package.require_installed_entries("TakosumiFixture", key, shortcut)
+
     def test_what_remains_is_the_products_and_the_fixtures_data(self):
         self.assertEqual(package.identified(["com.takosumi", "com.takosumi.fixture.browserprocess.sumi-w6",
                                              "com.takosumix", "Microsoft", "com.other"]),

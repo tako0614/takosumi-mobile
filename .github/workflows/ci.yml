@@ -1057,7 +1057,10 @@ jobs:
         if: ${{ !cancelled() && steps.fixture-install.outcome == 'success' }}
         working-directory: takosumi-mobile
         run: |
-          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-fixture-app" --report "$env:RUNNER_TEMP\w6-fixture-uninstall.json" --product TakosumiFixture
+          # The productName its installer was built with (its uninstall key and shortcut).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef-fixture.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-fixture-app" --report "$env:RUNNER_TEMP\w6-fixture-uninstall.json" --product $product
           if ($LASTEXITCODE -ne 0) { throw "The fixture uninstall failed (exit $LASTEXITCODE)" }
       - name: Build the product installer (NSIS, unsigned)
         id: product-installer
@@ -1110,7 +1113,10 @@ jobs:
         if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
         working-directory: takosumi-mobile
         run: |
-          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-app" --report "$env:RUNNER_TEMP\w6-uninstall.json"
+          # The productName its installer was built with (its uninstall key and shortcut).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-app" --report "$env:RUNNER_TEMP\w6-uninstall.json" --product $product
           if ($LASTEXITCODE -ne 0) { throw "The product uninstall failed (exit $LASTEXITCODE)" }
       - name: Remove the fixture CA
         if: ${{ always() && steps.w6-tls.outcome != 'skipped' }}
