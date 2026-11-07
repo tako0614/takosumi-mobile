@@ -110,7 +110,7 @@ jobs:
             options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
             timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
           }
-          if ! attempt 200; then
+          if ! attempt 180; then
             switched=""
             # ubuntu-24.04 images point ubuntu.sources at this mirror list
             # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
@@ -130,13 +130,23 @@ jobs:
               fi
             done
             if [[ -n "$switched" ]]; then
-              echo "::warning::apt-get failed or took over 200 s; retrying once with archive.ubuntu.com first in:$switched"
+              echo "::warning::apt-get failed or took over 180 s; retrying once with archive.ubuntu.com first in:$switched"
             else
-              echo "::warning::apt-get failed or took over 200 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+              echo "::warning::apt-get failed or took over 180 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
             fi
-            # An attempt ended during unpacking leaves dpkg to finish first.
+            # An attempt ended during unpacking leaves dpkg to finish first,
+            # once its lock is free (at most 60 s; a lock still held then makes
+            # dpkg fail the step visibly).
+            if command -v fuser > /dev/null; then
+              for _ in $(seq 60); do
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sleep 1
+              done
+            else
+              echo "::warning::fuser is unavailable; dpkg's lock is not awaited"
+            fi
             sudo dpkg --configure -a
-            attempt 200
+            attempt 180
           fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -280,7 +290,7 @@ jobs:
             options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
             timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
           }
-          if ! attempt 200; then
+          if ! attempt 180; then
             switched=""
             # ubuntu-24.04 images point ubuntu.sources at this mirror list
             # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
@@ -300,13 +310,23 @@ jobs:
               fi
             done
             if [[ -n "$switched" ]]; then
-              echo "::warning::apt-get failed or took over 200 s; retrying once with archive.ubuntu.com first in:$switched"
+              echo "::warning::apt-get failed or took over 180 s; retrying once with archive.ubuntu.com first in:$switched"
             else
-              echo "::warning::apt-get failed or took over 200 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+              echo "::warning::apt-get failed or took over 180 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
             fi
-            # An attempt ended during unpacking leaves dpkg to finish first.
+            # An attempt ended during unpacking leaves dpkg to finish first,
+            # once its lock is free (at most 60 s; a lock still held then makes
+            # dpkg fail the step visibly).
+            if command -v fuser > /dev/null; then
+              for _ in $(seq 60); do
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sleep 1
+              done
+            else
+              echo "::warning::fuser is unavailable; dpkg's lock is not awaited"
+            fi
             sudo dpkg --configure -a
-            attempt 200
+            attempt 180
           fi
       - name: Shared Web-home confirmation in isolated Chromium
         if: runner.os == 'Linux'
