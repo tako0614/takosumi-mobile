@@ -23,10 +23,11 @@ use tauri_plugin_app_screen::{
 };
 
 /// Windows: how the browser ends after CefShutdown (W7): it records its
-/// children still running and the sandboxed browser ends with ExitProcess.
+/// children still running and how long its end took, and the sandboxed
+/// browser ends with ExitProcess (also from `browser_dll.rs` after a panic).
 #[cfg(windows)]
 #[path = "children_windows.rs"]
-mod children_windows;
+pub(crate) mod children_windows;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
@@ -106,6 +107,8 @@ fn maybe_quit() {
         if let Some(id) = with_state(|state| state.shutdown) {
             reply(Reply::Stopped { id });
         }
+        #[cfg(windows)]
+        children_windows::mark(children_windows::Mark::Quit);
         quit_message_loop();
     }
 }
@@ -609,6 +612,8 @@ wrap_life_span_handler! {
                 }
                 state.live-=1;
             });
+            #[cfg(windows)]
+            children_windows::mark(children_windows::Mark::BrowserClosed);
             // A cancel clears the shutdown, so the remaining windows stay open.
             if let Some(next)=next_to_close(id) { request_close(next); }
             maybe_quit();
@@ -784,6 +789,8 @@ fn dispatch(bytes: Option<&[u8]>) {
         // The end of input while running is an abnormal stop; after the last
         // window has gone there is nothing left to close.
         if with_state(|state| state.shutdown.is_none() && !state.quitting) {
+            #[cfg(windows)]
+            children_windows::mark(children_windows::Mark::CloseRequested);
             close_all(None, true);
         }
         return;
@@ -830,6 +837,8 @@ fn dispatch(bytes: Option<&[u8]>) {
     match request {
         Request::Open { id, payload } => open(id, payload),
         Request::Close { id, key } => {
+            #[cfg(windows)]
+            children_windows::mark(children_windows::Mark::CloseRequested);
             let browser = with_state(|state| {
                 let found = state
                     .screens
@@ -848,6 +857,8 @@ fn dispatch(bytes: Option<&[u8]>) {
             }
         }
         Request::Shutdown { id } => {
+            #[cfg(windows)]
+            children_windows::mark(children_windows::Mark::CloseRequested);
             // Chrome-style CEF exposes no reversible close preparation, so
             // windows close one at a time and a beforeunload cancel stops the
             // rest (the owner's sequential-quit decision). A window still being

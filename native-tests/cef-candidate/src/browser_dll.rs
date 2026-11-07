@@ -28,9 +28,12 @@ mod process_main;
 /// the sandbox broker, which waits for every target still ending (up to
 /// 5 s, then 7014), does not run; the kernel ends the targets through their
 /// kill-on-close jobs. A panic that reaches here is not unwound into the
-/// bootstrap: it is caught and returned as 101, Rust's own exit code for a
-/// panicking `main`; the bootstrap's teardown then runs, which for a panic
-/// before CefShutdown (rare) may end in 7014 when targets remain.
+/// bootstrap: it is caught and the process ends the same way, with
+/// `ExitProcess(101)` (Rust's own exit code for a panicking `main`), so a
+/// panic after the message loop does not run the broker's teardown and turn
+/// into 7014. Only panics on `run`'s own path reach here: one inside a CEF
+/// callback (an `extern "C"` function) cannot unwind and aborts the process
+/// with 0xC0000409 instead.
 ///
 /// # Safety
 ///
@@ -43,8 +46,10 @@ pub unsafe extern "C" fn RunWinMain(
     sandbox_info: *mut std::ffi::c_void,
     _version_info: *mut std::ffi::c_void,
 ) -> i32 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         process_main::run(sandbox_info.cast())
-    }))
-    .unwrap_or(101)
+    })) {
+        Ok(code) => code,
+        Err(_) => process_main::children_windows::exit_process(101),
+    }
 }

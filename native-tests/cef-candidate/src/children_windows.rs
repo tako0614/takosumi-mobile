@@ -15,8 +15,10 @@
 //! them first took 7.5 s, too long for the App's sequential quit.
 //!
 //! So once CefShutdown has returned, the sandboxed browser ends itself with
-//! `ExitProcess` and the run's exit code, as it did before W7 round 2
-//! (`std::process::exit`), and never returns to the bootstrap. `ExitProcess`
+//! `ExitProcess` and the run's exit code, as the browser process did before
+//! W7 round 2 (`std::process::exit`), and never returns to the bootstrap.
+//! (CEF helper processes, which have no broker, return to the bootstrap;
+//! before round 2 they too ended with `std::process::exit`.) `ExitProcess`
 //! skips the executable's `_onexit` handlers (the broker's teardown) and
 //! closes the process's handles, among them every target's job handle; each
 //! job was created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (sandbox/win/src/
@@ -24,15 +26,85 @@
 //! still running. CefShutdown has already flushed the profile, so nothing
 //! that writes data is skipped. Before ending, the browser counts its child
 //! processes still running (no wait) and writes one evidence line to its
-//! standard error (the guard's log). The unsandboxed candidate (an
+//! standard error (the guard's log), with how long the close and CefShutdown
+//! took (`mark` records the moments). The unsandboxed candidate (an
 //! executable, no bootstrap and no broker) writes the same line and returns
 //! its code as before.
 //!
 //! The pure parts build everywhere and are tested with plain
 //! `rustc --test` (std only, no CEF); the Win32 parts are Windows only.
 
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
+
 /// The evidence line's prefix on the browser's standard error.
 pub const EVIDENCE_PREFIX: &str = "takosumi-cef-browser-process: shutdown ";
+
+/// A moment of the browser's end that the evidence line measures from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// The App's Close or Shutdown request (or the end of its input)
+    /// reached the UI thread; the latest one counts.
+    CloseRequested,
+    /// A browser window's `on_before_close`; the latest (the last window's)
+    /// counts.
+    BrowserClosed,
+    /// The message loop was asked to quit (CefShutdown follows).
+    Quit,
+}
+
+/// The moments recorded so far.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Marks {
+    pub close_requested: Option<Instant>,
+    pub browser_closed: Option<Instant>,
+    pub quit: Option<Instant>,
+}
+
+static MARKS: Mutex<Marks> = Mutex::new(Marks {
+    close_requested: None,
+    browser_closed: None,
+    quit: None,
+});
+
+/// Record `which` now (the latest of each kind is kept).
+pub fn mark(which: Mark) {
+    let now = Instant::now();
+    let mut marks = MARKS.lock().unwrap_or_else(PoisonError::into_inner);
+    match which {
+        Mark::CloseRequested => marks.close_requested = Some(now),
+        Mark::BrowserClosed => marks.browser_closed = Some(now),
+        Mark::Quit => marks.quit = Some(now),
+    }
+}
+
+/// The moments recorded so far.
+pub fn marks() -> Marks {
+    *MARKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How long the end took, in milliseconds (None when a moment is missing or
+/// out of order): `close` from the close request to the last window's
+/// `on_before_close`, `shutdown` from the quit to CefShutdown's return
+/// (`ended`), `total` from the close request to `ended`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Durations {
+    pub close: Option<u128>,
+    pub shutdown: Option<u128>,
+    pub total: Option<u128>,
+}
+
+pub fn durations(marks: &Marks, ended: Instant) -> Durations {
+    let between = |from: Option<Instant>, to: Option<Instant>| {
+        to?.checked_duration_since(from?)
+            .map(|duration| duration.as_millis())
+    };
+    Durations {
+        close: between(marks.close_requested, marks.browser_closed),
+        shutdown: between(marks.quit, Some(ended)),
+        total: between(marks.close_requested, Some(ended)),
+    }
+}
 
 /// How the browser process ends after CefShutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,10 +169,23 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// A duration for the evidence line: its milliseconds, or `null`.
+fn millis(value: Option<u128>) -> String {
+    value.map_or_else(|| "null".into(), |ms| ms.to_string())
+}
+
 /// The evidence line: `EVIDENCE_PREFIX` and one JSON object with the
 /// browser's pid (so a log shared by several launches attributes it), the
-/// children still running, how it ends and its exit code.
-pub fn evidence_line(pid: u32, census: &Census, end: End, exit_code: i32) -> String {
+/// children still running, how it ends, its exit code and how long the
+/// close (`closeMs`), CefShutdown (`shutdownMs`) and the whole end
+/// (`totalMs`) took.
+pub fn evidence_line(
+    pid: u32,
+    census: &Census,
+    end: End,
+    exit_code: i32,
+    took: &Durations,
+) -> String {
     let error = census
         .error
         .as_deref()
@@ -108,30 +193,45 @@ pub fn evidence_line(pid: u32, census: &Census, end: End, exit_code: i32) -> Str
         .unwrap_or_default();
     format!(
         "{EVIDENCE_PREFIX}{{\"pid\":{pid},\"children\":{},\"unopened\":{},\"end\":\"{}\",\
-         \"exitCode\":{exit_code}{error}}}",
+         \"exitCode\":{exit_code},\"closeMs\":{},\"shutdownMs\":{},\"totalMs\":{}{error}}}",
         census.children,
         census.unopened,
         end.name(),
+        millis(took.close),
+        millis(took.shutdown),
+        millis(took.total),
     )
 }
 
 /// After CefShutdown: count this process's running children, write the
 /// evidence line and, for the sandboxed browser (`exit`), end the process
-/// with `ExitProcess(exit_code)`; otherwise return.
+/// with `ExitProcess(exit_code)`; otherwise return. A failed log write is
+/// ignored (it must not turn a clean end into a panic).
 #[cfg(windows)]
 pub fn finish(exit_code: i32, exit: bool) {
     use std::io::Write;
+    let took = durations(&marks(), Instant::now());
     let end = if exit { End::ExitProcess } else { End::Return };
     // SAFETY: no arguments; always succeeds.
     let pid = unsafe { win32::GetCurrentProcessId() };
-    eprintln!("{}", evidence_line(pid, &census(), end, exit_code));
+    let line = evidence_line(pid, &census(), end, exit_code, &took);
+    let _ = writeln!(std::io::stderr(), "{line}");
     if exit {
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        // SAFETY: ends the process; its handles (the targets' jobs among
-        // them) are closed by the kernel.
-        unsafe { win32::ExitProcess(exit_code as u32) }
+        exit_process(exit_code);
     }
+}
+
+/// End this process now with `exit_code`, after flushing standard output
+/// and error: `ExitProcess`, so CEF's bootstrap never runs its teardown of
+/// the sandbox broker; the kernel closes the process's handles, among them
+/// every target's kill-on-close job.
+#[cfg(windows)]
+pub fn exit_process(exit_code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: ends the process.
+    unsafe { win32::ExitProcess(exit_code as u32) }
 }
 
 #[cfg(windows)]
@@ -307,22 +407,74 @@ mod tests {
             unopened: 1,
             error: None,
         };
+        let took = Durations {
+            close: Some(1250),
+            shutdown: Some(2300),
+            total: Some(4100),
+        };
         assert_eq!(
-            evidence_line(4242, &census, End::ExitProcess, 0),
+            evidence_line(4242, &census, End::ExitProcess, 0, &took),
             "takosumi-cef-browser-process: shutdown {\"pid\":4242,\"children\":65,\"unopened\":1,\
-             \"end\":\"exit-process\",\"exitCode\":0}"
+             \"end\":\"exit-process\",\"exitCode\":0,\"closeMs\":1250,\"shutdownMs\":2300,\
+             \"totalMs\":4100}"
         );
         let failed = Census {
             error: Some("CreateToolhelp32Snapshot: \"denied\"\n\\".into()),
             ..Census::default()
         };
         assert_eq!(
-            evidence_line(7, &failed, End::Return, 1),
+            evidence_line(7, &failed, End::Return, 1, &Durations::default()),
             "takosumi-cef-browser-process: shutdown {\"pid\":7,\"children\":0,\"unopened\":0,\
-             \"end\":\"return\",\"exitCode\":1,\
+             \"end\":\"return\",\"exitCode\":1,\"closeMs\":null,\"shutdownMs\":null,\"totalMs\":null,\
              \"error\":\"CreateToolhelp32Snapshot: \\\"denied\\\"\\n\\\\\"}"
         );
         assert_eq!(json_string("\u{1}é"), "\"\\u0001é\"");
+    }
+
+    #[test]
+    fn the_durations_split_the_close_from_cef_shutdown() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let recorded = Marks {
+            close_requested: Some(at(100)),
+            browser_closed: Some(at(1350)),
+            quit: Some(at(1400)),
+        };
+        assert_eq!(
+            durations(&recorded, at(3700)),
+            Durations {
+                close: Some(1250),
+                shutdown: Some(2300),
+                total: Some(3600),
+            }
+        );
+        // A missing moment, or one out of order, gives no duration.
+        let partial = Marks {
+            close_requested: None,
+            browser_closed: Some(at(50)),
+            quit: Some(at(60)),
+        };
+        assert_eq!(
+            durations(&partial, at(80)),
+            Durations {
+                close: None,
+                shutdown: Some(20),
+                total: None,
+            }
+        );
+        let reversed = Marks {
+            close_requested: Some(at(500)),
+            browser_closed: Some(at(400)),
+            quit: None,
+        };
+        assert_eq!(durations(&reversed, at(600)).close, None);
+        // The latest mark of a kind is kept.
+        mark(Mark::Quit);
+        let first = marks().quit.unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        mark(Mark::Quit);
+        assert!(marks().quit.unwrap() > first);
     }
 
     /// Windows: this test binary's own children (it re-executes itself as
