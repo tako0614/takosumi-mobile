@@ -973,13 +973,20 @@ jobs:
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
+          # Only the browser: the guard in the build directory stays the
+          # product one, so the packaged W3 run exercises the product guard.
           Push-Location native-tests/cef-candidate
-          cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+          cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
           $built = $LASTEXITCODE
           Pop-Location
           if ($built -ne 0) { throw "The fixture browser build failed (exit $built)" }
           node scripts/stage-windows-cef.mjs --fixture --cef $env:W6_CEF --bin "$env:CARGO_TARGET_DIR\debug"
           if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
+          $guards = foreach ($stage in @('src-tauri/target/windows-cef/stage.json', 'src-tauri/target/windows-cef-fixture/stage.json')) {
+            @((Get-Content -Raw $stage | ConvertFrom-Json).files | Where-Object { $_.path -eq 'takosumi-browser-guard.exe' }).sha256
+          }
+          if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw "The product and fixture stages hold different guards: $guards" }
+          "Both stages hold the product guard $($guards[0])"
       # Both installers share Tauri's bundle path, so each is copied aside
       # (never uploaded) before the next build.
       - name: Build the fixture installer (NSIS, unsigned)

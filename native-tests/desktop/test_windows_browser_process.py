@@ -519,6 +519,14 @@ class RunnerTests(unittest.TestCase):
             self.assertIn(f"$product = (Get-Content -Raw {config} | ConvertFrom-Json).productName",
                           before[before.rindex("- name:"):])
         self.assertNotIn("--product TakosumiFixture", job)
+        # The fixture stage keeps the product guard, and the two stages must
+        # record the same one (the packaged run then runs the product guard).
+        fixture = job[job.index("- name: Build and stage the fixture browser"):]
+        fixture = fixture[:fixture.index("\n      - name:")]
+        self.assertIn("--features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process\n",
+                      fixture)
+        self.assertNotIn("--bin takosumi-browser-guard", fixture)
+        self.assertIn("if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw", fixture)
         overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
             encoding="utf-8"))
         self.assertEqual((overlay["productName"], overlay["identifier"]),
@@ -638,6 +646,25 @@ class RunnerTests(unittest.TestCase):
                       "D:\\a\\_temp\\w6-fixture-app\\cef-other\\x.exe",
                       "D:\\a\\_temp\\w6-fixture-app\\cef", None):
             self.assertFalse(observer.inside(image, cef), image)
+
+    def test_installed_processes_load_no_crt_and_the_installed_libcef(self):
+        cef = "D:\\a\\_temp\\w6-fixture-app\\cef"
+        system = ["C:\\Windows\\SYSTEM32\\ntdll.dll", "C:\\Windows\\System32\\KERNEL32.DLL"]
+        browser = [cef + "\\takosumi-cef-browser-process.exe", cef + "\\libcef.dll", *system]
+        self.assertEqual(observer.module_problems("browser", browser, cef), [])
+        self.assertEqual(observer.module_problems("guard", [cef + "\\takosumi-browser-guard.exe", *system], cef), [])
+        crt = "C:\\Windows\\System32\\VCRUNTIME140.dll"
+        self.assertEqual(observer.module_problems("guard", [*system, crt], cef), [f"the guard loaded {crt}"])
+        self.assertEqual(len(observer.module_problems("browser", [*browser, "C:\\x\\msvcp140_1.dll"], cef)), 1)
+        elsewhere = "D:\\a\\target-w3\\debug\\libcef.dll"
+        self.assertEqual(observer.module_problems("browser", [cef + "\\b.exe", elsewhere, *system], cef),
+                         [f"the browser loaded libcef.dll from {elsewhere}"])
+        self.assertEqual(observer.module_problems("browser", system, cef), ["the browser has not loaded libcef.dll"])
+        self.assertEqual(observer.module_problems("guard", None, cef), ["no module snapshot of the guard"])
+        # MODULEENTRY32W: 1080 bytes on x64 Windows (two-byte WCHAR).
+        ctypes = observer.ctypes
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(observer.ModuleEntry), 48 + 516 * ctypes.sizeof(ctypes.c_wchar))
 
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:

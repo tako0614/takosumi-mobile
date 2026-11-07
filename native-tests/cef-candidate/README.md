@@ -1580,8 +1580,12 @@ hold exactly the staged files (paths, sizes, SHA-256), and runs the W3 cases
 against the installed App with `windows_browser_process.py --packaged`: no
 browser, guard or runtime override, so the App resolves its bundle and
 runtime root itself, the observer requires every guard and browser to run
-from the installation's `cef\` (their image paths), and exactly the ten W3
-cases must pass. It uninstalls it silently. It then builds the product
+from the installation's `cef\` (their image paths) and, from a snapshot of
+their loaded modules, the browser's `libcef.dll` to come from there and
+neither process to have loaded `vcruntime140*` or `msvcp140*` (the static C
+runtime at run time), and exactly the ten W3 cases must pass. The fixture
+installer carries the product guard: the fixture build rebuilds only the
+browser, and the two stage manifests must record the same guard. It uninstalls it silently. It then builds the product
 installer (`desktop-cef`), installs it the same way, runs the installed
 product browser alone through `windows_smoke.py` (boot open, shutdown,
 `stopped`, exit 0, nothing left in its job), and launches the installed App

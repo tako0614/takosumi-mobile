@@ -125,6 +125,13 @@ class LastInput(ctypes.Structure):  # LASTINPUTINFO
 
 # --- Win32 -----------------------------------------------------------------
 
+class ModuleEntry(ctypes.Structure):  # MODULEENTRY32W
+    _fields_ = [("dwSize", ctypes.c_uint32), ("th32ModuleID", ctypes.c_uint32), ("th32ProcessID", ctypes.c_uint32),
+                ("GlblcntUsage", ctypes.c_uint32), ("ProccntUsage", ctypes.c_uint32),
+                ("modBaseAddr", ctypes.c_void_p), ("modBaseSize", ctypes.c_uint32), ("hModule", ctypes.c_void_p),
+                ("szModule", ctypes.c_wchar * 256), ("szExePath", ctypes.c_wchar * 260)]
+
+
 class Win32:
     """user32, kernel32 and iphlpapi with the prototypes used here."""
 
@@ -160,6 +167,9 @@ class Win32:
             (self.kernel32, "CloseHandle", boolean, [handle]),
             (self.kernel32, "QueryFullProcessImageNameW", boolean, [handle, dword, ctypes.c_wchar_p,
                                                                    ctypes.POINTER(dword)]),
+            (self.kernel32, "CreateToolhelp32Snapshot", handle, [dword, dword]),
+            (self.kernel32, "Module32FirstW", boolean, [handle, ctypes.POINTER(ModuleEntry)]),
+            (self.kernel32, "Module32NextW", boolean, [handle, ctypes.POINTER(ModuleEntry)]),
             (self.kernel32, "GetCurrentThreadId", dword, []),
             (self.iphlpapi, "GetExtendedTcpTable", dword, [ctypes.c_void_p, ctypes.POINTER(dword), boolean,
                                                            ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]),
@@ -180,6 +190,28 @@ class Win32:
             return name.value
         finally:
             self.kernel32.CloseHandle(process)
+
+    def modules(self, pid):
+        """The paths of the modules a running process has loaded (a
+        TH32CS_SNAPMODULE snapshot, retried while the process is still
+        settling); None if no snapshot could be taken."""
+        for _ in range(10):
+            snapshot = self.kernel32.CreateToolhelp32Snapshot(0x8 | 0x10, pid)  # TH32CS_SNAPMODULE(32)
+            if snapshot and snapshot != ctypes.c_void_p(-1).value:
+                break
+            time.sleep(0.1)
+        else:
+            return None
+        try:
+            found = []
+            entry = ModuleEntry(dwSize=ctypes.sizeof(ModuleEntry))
+            more = self.kernel32.Module32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                found.append(entry.szExePath)
+                more = self.kernel32.Module32NextW(snapshot, ctypes.byref(entry))
+            return found
+        finally:
+            self.kernel32.CloseHandle(snapshot)
 
     def owner(self, window):
         """(process id, thread id) owning a window; (0, 0) for none."""
@@ -556,6 +588,25 @@ def inside(image, directory):
     return ntpath.normcase(ntpath.normpath(image)).startswith(root + "\\")
 
 
+CRT_MODULES = ("vcruntime140", "msvcp140")
+
+
+def module_problems(role, modules, cef):
+    """What a W6 process's loaded modules show against the static C runtime
+    and the installed bundle: no Visual C++ runtime module in either process,
+    and the browser's libcef.dll from the installation's cef directory."""
+    if modules is None:
+        return [f"no module snapshot of the {role}"]
+    problems = [f"the {role} loaded {path}" for path in modules
+                if ntpath.basename(path).lower().startswith(CRT_MODULES)]
+    if role == "browser":
+        libcef = [path for path in modules if ntpath.basename(path).lower() == "libcef.dll"]
+        if not libcef:
+            problems.append("the browser has not loaded libcef.dll")
+        problems += [f"the browser loaded libcef.dll from {path}" for path in libcef if not inside(path, cef)]
+    return problems
+
+
 def url_origin(url):
     """The origin part (scheme and authority) of a dialog's URL."""
     return urlsplit(url)._replace(path="", query="", fragment="").geturl()
@@ -805,10 +856,19 @@ class Observer:
         """W6: this profile's guard and browser run from the installed App's
         cef directory (its own bundle, resolved without overrides)."""
         cef = ntpath.join(str(self.installed), "cef")
-        images = {"guard": self.win.image(process["pid"]), "browser": self.win.image(process["opened"]["nativePid"])}
-        self.proof.setdefault("installedImages", []).append(dict(images, profile=process["profile"]))
+        pids = {"guard": process["pid"], "browser": process["opened"]["nativePid"]}
+        images = {role: self.win.image(pid) for role, pid in pids.items()}
+        # Their loaded modules: the static C runtime (no vcruntime140 or
+        # msvcp140) and the installed libcef.dll, at run time.
+        modules = {role: self.win.modules(pid) for role, pid in pids.items()}
+        problems = [problem for role in pids for problem in module_problems(role, modules[role], cef)]
+        libcef = [path for path in modules["browser"] or [] if ntpath.basename(path).lower() == "libcef.dll"]
+        self.proof.setdefault("installedImages", []).append(dict(
+            images, profile=process["profile"], libcef=libcef,
+            modules={role: len(found) if found is not None else None for role, found in modules.items()}))
         for role, image in images.items():
             require(inside(image, cef), f"The {role} of {process['profile']} runs from {image}, not from {cef}")
+        require(not problems, f"The installed processes of {process['profile']}: {problems}")
 
     def attach(self, process):
         native = process["opened"]
