@@ -1,5 +1,5 @@
-//! Opt-in browser service for Linux and Windows. Its only control input is
-//! the parent's pipe.
+//! Opt-in browser service for Linux, Windows and macOS. Its only control
+//! input is the parent's pipe.
 //! No remote-page IPC/V8 extension or permission handler. Explicit fixture
 //! inspection (`fixture-inspection` builds only) uses a loopback DevTools
 //! port, never the parent's control pipe.
@@ -8,7 +8,10 @@
 //! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
 //! the sandboxed Windows browser (W7, feature `windows-sandbox`), from the DLL
 //! CEF's `bootstrap.exe` loads (`browser_dll.rs`), which passes the sandbox
-//! information.
+//! information. On macOS (M1) the executable runs in the app bundle's
+//! `Contents/MacOS`, loads the CEF framework first and installs its
+//! `NSApplication` (`mac_front`); CEF's helper processes are the bundle's
+//! helper apps (`helper_main.rs`), not this executable.
 use cef::*;
 use std::{
     cell::RefCell,
@@ -28,6 +31,11 @@ use tauri_plugin_app_screen::{
 #[cfg(windows)]
 #[path = "children_windows.rs"]
 pub(crate) mod children_windows;
+
+/// macOS: the browser process's `NSApplication` and the raise (M1).
+#[cfg(target_os = "macos")]
+#[path = "mac_front.rs"]
+pub(crate) mod mac_front;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
@@ -542,9 +550,14 @@ fn raise(host: &BrowserHost) -> Result<(), &'static str> {
 fn raise(host: &BrowserHost) -> Result<(), &'static str> {
     win32_front::raise(win32_front::top_level(host.window_handle().0.cast()))
 }
+#[cfg(target_os = "macos")]
+fn raise(host: &BrowserHost) -> Result<(), &'static str> {
+    mac_front::raise(host.window_handle())
+}
 
 /// The native window id reported to the App: the X11 window CEF reports on
-/// Linux; on Windows the value of the top-level HWND the raise brings forward.
+/// Linux; on Windows the value of the top-level HWND the raise brings forward;
+/// on macOS the `windowNumber` of the NSWindow holding CEF's view.
 #[cfg(target_os = "linux")]
 fn window_id(host: &BrowserHost) -> u64 {
     host.window_handle()
@@ -552,6 +565,10 @@ fn window_id(host: &BrowserHost) -> u64 {
 #[cfg(windows)]
 fn window_id(host: &BrowserHost) -> u64 {
     win32_front::top_level(host.window_handle().0.cast()) as usize as u64
+}
+#[cfg(target_os = "macos")]
+fn window_id(host: &BrowserHost) -> u64 {
+    mac_front::window_number(host.window_handle())
 }
 
 fn opened(id: u64, key: String, browser: &Browser) {
@@ -567,7 +584,7 @@ fn opened(id: u64, key: String, browser: &Browser) {
     #[cfg(target_os = "linux")]
     assert_eq!(actual, expected);
     // Exactly the requested spelling, not merely the same components.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     assert_eq!(actual.as_os_str(), expected.as_os_str());
     reply(Reply::Opened {
         id,
@@ -912,7 +929,7 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 wrap_app! {
     struct Application;
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
@@ -1062,6 +1079,14 @@ fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     let root = unsafe { libc::geteuid() } == 0;
     root || args.any(|arg| arg == "--no-sandbox")
 }
+/// macOS (M1): CEF's helper processes run in the seatbelt sandbox, which each
+/// helper enters itself (`helper_main.rs`, CEF's `libcef_sandbox.dylib`)
+/// before it loads the framework; the browser process is not sandboxed. Only
+/// a parent that passes `--no-sandbox` (a fixture's opt-out) turns it off.
+#[cfg(target_os = "macos")]
+fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.any(|arg| arg == "--no-sandbox")
+}
 /// Windows with the sandbox (W7, feature `windows-sandbox`): CEF 154 ships no
 /// `cef_sandbox` library for embedders; its prebuilt `bootstrap.exe`, renamed
 /// to the browser, initializes Chromium's sandbox and loads this browser as a
@@ -1102,6 +1127,13 @@ compile_error!("windows-sandbox and windows-unsandboxed-candidate exclude each o
 fn is_final(directory: &Path) -> bool {
     directory.canonicalize().unwrap() == directory
 }
+/// macOS: as on Linux, but the spelling must match exactly (as on Windows):
+/// `Path` equality would accept repeated or trailing separators. The parent
+/// passes the final path (`/private/var/...`, not the `/var` link).
+#[cfg(target_os = "macos")]
+fn is_final(directory: &Path) -> bool {
+    directory.canonicalize().unwrap().as_os_str() == directory.as_os_str()
+}
 /// On Windows `canonicalize` spells the final path in its verbatim form
 /// (`\\?\C:\…` or `\\?\UNC\server\share\…`); the parent and CEF use the
 /// ordinary spelling of the same path (`C:\…`, `\\server\share\…`). After
@@ -1140,7 +1172,7 @@ fn is_final(directory: &Path) -> bool {
 /// that still reaches the bootstrap (101).
 pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     const {
-        assert!(cfg!(any(target_os = "linux", windows)));
+        assert!(cfg!(any(target_os = "linux", windows, target_os = "macos")));
     }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = cef::args::Args::new();

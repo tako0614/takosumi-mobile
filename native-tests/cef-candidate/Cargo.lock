@@ -2828,6 +2828,8 @@ version = "0.0.0"
 dependencies = [
  "cef",
  "libc",
+ "objc2",
+ "objc2-app-kit",
  "serde_json",
  "tauri",
  "tauri-plugin-app-screen",
