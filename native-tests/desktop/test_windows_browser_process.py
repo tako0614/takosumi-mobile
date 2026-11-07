@@ -504,10 +504,26 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("windows_browser_process.py --packaged --binary $env:W6_FIXTURE_APP ", job)
         for step in ("windows_package.py install", "windows_package.py smoke", "windows_package.py uninstall"):
             self.assertIn(step, job)
+        # The upload takes one gathered directory; the gathering copies only
+        # the named evidence, through one copier that never takes an
+        # executable, a library or an installer.
         upload = job[job.index("name: cef-windows-package-evidence"):]
-        paths = upload[upload.index("path: |"):upload.index("if-no-files-found")]
-        for forbidden in (".exe", ".dll", "setup", "bundle", "target-w3", "/cef/"):
-            self.assertNotIn(forbidden, paths, f"the evidence must not include {forbidden}")
+        self.assertIn("path: ${{ runner.temp }}/w6-evidence\n          if-no-files-found", upload)
+        gather = job[job.index("- name: Gather the W6 evidence"):job.index("- name: Keep the W6 evidence")]
+        self.assertIn("if: ${{ always() }}", gather)
+        self.assertIn("$never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')", gather)
+        self.assertEqual(gather.count("Copy-Item"), 1, "every copy goes through Copy-Evidence")
+        self.assertIn("if ($never -contains $file.Extension.ToLowerInvariant()) { return }", gather)
+        sources = ["foreach ($pattern in @('w6-*.json', 'w6-*.log'))",
+                   "'product-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef/stage.json'",
+                   "'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'",
+                   "Get-ChildItem -LiteralPath $case -Recurse -File",
+                   "Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log'"]
+        for source in sources:
+            self.assertIn(source, gather)
+        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 5, "no other source is gathered")
+        for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
+            self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
 
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")

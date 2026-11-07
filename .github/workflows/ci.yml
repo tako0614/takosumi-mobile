@@ -1077,19 +1077,54 @@ jobs:
         run: |
           pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w6-tls" -Remove
           if ($LASTEXITCODE -ne 0) { throw "The fixture CA was not removed (exit $LASTEXITCODE)" }
-      # Reports, logs, stage manifests and the packaged case; never an
-      # installer or a binary.
+      # One directory for the evidence (the upload needs one root): the
+      # reports and logs, both stage manifests, the packaged case and the
+      # profiles' logs. No executable, library or installer is ever copied.
+      - name: Gather the W6 evidence
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'w6-evidence'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')
+          function Copy-Evidence([System.IO.FileInfo]$file, [string]$target) {
+            if ($never -contains $file.Extension.ToLowerInvariant()) { return }
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $target
+          }
+          foreach ($pattern in @('w6-*.json', 'w6-*.log')) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -File -Filter $pattern)) {
+              Copy-Evidence $file (Join-Path $out $file.Name)
+            }
+          }
+          $stages = @{
+            'product-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef/stage.json'
+            'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'
+          }
+          foreach ($name in $stages.Keys) {
+            if (Test-Path -LiteralPath $stages[$name] -PathType Leaf) { Copy-Evidence (Get-Item -LiteralPath $stages[$name]) (Join-Path $out $name) }
+          }
+          if ($env:W6_CASE -and (Test-Path -LiteralPath $env:W6_CASE -PathType Container)) {
+            $case = (Get-Item -LiteralPath $env:W6_CASE).FullName.TrimEnd('\')
+            foreach ($file in @(Get-ChildItem -LiteralPath $case -Recurse -File)) {
+              Copy-Evidence $file (Join-Path (Join-Path $out 'case') $file.FullName.Substring($case.Length + 1))
+            }
+          }
+          $profiles = if ($env:W6_APP_DATA) { Join-Path $env:W6_APP_DATA 'browser-process-experiment' } else { '' }
+          if ($profiles -and (Test-Path -LiteralPath $profiles -PathType Container)) {
+            foreach ($profile in @(Get-ChildItem -LiteralPath $profiles -Directory)) {
+              foreach ($file in @(Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log')) {
+                Copy-Evidence $file (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $file.Name)
+              }
+            }
+          }
+          $kept = @(Get-ChildItem -LiteralPath $out -Recurse -File)
+          "Gathered $($kept.Count) evidence files"
       - name: Keep the W6 evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cef-windows-package-evidence
-          path: |
-            ${{ runner.temp }}/w6-*.json
-            ${{ runner.temp }}/w6-*.log
-            takosumi-mobile/src-tauri/target/windows-cef/stage.json
-            takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json
-            ${{ env.W6_CASE }}
-            ${{ env.W6_APP_DATA }}/browser-process-experiment/*/*.log
+          path: ${{ runner.temp }}/w6-evidence
           if-no-files-found: warn
           retention-days: 14
