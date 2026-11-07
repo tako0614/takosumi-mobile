@@ -96,10 +96,58 @@ jobs:
         run: |
           swift test --package-path src-tauri/plugins/app-screen/ios/PolicyTests 2>&1 | tee "$RUNNER_TEMP/app-screen-swift-test.log"
           grep -E "Executed [1-9][0-9]* tests?, with 0 failures" "$RUNNER_TEMP/app-screen-swift-test.log"
+      # The image's mirror has crawled for most of the job's budget; bound one
+      # attempt, then retry once with archive.ubuntu.com first (the image's
+      # mirror list, or plain sources, rewritten only for the retry). The
+      # package list is unchanged.
       - name: System libraries for Tauri on Linux
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+          packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev"
+          attempt() {
+            # update and install within $1 seconds, apt retrying each download
+            options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
+          }
+          if ! attempt 180; then
+            switched=""
+            # ubuntu-24.04 images point ubuntu.sources at this mirror list
+            # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
+            # first and drop the Azure entry.
+            mirrors=/etc/apt/apt-mirrors.txt
+            if [[ -f "$mirrors" ]]; then
+              { printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n'
+                grep -v -E '^[^[:space:]]*(azure\.archive|//archive)\.ubuntu\.com' "$mirrors" || true; } > "$RUNNER_TEMP/apt-mirrors.txt"
+              sudo cp "$RUNNER_TEMP/apt-mirrors.txt" "$mirrors"
+              switched="$mirrors"
+            fi
+            # Sources that name an archive.ubuntu.com mirror directly.
+            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [[ -f "$sources" ]] && grep -q -E 'https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu' "$sources"; then
+                sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+                switched="$switched $sources"
+              fi
+            done
+            if [[ -n "$switched" ]]; then
+              echo "::warning::apt-get failed or took over 180 s; retrying once with archive.ubuntu.com first in:$switched"
+            else
+              echo "::warning::apt-get failed or took over 180 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+            fi
+            # An attempt ended during unpacking leaves dpkg to finish first,
+            # once its lock is free (at most 60 s; a lock still held then makes
+            # dpkg fail the step visibly).
+            if command -v fuser > /dev/null; then
+              for _ in $(seq 60); do
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sleep 1
+              done
+            else
+              echo "::warning::fuser is unavailable; dpkg's lock is not awaited"
+            fi
+            sudo dpkg --configure -a
+            attempt 180
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -227,11 +275,59 @@ jobs:
         working-directory: takosumi-mobile
       - run: bun run build
         working-directory: takosumi-mobile
+      # The image's mirror has crawled for most of the job's budget; bound one
+      # attempt, then retry once with archive.ubuntu.com first (the image's
+      # mirror list, or plain sources, rewritten only for the retry). The
+      # package list is unchanged.
       - name: Linux desktop SDK and isolated test tools
         if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11
+          packages="libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev xvfb xdotool dbus-x11"
+          attempt() {
+            # update and install within $1 seconds, apt retrying each download
+            options="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o DPkg::Lock::Timeout=60"
+            timeout --kill-after=15 "$1" sudo bash -c "apt-get $options update && apt-get $options install -y --no-install-recommends $packages"
+          }
+          if ! attempt 180; then
+            switched=""
+            # ubuntu-24.04 images point ubuntu.sources at this mirror list
+            # (mirror+file:), the Azure mirror first: put archive.ubuntu.com
+            # first and drop the Azure entry.
+            mirrors=/etc/apt/apt-mirrors.txt
+            if [[ -f "$mirrors" ]]; then
+              { printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n'
+                grep -v -E '^[^[:space:]]*(azure\.archive|//archive)\.ubuntu\.com' "$mirrors" || true; } > "$RUNNER_TEMP/apt-mirrors.txt"
+              sudo cp "$RUNNER_TEMP/apt-mirrors.txt" "$mirrors"
+              switched="$mirrors"
+            fi
+            # Sources that name an archive.ubuntu.com mirror directly.
+            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              if [[ -f "$sources" ]] && grep -q -E 'https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu' "$sources"; then
+                sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g' "$sources"
+                switched="$switched $sources"
+              fi
+            done
+            if [[ -n "$switched" ]]; then
+              echo "::warning::apt-get failed or took over 180 s; retrying once with archive.ubuntu.com first in:$switched"
+            else
+              echo "::warning::apt-get failed or took over 180 s; no mirror list or archive.ubuntu.com source to switch, retrying once unchanged"
+            fi
+            # An attempt ended during unpacking leaves dpkg to finish first,
+            # once its lock is free (at most 60 s; a lock still held then makes
+            # dpkg fail the step visibly).
+            if command -v fuser > /dev/null; then
+              for _ in $(seq 60); do
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sleep 1
+              done
+            else
+              echo "::warning::fuser is unavailable; dpkg's lock is not awaited"
+            fi
+            sudo dpkg --configure -a
+            attempt 180
+          fi
       - name: Shared Web-home confirmation in isolated Chromium
         if: runner.os == 'Linux'
         timeout-minutes: 2
@@ -295,6 +391,15 @@ jobs:
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled"
           python3 native-tests/desktop/run.py --spa-resume --cancelled-navigation --cancelled-spa --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-cancelled-spa"
           python3 native-tests/desktop/run.py --spa-resume --pending-navigation --binary "$CARGO_TARGET_DIR/debug/examples/desktop-profile-probe" --data "$TAKOSUMI_FIXTURE_DATA-pending"
+      # The browser-process actual-App fixture's GTK driver (shared with the
+      # Windows one) is run locally against real sites, not here; compile it
+      # so a change to the shared flow cannot break the Linux build unseen.
+      - name: Compile the browser-process App fixture (Linux GTK driver)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+        working-directory: takosumi-mobile
       - name: Build bundled App and verify the fixture observer
         id: linux-app-fixture-build
         if: ${{ !cancelled() && runner.os == 'Linux' }}
@@ -530,3 +635,198 @@ jobs:
         if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
         timeout-minutes: 15
         run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" --expect-load --reuse
+
+  # The actual App on Windows (W3): the real home in WebView2 drives the
+  # per-profile CEF browser through the App's own adapter, as the Linux
+  # actual-App fixture does. It builds the fixture-inspection browser and the
+  # guard (the unsandboxed candidate) and the App with
+  # native-browser-process-fixture, then windows_browser_process.py runs one
+  # case in three launches (first, restart, reset) against its local HTTPS
+  # fixture site. The site's disposable CA is trusted on the runner only for
+  # this run. Real sites stay Linux-only. Independent of the other jobs.
+  cef-windows-app:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: takosumi-mobile
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tako0614/mobile-kit
+          ref: ${{ env.MOBILE_KIT_SOURCE_REF }}
+          path: mobile-kit
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tako0614/takosumi
+          ref: ${{ env.TAKOSUMI_SOURCE_REF }}
+          path: takosumi
+          sparse-checkout: contract
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+        working-directory: takosumi-mobile
+      # The App bundles the built home (tauri/custom-protocol).
+      - run: bun run build
+        working-directory: takosumi-mobile
+      - name: W3 runner unit tests
+        working-directory: takosumi-mobile
+        run: |
+          python -B native-tests/desktop/test_windows_browser_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw "W3 runner unit tests failed (exit $LASTEXITCODE)" }
+      # Tauri's home needs the Evergreen WebView2 Runtime; name it, or stop
+      # here with that reason instead of a failed App start.
+      - name: WebView2 Runtime
+        shell: pwsh
+        run: |
+          $client = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $versions = foreach ($key in @("HKLM:\SOFTWARE\WOW6432Node\$client", "HKLM:\SOFTWARE\$client", "HKCU:\Software\$client")) {
+            (Get-ItemProperty -Path $key -Name pv -ErrorAction SilentlyContinue).pv
+          }
+          $version = @($versions | Where-Object { $_ -and $_ -ne '0.0.0.0' }) | Select-Object -First 1
+          if (-not $version) { throw 'The WebView2 Runtime is not installed on this runner' }
+          "WebView2 Runtime $version"
+      - name: Locked CEF version
+        id: cef
+        shell: pwsh
+        working-directory: takosumi-mobile
+        run: |
+          $lock = Get-Content native-tests/cef-candidate/Cargo.lock
+          $index = [array]::IndexOf($lock, 'name = "cef-dll-sys"')
+          if ($index -lt 0 -or $lock[$index + 1] -notmatch '^version = "(.+)"$') { throw 'cef-dll-sys is not locked' }
+          "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+      # The cef-windows job's CEF distribution cache (same key).
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cef-sdk
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: cef-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.cef.outputs.version }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: w3-cargo
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-w3
+          key: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: CMake and Ninja for the CEF wrapper
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            # Visual Studio ships Ninja with its CMake tools.
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+            if (-not (Test-Path (Join-Path $ninja 'ninja.exe'))) { throw 'Ninja is not available' }
+            Add-Content -Path $env:GITHUB_PATH -Value $ninja
+            & (Join-Path $ninja 'ninja.exe') --version
+          } else {
+            ninja --version
+          }
+          rustc --version
+          cargo --version
+          python --version
+      - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
+        id: browser-build
+        working-directory: takosumi-mobile
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+      # Line tables keep panics' locations while the App's debug build (and
+      # its cache) stays small.
+      - name: Build the App with native-browser-process-fixture
+        id: app-build
+        working-directory: takosumi-mobile
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
+      - name: Preserve CEF distribution
+        if: ${{ !cancelled() && steps.browser-build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: ${{ steps.cef-sdk.outputs.cache-primary-key }}
+      - name: Preserve W3 compiler cache
+        if: ${{ !cancelled() && steps.app-build.outcome == 'success' && steps.w3-cargo.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-w3
+          key: ${{ steps.w3-cargo.outputs.cache-primary-key }}
+      - name: Fixture site TLS (disposable CA trusted for this run)
+        id: w3-tls
+        if: ${{ !cancelled() && steps.app-build.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w3-tls"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture TLS setup failed (exit $LASTEXITCODE)" }
+      # One case, three launches of the App on its data (first, restart,
+      # reset). Every required case must pass and exactly these ten run.
+      - name: Actual App cases (home, per-profile CEF, reuse, quit, restart, clear)
+        id: w3-run
+        if: ${{ !cancelled() && steps.w3-tls.outcome == 'success' }}
+        timeout-minutes: 20
+        working-directory: takosumi-mobile
+        run: |
+          # The App's browser runtime root must lie in the user's profile, so
+          # the case is in the user's temp directory, not RUNNER_TEMP. Its
+          # short name also names the App's data (a fresh runner each run).
+          $name = 'sumi-w3'
+          $case = Join-Path ([System.IO.Path]::GetTempPath()) $name
+          "W3_CASE=$case" >> $env:GITHUB_ENV
+          "W3_APP_DATA=$env:LOCALAPPDATA\com.takosumi.fixture.browserprocess.$name" >> $env:GITHUB_ENV
+          $tls = Join-Path $env:RUNNER_TEMP 'w3-tls'
+          $log = Join-Path $env:RUNNER_TEMP 'w3-cases.log'
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --guard "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "W3 actual App cases failed (exit $LASTEXITCODE)" }
+          $w3Cases = @(
+            'separate-profiles',
+            'home-by-window-switch',
+            'reuse-raises-window',
+            'quit-cancel-stops',
+            'quit-partial-order',
+            'quit-completes',
+            'restart-keeps-separation',
+            'clear-only-one-profile',
+            'no-process-left',
+            'no-opener-request'
+          )
+          foreach ($case_name in $w3Cases) {
+            if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "W3 case $case_name did not pass" }
+          }
+          $w3Count = @(Select-String -Path $log -Pattern '^PASS case ').Count
+          if ($w3Count -ne 10) { throw "Expected exactly ten W3 cases, saw $w3Count" }
+          $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
+          if ($summary.passed -ne $true) { throw 'The W3 summary did not pass' }
+      - name: Remove the fixture CA
+        if: ${{ always() && steps.w3-tls.outcome != 'skipped' }}
+        working-directory: takosumi-mobile
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w3-tls" -Remove
+          if ($LASTEXITCODE -ne 0) { throw "The fixture CA was not removed (exit $LASTEXITCODE)" }
+      # The case's receipts, markers and logs, and each profile's browser logs.
+      - name: Keep the W3 case
+        if: ${{ !cancelled() && env.W3_CASE != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cef-windows-app-case
+          path: |
+            ${{ env.W3_CASE }}
+            ${{ env.W3_APP_DATA }}/browser-process-experiment/*/*.log
+          if-no-files-found: warn
+          retention-days: 14

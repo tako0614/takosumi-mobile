@@ -90,6 +90,29 @@ pub(super) fn inspection(lookup: Lookup) -> bool {
     FIXTURE && lookup("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref() == Some(OsStr::new("1"))
 }
 
+/// One line of a fixture build's recording opener log (Windows; see
+/// `process_windows::shell_open`): the link as the opener's only argument
+/// and the App's pid, as one JSON object.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(windows, not(test), feature = "fixture-overrides")
+))]
+pub(super) fn opener_record(url: &str, pid: u32) -> String {
+    serde_json::json!({"argv": [url], "pid": pid}).to_string() + "\n"
+}
+
+/// The recording log a fixture build appends to
+/// (`TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG`), only as an absolute path.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(windows, not(test), feature = "fixture-overrides")
+))]
+pub(super) fn opener_log(lookup: Lookup) -> Option<PathBuf> {
+    lookup("TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG")
+        .map(PathBuf::from)
+        .filter(|log| log.is_absolute())
+}
+
 /// A setuid or setgid App would start browsers with an identity the person
 /// did not choose; the browser path refuses to run that way.
 #[cfg(target_os = "linux")]
@@ -560,6 +583,32 @@ mod tests {
             "TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX" | "TAKOSUMI_BROWSER_PROCESS_INSPECT" => "1",
             _ => "/elsewhere",
         }))
+    }
+
+    #[test]
+    fn the_opener_record_is_one_json_line_with_only_the_link_and_the_app_pid() {
+        let url = "https://example.com/a?b=\"c\"";
+        let line = opener_record(url, 4242);
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"argv": [url], "pid": 4242})
+        );
+    }
+
+    #[test]
+    fn only_an_absolute_opener_log_is_used() {
+        let named = |value: &'static str| {
+            move |key: &str| {
+                (key == "TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG").then(|| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            opener_log(&named("/case/external-open.log")),
+            Some(PathBuf::from("/case/external-open.log"))
+        );
+        assert_eq!(opener_log(&named("external-open.log")), None);
+        assert_eq!(opener_log(&|_: &str| None), None);
     }
 
     #[test]

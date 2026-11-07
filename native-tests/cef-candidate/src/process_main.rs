@@ -9,10 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Mutex, PoisonError},
 };
 use tauri_plugin_app_screen::{
     browser_process::{decode, external_link, link_host, read_packet, Reply, Request},
@@ -49,8 +46,18 @@ struct State {
     chain: Option<i32>,
     failed: bool,
     unload_dialogs: BTreeSet<i32>,
+    /// Set once the last window has gone and the message loop is asked to
+    /// quit; no later request may start anything.
+    quitting: bool,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
+/// Whether the control pipe's reader may still post a request to the UI
+/// thread. Closed before the message loop is asked to quit, under the same
+/// lock the reader holds while it posts, so nothing is posted afterwards.
+static CONTROL_OPEN: Mutex<bool> = Mutex::new(true);
+fn close_control() {
+    *CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner) = false;
+}
 
 fn with_state<T>(run: impl FnOnce(&mut State) -> T) -> T {
     assert_ne!(currently_on(ThreadId::UI), 0);
@@ -73,16 +80,49 @@ fn error(id: u64, message: &str) {
 fn maybe_quit() {
     let done = with_state(|state| {
         if state.live == 0 && state.pending == 0 {
-            if let Some(id) = state.shutdown {
-                reply(Reply::Stopped { id });
-            }
+            state.quitting = true;
             true
         } else {
             false
         }
     });
     if done {
+        // The parent closes its end of the pipe once it reads `stopped`, so
+        // the reader stops posting first; a request it already posted is
+        // refused (`quitting`) or, after the loop, ignored (`dispatch`).
+        close_control();
+        if let Some(id) = with_state(|state| state.shutdown) {
+            reply(Reply::Stopped { id });
+        }
         quit_message_loop();
+    }
+}
+/// What a control request gets.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// It runs.
+    Run,
+    /// The browser already has no window left and is quitting: a shutdown
+    /// is answered `stopped` at once (it is what the parent asked for).
+    Stopped,
+    /// "Stale command or browser stopping".
+    Refuse,
+}
+/// The admission of a request (`shutdown`: whether it is a Shutdown), by its
+/// id against the last one, whether a shutdown is already recorded, and
+/// whether the browser is quitting after the person closed its last window.
+/// While quitting, an Open or Close must not start anything (the pending
+/// count would trip the exit check), but a Shutdown posted just before is
+/// answered `stopped`, as it was before `quitting` existed.
+fn admission(shutdown: bool, id: u64, last_id: u64, recorded: bool, quitting: bool) -> Admission {
+    if id <= last_id || recorded {
+        Admission::Refuse
+    } else if !quitting {
+        Admission::Run
+    } else if shutdown {
+        Admission::Stopped
+    } else {
+        Admission::Refuse
     }
 }
 fn close_all(id: Option<u64>, failed: bool) {
@@ -380,8 +420,9 @@ mod x11_front {
 /// Windows browser windows. The browser's native handle may be a child of
 /// its frame; both the raise and the `window_id` reported to the App use the
 /// frame, the top-level window (`GA_ROOT`) the person sees and switches to.
-/// Bringing a reused window to the front restores it when minimized, shows it
-/// and asks for the foreground. Windows hands the foreground only to a
+/// Bringing a reused window to the front restores it when minimized, shows it,
+/// puts it at the top of the Z-order and asks for the foreground. Windows
+/// hands the foreground only to a
 /// process allowed to take it (for example one the foreground App passed that
 /// right with `AllowSetForegroundWindow`); otherwise it flashes the taskbar
 /// button, and the refusal is reported like an X11 one. A stale handle makes
@@ -397,11 +438,25 @@ mod win32_front {
         fn GetAncestor(window: Hwnd, flags: c_uint) -> Hwnd;
         fn IsIconic(window: Hwnd) -> c_int;
         fn ShowWindow(window: Hwnd, command: c_int) -> c_int;
+        fn SetWindowPos(
+            window: Hwnd,
+            after: Hwnd,
+            x: c_int,
+            y: c_int,
+            width: c_int,
+            height: c_int,
+            flags: c_uint,
+        ) -> c_int;
         fn SetForegroundWindow(window: Hwnd) -> c_int;
     }
     const GA_ROOT: c_uint = 2;
     const SW_SHOW: c_int = 5;
     const SW_RESTORE: c_int = 9;
+    /// `HWND_TOP`: the top of the (non-topmost) Z-order.
+    const HWND_TOP: Hwnd = std::ptr::null_mut();
+    const SWP_NOSIZE: c_uint = 0x0001;
+    const SWP_NOMOVE: c_uint = 0x0002;
+    const SWP_SHOWWINDOW: c_uint = 0x0040;
 
     /// The top-level window of a browser handle (itself when it has none).
     pub fn top_level(window: Hwnd) -> Hwnd {
@@ -436,8 +491,28 @@ mod win32_front {
                     SW_SHOW
                 },
             );
+            // Ask for the reorder explicitly before the foreground. In CI
+            // (run 42298520970) SetForegroundWindow alone made a reused window
+            // the foreground window, yet its page stayed `hidden`: another
+            // profile's window at the same rectangle had covered it, and
+            // Chromium's native occlusion tracker still counted it as
+            // covered. A real move to the top of the Z-order (not a
+            // minimize/restore or a topmost toggle) reorders the window and
+            // raises the reorder event the tracker recomputes on.
+            let reordered = SetWindowPos(
+                top,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            ) != 0;
             if SetForegroundWindow(top) == 0 {
                 return Err("Windows refused the foreground change");
+            }
+            if !reordered {
+                return Err("Windows refused the move to the top of the Z-order");
             }
         }
         Ok(())
@@ -632,8 +707,23 @@ fn open(id: u64, payload: OpenRequest) {
         host.set_focus(1);
         // set_focus only moves keyboard focus inside the browser. A window
         // covered by another profile stays hidden unless it is raised.
-        if let Err(problem) = raise(&host) {
-            eprintln!("Reused browser window was not raised: {problem}");
+        match raise(&host) {
+            Err(problem) => eprintln!("Reused browser window was not raised: {problem}"),
+            // Windows: focus given while the window was still minimized does
+            // not reach the page once it is restored and in front (the page
+            // reported `hasFocus()` false in CI, also with a second set_focus
+            // right after the raise in this task). Ask again from a task
+            // posted behind this one, once the activation the raise caused
+            // has been processed; no timer.
+            #[cfg(windows)]
+            Ok(()) => {
+                let mut focus = FocusTask::new(browser.clone());
+                if post_task(ThreadId::UI, Some(&mut focus)) != 1 {
+                    eprintln!("Reused browser window focus could not be requested after the raise");
+                }
+            }
+            #[cfg(not(windows))]
+            Ok(()) => {}
         }
         opened(id, payload.key, &browser);
         return;
@@ -668,8 +758,20 @@ fn open(id: u64, payload: OpenRequest) {
     }
 }
 fn dispatch(bytes: Option<&[u8]>) {
+    // A request the reader posted just before the control pipe closed can
+    // still run while CEF shuts down, after the browser state is gone (on
+    // Windows the parent's end of input arrived while the closing window
+    // handed over the foreground). Nothing is left to do then. A panic here
+    // would abort the browser: CEF task callbacks cannot unwind, and the
+    // process ends with 0xC0000409 instead of exit 0.
+    if STATE.with(|state| state.borrow().is_none()) {
+        eprintln!("A control request arrived after the browser stopped; ignored.");
+        return;
+    }
     let Some(bytes) = bytes else {
-        if with_state(|state| state.shutdown.is_none()) {
+        // The end of input while running is an abnormal stop; after the last
+        // window has gone there is nothing left to close.
+        if with_state(|state| state.shutdown.is_none() && !state.quitting) {
             close_all(None, true);
         }
         return;
@@ -684,16 +786,34 @@ fn dispatch(bytes: Option<&[u8]>) {
         }
     };
     let id = request.id();
-    let allowed = with_state(|state| {
-        if id <= state.last_id || state.shutdown.is_some() {
-            return false;
+    let shutdown = matches!(request, Request::Shutdown { .. });
+    let admitted = with_state(|state| {
+        let admitted = admission(
+            shutdown,
+            id,
+            state.last_id,
+            state.shutdown.is_some(),
+            state.quitting,
+        );
+        if admitted != Admission::Refuse {
+            state.last_id = id;
         }
-        state.last_id = id;
-        true
+        if admitted == Admission::Stopped {
+            // Answered once: a later Shutdown finds it recorded.
+            state.shutdown = Some(id);
+        }
+        admitted
     });
-    if !allowed {
-        error(id, "Stale command or browser stopping");
-        return;
+    match admitted {
+        Admission::Run => {}
+        Admission::Stopped => {
+            reply(Reply::Stopped { id });
+            return;
+        }
+        Admission::Refuse => {
+            error(id, "Stale command or browser stopping");
+            return;
+        }
     }
     match request {
         Request::Open { id, payload } => open(id, payload),
@@ -735,6 +855,12 @@ wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
     impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
 }
+// Windows: keyboard focus for a reused browser, requested after its raise.
+#[cfg(windows)]
+wrap_task! {
+    struct FocusTask { browser: Browser }
+    impl Task { fn execute(&self) { if let Some(host) = self.browser.host() { host.set_focus(1); } } }
+}
 wrap_request_context_handler! {
     struct ContextHandler;
     impl RequestContextHandler {
@@ -763,9 +889,107 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
+#[cfg(target_os = "linux")]
 wrap_app! {
     struct Application;
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
+}
+#[cfg(windows)]
+wrap_app! {
+    struct Application;
+    impl App {
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
+            // The browser process's own command line; its helpers inherit
+            // the feature switches from it.
+            if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
+            if let Some(command_line) = command_line { disable_native_occlusion(command_line); }
+        }
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) }
+    }
+}
+
+/// Windows: Chromium's native window occlusion tracking is off, as Electron
+/// does. In CI (run 42306043123) the tracker marked a browser window covered
+/// by another profile's window as hidden, but after that window was moved to
+/// the top of the Z-order and became the foreground window, neither
+/// browser process recomputed: the reused window's page stayed `hidden` and
+/// the window now below stayed `visible`. Whether the tracker would follow
+/// on a real desktop is unknown. The trade-off: a covered window that is not
+/// minimized keeps rendering at the normal rate; a minimized window is still
+/// hidden. Any `--disable-features` already given is kept.
+#[cfg(windows)]
+const NATIVE_OCCLUSION: &str = "CalculateNativeWinOcclusion";
+#[cfg(windows)]
+fn disable_native_occlusion(command_line: &mut CommandLine) {
+    let name = CefString::from("disable-features");
+    let current = CefString::from(&command_line.switch_value(Some(&name))).to_string();
+    let merged = with_feature(&current, NATIVE_OCCLUSION);
+    // A repeated switch replaces the earlier value, so the merged list wins.
+    command_line.append_switch_with_value(Some(&name), Some(&CefString::from(merged.as_str())));
+}
+/// A comma-separated feature list with `feature` in it once.
+#[cfg(any(windows, test))]
+fn with_feature(current: &str, feature: &str) -> String {
+    let mut features: Vec<&str> = current
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if !features.contains(&feature) {
+        features.push(feature);
+    }
+    features.join(",")
+}
+#[cfg(test)]
+mod control_tests {
+    use super::{admission, Admission};
+
+    #[test]
+    fn a_newer_request_runs_while_the_browser_has_windows() {
+        assert_eq!(admission(false, 1, 0, false, false), Admission::Run);
+        assert_eq!(admission(true, 5, 4, false, false), Admission::Run);
+    }
+
+    #[test]
+    fn a_stale_request_or_one_after_a_recorded_shutdown_is_refused() {
+        for shutdown in [false, true] {
+            for quitting in [false, true] {
+                assert_eq!(
+                    admission(shutdown, 5, 5, false, quitting),
+                    Admission::Refuse
+                );
+                assert_eq!(
+                    admission(shutdown, 4, 5, false, quitting),
+                    Admission::Refuse
+                );
+                assert_eq!(admission(shutdown, 6, 5, true, quitting), Admission::Refuse);
+            }
+        }
+    }
+
+    #[test]
+    fn while_quitting_only_a_shutdown_is_answered_and_it_is_stopped() {
+        // The person closed the last window; the parent's quit arrives next.
+        assert_eq!(admission(true, 6, 5, false, true), Admission::Stopped);
+        // An Open or a Close must not start anything then.
+        assert_eq!(admission(false, 6, 5, false, true), Admission::Refuse);
+    }
+}
+#[cfg(test)]
+mod feature_tests {
+    #[test]
+    fn a_disabled_feature_is_added_once_and_others_are_kept() {
+        let feature = "CalculateNativeWinOcclusion";
+        assert_eq!(super::with_feature("", feature), feature);
+        assert_eq!(
+            super::with_feature("Foo, Bar,", feature),
+            format!("Foo,Bar,{feature}")
+        );
+        assert_eq!(
+            super::with_feature(&format!("{feature},Foo"), feature),
+            format!("{feature},Foo")
+        );
+    }
 }
 
 /// The native fixture's observation seam: only a browser built with this
@@ -910,6 +1134,7 @@ fn main() {
             chain: None,
             failed: false,
             unload_dialogs: BTreeSet::new(),
+            quitting: false,
         }))
     });
     let port = inspection_port(&directory);
@@ -930,15 +1155,13 @@ fn main() {
         ),
         1
     );
-    let active = Arc::new((Mutex::new(()), AtomicBool::new(true)));
-    let gate = active.clone();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(io::stdin());
         loop {
             let bytes = read_packet(&mut reader).ok().flatten();
             let stop = bytes.is_none();
-            let _guard = gate.0.lock().unwrap();
-            if !gate.1.load(Ordering::Acquire) {
+            let open = CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*open {
                 break;
             }
             let mut task = PipeTask::new(bytes);
@@ -948,10 +1171,7 @@ fn main() {
         }
     });
     run_message_loop();
-    {
-        let _guard = active.0.lock().unwrap();
-        active.1.store(false, Ordering::Release);
-    }
+    close_control();
     let failed = STATE.with(|state| {
         let mut state = state.borrow_mut().take().unwrap();
         assert!(state.screens.is_empty() && state.live == 0 && state.pending == 0);
