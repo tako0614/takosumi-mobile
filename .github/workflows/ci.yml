@@ -852,9 +852,9 @@ jobs:
   # installs per user. A fixture installer (tauri.windows-cef-fixture.conf.json)
   # is installed silently and the W3 cases run against the installed App
   # (--packaged); the product installer (tauri.windows-cef.conf.json) is
-  # installed and the installed App launched once (window, a few seconds up,
-  # no unavailable browser, WM_CLOSE, empty job). Each is then uninstalled
-  # silently. The browser stays the unsandboxed candidate. No installer or
+  # installed, its browser run alone (windows_smoke.py) and the installed App
+  # launched once (window, a few seconds up, no unavailable browser, WM_CLOSE,
+  # empty job). Each is then uninstalled silently. The browser stays the unsandboxed candidate. No installer or
   # binary is uploaded: logs, reports, stage manifests and the case only.
   # Independent of the other jobs.
   cef-windows-package:
@@ -1053,7 +1053,7 @@ jobs:
         if: ${{ !cancelled() && steps.fixture-install.outcome == 'success' }}
         working-directory: takosumi-mobile
         run: |
-          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-fixture-app" --report "$env:RUNNER_TEMP\w6-fixture-uninstall.json"
+          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-fixture-app" --report "$env:RUNNER_TEMP\w6-fixture-uninstall.json" --product TakosumiFixture
           if ($LASTEXITCODE -ne 0) { throw "The fixture uninstall failed (exit $LASTEXITCODE)" }
       - name: Build the product installer (NSIS, unsigned)
         id: product-installer
@@ -1079,6 +1079,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "The product install failed (exit $LASTEXITCODE)" }
           $installed = Get-Content -Raw $report | ConvertFrom-Json
           "W6_APP=$(Join-Path $dir $installed.app)" >> $env:GITHUB_ENV
+      # The installed product browser (no inspection seam) on its own, as
+      # W1 runs the built one: boot open, shutdown, stopped, exit 0, nothing
+      # left in its job.
+      - name: Run the installed product browser alone
+        if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
+        timeout-minutes: 10
+        working-directory: takosumi-mobile
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'w6-browser-smoke'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w6-app\cef\takosumi-cef-browser-process.exe" --work $work | Tee-Object -FilePath "$env:RUNNER_TEMP\w6-browser-smoke.log"
+          if ($LASTEXITCODE -ne 0) { throw "The installed browser smoke failed (exit $LASTEXITCODE)" }
       - name: Launch the installed product App once
         if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
         timeout-minutes: 5

@@ -27,6 +27,7 @@ import ctypes
 import hashlib
 import http.client
 import json
+import ntpath
 import os
 import socket
 import struct
@@ -155,12 +156,30 @@ class Win32:
             (self.user32, "GetGUIThreadInfo", boolean, [dword, ctypes.POINTER(GuiThreadInfo)]),
             (self.user32, "GetClassNameW", ctypes.c_int, [handle, ctypes.c_wchar_p, ctypes.c_int]),
             (self.kernel32, "GetTickCount", dword, []),
+            (self.kernel32, "OpenProcess", handle, [dword, boolean, dword]),
+            (self.kernel32, "CloseHandle", boolean, [handle]),
+            (self.kernel32, "QueryFullProcessImageNameW", boolean, [handle, dword, ctypes.c_wchar_p,
+                                                                   ctypes.POINTER(dword)]),
             (self.kernel32, "GetCurrentThreadId", dword, []),
             (self.iphlpapi, "GetExtendedTcpTable", dword, [ctypes.c_void_p, ctypes.POINTER(dword), boolean,
                                                            ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]),
         ):
             function = getattr(library, name)
             function.restype, function.argtypes = restype, argtypes
+
+    def image(self, pid):
+        """A running process's executable path, or None."""
+        process = self.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        try:
+            name = ctypes.create_unicode_buffer(32768)
+            size = ctypes.c_uint32(32768)
+            if not self.kernel32.QueryFullProcessImageNameW(process, 0, name, ctypes.byref(size)):
+                return None
+            return name.value
+        finally:
+            self.kernel32.CloseHandle(process)
 
     def owner(self, window):
         """(process id, thread id) owning a window; (0, 0) for none."""
@@ -528,6 +547,15 @@ class Cdp:
             pass
 
 
+def inside(image, directory):
+    """Whether `image`, a process's executable path, lies in `directory`
+    (Windows paths, compared case-insensitively)."""
+    if not image:
+        return False
+    root = ntpath.normcase(ntpath.normpath(str(directory))).rstrip("\\")
+    return ntpath.normcase(ntpath.normpath(image)).startswith(root + "\\")
+
+
 def url_origin(url):
     """The origin part (scheme and authority) of a dialog's URL."""
     return urlsplit(url)._replace(path="", query="", fragment="").geturl()
@@ -657,8 +685,11 @@ class Page:
 # --- Observation ---------------------------------------------------------------
 
 class Observer:
-    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None):
+    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None, installed=None):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
+        # W6 (--packaged): the installed App's directory; each guard and
+        # browser must run from its cef\ (installed_from).
+        self.installed = installed
         # W4: the app link leads to this real site (None: the fixture's /app/).
         self.real = REAL_SITES[real_site] if real_site else None
         self.real_name = real_site
@@ -770,9 +801,20 @@ class Observer:
         require(process is not None, f"No browser process for {name}")
         return process
 
+    def installed_from(self, process):
+        """W6: this profile's guard and browser run from the installed App's
+        cef directory (its own bundle, resolved without overrides)."""
+        cef = ntpath.join(str(self.installed), "cef")
+        images = {"guard": self.win.image(process["pid"]), "browser": self.win.image(process["opened"]["nativePid"])}
+        self.proof.setdefault("installedImages", []).append(dict(images, profile=process["profile"]))
+        for role, image in images.items():
+            require(inside(image, cef), f"The {role} of {process['profile']} runs from {image}, not from {cef}")
+
     def attach(self, process):
         native = process["opened"]
         self.proof["stage"] = {"name": "attach", "pid": native["nativePid"], "profile": process["profile"]}
+        if self.installed:
+            self.installed_from(process)
         # Only a browser built with the cef-candidate `fixture-inspection` feature writes it.
         try:
             inspection = json.loads((Path(process["directory"]) / "inspection.json").read_bytes())
@@ -1368,6 +1410,8 @@ def main():
     parser.add_argument("--app-pid", type=int, required=True)
     parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
     parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
+    parser.add_argument("--installed", type=Path,
+                        help="W6: the installed App's directory; its guards and browsers must run from its cef")
     args = parser.parse_args()
     if args.real_site and args.phase:
         parser.error("--real-site runs the first launch only")
@@ -1375,7 +1419,7 @@ def main():
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
-    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site).run()
+    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site, args.installed).run()
 
 
 if __name__ == "__main__":

@@ -1521,7 +1521,10 @@ each one's size and SHA-256. `src-tauri/tauri.windows-cef.conf.json` maps the
 stage to the NSIS bundle's `cef/` and installs per user (`installMode:
 currentUser`, by default into `%LOCALAPPDATA%\Takosumi`);
 `tauri.windows-cef-fixture.conf.json` does the same for the fixture stage,
-uncompressed for CI. The installed tree is `<install dir>\<App>.exe`,
+uncompressed for CI, under its own product name and identifier
+(`TakosumiFixture`, `com.takosumi.fixture.package`), so the two installers
+never share an uninstall key, a Start menu entry or a default directory
+(the fixture App still takes a per-case identifier at run time). The installed tree is `<install dir>\<App>.exe`,
 `uninstall.exe` and `cef\`. A release build of the App on Windows is a
 GUI-subsystem program (no console window when launched normally); a debug
 build keeps its console.
@@ -1562,21 +1565,26 @@ silently into a fresh directory (`/S /D=`), requires the installed `cef\` to
 hold exactly the staged files (paths, sizes, SHA-256), and runs the W3 cases
 against the installed App with `windows_browser_process.py --packaged`: no
 browser, guard or runtime override, so the App resolves its bundle and
-runtime root itself, and exactly the ten W3 cases must pass. It uninstalls
-it silently. It then builds the product installer (`desktop-cef`), installs
-it the same way and launches the installed App once
-(`windows_package.py smoke`): with no `TAKOSUMI_` or `WEBVIEW2_` variable,
-inside a kill-on-close job, its window must appear, it must stay up for 8 s,
-must not report its browser unavailable and must have created its runtime
-root; `WM_CLOSE` must end it with exit code 0 and the job must empty. The
-uninstall must remove the installation directory and leave no process
-running from it. What remains is reported, not removed: the App's data
+runtime root itself, the observer requires every guard and browser to run
+from the installation's `cef\` (their image paths), and exactly the ten W3
+cases must pass. It uninstalls it silently. It then builds the product
+installer (`desktop-cef`), installs it the same way, runs the installed
+product browser alone through `windows_smoke.py` (boot open, shutdown,
+`stopped`, exit 0, nothing left in its job), and launches the installed App
+once (`windows_package.py smoke`): on a runner where it has no runtime root
+yet, with no `TAKOSUMI_` or `WEBVIEW2_` variable, inside a kill-on-close
+job, its window must appear, it must stay up for 8 s, must not report its
+browser unavailable and must have created its runtime root; `WM_CLOSE` must
+end it with exit code 0 and the job must empty. Each uninstall must remove
+the installation directory, its per-user uninstall key and its Start menu
+shortcut and leave no process running from it (run 42351529951 read the key
+and shortcut right after the directory went, before the uninstaller had
+removed them; the check now waits for all three). What remains is reported, not removed: the App's data
 directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime
 root and browser profiles, and the fixture's per-case
-`com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any), and
-whether the per-user uninstall key and the Start menu shortcut are gone. The
+`com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any). The
 artifact keeps only reports, logs, the stage manifests and the packaged case,
-never an installer or a binary.
+gathered into one directory, never an installer or a binary.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows

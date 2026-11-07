@@ -444,6 +444,9 @@ def run_phase(args, env, files, before, head, suffix):
         proof["appPid"] = app.pid
         try:
             real = ["--real-site", args.real_site] if args.real_site else []
+            # A packaged run also requires each guard and browser to run from
+            # the installed App's cef directory.
+            real += ["--installed", str(args.binary.parent)] if args.packaged else []
             with create_exclusive(session / f"observer{suffix}.log") as observer:
                 subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
                                 "--app-pid", str(app.pid), "--phase", phase, *real],

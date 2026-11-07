@@ -13,7 +13,8 @@ requires the installed `cef\\` to hold exactly the staged files
 (scripts/stage-windows-cef.mjs's stage.json: same paths, sizes and SHA-256)
 and names the installed App executable.
 
-smoke launches the installed product App (not the fixture) once, with no
+smoke launches the installed product App (not the fixture) once, on a machine
+where it has no runtime root yet, with no
 TAKOSUMI_ or WEBVIEW2_ variable, suspended inside a kill-on-close Job Object
 this script owns: its top-level window must appear, the App must stay up for
 `--seconds`, must not report its browser unavailable (the bundled browser,
@@ -22,9 +23,9 @@ its runtime root `<app cache>\\cef`. WM_CLOSE to its window must end it with
 exit code 0, and the job must then empty.
 
 uninstall runs the installer's uninstaller silently, waits until the
-installation directory is gone and no process runs from it, and reports what
-remains of the App on the machine (its data directories, the uninstall
-registry key, the Start menu shortcut), without removing any of it.
+installation directory, its per-user uninstall key and its Start menu
+shortcut are gone and no process runs from it, and reports what remains of
+the App on the machine (its data directories), without removing any of it.
 
 Each command prints one JSON report line and writes it to --report; it never
 removes anything besides what the installer and uninstaller do.
@@ -223,6 +224,8 @@ def smoke(args, value):
     require(exe.is_file(), f"No App at {exe}")
     runtime = Path(os.environ["LOCALAPPDATA"]) / args.identifier / "cef"
     value.update(app=str(exe), runtimeRootBefore=runtime.is_dir())
+    # A fresh machine for this App: the runtime root it creates is its own.
+    require(not value["runtimeRootBefore"], f"The runtime root {runtime} existed before the App started")
     library = user32()
     with open(args.log, "xb") as log:
         job = WindowsJob()
@@ -278,28 +281,34 @@ def uninstall(args, value):
     # The NSIS uninstaller copies itself to the temp directory and runs from
     # there, so its own process ends at once: wait for its work instead.
     code = subprocess.run([str(uninstaller), "/S"], timeout=UNINSTALL_WAIT, check=False).returncode
-    while os.path.lexists(directory) and time.monotonic() - started < UNINSTALL_WAIT:
+    local, roaming = Path(os.environ["LOCALAPPDATA"]), Path(os.environ["APPDATA"])
+    shortcut = roaming / "Microsoft/Windows/Start Menu/Programs" / f"{args.product}.lnk"
+    # The directory goes first; its uninstall key and Start menu shortcut a
+    # moment later (run 42351529951 read them right after the directory).
+    while (os.path.lexists(directory) or uninstall_key(args.product) or shortcut.exists()) \
+            and time.monotonic() - started < UNINSTALL_WAIT:
         time.sleep(0.5)
     left = sorted(str(path.relative_to(directory)) for path in directory.rglob("*")) if directory.exists() else []
-    local, roaming = Path(os.environ["LOCALAPPDATA"]), Path(os.environ["APPDATA"])
     value.update(uninstallerExit=code, seconds=round(time.monotonic() - started, 1),
                  installationGone=not os.path.lexists(directory), left=left[:50],
                  processesFromInstallation=[image for _, image in processes_under(directory)],
                  dataRemaining=remains([local, roaming], lambda root: identified(
                      [entry.name for entry in os.scandir(root)]) if root.is_dir() else []),
-                 uninstallKey=uninstall_key(),
-                 startMenuShortcut=(roaming / "Microsoft/Windows/Start Menu/Programs" / f"{PRODUCT}.lnk").exists())
+                 product=args.product, uninstallKey=uninstall_key(args.product),
+                 startMenuShortcut=shortcut.exists())
     require(code == 0, f"The uninstaller exited with {code}")
     require(value["installationGone"], f"The installation directory remains: {left[:20]}")
     require(not value["processesFromInstallation"], "Processes still run from the removed installation")
+    require(not value["uninstallKey"], f"The uninstall key of {args.product} remains")
+    require(not value["startMenuShortcut"], f"The Start menu shortcut {shortcut} remains")
 
 
-def uninstall_key():
-    """Whether the per-user uninstall registry entry for the product remains."""
+def uninstall_key(product):
+    """Whether the per-user uninstall registry entry of `product` exists."""
     import winreg
     try:
         winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                       rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{PRODUCT}"))
+                                       rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{product}"))
         return True
     except OSError:
         return False
@@ -324,6 +333,8 @@ def main():
     removing = commands.add_parser("uninstall", help="silent uninstall, then what remains")
     removing.add_argument("--dir", required=True)
     removing.add_argument("--report", required=True)
+    removing.add_argument("--product", default=PRODUCT,
+                          help="the installer's productName (its uninstall key and Start menu shortcut)")
     args = parser.parse_args()
     if not WINDOWS:
         parser.error("windows_package.py runs on Windows")

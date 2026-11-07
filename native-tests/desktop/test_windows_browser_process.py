@@ -504,6 +504,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("windows_browser_process.py --packaged --binary $env:W6_FIXTURE_APP ", job)
         for step in ("windows_package.py install", "windows_package.py smoke", "windows_package.py uninstall"):
             self.assertIn(step, job)
+        # The installed product browser alone, and each installer's own
+        # uninstall key and shortcut (the fixture has its own productName).
+        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe"',
+                      job)
+        self.assertIn('--report "$env:RUNNER_TEMP\\w6-fixture-uninstall.json" --product TakosumiFixture', job)
+        overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual((overlay["productName"], overlay["identifier"]),
+                         ("TakosumiFixture", "com.takosumi.fixture.package"))
         # The upload takes one gathered directory; the gathering copies only
         # the named evidence, through one copier that never takes an
         # executable, a library or an installer.
@@ -581,6 +590,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(f'pub(super) const BROWSER: &str = "{runner.PACKAGED_BROWSER}";', rust)
         self.assertIn(f'pub(super) const GUARD: &str = "{runner.PACKAGED_GUARD}";', rust)
         self.assertIn('pub(super) const PACKAGED: &str = "cef";', rust)
+
+    def test_a_packaged_process_must_run_from_the_installed_cef(self):
+        cef = "D:\\a\\_temp\\w6-fixture-app\\cef"
+        self.assertTrue(observer.inside("D:\\a\\_temp\\w6-fixture-app\\cef\\takosumi-browser-guard.exe", cef))
+        self.assertTrue(observer.inside("d:\\A\\_TEMP\\w6-fixture-app\\CEF\\takosumi-cef-browser-process.exe", cef))
+        for image in ("D:\\a\\target-w3\\debug\\takosumi-browser-guard.exe",
+                      "D:\\a\\_temp\\w6-fixture-app\\cef-other\\x.exe",
+                      "D:\\a\\_temp\\w6-fixture-app\\cef", None):
+            self.assertFalse(observer.inside(image, cef), image)
 
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:
