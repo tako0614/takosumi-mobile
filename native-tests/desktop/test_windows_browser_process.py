@@ -1010,8 +1010,11 @@ class RunnerTests(unittest.TestCase):
 
     def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
         """M2: cef-macos runs every macOS guard self-test, then the adapter's
-        macOS tests (the ignored ones included) with the built guard and the
-        bundled product browser, and requires each of them by name."""
+        macOS tests (the ignored ones included, the stand-in App skipped)
+        with the built guard and the bundled product browser, requires each
+        of them by name, and compiles the adapter's product and fixture
+        builds; the desktop job's macOS run compiles the App with
+        desktop-cef."""
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = workflow[workflow.index("\n  cef-macos:\n"):]
         # The guard's self-tests: exactly the cases its runner lists.
@@ -1034,9 +1037,11 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('export TAKOSUMI_MACOS_GUARD="$CARGO_TARGET_DIR/debug/takosumi-browser-guard"\n', adapter)
         self.assertIn('export TAKOSUMI_MACOS_BROWSER="$RUNNER_TEMP/m1-product/takosumi-cef-browser-process.app/'
                       'Contents/MacOS/takosumi-cef-browser-process"\n', adapter)
-        self.assertIn("if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}", adapter)
+        self.assertIn("if: ${{ !cancelled() && steps.bundle.outcome == 'success' && "
+                      "steps.plugin-lock.outcome == 'success' }}", adapter)
         self.assertIn("cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features "
-                      "desktop-process-experiment --lib -- macos_tests --include-ignored --test-threads 1 "
+                      "desktop-process-experiment --lib -- macos_tests --include-ignored "
+                      "--skip app_stand_in_for_the_death_case --test-threads 1 "
                       '--show-output | tee "$log"\n', adapter)
         self.assertNotIn("fixture-overrides", adapter)
         plugin = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_adapter.rs").read_text(
@@ -1044,14 +1049,39 @@ class RunnerTests(unittest.TestCase):
         module = plugin[plugin.index("\nmod macos_tests {\n"):]
         tests = re.findall(r"^    #\[test\]\n(?:    #\[ignore = \"[^\"]*\"\]\n)?    fn ([a-z_]+)\(\)", module, re.M)
         self.assertEqual(len(tests), module.count("#[test]"))
+        # The stand-in App runs only inside the death case; the run skips it
+        # (a substring filter that no other test name contains).
+        self.assertIn("app_stand_in_for_the_death_case", tests)
+        tests.remove("app_stand_in_for_the_death_case")
+        self.assertFalse([name for name in tests if "app_stand_in_for_the_death_case" in name])
+        self.assertIn('"desktop::process_adapter::macos_tests::app_stand_in_for_the_death_case",\n', module)
         required = re.findall(r"^\s+desktop::process_adapter::macos_tests::([a-z_]+)(?: \\|;)", adapter, re.M)
-        self.assertEqual(required, tests)
+        self.assertEqual(sorted(required), sorted(tests))
+        self.assertEqual(len(required), len(set(required)))
         self.assertIn('grep -qF "test $name ... ok" "$log"', adapter)
         self.assertIn(f"grep -q '^test result: ok\\. {len(tests)} passed; 0 failed; 0 ignored' \"$log\"", adapter)
         # The real opener is never started: the tests' open_externally only
         # records the link.
         self.assertIn("#[cfg(test)]\nfn open_externally(url: &str) {\n    OPENED.lock().unwrap().push(url.to_owned());\n}",
                       plugin)
+        # The adapter's own lock comes from the App's, pruned only.
+        lock = job[job.index("- name: Plugin lockfile from the App's"):]
+        lock = lock[:lock.index("\n      - name:")]
+        self.assertIn("id: plugin-lock\n", lock)
+        self.assertIn("cp src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock\n", lock)
+        self.assertIn("added = sorted(plugin - app)", lock)
+        # The product and fixture builds compile outside the tests.
+        compiled = job[job.index("- name: Compile the adapter's macOS product and fixture builds"):]
+        compiled = compiled[:compiled.index("\n      - name:")]
+        self.assertIn("if: ${{ !cancelled() && steps.plugin-lock.outcome == 'success' }}", compiled)
+        for features in ("desktop-process-experiment", "fixture-overrides"):
+            self.assertIn("cargo check --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml "
+                          f"--features {features} --lib\n", compiled)
+        desktop = workflow[workflow.index("\n  desktop:\n"):workflow.index("\n  cef-windows:\n")]
+        cef_app = desktop[desktop.index("- name: Compile desktop App with the per-profile CEF adapter"):]
+        cef_app = cef_app[:cef_app.index("\n      - name:")]
+        self.assertIn("if: runner.os == 'Windows' || runner.os == 'macOS'\n", cef_app)
+        self.assertIn("cargo check --locked --manifest-path src-tauri/Cargo.toml --features desktop-cef\n", cef_app)
         upload = job[job.index("name: cef-macos-smoke"):]
         for path in ("m2-*-tests.log", "sumi-m2-*/profiles/*/browser.log", "sumi-m2-*/profiles/*/cef-native.log",
                      "sumi-m2-*/rt/*/guard.json"):
