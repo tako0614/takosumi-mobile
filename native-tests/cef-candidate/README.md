@@ -973,7 +973,8 @@ drops the App's spawner (closing the App's job) and requires every process
 held to end within 15 s, naming each survivor with its image, and no normal
 receipt. A missing helper prints a fresh view of the browser's tree with
 each process's parent and image and the expected program. The step fails
-unless each named test passed and exactly thirteen ran. The `desktop` job also checks the App with `--features desktop-cef` on
+unless each named test passed and exactly fourteen ran (the W6 bundle
+resolution test included). The `desktop` job also checks the App with `--features desktop-cef` on
 Windows.
 
 **2026-11-06 local checks (W2).** On the Linux host the plugin type-checks for

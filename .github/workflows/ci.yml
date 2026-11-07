@@ -616,12 +616,13 @@ jobs:
             'desktop::process_adapter::windows_tests::a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data',
             'desktop::process_adapter::windows_tests::an_unresolvable_browser_leaves_the_app_running_with_its_reason',
             'desktop::process_setup::windows::windows_tests::a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go',
-            'desktop::process_setup::windows::windows_tests::a_missing_cache_runtime_root_is_created_and_located'
+            'desktop::process_setup::windows::windows_tests::a_missing_cache_runtime_root_is_created_and_located',
+            'desktop::process_setup::windows::windows_tests::bundled_executables_must_be_plain_files_in_the_installation'
           )
           foreach ($name in $required) {
             if (-not (Select-String -Path $log -SimpleMatch "test $name ... ok" -Quiet)) { throw "$name did not pass" }
           }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all thirteen Windows adapter tests ran' }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 14 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all fourteen Windows adapter tests ran' }
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the Win32
       # raise to make its top-level window the foreground window.

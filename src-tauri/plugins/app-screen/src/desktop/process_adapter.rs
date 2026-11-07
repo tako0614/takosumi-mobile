@@ -2647,6 +2647,8 @@ mod windows_tests {
                 program: built("TAKOSUMI_WINDOWS_BROWSER"),
                 guard: built("TAKOSUMI_WINDOWS_GUARD"),
                 runtime: setup::Runtime::Given(case.join("rt")),
+                // The built executables, as a fixture's overrides name them.
+                bundle: None,
             },
             &identity,
         )

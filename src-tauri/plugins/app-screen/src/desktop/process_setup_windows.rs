@@ -10,6 +10,13 @@
 //! letter case and adds a verbatim `\\?\` prefix, which is then dropped, as
 //! the browser's own final-path check does.
 //!
+//! An executable from the App's bundle (`<resources>\cef`, where an installed
+//! App's resources are its installation directory) must be a plain file (no
+//! reparse point) directly in that directory, itself a plain directory, so a
+//! link or junction cannot make anything outside the installation stand in
+//! for the browser or the guard. A fixture override only has to resolve to a
+//! file.
+//!
 //! A runtime root must be a plain directory (no reparse point: not a link, a
 //! junction or another reparse point) whose canonical path lies inside this
 //! user's profile directory, whose default access control limits it to the
@@ -80,8 +87,13 @@ fn plain_directory(metadata: &std::fs::Metadata) -> bool {
 /// cache candidate is created when missing). Every returned path is canonical
 /// in the ordinary spelling.
 pub(in crate::desktop) fn locate(plan: Plan, identity: &Identity) -> Result<Located> {
-    let program = existing_file(&plan.program, "Browser process executable is unavailable.")?;
-    let guard = existing_file(&plan.guard, "Browser guard is unavailable.")?;
+    let bundle = plan.bundle.as_deref();
+    let program = executable(
+        &plan.program,
+        bundle,
+        "Browser process executable is unavailable.",
+    )?;
+    let guard = executable(&plan.guard, bundle, "Browser guard is unavailable.")?;
     let runtime = match plan.runtime {
         Runtime::Given(path) => private_runtime(&path, identity)?,
         Runtime::Search(candidates) => search(&candidates, identity)?,
@@ -91,6 +103,49 @@ pub(in crate::desktop) fn locate(plan: Plan, identity: &Identity) -> Result<Loca
         guard,
         runtime,
     })
+}
+
+/// An executable of the plan: one from the App's bundle must be a plain file
+/// directly in the plain bundle directory (`bundled_file`); a fixture
+/// override only has to resolve to a file.
+fn executable(path: &Path, bundle: Option<&Path>, missing: &'static str) -> Result<PathBuf> {
+    match bundle {
+        Some(bundle) if path.parent() == Some(bundle) => bundled_file(bundle, path, missing),
+        _ => existing_file(path, missing),
+    }
+}
+
+/// `path` in the bundle directory `bundle`: the directory must be a plain
+/// directory and the file a plain file (neither a link, a junction nor
+/// another reparse point), and the file's canonical path must lie directly
+/// in the directory's. Returns the canonical file in the ordinary spelling.
+fn bundled_file(bundle: &Path, path: &Path, missing: &'static str) -> Result<PathBuf> {
+    let unavailable = |at: &Path, error: std::io::Error| {
+        failure(format!("{missing} ({}: {error})", at.display()))
+    };
+    let directory = bundle
+        .symlink_metadata()
+        .map_err(|error| unavailable(bundle, error))?;
+    if !plain_directory(&directory) {
+        return Err(Error::InvalidRequest(
+            "The App's bundled browser directory must be a plain directory in its installation.",
+        ));
+    }
+    let file = path
+        .symlink_metadata()
+        .map_err(|error| unavailable(path, error))?;
+    if !file.file_type().is_file() || file.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::InvalidRequest(
+            "A bundled browser executable must be a plain file in the App's installation.",
+        ));
+    }
+    let resolved = existing_file(path, missing)?;
+    if resolved.parent() != Some(canonical(bundle)?.as_path()) {
+        return Err(Error::InvalidRequest(
+            "A bundled browser executable must lie in the App's installation.",
+        ));
+    }
+    Ok(resolved)
 }
 
 fn search(candidates: &[Candidate], identity: &Identity) -> Result<PathBuf> {
@@ -207,7 +262,9 @@ pub(in crate::desktop) fn sweep_runtime(root: &Path, _identity: &Identity) -> Ve
 
 #[cfg(test)]
 mod windows_tests {
-    use super::super::{claim_runtime, plan, remove_runtime, runtime_name, Overrides};
+    use super::super::{
+        claim_runtime, plan, remove_runtime, runtime_name, Overrides, BROWSER, GUARD, PACKAGED,
+    };
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
@@ -233,8 +290,98 @@ mod windows_tests {
                 runtime: Runtime::Search(vec![Candidate::Cache(
                     r"C:\Users\a\AppData\Local\com.takosumi".into()
                 )]),
+                bundle: Some(r"C:\Program Files\Takosumi\cef".into()),
             }
         );
+    }
+
+    #[test]
+    fn bundled_executables_must_be_plain_files_in_the_installation() {
+        let root = scratch("bundle");
+        let identity = Identity {
+            profile: root.clone(),
+        };
+        let cache = root.join("cache");
+        private_directory(&cache).unwrap();
+        let installed = |name: &str| {
+            let install = root.join(name);
+            private_directory(&install.join(PACKAGED)).unwrap();
+            for file in [BROWSER, GUARD] {
+                std::fs::write(install.join(PACKAGED).join(file), b"").unwrap();
+            }
+            install
+        };
+        let resolve = |overrides: &Overrides, install: &Path| {
+            locate(
+                plan(overrides, Some(install), None, Some(&cache)).unwrap(),
+                &identity,
+            )
+        };
+        // `mklink /J` makes a junction; with no switch, a file symbolic link.
+        let mklink = |kind: Option<&str>, link: &Path, target: &Path| {
+            let made = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink"])
+                .args(kind)
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            made.status.success()
+        };
+        // The installed App resolves both from its own bundle.
+        let install = installed("install");
+        let found = resolve(&Overrides::default(), &install);
+        // A bundle directory that is a junction to files elsewhere (no
+        // privilege needed) is refused, even though the files exist.
+        let elsewhere = installed("elsewhere");
+        let joined = root.join("joined");
+        private_directory(&joined).unwrap();
+        assert!(mklink(
+            Some("/J"),
+            &joined.join(PACKAGED),
+            &elsewhere.join(PACKAGED)
+        ));
+        let through_junction = resolve(&Overrides::default(), &joined);
+        // A missing bundled guard is refused with its reason.
+        let partial = installed("partial");
+        std::fs::remove_file(partial.join(PACKAGED).join(GUARD)).unwrap();
+        let missing = resolve(&Overrides::default(), &partial);
+        // A fixture override may point anywhere; the executable left to the
+        // bundle is still checked.
+        let outside = elsewhere.join(PACKAGED).join(BROWSER);
+        let mixed = Overrides {
+            program: Some(outside.clone().into()),
+            ..Overrides::default()
+        };
+        let mixed_found = resolve(&mixed, &install);
+        let mixed_missing = resolve(&mixed, &partial);
+        // A file symbolic link in the bundle (when this account may create
+        // one) is refused too.
+        let linked = installed("linked");
+        let browser = linked.join(PACKAGED).join(BROWSER);
+        std::fs::remove_file(&browser).unwrap();
+        let symlink =
+            mklink(None, &browser, &outside).then(|| resolve(&Overrides::default(), &linked));
+        // The junction is removed, never followed.
+        std::fs::remove_dir(joined.join(PACKAGED)).unwrap();
+        let kept = elsewhere.join(PACKAGED).join(GUARD).is_file();
+        std::fs::remove_dir_all(&root).unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.program, install.join(PACKAGED).join(BROWSER));
+        assert_eq!(found.guard, install.join(PACKAGED).join(GUARD));
+        let reason = through_junction.unwrap_err().to_string();
+        assert!(reason.contains("plain directory"), "{reason}");
+        let reason = missing.unwrap_err().to_string();
+        assert!(reason.contains("Browser guard is unavailable"), "{reason}");
+        let mixed_found = mixed_found.unwrap();
+        assert_eq!(mixed_found.program, outside);
+        assert_eq!(mixed_found.guard, install.join(PACKAGED).join(GUARD));
+        assert!(mixed_missing.is_err());
+        if let Some(symlink) = symlink {
+            let reason = symlink.unwrap_err().to_string();
+            assert!(reason.contains("plain file"), "{reason}");
+        }
+        assert!(kept);
     }
 
     #[test]
@@ -301,6 +448,7 @@ mod windows_tests {
                     Candidate::Xdg(root.join("never-used")),
                     Candidate::Cache(cache.clone()),
                 ]),
+                bundle: None,
             },
             &identity,
         );
