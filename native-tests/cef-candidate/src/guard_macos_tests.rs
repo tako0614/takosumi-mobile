@@ -113,13 +113,17 @@ fn standin(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         // A descendant outside the group (its own session) that forks long
-        // lived children of its own, as fast as it can, from just before
-        // the guard's kill begins: the browser exits after the guard has
-        // seen the breeder, the breeder waits to be orphaned, then 300 ms
-        // (the guard's natural phase is 500 ms), then forks every
-        // millisecond until it is stopped (at most 400 children).
+        // lived children of its own until it is stopped: the breeder reports
+        // on a pipe once its first child exists, and only then does this
+        // browser exit (after the guard has had time to record the breeder),
+        // so the guard's natural phase and its kill both find it forking.
         Some("breed") => {
-            let mut command = helper(&["breeder"]);
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([STANDIN, "breeder"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
             // SAFETY: setsid in the forked child before exec.
             unsafe {
                 command.pre_exec(|| {
@@ -130,19 +134,20 @@ fn standin(args: &[String]) -> ExitCode {
                 });
             }
             #[allow(clippy::zombie_processes)]
-            let child = command.spawn().unwrap();
+            let mut child = command.spawn().unwrap();
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "forking\n");
             say(format!("breeder {}", child.id()));
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(300));
             ExitCode::SUCCESS
         }
+        // Forks a child every 5 ms (at most 400, over 2 s, beyond the
+        // guard's 0.5 s natural phase), each only waiting for a signal.
         Some("breeder") => {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            // SAFETY: getppid has no preconditions.
-            while unsafe { libc::getppid() } != 1 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            std::thread::sleep(Duration::from_millis(300));
-            for _ in 0..400 {
+            for n in 0..400 {
                 // SAFETY: this stand-in is single-threaded; the child only
                 // waits for a signal and never returns into Rust.
                 if unsafe { libc::fork() } == 0 {
@@ -150,7 +155,10 @@ fn standin(args: &[String]) -> ExitCode {
                         unsafe { libc::pause() };
                     }
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                if n == 0 {
+                    say("forking".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
             std::thread::sleep(Duration::from_secs(60));
             ExitCode::SUCCESS
@@ -207,6 +215,7 @@ const TESTS: &[Test] = tests![
     a_descendant_that_left_the_group_is_still_killed,
     a_descendant_that_ends_by_itself_is_not_forced,
     a_tree_forking_as_the_kill_begins_is_frozen_then_killed,
+    an_unwritable_log_still_kills_the_frozen_tree,
     a_stop_request_drains_a_running_browser,
     the_apps_death_ends_the_guard_and_the_browser,
     refusals_create_no_receipt_and_start_nothing,
@@ -504,13 +513,45 @@ fn a_tree_forking_as_the_kill_begins_is_frozen_then_killed() {
     assert!(clean(&proof), "{proof}");
     assert_eq!(proof["rootExit"], 0, "{proof}");
     assert_eq!(proof["complete"], true, "{proof}");
-    // Every process seen but the browser (which exited by itself) was the
-    // breeder or a child of it, none of which ends by itself: each was
-    // killed and counted once.
+    // Every process seen but the browser (which exited by itself, and
+    // counts once) was the breeder or a child of it, none of which ends by
+    // itself: each was killed and counted once. The breeder had a child
+    // before the browser exited.
     let forced = proof["forcedCleanup"].as_u64().unwrap();
     let observed = proof["observed"].as_u64().unwrap();
-    assert!(forced >= 2, "no child was forked by the kill: {proof}");
-    assert_eq!(forced, observed - 1, "{proof}");
+    assert!(forced >= 2, "{proof}");
+    assert_eq!(forced + 1, observed, "{proof}");
+}
+
+fn an_unwritable_log_still_kills_the_frozen_tree() {
+    let case = Case::new("no-log");
+    // The guard's standard error (the browser.log) is a pipe whose reader
+    // is closed: every write fails (EPIPE; Rust programs ignore SIGPIPE).
+    // The freeze's line then cannot be written, and the guard must still
+    // kill what it stopped and write its receipt.
+    let mut ends = [0; 2];
+    // SAFETY: pipe fills two descriptors this test then owns.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    drop(reader);
+    let mut command = case.guard(&["sleep"]);
+    command.stderr(Stdio::from(writer));
+    let mut guard = command.spawn().unwrap();
+    // Drop the command (and its copy of the writer) at once.
+    drop(command);
+    let browser = pid_in(&first_line(&mut guard));
+    // SAFETY: the guard this test started.
+    unsafe { libc::kill(guard.id() as i32, libc::SIGTERM) };
+    let status = finish(&mut guard, Duration::from_secs(10));
+    let proof = case.receipt();
+    // Exit 1 (killed browser), not a panic's 101; nothing left stopped.
+    assert_eq!(status.code(), Some(1), "{proof}");
+    assert_eq!(proof["rootExit"], -libc::SIGKILL, "{proof}");
+    assert_eq!(proof["complete"], true, "{proof}");
+    assert_eq!(proof["forcedCleanup"], 1, "{proof}");
+    assert!(clean(&proof), "{proof}");
+    assert_nothing_left(guard.id() as i32, &[browser]);
 }
 
 fn a_stop_request_drains_a_running_browser() {
