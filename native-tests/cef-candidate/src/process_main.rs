@@ -555,9 +555,10 @@ fn raise(host: &BrowserHost) -> Result<(), &'static str> {
     mac_front::raise(host.window_handle())
 }
 
-/// macOS: how often a new browser's NSWindow is looked for.
+/// macOS: the wait for a new browser's NSWindow (its pure decisions).
 #[cfg(target_os = "macos")]
-const WINDOW_POLL_MS: i64 = 25;
+#[path = "window_wait.rs"]
+mod window_wait;
 
 /// macOS: whether a new browser's view is not in an NSWindow yet (so its
 /// `opened` must wait); its window handle's state goes to standard error.
@@ -574,52 +575,81 @@ fn mac_window_pending(browser: &Browser) -> bool {
 
 /// macOS: send a new screen's `opened` once CEF's view is in an NSWindow
 /// (its `windowNumber` is the window id the App gets), looking again every
-/// WINDOW_POLL_MS on the UI thread. No bound of its own: the parent's wait
-/// for `opened` bounds it (the smoke's `--open-timeout`; in the App the
-/// adapter's 20 s for an Open reply), and a screen closed meanwhile stops
-/// it. Until then the screen counts as opening (`pending`), as before its
-/// creation, so a Shutdown is answered CloseBlocked.
+/// `window_wait::POLL` on the UI thread. Until then the screen counts as
+/// opening (`pending`), as before its creation, so a Shutdown is answered
+/// CloseBlocked. Every end without `opened` answers the Open with an error
+/// (`window_wait::refusal`) and stops counting it as opening: the screen
+/// closed meanwhile (also by the end of the App's input, whose close_all
+/// closes every screen in `screens`, this one included), the browser is
+/// stopping (the screen is closed), or the window did not appear within
+/// `window_wait::BOUND` (15 s, before the adapter's 20 s Open wait; the
+/// screen is closed). A look that cannot be posted ends the same way.
 #[cfg(target_os = "macos")]
 fn await_window(id: u64, key: String, browser: Browser, started: std::time::Instant) {
+    use window_wait::Step;
     let browser_id = browser.identifier();
-    let elapsed = started.elapsed().as_millis();
-    if !with_state(|state| state.screens.contains_key(&browser_id)) {
-        eprintln!("macOS: browser {browser_id} closed before its window appeared ({elapsed} ms)");
-        with_state(|state| state.pending -= 1);
-        maybe_quit();
-        return;
-    }
+    let waited = started.elapsed();
+    let (screen_open, stopping) = with_state(|state| {
+        (
+            state.screens.contains_key(&browser_id),
+            state.shutdown.is_some() || state.quitting,
+        )
+    });
     let host = browser.host().unwrap();
-    if mac_front::window_number(host.window_handle()) == 0 {
-        let mut task = WindowTask::new(id, key, browser.clone(), started);
-        if post_delayed_task(ThreadId::UI, Some(&mut task), WINDOW_POLL_MS) != 1 {
-            // It can no longer open: it stops counting as opening and is
-            // closed (its on_before_close lets the browser quit).
+    let window = screen_open && mac_front::window_number(host.window_handle()) != 0;
+    let step = window_wait::step(screen_open, stopping, window, waited);
+    match step {
+        Step::Again => {
+            let mut task = WindowTask::new(id, key, browser.clone(), started);
+            let delay = i64::try_from(window_wait::POLL.as_millis()).unwrap_or(i64::MAX);
+            if post_delayed_task(ThreadId::UI, Some(&mut task), delay) == 1 {
+                return;
+            }
             eprintln!(
                 "macOS: the look for browser {browser_id}'s window could not be posted; closing it"
             );
-            with_state(|state| state.pending -= 1);
-            host.close_browser(1);
+            end_window_wait(id, &host, true, "The browser window could not be awaited");
         }
-        return;
+        Step::Ready => {
+            eprintln!(
+                "macOS: browser {browser_id} window after {} ms: {}",
+                waited.as_millis(),
+                mac_front::describe(host.window_handle())
+            );
+            let over_limit = with_state(|state| {
+                state.pending -= 1;
+                state.screens.len() > 48
+            });
+            if over_limit {
+                error(id, "Browser screen limit or context unavailable");
+                host.close_browser(1);
+                return;
+            }
+            opened(id, key, &browser);
+        }
+        Step::Closed | Step::Stopping | Step::Expired => {
+            eprintln!(
+                "macOS: browser {browser_id} window wait ended after {} ms: {step:?}",
+                waited.as_millis()
+            );
+            let message = window_wait::refusal(step).expect("An end without opened has its error");
+            end_window_wait(id, &host, step != Step::Closed, message);
+        }
     }
-    eprintln!(
-        "macOS: browser {browser_id} window after {elapsed} ms: {}",
-        mac_front::describe(host.window_handle())
-    );
+}
+
+/// macOS: end a window wait without `opened`: answer the Open, stop counting
+/// the screen as opening, close it when it is still open (its
+/// on_before_close lets the browser quit), and let a browser whose last
+/// screen has gone quit.
+#[cfg(target_os = "macos")]
+fn end_window_wait(id: u64, host: &BrowserHost, close: bool, message: &str) {
+    error(id, message);
     with_state(|state| state.pending -= 1);
-    let (stopping, failed, over_limit) = with_state(|state| {
-        (
-            state.shutdown.is_some(),
-            state.failed,
-            state.screens.len() > 48,
-        )
-    });
-    if stopping || over_limit {
-        host.close_browser(i32::from(failed || over_limit));
-        return;
+    if close {
+        host.close_browser(1);
     }
-    opened(id, key, &browser);
+    maybe_quit();
 }
 
 /// The native window id reported to the App: the X11 window CEF reports on

@@ -1358,6 +1358,15 @@ jobs:
           python3 --version
           node --version
           sw_vers
+      # The decisions of the browser's wait for a new window before its
+      # opened (src/window_wait.rs, std only, built with rustc alone). All
+      # three must run.
+      - name: Browser window wait tests (macOS)
+        run: |
+          exe="$RUNNER_TEMP/window-wait-tests"
+          rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"
+          "$exe" | tee "$RUNNER_TEMP/window-wait-tests.log"
+          grep -q '^test result: ok\. 3 passed; 0 failed' "$RUNNER_TEMP/window-wait-tests.log" || { echo 'Not all three window wait tests ran'; exit 1; }
       - name: Build takosumi-cef-browser-process and takosumi-cef-browser-helper (product)
         id: build
         working-directory: native-tests/cef-candidate
