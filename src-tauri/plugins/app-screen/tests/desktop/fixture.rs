@@ -982,7 +982,7 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
     // replace. Check the native document first, including across process swaps.
     if view.is_loading() || view.uri().as_deref() != Some(pending.uri.as_str()) {
         if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, events={}", gtk::prelude::WidgetExt::widget_name(&view), pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary());
+            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, events={}, view_events={}", gtk::prelude::WidgetExt::widget_name(&view), pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary(), fixture_view_events(&gtk::prelude::WidgetExt::widget_name(&view)));
             end_trail(&view, &pending);
             pending.app.exit(1);
         } else {
@@ -1007,7 +1007,7 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
             let callback = pending.callback.borrow_mut().take();
             if let Some(next) = callback { next(); }
         } else if std::time::Instant::now() >= pending.deadline {
-            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}, events={}", gtk::prelude::WidgetExt::widget_name(&native), pending.uri, pending.nonce, native.uri(), native.is_loading(), pending.trail.summary());
+            eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, last={diagnostic}, events={}, view_events={}", gtk::prelude::WidgetExt::widget_name(&native), pending.uri, pending.nonce, native.uri(), native.is_loading(), pending.trail.summary(), fixture_view_events(&gtk::prelude::WidgetExt::widget_name(&native)));
             end_trail(&native, &pending);
             pending.app.exit(1);
         } else {

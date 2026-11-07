@@ -60,30 +60,89 @@ pub(crate) fn fixture_clock() -> u128 {
         .as_millis()
 }
 
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+thread_local! {
+    /// Fixture diagnostics only: each view's lifecycle and load events since
+    /// its creation (the last 40), for the fixture's failure lines.
+    static FIXTURE_VIEW_EVENTS: RefCell<HashMap<String, std::collections::VecDeque<String>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Fixture diagnostics only: log one event of a view (shared monotonic clock
+/// and the view's label) and keep it for `fixture_view_events`.
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+fn note_fixture_view(label: &str, event: String) {
+    let line = format!("t={}ms {event}", fixture_clock());
+    eprintln!("fixture GTK view: label={label} {line}");
+    FIXTURE_VIEW_EVENTS.with(|events| {
+        let mut events = events.borrow_mut();
+        let list = events.entry(label.to_owned()).or_default();
+        if list.len() == 40 {
+            list.pop_front();
+        }
+        list.push_back(line);
+    });
+}
+
+/// Fixture diagnostics only: the events kept for a view since its creation.
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+pub(crate) fn fixture_view_events(label: &str) -> String {
+    FIXTURE_VIEW_EVENTS.with(|events| {
+        format!(
+            "[{}]",
+            events
+                .borrow()
+                .get(label)
+                .map(|list| list.iter().cloned().collect::<Vec<_>>().join("; "))
+                .unwrap_or_default()
+        )
+    })
+}
+
 /// Fixture diagnostics only: name the GTK view after its window label (read
-/// back by the navigation record) and log when it is created, realized and
-/// mapped. Nothing here changes what the view does.
+/// back by the navigation record) and, from its creation, log when it is
+/// realized and mapped and every load event, load failure (URI and the
+/// error's domain, code and message), TLS failure (the fact and its flags)
+/// and web-process termination. The failure handlers let WebKit's default
+/// run; nothing here changes what the view does. No cookie, storage value,
+/// credential or argv is logged.
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
 fn trace_fixture_view(label: &str, popup: bool, view: &webkit2gtk::WebView) {
     use gtk::prelude::*;
+    use webkit2gtk::WebViewExt;
     view.set_widget_name(label);
-    eprintln!(
-        "fixture GTK view: t={}ms label={label} event=created popup={popup}",
-        fixture_clock()
-    );
-    for (signal, event) in [("realize", "realized"), ("map", "mapped")] {
-        let label = label.to_owned();
-        let handler = move |_: &webkit2gtk::WebView| {
-            eprintln!(
-                "fixture GTK view: t={}ms label={label} event={event}",
-                fixture_clock()
-            );
-        };
-        match signal {
-            "realize" => view.connect_realize(handler),
-            _ => view.connect_map(handler),
-        };
-    }
+    note_fixture_view(label, format!("event=created popup={popup}"));
+    let named = label.to_owned();
+    view.connect_realize(move |_| note_fixture_view(&named, "event=realized".into()));
+    let named = label.to_owned();
+    view.connect_map(move |_| note_fixture_view(&named, "event=mapped".into()));
+    let named = label.to_owned();
+    view.connect_load_changed(move |view, event| {
+        note_fixture_view(
+            &named,
+            format!("event=load-changed {event:?} uri={:?}", view.uri()),
+        );
+    });
+    let named = label.to_owned();
+    view.connect_load_failed(move |_, event, uri, error| {
+        note_fixture_view(
+            &named,
+            format!("event=load-failed {event:?} uri={uri} error={error:?}"),
+        );
+        false
+    });
+    let named = label.to_owned();
+    view.connect_load_failed_with_tls_errors(move |_, _, _, flags| {
+        note_fixture_view(
+            &named,
+            format!("event=load-failed-with-tls-errors flags={flags:?}"),
+        );
+        false
+    });
+    let named = label.to_owned();
+    view.connect_web_process_terminated(move |_, reason| {
+        note_fixture_view(&named, format!("event=web-process-terminated {reason:?}"));
+    });
 }
 const MAX_WINDOWS: usize = 48;
 
@@ -503,10 +562,12 @@ fn create_screen(
         if !is_popup {
             let loaded = view.load_url(&start);
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
-            eprintln!(
-                "fixture GTK view: t={}ms label={label} event=initial-load-requested accepted={} target={start}",
-                fixture_clock(),
-                loaded.is_ok()
+            note_fixture_view(
+                &label,
+                format!(
+                    "event=initial-load-requested accepted={} target={start}",
+                    loaded.is_ok()
+                ),
             );
             loaded.map_err(failure)?;
         }
