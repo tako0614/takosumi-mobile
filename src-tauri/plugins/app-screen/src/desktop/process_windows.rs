@@ -338,12 +338,11 @@ extern "system" {
 /// the foreground only to a process allowed to take it; the App is the
 /// foreground process while the person uses the home and may pass that right
 /// on. A refusal (the App is not in front) is harmless: the browser then
-/// flashes its taskbar button and reports that it was not raised.
-pub(super) fn allow_foreground(pid: u32) {
+/// flashes its taskbar button and reports that it was not raised. Returns
+/// whether Windows accepted the grant.
+pub(super) fn allow_foreground(pid: u32) -> bool {
     // SAFETY: a documented user32 call taking a plain process id.
-    unsafe {
-        AllowSetForegroundWindow(pid);
-    }
+    unsafe { AllowSetForegroundWindow(pid) != 0 }
 }
 
 /// The App's end of a browser's control pipe. Windows has no portable

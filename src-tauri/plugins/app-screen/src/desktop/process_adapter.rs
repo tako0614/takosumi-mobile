@@ -153,6 +153,10 @@ struct Process {
     /// name the guard opened at start; setting it makes the guard drain.
     #[cfg(windows)]
     stop: crate::windows_job::Event,
+    /// Whether Windows accepted the foreground grant before the last reopen
+    /// (`None` before any reopen); reported by `status`.
+    #[cfg(windows)]
+    foreground_grant: Option<bool>,
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 /// How long a browser that agreed to stop (it answered Stopped, or its pipe
@@ -702,11 +706,20 @@ pub(super) fn status(app: &AppHandle) -> Result<serde_json::Value> {
         return Err(failure(unavailable(app).unwrap_or_default()));
     };
     let state = backend.0.lock().map_err(failure)?;
-    Ok(serde_json::Value::Array(state.processes.values().map(|process|serde_json::json!({
-        "pid":process.child.id(),"profile":process.profile,"directory":process.directory,"guardReceipt":process.guard_receipt,
-        "next":process.next,"uncertain":process.uncertain,"opened":process.opened,
-        "closing":backend.1.state.load(Ordering::Acquire),"exitRequests":backend.1.requests.load(Ordering::Acquire)
-    })).collect()))
+    Ok(serde_json::Value::Array(state.processes.values().map(|process|{
+        #[allow(unused_mut)]
+        let mut entry = serde_json::json!({
+            "pid":process.child.id(),"profile":process.profile,"directory":process.directory,"guardReceipt":process.guard_receipt,
+            "next":process.next,"uncertain":process.uncertain,"opened":process.opened,
+            "closing":backend.1.state.load(Ordering::Acquire),"exitRequests":backend.1.requests.load(Ordering::Acquire)
+        });
+        // Windows: whether the last reopen's foreground grant was accepted.
+        #[cfg(windows)]
+        {
+            entry["foregroundGrant"] = serde_json::json!(process.foreground_grant);
+        }
+        entry
+    }).collect()))
 }
 
 impl Process {
@@ -914,6 +927,8 @@ impl Process {
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
             #[cfg(windows)]
             stop,
+            #[cfg(windows)]
+            foreground_grant: None,
         };
         #[cfg(target_os = "linux")]
         nonblocking(process.input.as_ref().unwrap())?;
@@ -1127,7 +1142,7 @@ impl Process {
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
         {
-            windows::allow_foreground(pid);
+            self.foreground_grant = Some(windows::allow_foreground(pid));
         }
         if let Err(error) = self.send(Request::Open { id, payload }, deadline) {
             self.uncertain = true;
