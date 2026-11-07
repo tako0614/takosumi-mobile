@@ -654,7 +654,16 @@ class SandboxEvidenceTests(unittest.TestCase):
 
 class MacSmokeTests(unittest.TestCase):
     """windows_smoke.py's macOS path (M1): the process table, the seatbelt
-    sandbox evidence and the descendants left after the exit."""
+    sandbox evidence and the descendants left after the exit. Platform
+    neutral: `ps`, `sandbox_check` and the process signals are stand-ins,
+    and a real call to either of the first two fails the test."""
+
+    def setUp(self):
+        import windows_smoke as smoke
+        for name in ("ps_rows", "seatbelt_sandboxed"):
+            patcher = mock.patch.object(smoke, name, mock.Mock(side_effect=AssertionError(f"real {name} called")))
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     PS = ("    1     0 /sbin/launchd\n"
           "  500     1 /Users/runner/work/_temp/m1/takosumi-cef-browser-process.app/Contents/MacOS/"

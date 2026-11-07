@@ -95,25 +95,55 @@ pub fn install_application() {
     let _: Bool = unsafe { msg_send![&app, setActivationPolicy: 0isize] };
 }
 
-/// The `NSWindow` of a browser's native view (CEF's window handle on
-/// macOS), if it has one.
-fn window_of(view: *mut c_void) -> Option<&'static AnyObject> {
-    // SAFETY: CEF's window handle on macOS is the browser's NSView (or
-    // null); `window` returns its NSWindow or nil, owned by AppKit while the
-    // browser lives.
-    let view = unsafe { view.cast::<AnyObject>().as_ref() }?;
-    let window: *mut AnyObject = unsafe { msg_send![view, window] };
-    unsafe { window.as_ref() }
+/// Whether an Objective-C object answers `selector`.
+fn responds(object: &AnyObject, selector: objc2::runtime::Sel) -> bool {
+    let answer: Bool = unsafe { msg_send![object, respondsToSelector: selector] };
+    answer.as_bool()
 }
 
-/// The window number of a browser's `NSWindow` (0 when it has none).
-pub fn window_number(view: *mut c_void) -> u64 {
-    window_of(view)
+/// The `NSWindow` of a browser's native window handle, if it has one. CEF's
+/// handle on macOS is an `NSView` (for a Chrome-style window the content view
+/// of its `NSWindow`), null before CEF sets it; an `NSView` not yet in a
+/// window answers nil. A handle that is itself a window is taken as it is.
+fn window_of<'a>(handle: *mut c_void) -> Option<&'a AnyObject> {
+    // SAFETY: the handle is null or a live AppKit object CEF owns while the
+    // browser lives; it is only asked selectors it answers.
+    let object = unsafe { handle.cast::<AnyObject>().as_ref() }?;
+    if responds(object, sel!(window)) {
+        let window: *mut AnyObject = unsafe { msg_send![object, window] };
+        unsafe { window.as_ref() }
+    } else if responds(object, sel!(windowNumber)) {
+        Some(object)
+    } else {
+        None
+    }
+}
+
+/// The window number of a browser's `NSWindow` (0 when it has none yet).
+pub fn window_number(handle: *mut c_void) -> u64 {
+    window_of(handle)
         .map(|window| {
             let number: isize = unsafe { msg_send![window, windowNumber] };
             u64::try_from(number).unwrap_or(0)
         })
         .unwrap_or(0)
+}
+
+/// What a browser's native window handle shows, for the browser's standard
+/// error: null or not, its class, whether it is in an `NSWindow`, and that
+/// window's number (0 when none).
+pub fn describe(handle: *mut c_void) -> String {
+    // SAFETY: as in `window_of`.
+    let Some(object) = (unsafe { handle.cast::<AnyObject>().as_ref() }) else {
+        return "window handle null, no NSWindow, windowNumber 0".into();
+    };
+    let class = object.class().name().to_string_lossy().into_owned();
+    let window = window_of(handle).is_some();
+    format!(
+        "window handle set ({class}), NSWindow {}, windowNumber {}",
+        if window { "present" } else { "nil" },
+        window_number(handle)
+    )
 }
 
 /// Bring a reused browser window forward: restore it when minimized,
@@ -122,9 +152,10 @@ pub fn window_number(view: *mut c_void) -> u64 {
 /// the front, also when the application is not active. macOS decides
 /// activation cooperatively, so whether the window becomes the active one
 /// is not checked here.
-pub fn raise(view: *mut c_void) -> Result<(), &'static str> {
+pub fn raise(handle: *mut c_void) -> Result<(), &'static str> {
     let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
-    let window = window_of(view).ok_or("the browser view has no window")?;
+    // Resolved now: the window holding the browser can change.
+    let window = window_of(handle).ok_or("the browser view has no window")?;
     let nil: Option<&AnyObject> = None;
     unsafe {
         let miniaturized: Bool = msg_send![window, isMiniaturized];

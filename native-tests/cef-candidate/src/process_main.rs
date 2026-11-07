@@ -555,6 +555,73 @@ fn raise(host: &BrowserHost) -> Result<(), &'static str> {
     mac_front::raise(host.window_handle())
 }
 
+/// macOS: how often a new browser's NSWindow is looked for.
+#[cfg(target_os = "macos")]
+const WINDOW_POLL_MS: i64 = 25;
+
+/// macOS: whether a new browser's view is not in an NSWindow yet (so its
+/// `opened` must wait); its window handle's state goes to standard error.
+#[cfg(target_os = "macos")]
+fn mac_window_pending(browser: &Browser) -> bool {
+    let handle = browser.host().unwrap().window_handle();
+    eprintln!(
+        "macOS: browser {} created: {}",
+        browser.identifier(),
+        mac_front::describe(handle)
+    );
+    mac_front::window_number(handle) == 0
+}
+
+/// macOS: send a new screen's `opened` once CEF's view is in an NSWindow
+/// (its `windowNumber` is the window id the App gets), looking again every
+/// WINDOW_POLL_MS on the UI thread. No bound of its own: the parent's wait
+/// for `opened` bounds it (the smoke's `--open-timeout`; in the App the
+/// adapter's 20 s for an Open reply), and a screen closed meanwhile stops
+/// it. Until then the screen counts as opening (`pending`), as before its
+/// creation, so a Shutdown is answered CloseBlocked.
+#[cfg(target_os = "macos")]
+fn await_window(id: u64, key: String, browser: Browser, started: std::time::Instant) {
+    let browser_id = browser.identifier();
+    let elapsed = started.elapsed().as_millis();
+    if !with_state(|state| state.screens.contains_key(&browser_id)) {
+        eprintln!("macOS: browser {browser_id} closed before its window appeared ({elapsed} ms)");
+        with_state(|state| state.pending -= 1);
+        maybe_quit();
+        return;
+    }
+    let host = browser.host().unwrap();
+    if mac_front::window_number(host.window_handle()) == 0 {
+        let mut task = WindowTask::new(id, key, browser.clone(), started);
+        if post_delayed_task(ThreadId::UI, Some(&mut task), WINDOW_POLL_MS) != 1 {
+            // It can no longer open: it stops counting as opening and is
+            // closed (its on_before_close lets the browser quit).
+            eprintln!(
+                "macOS: the look for browser {browser_id}'s window could not be posted; closing it"
+            );
+            with_state(|state| state.pending -= 1);
+            host.close_browser(1);
+        }
+        return;
+    }
+    eprintln!(
+        "macOS: browser {browser_id} window after {elapsed} ms: {}",
+        mac_front::describe(host.window_handle())
+    );
+    with_state(|state| state.pending -= 1);
+    let (stopping, failed, over_limit) = with_state(|state| {
+        (
+            state.shutdown.is_some(),
+            state.failed,
+            state.screens.len() > 48,
+        )
+    });
+    if stopping || over_limit {
+        host.close_browser(i32::from(failed || over_limit));
+        return;
+    }
+    opened(id, key, &browser);
+}
+
 /// The native window id reported to the App: the X11 window CEF reports on
 /// Linux; on Windows the value of the top-level HWND the raise brings forward;
 /// on macOS the `windowNumber` of the NSWindow holding CEF's view.
@@ -606,14 +673,24 @@ wrap_life_span_handler! {
             let host=browser.host().unwrap();
             let mut observer=DialogEvents::new(browser.identifier());
             let registration=host.add_dev_tools_message_observer(Some(&mut observer)).expect("Owned browser lifecycle observer");
+            // macOS: a Chrome-style window is created and shown after this
+            // call, so CEF's view may not be in an NSWindow yet; `opened`
+            // waits for it (`await_window`), and the screen keeps counting
+            // as opening until then.
+            #[cfg(target_os = "macos")]
+            let awaiting=self.bound&&!popup&&mac_window_pending(browser);
+            #[cfg(not(target_os = "macos"))]
+            let awaiting=false;
             with_state(|state| {
                 state.live+=1;
                 if self.bound {
-                    if !popup { state.pending-=1; }
+                    if !popup&&!awaiting { state.pending-=1; }
                     assert!(state.screens.insert(browser.identifier(),Screen{browser:browser.clone(),key:self.key.clone(),popup,_observer:registration.clone(),observation:CloseObservation::Idle,load_noted:false}).is_none());
                 }
             });
             if !self.bound { browser.host().unwrap().close_browser(1);return; }
+            #[cfg(target_os = "macos")]
+            if awaiting { await_window(self.id,self.key.clone(),browser.clone(),std::time::Instant::now());return; }
             let (stopping,failed,over_limit)=with_state(|state|(state.shutdown.is_some(),state.failed,state.screens.len()>48));
             if stopping||over_limit { browser.host().unwrap().close_browser(i32::from(failed||over_limit));return; }
             if !popup { opened(self.id,self.key.clone(),browser); }
@@ -894,6 +971,12 @@ fn dispatch(bytes: Option<&[u8]>) {
 wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
     impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
+}
+// macOS: the next look for a new browser's NSWindow (`await_window`).
+#[cfg(target_os = "macos")]
+wrap_task! {
+    struct WindowTask { id: u64, key: String, browser: Browser, started: std::time::Instant }
+    impl Task { fn execute(&self) { await_window(self.id, self.key.clone(), self.browser.clone(), self.started); } }
 }
 // Windows: keyboard focus for a reused browser, requested after its raise.
 #[cfg(windows)]
