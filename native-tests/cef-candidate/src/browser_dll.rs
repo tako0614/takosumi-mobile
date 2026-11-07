@@ -21,6 +21,12 @@ mod process_main;
 /// The window arguments are not used; `cef::args::Args` reads the process's
 /// own module handle and command line, which are the bootstrap's.
 ///
+/// The exit code goes back to the bootstrap, which returns it from its
+/// `wWinMain`, so its teardown runs (the sandbox broker's cleanup is an
+/// `_onexit` handler in it) instead of `std::process::exit` here. A panic
+/// that reaches here is not unwound into the bootstrap: it is caught and
+/// returned as 101, Rust's own exit code for a panicking `main`.
+///
 /// # Safety
 ///
 /// Called only by CEF's bootstrap with the documented arguments.
@@ -32,6 +38,8 @@ pub unsafe extern "C" fn RunWinMain(
     sandbox_info: *mut std::ffi::c_void,
     _version_info: *mut std::ffi::c_void,
 ) -> i32 {
-    process_main::run(sandbox_info.cast());
-    0
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        process_main::run(sandbox_info.cast())
+    }))
+    .unwrap_or(101)
 }

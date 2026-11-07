@@ -2,6 +2,10 @@
 name = "takosumi-cef-candidate"
 version = "0.0.0"
 edition = "2021"
+# The App's plugin (a path dependency) needs 1.89; the DLL's RunWinMain also
+# relies on a panic at an extern "C" boundary aborting (1.81) and catches its
+# own.
+rust-version = "1.89"
 publish = false
 
 [features]

@@ -1112,7 +1112,11 @@ fn is_final(directory: &Path) -> bool {
 /// Every process of the browser starts here: the browser itself and each CEF
 /// helper (renderer, GPU, utility). `sandbox_info` is what CEF's
 /// `bootstrap.exe` passes on Windows with the sandbox, otherwise null.
-pub(crate) fn run(sandbox_info: *mut u8) {
+/// Returns the process's exit code: a helper's from `execute_process`, the
+/// browser's 0, or 1 when a request failed. The caller ends the process with
+/// it (the executable) or returns it to the bootstrap (the DLL), so the
+/// bootstrap's own teardown runs.
+pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     const {
         assert!(cfg!(any(target_os = "linux", windows)));
     }
@@ -1120,7 +1124,7 @@ pub(crate) fn run(sandbox_info: *mut u8) {
     let args = cef::args::Args::new();
     let status = execute_process(Some(args.as_main_args()), None, sandbox_info);
     if status >= 0 {
-        std::process::exit(status);
+        return status;
     }
     let directory = PathBuf::from(
         std::env::var_os("TAKOSUMI_BROWSER_PROCESS_DIRECTORY").expect("Owned parent directory"),
@@ -1202,7 +1206,5 @@ pub(crate) fn run(sandbox_info: *mut u8) {
     });
     drop(app);
     shutdown();
-    if failed {
-        std::process::exit(1);
-    }
+    i32::from(failed)
 }

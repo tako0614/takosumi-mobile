@@ -22,5 +22,11 @@ fn main() {
         );
         std::process::exit(2);
     }
-    process_main::run(std::ptr::null_mut());
+    // As before `run` returned its code: a non-zero one ends the process
+    // with it, and the browser's 0 returns from `main`. A panic still exits
+    // with Rust's 101.
+    match process_main::run(std::ptr::null_mut()) {
+        0 => {}
+        code => std::process::exit(code),
+    }
 }
