@@ -1733,7 +1733,12 @@ and the W3 runner also hashes the DLL beside a browser it is given.
   job inside the App's; see [In the App](#in-the-app-w7)); they do not read
   the jobs' limits, the desktop or the token's restricting SIDs.
 
-**CI evidence** (the c67a29c run passed every Windows job). `cef-windows` builds the
+**CI evidence.** Runs on this branch: at `c67a29c`, every Windows job of
+ci.yml passed (run 42363489107; the `desktop` job's Ubuntu leg hit the known
+WebKitGTK failure) and the real sites passed (42363524297). At `0761843`,
+ci.yml passed 8/8 (42369536894); in the real sites (42369567617)
+Excalidraw passed 8/8 with the in-App sandbox check, and Photopea's partial
+quit failed (an open RED, below). `cef-windows` builds the
 DLL and the guard, stages them (`--out $RUNNER_TEMP\w7-product`), requires
 the staged bootstrap's embedded manifest to name Windows 10/11 among its
 `supportedOS` entries and to ask for no elevation (`asInvoker`, or no level,
@@ -1763,10 +1768,14 @@ one renderer, every renderer to carry no `--no-sandbox` and to run at
 Untrusted (0x0000) or Low (0x1000) integrity, below the browser's, and every
 other process whose command line could not be read (so whose type is
 unknown) to have already exited (its id no longer opens,
-`ERROR_INVALID_PARAMETER`, or it has an exit code). The summary records it
-as `sandbox` (each process's pid, integrity level and the process types
-seen, and the processes whose command line could not be read, with the
-reason and whether they had exited); any problem fails the run. Command
+`ERROR_INVALID_PARAMETER`, or it has an exit code) or to end within 1 s: a
+process being terminated can lose its readable command line while its exit
+code still reads `STILL_ACTIVE`, so it is reopened with `SYNCHRONIZE` and
+waited for before it counts as a problem (`endedAfterWait` when it ended).
+The summary records it as `sandbox` (each process's pid, integrity level
+and the process types seen, and the processes whose command line could not
+be read, with the reason and whether they had exited); any problem fails
+the run. Command
 lines are split like the C runtime (unit-tested). The c67a29c run's W1
 evidence: browser high, every renderer untrusted, no `--no-sandbox`, no
 unread process.
@@ -1775,14 +1784,19 @@ unread process.
 W3, the W6 packaged run and W4). Once each profile's page has loaded, the
 observer takes that profile's browser and its descendants by parent process
 id (a Toolhelp process snapshot: the browser runs in its guard's job inside
-the App's, so no job holds just it) and applies the same evidence function
-(`sandbox_evidence`), with the same requirements: at least one renderer per
-profile, each Untrusted or Low below the browser's, no `--no-sandbox`, no
-live unread process. Each record goes into the launch's
-`browser-observation*.json` (`sandbox`) and the CI log's evidence line; the
+the App's, so no job holds just it; a process created before the one its
+parent id names is not its child, so a reused id adds nothing) and applies
+the same evidence function (`sandbox_evidence`), with the same
+requirements: at least one renderer per profile, each Untrusted or Low
+below the browser's, no `--no-sandbox`, no live unread process. A real-site
+run (W4) checks each profile again once the real site is ready, so the
+site's own renderers (site isolation, ad frames) are covered too. Each
+record goes into the launch's `browser-observation*.json` (`sandbox`, with
+its `stage`: `attach` or `real-site`) and the CI log's evidence line; the
 runner checks again that every opened profile of the launch has a record
-without a problem and keeps a summary (the browser's and renderers'
-integrity levels) in each phase of `summary.json`. Any problem fails the
+from each stage (both in a real-site run) without a problem and keeps a
+summary (stage, the browser's and renderers' integrity levels) in each
+phase of `summary.json`. Any problem fails the
 launch. `--unsandboxed-candidate` (runner and observer) records without
 requiring, for diagnostics with the unsandboxed candidate only; CI never
 passes it.
@@ -1800,21 +1814,25 @@ helper's from `execute_process`, the browser's 0, or 1 when a request
 failed). A CEF helper's `RunWinMain` returns it to the bootstrap, which
 returns it from its `wWinMain`. The sandboxed browser process does not come
 back: once CefShutdown has returned it ends itself with `ExitProcess` and
-that code (below). A panic reaching `RunWinMain` is caught and returned to
-the bootstrap as 101, so its teardown then runs; for a panic before
-CefShutdown (rare) that teardown may end in 7014 when sandboxed targets
-remain. The executable (Linux, the unsandboxed candidate) exits with a
+that code (below). A panic reaching `RunWinMain` is caught; the process
+then flushes its standard output and error and ends with
+`ExitProcess(101)` (Rust's code for a panicking `main`), so a panic after
+the message loop does not run the broker's teardown and turn into 7014.
+Only panics on `run`'s own path get there: a panic inside a CEF callback
+(an `extern "C"` function) cannot unwind and aborts the process with
+0xC0000409 instead, before anything reaches `RunWinMain`. The executable (Linux, the unsandboxed candidate) exits with a
 non-zero code and returns from `main` on 0, as before. The stage refuses a
 client DLL that does not export `RunWinMain` (a library built without
 `windows-sandbox` is empty). The crate declares `rust-version = "1.89"` (its
 path dependency, the App's plugin, needs it).
 
-**How the browser ends after CefShutdown** (rounds 3 and 4). Three runs of
+**How the browser ends after CefShutdown** (rounds 3 to 5). Runs of
 Photopea's sequential quit (W4), whose page leaves dozens of sandboxed
 targets (site-isolated ad frames, each a renderer, and utilities):
 
 - `c67a29c` (run 42363524297): the browser ended with `std::process::exit`
-  (`ExitProcess`) after CefShutdown; Photopea passed 16/16.
+  (`ExitProcess`) after CefShutdown, and so did every CEF helper process
+  after `execute_process`; Photopea passed 16/16.
 - `0f6fa36` (run 42366574526): the browser returned its code to the
   bootstrap (round 2). Work's guard receipt had `rootExit` 7014 (`complete`,
   nothing forced, 92 processes observed), so the App stopped the quit as an
@@ -1824,6 +1842,18 @@ targets (site-isolated ad frames, each a renderer, and utilities):
   receipt `rootExit` 0, nothing forced, 77 observed; no 7014, but Work's end
   then took so long that Personal's beforeunload did not open within the
   observer's 20 s (`END_WAIT`), which stays as it is.
+- `0761843` (run 42369567617), the browser ending with `ExitProcess` after
+  CefShutdown (below): **an open RED, cause UNKNOWN.** Work ended as
+  designed (`end` `exit-process`, exit code 0, 46 children still running at
+  the end; guard receipt `rootExit` 0, nothing forced, 76 observed), but its
+  page frames detached only about 25 s after the partial quit was
+  requested, with no dialog, so Personal's beforeunload did not open within
+  `END_WAIT` (20 s). Work's CEF log shows page activity until about
+  11:49:40 and the cookie flush at 11:49:42, then the shutdown line. Whether
+  the time went to the page's close, to CefShutdown or to the guard's drain
+  is not known; the `closeMs`, `shutdownMs` and `totalMs` the line now
+  carries (below) split it on a recurrence. Excalidraw passed 8/8 in the
+  same run, and the real-site workflow is evidence, not a merge gate.
 
 From Chromium 154.0.8037.98's sources (the locked CEF 154.0.34):
 
@@ -1856,20 +1886,31 @@ From Chromium 154.0.8037.98's sources (the locked CEF 154.0.34):
   `kLimitedUser` and `kInteractive` fall through to `kUnprotected`, which
   sets it). The broker holds the job handles; when its process ends, the
   kernel closes them and ends the targets still in those jobs.
-- CefShutdown has already shut the browser down and flushed the profile
-  before it returns, so ending the process then skips nothing that writes
-  data.
+- CefShutdown has already shut the browser down and asked the profile to
+  flush before it returns. The network service, which holds the cookies, is
+  a separate (utility) process in a job of its own, ended through that job
+  like the other targets. That data survives is shown by W3's restart case
+  (each profile's storage, cookie and session after an App restart), not
+  guaranteed by this reasoning.
 
 So once CefShutdown has returned, the sandboxed browser ends with
 `ExitProcess` and the run's exit code (`src/children_windows.rs`, Windows
-only), as at `c67a29c`, and the kernel ends the remaining targets through
-their jobs; the guard then sees them end. There is no wait: just before
+only), and the kernel ends the remaining targets through their jobs; the
+guard then sees them end. That is the browser process's end at `c67a29c`;
+unlike then, CEF helper processes now return their code to the bootstrap
+(round 2), where they have no broker to tear down. There is no wait: just before
 ending, the browser counts its child processes still running (a Toolhelp
 snapshot; a child is a process whose parent id is its own and that was
 created after it; no wait) and writes one line to its standard error (the
 guard's `browser.log`):
-`takosumi-cef-browser-process: shutdown {"pid":…,"children":…,"unopened":…,"end":"exit-process","exitCode":…}`
-(`unopened`: children it could not open to tell). The unsandboxed candidate
+`takosumi-cef-browser-process: shutdown {"pid":…,"children":…,"unopened":…,"end":"exit-process","exitCode":…,"closeMs":…,"shutdownMs":…,"totalMs":…}`
+(`unopened`: children it could not open to tell; `closeMs`: from the App's
+latest Close or Shutdown request (or the end of its input) reaching the UI
+thread to the last window's `on_before_close`; `shutdownMs`: from the quit
+of the message loop to CefShutdown's return; `totalMs`: from that request
+to the line; `null` when a moment is missing). With the guard receipt and
+the App's own log this splits a slow end into the page's close, CefShutdown
+and the guard's drain. A failed write of the line is ignored. The unsandboxed candidate
 writes the same line with `"end":"return"` and returns its code as before;
 Linux is unchanged. Unsandboxed child processes, if any, are not in a
 sandbox job; they end on their own once their connection to the browser is
@@ -1880,9 +1921,10 @@ launch's `execution*.json` (`guardRecords[].browserShutdown`), in each
 phase of `summary.json` (`shutdown`, with the guard receipt's `rootExit`)
 and prints it to the CI log (`shutdown-first`, `shutdown-restart`, ...); the
 W1 smoke records it in its summary (`shutdown`). The CI job `cef-windows`
-builds the module's tests with `rustc` alone and runs all five on Windows:
-the pure parts, and the count of the test binary's own children (it
-re-executes itself as them), running and ended.
+builds the module's tests with `rustc` alone and runs all six on Windows:
+the pure parts (children by parent id, the line, the durations), and the
+count of the test binary's own children (it re-executes itself as them),
+running and ended.
 
 **Not shown:** Authenticode signing (every PE file under `cef\` with the
 same certificate), SmartScreen, a release build, real devices and other
