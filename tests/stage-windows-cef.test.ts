@@ -175,7 +175,12 @@ describe("stage-windows-cef", () => {
 
   test("stops at an unknown entry, a missing file, a wrong machine or an existing stage", () => {
     const product = ["--unsandboxed-candidate"];
-    for (const extra of [{ "brand-new.dll": pe() }, { "new_resources.pak": "x" }, { "snapshot2.bin": "x" }]) {
+    const extras: Record<string, Buffer | string>[] = [
+      { "brand-new.dll": pe() },
+      { "new_resources.pak": "x" },
+      { "snapshot2.bin": "x" },
+    ];
+    for (const extra of extras) {
       const unknown = distribution(extra);
       const result = stage(["--cef", unknown.cef, "--bin", unknown.bin, "--out", unknown.out, ...product]);
       expect(result.status).toBe(2);
