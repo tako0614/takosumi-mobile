@@ -25,7 +25,21 @@ session and process group. It then requires, each within a bound:
 4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
    a `stopped` reply for N and process exit code 0;
 5. no process left: none still in the Job Object (Windows) or the process
-   group (Linux) within 10 s of the exit.
+   group (Linux) within 10 s of the exit;
+6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
+   shutdown: at least one renderer process in the job, each without
+   `--no-sandbox` and with a token integrity level of Low or Untrusted,
+   below the browser's own (read from its token), the browser's own
+   command line read and without `--no-sandbox` either, and no other process
+   in the job whose command line could not be read unless it had already
+   exited or ends within 1 s (one being terminated can lose its readable
+   command line while it still reads as running); recorded as `sandbox`
+   (with those unread processes). The
+   observer of the actual App (desktop/windows_browser_observer.py) applies
+   the same check to each profile's browser and its process tree;
+7. on Windows, the browser's own shutdown line from its log (W7: child
+   processes still running after CefShutdown, how it ends, its exit code),
+   recorded as `shutdown`.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -35,6 +49,7 @@ case directory is never removed.
 """
 import argparse
 import ctypes
+import datetime
 import hashlib
 import json
 import os
@@ -108,7 +123,16 @@ class ThreadEntry(ctypes.Structure):  # THREADENTRY32
                 ("tpDeltaPri", ctypes.c_int32), ("dwFlags", ctypes.c_uint32)]
 
 
-X64_SIZES = {BasicLimit: 64, IoCounters: 48, ExtendedLimit: 144, Accounting: 48, ThreadEntry: 28}
+class ProcessEntry(ctypes.Structure):  # PROCESSENTRY32W
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ProcessID", ctypes.c_uint32),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", ctypes.c_uint32),
+                ("cntThreads", ctypes.c_uint32), ("th32ParentProcessID", ctypes.c_uint32),
+                ("pcPriClassBase", ctypes.c_int32), ("dwFlags", ctypes.c_uint32),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+X64_SIZES = {BasicLimit: 64, IoCounters: 48, ExtendedLimit: 144, Accounting: 48, ThreadEntry: 28,
+             ProcessEntry: 568}
 
 CREATE_SUSPENDED = 0x4
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -152,6 +176,396 @@ def win32():
 def last_error(what):
     code = ctypes.get_last_error()
     return OSError(f"{what} failed (Windows error {code})")
+
+
+# Token integrity levels (the mandatory label's RID).
+INTEGRITY = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium", 0x2100: "medium-plus", 0x3000: "high",
+             0x4000: "system"}
+LOW_INTEGRITY = 0x1000
+# OpenProcess's error for a process id that no longer names a process.
+ERROR_INVALID_PARAMETER = 87
+STILL_ACTIVE = 259
+TH32CS_SNAPPROCESS = 0x2
+
+
+def windows_arguments(line):
+    """A Windows command line split as the C runtime does (the program name
+    first, without backslash escapes; then quotes, 2n/2n+1 backslashes before
+    a quote, and "" inside quotes), as process_type.rs splits it."""
+    arguments, index, program, quoted = [], 0, [], False
+    while index < len(line) and (quoted or line[index] not in " \t"):
+        if line[index] == '"':
+            quoted = not quoted
+        else:
+            program.append(line[index])
+        index += 1
+    arguments.append("".join(program))
+    while True:
+        while index < len(line) and line[index] in " \t":
+            index += 1
+        if index >= len(line):
+            return arguments
+        argument, quoted = [], False
+        while index < len(line):
+            c = line[index]
+            if c == "\\":
+                start = index
+                while index < len(line) and line[index] == "\\":
+                    index += 1
+                count = index - start
+                if index < len(line) and line[index] == '"':
+                    argument.append("\\" * (count // 2))
+                    if count % 2:
+                        argument.append('"')
+                        index += 1
+                else:
+                    argument.append("\\" * count)
+                continue
+            if c == '"':
+                if quoted and index + 1 < len(line) and line[index + 1] == '"':
+                    argument.append('"')
+                    index += 2
+                    continue
+                quoted = not quoted
+                index += 1
+                continue
+            if not quoted and c in " \t":
+                break
+            argument.append(c)
+            index += 1
+        arguments.append("".join(argument))
+
+
+def process_type(arguments):
+    """The Chromium process type of split arguments (None: the browser
+    process); switches end at a bare `--`."""
+    kind = None
+    for argument in arguments[1:]:
+        if argument == "--":
+            break
+        if argument.startswith("--type="):
+            kind = argument[len("--type="):]
+    return kind
+
+
+def has_no_sandbox(arguments):
+    rest = arguments[1:]
+    return "--no-sandbox" in (rest[:rest.index("--")] if "--" in rest else rest)
+
+
+# How long a process whose command line could not be read is given to end:
+# one being terminated can lose its readable command line while its exit
+# code still reads STILL_ACTIVE.
+UNREAD_WAIT = 1.0
+
+
+def settle_unread(unread, browser_pid, ended):
+    """`unread` with each live process other than the browser given
+    `ended(pid)` (it waits up to UNREAD_WAIT for the process to end): one
+    that ends then counts as exited (`endedAfterWait`)."""
+    settled = []
+    for process in unread:
+        if not process.get("exited") and process.get("pid") != browser_pid and ended(process["pid"]):
+            process = dict(process, exited=True, endedAfterWait=True)
+        settled.append(process)
+    return settled
+
+
+def ended_within(kernel32, pid, seconds):
+    """Whether a process ends within `seconds` (Windows): reopened with
+    SYNCHRONIZE and waited for; an id that no longer opens
+    (ERROR_INVALID_PARAMETER) has ended."""
+    process = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not process:
+        return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+    try:
+        return kernel32.WaitForSingleObject(process, int(seconds * 1000)) == 0  # WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def sandbox_problems(browser, renderers, unread=()):
+    """Why the sandbox is not shown (empty when it is): `browser` and each
+    of `renderers` are {"integrity": RID or None, "noSandbox": bool}; the
+    browser's `argumentsRead` is False when its command line was not read.
+    Each of `unread` ({"pid", "error", "exited"}) is a process whose command
+    line was not read, so whose type is unknown: a problem unless it had
+    already exited, or ended within UNREAD_WAIT (settle_unread; the
+    browser's own is reported above)."""
+    problems = []
+    for process in unread:
+        if not process.get("exited") and process.get("pid") != browser.get("pid"):
+            problems.append(f"process {process.get('pid')}: command line not read ({process.get('error')})")
+    if browser.get("argumentsRead") is False:
+        problems.append(f"the browser's command line was not read ({browser.get('error')})")
+    if browser.get("noSandbox"):
+        problems.append("the browser runs with --no-sandbox")
+    if browser.get("integrity") is None:
+        problems.append("the browser's integrity level is unknown")
+    if not renderers:
+        problems.append("no renderer process was found")
+    for renderer in renderers:
+        integrity = renderer.get("integrity")
+        if renderer.get("noSandbox"):
+            problems.append(f"renderer {renderer.get('pid')} runs with --no-sandbox")
+        if integrity is None:
+            problems.append(f"renderer {renderer.get('pid')}: integrity level unknown ({renderer.get('error')})")
+        elif integrity > LOW_INTEGRITY or (browser.get("integrity") is not None
+                                           and integrity >= browser["integrity"]):
+            problems.append(f"renderer {renderer.get('pid')} runs at {INTEGRITY.get(integrity, hex(integrity))} "
+                            f"integrity, not below the browser's and at most low")
+    return problems
+
+
+def process_facts(kernel32, advapi32, ntdll, pid):
+    """A process's split command line and token integrity RID (Windows):
+    {"pid", "arguments", "integrity", "error"?, "exited"?}. When either was
+    not read, `exited` says whether the process had already exited: its id
+    no longer opens (ERROR_INVALID_PARAMETER), or it has an exit code."""
+    facts = {"pid": pid, "arguments": None, "integrity": None}
+    process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        error = ctypes.get_last_error()
+        facts["error"] = f"OpenProcess: Windows error {error}"
+        facts["exited"] = error == ERROR_INVALID_PARAMETER
+        return facts
+    try:
+        size = ctypes.c_uint32(0)
+        buffer = (ctypes.c_uint64 * 8192)()  # 64 KiB, aligned for UNICODE_STRING
+        status = ntdll.NtQueryInformationProcess(process, 60, buffer, ctypes.sizeof(buffer), ctypes.byref(size))
+        if status == 0:
+            length = ctypes.c_uint16.from_buffer(buffer, 0).value
+            address = ctypes.c_void_p.from_buffer(buffer, 8).value
+            facts["arguments"] = windows_arguments(ctypes.wstring_at(address, length // 2)) if address else []
+        else:
+            facts["error"] = f"NtQueryInformationProcess: 0x{status & 0xFFFFFFFF:08X}"
+        token = ctypes.c_void_p()
+        if advapi32.OpenProcessToken(process, 0x8, ctypes.byref(token)):  # TOKEN_QUERY
+            try:
+                label = (ctypes.c_uint64 * 16)()
+                needed = ctypes.c_uint32(0)
+                # TokenIntegrityLevel: a TOKEN_MANDATORY_LABEL, its SID first.
+                if advapi32.GetTokenInformation(token, 25, label, ctypes.sizeof(label), ctypes.byref(needed)):
+                    sid = ctypes.c_void_p.from_buffer(label, 0)
+                    count = advapi32.GetSidSubAuthorityCount(sid)[0]
+                    facts["integrity"] = advapi32.GetSidSubAuthority(sid, count - 1)[0]
+                else:
+                    facts["error"] = f"GetTokenInformation: Windows error {ctypes.get_last_error()}"
+            finally:
+                kernel32.CloseHandle(token)
+        else:
+            facts["error"] = f"OpenProcessToken: Windows error {ctypes.get_last_error()}"
+        if facts["arguments"] is None or facts["integrity"] is None:
+            code = ctypes.c_uint32(0)
+            facts["exited"] = bool(kernel32.GetExitCodeProcess(process, ctypes.byref(code))
+                                   and code.value != STILL_ACTIVE)
+    finally:
+        kernel32.CloseHandle(process)
+    return facts
+
+
+# The browser's own line on its standard error after CefShutdown (Windows,
+# W7; src/children_windows.rs): its pid, how many child processes were still
+# running (and how many it could not open), how it ends ("exit-process" for
+# the sandboxed browser, "return" for the unsandboxed candidate) and its exit
+# code.
+BROWSER_SHUTDOWN = "takosumi-cef-browser-process: shutdown "
+
+
+def browser_shutdown(text, pid=None):
+    """The browser's shutdown lines in a log, parsed (with `pid`, only that
+    browser's); one that does not parse is kept as `unparsed`."""
+    found = []
+    for line in text.splitlines():
+        index = line.find(BROWSER_SHUTDOWN)
+        if index < 0:
+            continue
+        payload = line[index + len(BROWSER_SHUTDOWN):]
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            found.append({"unparsed": payload[:500]})
+            continue
+        if pid is None or (isinstance(parsed, dict) and parsed.get("pid") == pid):
+            found.append(parsed)
+    return found
+
+
+def descendant_pids(pairs, root, created=lambda pid: None):
+    """The ids of `root`'s descendants, from (pid, parent pid) pairs. With
+    `created(pid)` (a creation time, or None when unknown), a process counts
+    as its parent's child only if it was not created before that parent: an
+    older process whose parent id merely names a reused id is not one (as in
+    src/children_windows.rs)."""
+    children = {}
+    for pid, parent in pairs:
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+    found, queue, seen = [], [root], {root}
+    while queue:
+        parent = queue.pop()
+        for child in children.get(parent, ()):
+            if child in seen:
+                continue
+            born, parent_born = created(child), created(parent)
+            if born is not None and parent_born is not None and born < parent_born:
+                continue
+            seen.add(child)
+            found.append(child)
+            queue.append(child)
+    return sorted(found)
+
+
+class ProcessTree:
+    """A browser process and its descendants by parent process id (a
+    Toolhelp snapshot), the processes sandbox_evidence reads where no job of
+    the caller's own holds just that browser: in the App, each browser runs
+    in its guard's job inside the App's, and Chromium puts its sandboxed
+    processes in jobs of their own below those (Windows)."""
+
+    def __init__(self, kernel32, root):
+        require(not WINDOWS or ctypes.sizeof(ctypes.c_void_p) != 8
+                or ctypes.sizeof(ProcessEntry) == X64_SIZES[ProcessEntry], "Unexpected ProcessEntry layout")
+        self.kernel32, self.root = kernel32, root
+        handle = ctypes.c_void_p
+        kernel32.CreateToolhelp32Snapshot.restype = handle
+        kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        for name in ("Process32FirstW", "Process32NextW"):
+            function = getattr(kernel32, name)
+            function.restype, function.argtypes = ctypes.c_int, [handle, ctypes.POINTER(ProcessEntry)]
+        time = ctypes.POINTER(ctypes.c_uint64)
+        kernel32.GetProcessTimes.restype = ctypes.c_int
+        kernel32.GetProcessTimes.argtypes = [handle, time, time, time, time]
+
+    def created(self, pid):
+        """A process's creation time (FILETIME as one number), or None."""
+        process = self.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        try:
+            times = [ctypes.c_uint64(0) for _ in range(4)]
+            if not self.kernel32.GetProcessTimes(process, *(ctypes.byref(value) for value in times)):
+                return None
+            return times[0].value
+        finally:
+            self.kernel32.CloseHandle(process)
+
+    def entries(self):
+        """Every process's (pid, parent pid, image file name), from a
+        Toolhelp snapshot."""
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (None, INVALID_HANDLE_VALUE):
+            raise last_error("CreateToolhelp32Snapshot")
+        try:
+            found = []
+            entry = ProcessEntry(dwSize=ctypes.sizeof(ProcessEntry))
+            more = self.kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+                entry.dwSize = ctypes.sizeof(ProcessEntry)
+                more = self.kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            return found
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+
+    def pairs(self):
+        return [(pid, parent) for pid, parent, _ in self.entries()]
+
+    def process_ids(self):
+        times = {}
+
+        def created(pid):
+            if pid not in times:
+                times[pid] = self.created(pid)
+            return times[pid]
+
+        return [self.root] + descendant_pids(self.pairs(), self.root, created)
+
+
+# FILETIME ticks (100 ns since 1601-01-01 UTC) at the Unix epoch.
+FILETIME_UNIX_EPOCH = 116444736000000000
+
+
+def filetime_iso(value):
+    """A FILETIME (100 ns ticks since 1601-01-01, UTC) as ISO 8601 UTC with
+    milliseconds, or None for none (0 or None)."""
+    if not value:
+        return None
+    moment = (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+              + datetime.timedelta(microseconds=(value - FILETIME_UNIX_EPOCH) // 10))
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def describe_processes(records):
+    """Processes for a failure message, one after another: pid, image file
+    name, parent pid and creation time (`?` for what is unknown); no
+    command line."""
+    unknown = lambda value: "?" if value is None else value
+    return "; ".join(f"{record.get('pid')} {unknown(record.get('image'))} (parent {unknown(record.get('parent'))}, "
+                     f"created {unknown(record.get('created'))})" for record in records)
+
+
+def process_records(kernel32, pids):
+    """Windows: each of `pids` with its image file name and parent pid (a
+    Toolhelp process snapshot) and its creation time (GetProcessTimes, ISO
+    8601 UTC); None for what cannot be read (a process gone meanwhile). No
+    command line is read."""
+    tree = ProcessTree(kernel32, 0)
+    try:
+        listed = {pid: (parent, image) for pid, parent, image in tree.entries()}
+    except OSError:
+        listed = {}
+    records = []
+    for pid in pids:
+        parent, image = listed.get(pid, (None, None))
+        records.append({"pid": pid, "image": image, "parent": parent, "created": filetime_iso(tree.created(pid))})
+    return records
+
+
+def sandbox_evidence(job, browser_pid, deadline):
+    """Windows: the browser's and its renderers' integrity levels and
+    command lines, once at least one renderer is among `job.process_ids()`
+    (until `deadline`): `job` is a WindowsJob holding just the browser, or a
+    ProcessTree of it, with its `kernel32`. The `problems` it returns say
+    why they do not show Chromium's sandbox (empty when they do)."""
+    handle, dword = ctypes.c_void_p, ctypes.c_uint32
+    job.kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    job.kernel32.GetExitCodeProcess.argtypes = [handle, ctypes.POINTER(dword)]
+    job.kernel32.WaitForSingleObject.restype = dword
+    job.kernel32.WaitForSingleObject.argtypes = [handle, dword]
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    advapi32.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
+    advapi32.GetTokenInformation.argtypes = [handle, ctypes.c_int, ctypes.c_void_p, dword, ctypes.POINTER(dword)]
+    advapi32.GetSidSubAuthorityCount.argtypes = [handle]
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthority.argtypes = [handle, dword]
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(dword)
+    ntdll.NtQueryInformationProcess.argtypes = [handle, ctypes.c_int, ctypes.c_void_p, dword, ctypes.POINTER(dword)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_int32
+    while True:
+        facts = [process_facts(job.kernel32, advapi32, ntdll, pid) for pid in job.process_ids()]
+        renderers = [fact for fact in facts if fact["arguments"] and process_type(fact["arguments"]) == "renderer"]
+        if renderers or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    browser = next((fact for fact in facts if fact["pid"] == browser_pid), {"pid": browser_pid})
+    summarize = lambda fact: {"pid": fact["pid"], "integrity": fact.get("integrity"),
+                              "integrityName": INTEGRITY.get(fact.get("integrity")),
+                              "argumentsRead": fact.get("arguments") is not None,
+                              "noSandbox": bool(fact.get("arguments")) and has_no_sandbox(fact["arguments"]),
+                              **({"error": fact["error"]} if "error" in fact else {})}
+    evidence = {"browser": summarize(browser), "renderers": [summarize(fact) for fact in renderers],
+                "types": sorted({process_type(fact["arguments"]) or "browser" for fact in facts
+                                 if fact["arguments"]}),
+                # Processes whose command line could not be read (so their
+                # type is unknown), with the reason.
+                "unread": settle_unread(
+                    [{"pid": fact["pid"], "error": fact.get("error"), "exited": fact.get("exited", False)}
+                     for fact in facts if fact.get("arguments") is None],
+                    browser_pid, lambda pid: ended_within(job.kernel32, pid, UNREAD_WAIT))}
+    evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"], evidence["unread"])
+    return evidence
 
 
 class WindowsJob:
@@ -213,6 +627,17 @@ class WindowsJob:
                                                        ctypes.byref(info), ctypes.sizeof(info), None):
             raise last_error("QueryInformationJobObject")
         return info.TotalProcesses, info.ActiveProcesses
+
+    def process_ids(self):
+        """The ids of the processes now in the job (the first 1024)."""
+        class IdList(ctypes.Structure):  # JOBOBJECT_BASIC_PROCESS_ID_LIST
+            _fields_ = [("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32),
+                        ("ids", ctypes.c_size_t * 1024)]
+
+        ids = IdList()
+        if not self.kernel32.QueryInformationJobObject(self.handle, 3, ctypes.byref(ids), ctypes.sizeof(ids), None):
+            raise last_error("QueryInformationJobObject")
+        return [ids.ids[index] for index in range(min(ids.listed, 1024))]
 
     def terminate(self):
         if self.handle and not self.kernel32.TerminateJobObject(self.handle, 1):
@@ -451,16 +876,22 @@ def main():
                         help="require the main-frame load marker (fixture-inspection browsers only)")
     parser.add_argument("--reuse", action="store_true",
                         help="reopen the same screen and require the raise before shutting down")
+    parser.add_argument("--expect-sandbox", action="store_true",
+                        help="Windows (W7): require the renderers to run in Chromium's sandbox (token integrity "
+                             "low or untrusted, below the browser's; no --no-sandbox)")
     args = parser.parse_args()
     if not (WINDOWS or LINUX):
         parser.error("Only Windows and Linux browsers are supported")
+    if args.expect_sandbox and not WINDOWS:
+        parser.error("--expect-sandbox reads Windows tokens")
     if not URL_SHAPE.fullmatch(args.url) or args.url.endswith(":443/"):
         parser.error("--url must be a lowercase https site root such as https://example.com/")
 
     browser = Path(os.path.realpath(args.browser))
     runtime = Path(os.path.realpath(args.runtime or browser.parent))
     summary = {"passed": False, "platform": sys.platform, "browser": str(browser), "runtime": str(runtime),
-               "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse, "seconds": {}, "error": None}
+               "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse,
+               "expectSandbox": args.expect_sandbox, "seconds": {}, "error": None}
     session = None
     case = None
     try:
@@ -538,6 +969,11 @@ def main():
                 summary["foreground"] = True
             next_id += 1
 
+        if args.expect_sandbox:
+            summary["sandbox"] = sandbox_evidence(session.job, pid, time.monotonic() + args.open_timeout)
+            require(not summary["sandbox"]["problems"],
+                    f"The browser's processes do not show Chromium's sandbox: {summary['sandbox']['problems']}")
+
         stop_deadline = time.monotonic() + args.stop_timeout
         session.send({"operation": "shutdown", "id": next_id})
         summary["stopped"] = session.expect("stopped", next_id, stop_deadline)
@@ -553,6 +989,10 @@ def main():
             raise Failure("The browser did not exit within the bound after stopped") from None
         summary["exitCode"] = code
         summary["seconds"]["exit"] = round(time.monotonic() - started, 3)
+        if WINDOWS:
+            # Its own record of its end (W7): children still running after
+            # CefShutdown, how it ended, and its exit code.
+            summary["shutdown"] = browser_shutdown(tail(case / "browser.log"), pid)
         require(code == 0, f"The browser exited with {code}")
         session.reader.join(timeout=5)
         summary["stdoutClosed"] = not session.reader.is_alive()

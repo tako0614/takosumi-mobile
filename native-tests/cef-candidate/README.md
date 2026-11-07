@@ -561,9 +561,13 @@ or of a release.
 
 ## Windows browser process (first candidate)
 
-`takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`, as an
-unsandboxed test candidate that must be asked for by name with the
-cef-candidate feature `windows-unsandboxed-candidate`. The first Windows step
+`takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`. Until
+W6 it did so as an unsandboxed test candidate that must be asked for by name
+with the cef-candidate feature `windows-unsandboxed-candidate`; since W7 the
+product browser runs in Chromium's sandbox, as the DLL that CEF's
+`bootstrap.exe` loads ([Windows sandbox (W7)](#windows-sandbox-w7)), and the
+unsandboxed candidate remains for fixtures and diagnostics. This section
+describes the candidate as W1 built it. The first Windows step
 (W1, this section) ran the browser on its own, started by `windows_smoke.py`
 or the CI job. The second (W2, [Windows guard and adapter](#windows-guard-and-adapter))
 adds the Windows `takosumi-browser-guard` and lets the App's adapter start
@@ -590,14 +594,14 @@ Linux-only dependency) and the `$ORIGIN` run path are compiled only for Linux,
 where the browser's behaviour and output are unchanged; the feature has no
 effect there. On Windows:
 
-- **Sandbox.** Off on Windows in this candidate, whatever the switches. CEF's
-  Windows sandbox needs cef-dll-sys's `sandbox` feature (`cef_sandbox`) and the
-  bootstrap layout: the browser built as a DLL that CEF's `bootstrap.exe`,
-  renamed to the browser, loads, with sandbox information passed to
-  `execute_process` and `initialize`. This build links none of that, so it sets
-  CEF's `no_sandbox` itself, and a Windows build without
-  `windows-unsandboxed-candidate` is a compile error. The sandbox must be
-  qualified before any Windows package (the TODO in `without_sandbox`).
+- **Sandbox.** Off in this candidate, whatever the switches: the executable
+  built with `windows-unsandboxed-candidate` has no sandbox information, so it
+  sets CEF's `no_sandbox` itself. CEF's Windows sandbox needs the bootstrap
+  layout: the browser built as a DLL that CEF's `bootstrap.exe`, renamed to
+  the browser, loads, with sandbox information passed to `execute_process`
+  and `initialize`. W7 builds exactly that (feature `windows-sandbox`, see
+  [Windows sandbox (W7)](#windows-sandbox-w7)); a Windows build with neither
+  feature, or with both, is a compile error.
 - **DLLs and resources.** cef-dll-sys copies the distribution's files
   (`libcef.dll`, `chrome_elf.dll`, the `.pak`, `icudtl.dat` and V8 snapshot
   files) and `locales/` into the Cargo profile directory beside the executable.
@@ -612,10 +616,12 @@ effect there. On Windows:
   compatibility entry of CEF's cefsimple manifest, without which Windows
   reports an older version to Chromium, plus Common Controls 6 and `asInvoker`.
   It panics for a Windows target that is not MSVC, which would otherwise build
-  without the manifest. The CI job reads the `RT_MANIFEST` resource back from
-  the executable with the Windows SDK's `mt.exe -inputresource:<exe>;#1` and
-  requires exactly that `supportedOS` entry, the Common Controls 6 dependency
-  and one `asInvoker` execution level.
+  without the manifest. Until W7 the CI job read the `RT_MANIFEST` resource
+  back from this executable with the Windows SDK's
+  `mt.exe -inputresource:<exe>;#1` and required exactly that `supportedOS`
+  entry, the Common Controls 6 dependency and one `asInvoker` execution level.
+  Since W7 the staged executable is CEF's bootstrap, whose manifest CEF
+  builds; the job reads that one instead (see W7).
 - **Profile directory.** `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` must be absolute
   and in its final form, as on Linux. On Windows the check drops the `\\?\`
   (or `\\?\UNC\`) prefix that `canonicalize` adds and then compares the OS
@@ -683,12 +689,13 @@ failure it prints the log tails and ends every owned process (terminating the
 Job Object on Windows, SIGKILL to the process group on Linux); closing the job
 also kills anything still in it.
 
-The CI job `cef-windows` on `windows-latest` builds the product browser with
+The CI job `cef-windows` on `windows-latest` built the product browser with
 `--locked --features windows-unsandboxed-candidate` (`CEF_PATH` is
-`${{ runner.temp }}\cef`, cached by the locked cef-dll-sys version), checks
-its embedded manifest and runs the harness. It then builds the
-`fixture-inspection` browser with the same feature and runs it with
-`--expect-load --reuse`.
+`${{ runner.temp }}\cef`, cached by the locked cef-dll-sys version), checked
+its embedded manifest and ran the harness, then built the `fixture-inspection`
+browser with the same feature and ran it with `--expect-load --reuse`. Since
+W7 it builds and stages the sandboxed browser instead and runs both smokes
+with `--expect-sandbox` as well (see W7).
 
 **2026-11-06 checks.** The browser type-checks for `x86_64-pc-windows-msvc`
 with `cargo check --features cef/dox,windows-unsandboxed-candidate`, and
@@ -943,9 +950,10 @@ Cases that require the App's job
 to be empty afterwards wait at most 3 s for processes whose exit is already
 under way (the stand-ins that must be ended sleep 60 s) and name every
 process still there with its image. `App adapter with the built
-guard and browser (Process API)` runs the plugin's Windows tests with
+guard and browser (Process API)` (since W7 `App adapter with the staged guard
+and sandboxed browser`) runs the plugin's Windows tests with
 `TAKOSUMI_WINDOWS_GUARD` and `TAKOSUMI_WINDOWS_BROWSER` pointing at the
-product build: unit tests of the pipe writer (a write the reader does not
+product build (since W7 its stage): unit tests of the pipe writer (a write the reader does not
 take times out; dropping the App's end during such a write cancels it, so the
 reader sees the end of its input before all the data; that reader is a
 Python one-liner, as Python is on the `windows-latest` image; and, with a fake
@@ -1235,6 +1243,9 @@ the App with mobile-kit and the takosumi contract, builds the home
 client, the DevTools bookkeeping, the TCP table parser, the fixture site, the
 receipt check and the case list). It names the installed WebView2 Runtime or
 stops, builds the `fixture-inspection,windows-unsandboxed-candidate` browser
+(since W7 the `fixture-inspection,windows-sandbox` DLL, staged with the
+bootstrap by `scripts/stage-windows-cef.mjs --fixture`; see
+[Windows sandbox (W7)](#windows-sandbox-w7))
 with the guard and the App with `native-browser-process-fixture` (line
 tables only), creates the TLS files and trusts their CA
 (`native-tests/desktop/windows_fixture_tls.ps1`), runs one case with
@@ -1256,12 +1267,13 @@ sites).
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"
 Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
-cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+cargo build --locked --features fixture-inspection,windows-sandbox --lib --bin takosumi-browser-guard   # W7: the sandboxed DLL
 Pop-Location
+node scripts/stage-windows-cef.mjs --fixture --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin <target>\debug --out C:\absolute\owned\w3-stage
 bun run build
 cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls
-python -B native-tests/desktop/windows_browser_process.py --binary <target>\debug\takosumi-mobile.exe --browser <target>\debug\takosumi-cef-browser-process.exe --guard <target>\debug\takosumi-browser-guard.exe --data "$env:TEMP\sumi-w3-local" --tls-cert C:\absolute\owned\w3-tls\cert.pem --tls-key C:\absolute\owned\w3-tls\key.pem --tls-ca C:\absolute\owned\w3-tls\ca.pem --restart --reset
+python -B native-tests/desktop/windows_browser_process.py --binary <target>\debug\takosumi-mobile.exe --browser C:\absolute\owned\w3-stage\cef\takosumi-cef-browser-process.exe --guard C:\absolute\owned\w3-stage\cef\takosumi-browser-guard.exe --data "$env:TEMP\sumi-w3-local" --tls-cert C:\absolute\owned\w3-tls\cert.pem --tls-key C:\absolute\owned\w3-tls\key.pem --tls-ca C:\absolute\owned\w3-tls\ca.pem --restart --reset
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls -Remove
 ```
 
@@ -1486,23 +1498,25 @@ and the Rust guard are bundled, the App resolves them without environment
 variables, the installer installs it, and the installed App launches
 normally. **Boundaries:** the installers are unsigned (no Authenticode, so
 Windows SmartScreen would warn) and are not published or uploaded anywhere;
-the browser is still the explicit unsandboxed candidate
-(`windows-unsandboxed-candidate`), and the Windows sandbox is a separate,
-later step; the CI installers are debug builds. Authenticode, SmartScreen
+in W6 the browser was still the explicit unsandboxed candidate
+(`windows-unsandboxed-candidate`); since W7 both stages hold the sandboxed
+browser ([Windows sandbox (W7)](#windows-sandbox-w7)); the CI installers are
+debug builds. Authenticode, SmartScreen
 reputation, updates and real devices remain operator inputs, as listed in the
 control repo's `docs/takosumi/app-release-inputs.md`.
 
-**Layout.** `scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
+**Layout.** `scripts/stage-windows-cef.mjs --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
 copies into `src-tauri/target/windows-cef/cef/`, the same `cef/` layout the
-Linux bundle uses: `takosumi-cef-browser-process.exe`,
+Linux bundle uses: `takosumi-cef-browser-process.exe` (since W7 CEF's
+`bootstrap.exe`, with `takosumi-cef-browser-process.dll` beside it),
 `takosumi-browser-guard.exe`, `libcef.dll`, `chrome_elf.dll` (which
 `libcef.dll` imports), `icudtl.dat`, the `.pak` files, the V8 snapshot, every
 `locales/*.pak` (`en-US.pak` required), `CREDITS.html`, and ANGLE
 (`libEGL.dll`, `libGLESv2.dll`), the shader compilers (`d3dcompiler_47.dll`,
 `dxcompiler.dll`, `dxil.dll`) and SwiftShader (`vk_swiftshader.dll`, its ICD
 file, `vulkan-1.dll`) when present. It never stages the import library, the
-sandbox library, CEF's bootstrap executables or SDK build inputs (they are
-named in the manifest), and stops at any entry it neither stages nor knows
+sandbox library, `bootstrapc.exe` (and, before W7, `bootstrap.exe`) or SDK
+build inputs (they are named in the manifest), and stops at any entry it neither stages nor knows
 as ignorable (`README.txt`) rather than leave a possible dependency or
 resource out. CEF's own BSD license travels with it: the distribution's
 `LICENSE.txt` when it has one, otherwise `CREDITS.html` when it names CEF's
@@ -1527,8 +1541,10 @@ and guard therefore link the C runtime statically: Cargo builds them from
 `+crt-static` for `x86_64-pc-windows-msvc` (like the `/MT` CEF wrapper), so
 an installed App needs no Visual C++ redistributable (`VCRUNTIME140.dll`,
 which a clean Windows lacks), and a build without it is refused at staging.
-A package stage must say `--unsandboxed-candidate`, so an unsandboxed
-installer is never made by accident; a browser with the fixture inspection
+In W6 a package stage had to say `--unsandboxed-candidate`, so an
+unsandboxed installer was never made by accident; since W7 a package stage
+takes the sandboxed browser and `--unsandboxed-candidate` is accepted only
+with `--fixture`. A browser with the fixture inspection
 seam is refused unless `--fixture`, whose stage
 (`src-tauri/target/windows-cef-fixture/`) never goes to the package path. Files are copied, never linked, and `stage.json` beside the stage lists
 each one's size and SHA-256. `src-tauri/tauri.windows-cef.conf.json` maps the
@@ -1545,9 +1561,9 @@ build keeps its console.
 
 ```powershell
 Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
-cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard   # W7: the sandboxed browser DLL
 Pop-Location
-node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+node scripts/stage-windows-cef.mjs --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
 bunx tauri build --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
 ```
 
@@ -1614,9 +1630,308 @@ not stop the rest.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows
-sandbox, and opening a connection in the installed product App (the
-packaged fixture App does that; the product App is only launched and
+sandbox (W7 adds it), and opening a connection in the installed product App
+(the packaged fixture App does that; the product App is only launched and
 closed).
+
+## Windows sandbox (W7)
+
+Status: implemented on 2026-11-07; the Windows evidence is the CI run of this
+change (nothing was linked or run for Windows on the Linux host). The seventh
+Windows step runs the per-profile browser in Chromium's sandbox, so the
+product path no longer needs `windows-unsandboxed-candidate` (on Linux, #28
+already runs the sandbox for non-root users).
+
+**Route.** Since CEF M138 a Windows embedder gets no `cef_sandbox.lib` (it
+links only with Chromium's own Clang and libc++); CEF 154's distribution has
+the prebuilt `bootstrap.exe` (GUI subsystem) and `bootstrapc.exe` (console)
+instead. Renamed to the client, the bootstrap starts every process (the
+browser and each subprocess, which run the same executable), sets Chromium's
+sandbox up (the broker in the browser process, the target side in sandboxed
+subprocesses), loads `<its own name>.dll` from its own directory and calls
+that DLL's exported `RunWinMain(HINSTANCE, LPWSTR, int, void *sandbox_info,
+cef_version_info_t *)`. The locked crates support that as they are: cef
+154.5.0's `execute_process` and `initialize` take the sandbox information
+pointer, its `sandbox` feature builds the wrapper with `USE_SANDBOX=ON`
+(cef-dll-sys's `/MT` wrapper, matching the static C runtime), and cef-rs's
+own cefsimple example uses the same layout. Nothing is forked or vendored.
+
+**Build.** The cef-candidate feature `windows-sandbox` (`cef/sandbox`) builds
+the crate's library target `takosumi_cef_browser` (`src/browser_dll.rs`, a
+cdylib): it exports `RunWinMain`, which passes `sandbox_info` to
+`process_main::run`, which hands it to `execute_process` and `initialize`,
+with CEF's `no_sandbox` left at 0. The library is empty on every other target
+and without the feature, so Linux builds the same browser as before from the
+new executable root `src/browser_main.rs`. The executable built with
+`windows-sandbox` refuses to run (exit 2: it would have no sandbox
+information). A Windows browser built with neither feature, or with both,
+stops at a compile error. `windows-unsandboxed-candidate` stays for fixtures
+and diagnostics: its executable can be staged only with
+`--fixture --unsandboxed-candidate`.
+
+```powershell
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard
+Pop-Location
+node scripts/stage-windows-cef.mjs --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+# A fixture: --features fixture-inspection,windows-sandbox --lib, then the stage with --fixture.
+```
+
+**Stage.** The product stage copies the distribution's `bootstrap.exe` as
+`takosumi-cef-browser-process.exe` and the built `takosumi_cef_browser.dll` as
+`takosumi-cef-browser-process.dll`, beside the guard and the CEF runtime of
+W6. Both go through the same PE checks (x86-64; load-time imports only from
+the system DLL list or files staged beside them): a bootstrap import outside
+the list stops the stage, and the list is then changed deliberately. The
+fixture inspection seam is looked for in the DLL, which holds the browser's
+code. `bootstrapc.exe` stays unstaged. `stage.json` records which browser it
+holds (`sandbox`, `unsandboxedCandidate`). The App is unchanged: it starts
+`cef\takosumi-cef-browser-process.exe` (now the bootstrap) through the guard,
+and the W3 runner also hashes the DLL beside a browser it is given.
+
+**Constraints.**
+
+- **Signing.** In the browser process, before it runs the client, CEF 154's
+  bootstrap checks three files (`libcef_dll/bootstrap/bootstrap_win.cc` at
+  CEF commit `14c5a08`, the locked 154.0.34: `CheckDllCodeSigning`, lines
+  164-193, and its callers, lines 918-993). The executable itself must be
+  unsigned or carry only valid signatures. `chrome_elf.dll`, which it
+  preloads, must lie in the executable's own directory. Then `chrome_elf.dll`
+  and the client DLL must each be unsigned when the executable is, or carry
+  only valid signatures with the executable's primary certificate thumbprint
+  (`ThumbprintsInfo::IsSame` with unsigned allowed); any mismatch is fatal.
+  Subprocesses skip these checks (the browser process made them). So
+  `takosumi-cef-browser-process.exe` (the bootstrap),
+  `takosumi-cef-browser-process.dll` and `chrome_elf.dll` must be all
+  unsigned or all signed with the same certificate; CI runs them all
+  unsigned, as CEF distributes them. The policy for a signed release: sign
+  every PE file under `cef\` (the bootstrap, the client DLL, `libcef.dll`,
+  `chrome_elf.dll`, the ANGLE, shader compiler and SwiftShader DLLs, the
+  guard) and the App with the same certificate. Signing changes their bytes,
+  so it comes before the stage manifest and the installer are made (or the
+  manifest is written again).
+- CEF 154's bootstrap also carries CEF's installer logic, run by
+  `/cef-update`, `/cef-uninstall` and related switches or by an installer
+  configuration loaded from the client DLL. The client DLL holds none and the
+  App passes no such switch; this was not examined further.
+- The DLL must keep the executable's base name and sit beside it; renaming the
+  browser executable means renaming its DLL with it.
+- The executable is CEF's prebuilt binary from the locked distribution, so it
+  moves with cef-dll-sys's version; its embedded manifest, icon and version
+  resources are CEF's (build.rs's manifest applies only to the unsandboxed
+  candidate). Changing those resources would need a resource editor and must
+  happen before signing.
+- The browser process itself runs at its caller's integrity level (medium
+  for a standard user; high on the elevated CI runner, as the W1 evidence
+  shows); the sandbox restricts its subprocesses, renderers to a restricted
+  token at Untrusted or Low integrity. In the App each browser runs in its
+  guard's Job Object inside the App's, and Chromium puts its sandboxed
+  processes in jobs of their own below those (nested jobs, Windows 8 and
+  later). The checks read each renderer's integrity level and command line,
+  in W1 and the installed-browser smoke (the smoke's own job holds the
+  browser) and in the App's runs (W3, the W6 packaged run, W4: the guard's
+  job inside the App's; see [In the App](#in-the-app-w7)); they do not read
+  the jobs' limits, the desktop or the token's restricting SIDs.
+
+**CI evidence.** Runs on this branch: at `c67a29c`, every Windows job of
+ci.yml passed (run 42363489107; the `desktop` job's Ubuntu leg hit the known
+WebKitGTK failure) and the real sites passed (42363524297). At `0761843`,
+ci.yml passed 8/8 (42369536894); in the real sites (42369567617)
+Excalidraw passed 8/8 with the in-App sandbox check, and Photopea's partial
+quit failed (an open RED, below). `cef-windows` builds the
+DLL and the guard, stages them (`--out $RUNNER_TEMP\w7-product`), requires
+the staged bootstrap's embedded manifest to name Windows 10/11 among its
+`supportedOS` entries and to ask for no elevation (`asInvoker`, or no level,
+which an x64 image treats the same), warns when it has no Common Controls 6
+dependency (CEF's binary, not ours), and runs
+`windows_smoke.py --expect-sandbox` against the staged executable, the guard
+self-tests, and the App's adapter tests with the staged browser and guard;
+then the `fixture-inspection` DLL, staged with `--fixture`, runs with
+`--expect-load --reuse --expect-sandbox`. The smoke summaries, their logs
+and the product `stage.json` are kept as the artifact `cef-windows-smoke`.
+`cef-windows-app` (W3) and `windows-real-sites.yml` (W4) stage the sandboxed
+fixture browser and hand the App those files; `cef-windows-package` (W6)
+stages the sandboxed browser in both installers, its packaged W3 run's
+observer also requires each installed browser (the bootstrap) to have loaded
+`takosumi-cef-browser-process.dll` from the installation's `cef\`, and it runs
+the installed product browser with `--expect-sandbox`.
+
+**`--expect-sandbox`** (`windows_smoke.py`). Before the shutdown it lists the
+job's processes (`JobObjectBasicProcessIdList`), reads each one's command
+line (`NtQueryInformationProcess`, `ProcessCommandLineInformation`, with
+`PROCESS_QUERY_LIMITED_INFORMATION`) and token integrity level
+(`OpenProcessToken`, `GetTokenInformation(TokenIntegrityLevel)`), and waits
+up to the open timeout for a `--type=renderer` process. It then requires the
+browser's integrity level and command line to be readable, without
+`--no-sandbox`, at least
+one renderer, every renderer to carry no `--no-sandbox` and to run at
+Untrusted (0x0000) or Low (0x1000) integrity, below the browser's, and every
+other process whose command line could not be read (so whose type is
+unknown) to have already exited (its id no longer opens,
+`ERROR_INVALID_PARAMETER`, or it has an exit code) or to end within 1 s: a
+process being terminated can lose its readable command line while its exit
+code still reads `STILL_ACTIVE`, so it is reopened with `SYNCHRONIZE` and
+waited for before it counts as a problem (`endedAfterWait` when it ended).
+The summary records it as `sandbox` (each process's pid, integrity level
+and the process types seen, and the processes whose command line could not
+be read, with the reason and whether they had exited); any problem fails
+the run. Command
+lines are split like the C runtime (unit-tested). The c67a29c run's W1
+evidence: browser high, every renderer untrusted, no `--no-sandbox`, no
+unread process.
+
+<a id="in-the-app-w7"></a>**In the App** (`windows_browser_observer.py`, so
+W3, the W6 packaged run and W4). Once each profile's page has loaded, the
+observer takes that profile's browser and its descendants by parent process
+id (a Toolhelp process snapshot: the browser runs in its guard's job inside
+the App's, so no job holds just it; a process created before the one its
+parent id names is not its child, so a reused id adds nothing) and applies
+the same evidence function (`sandbox_evidence`), with the same
+requirements: at least one renderer per profile, each Untrusted or Low
+below the browser's, no `--no-sandbox`, no live unread process. A real-site
+run (W4) checks each profile again once the real site is ready, so the
+site's own renderers (site isolation, ad frames) are covered too. Each
+record goes into the launch's `browser-observation*.json` (`sandbox`, with
+its `stage`: `attach` or `real-site`) and the CI log's evidence line; the
+runner checks again that every opened profile of the launch has a record
+from each stage (both in a real-site run) without a problem and keeps a
+summary (stage, the browser's and renderers' integrity levels) in each
+phase of `summary.json`. Any problem fails the
+launch. `--unsandboxed-candidate` (runner and observer) records without
+requiring, for diagnostics with the unsandboxed candidate only; CI never
+passes it.
+
+**Shown on the Linux host (2026-11-07):** the Windows-target clippy of the
+browser (the sandboxed DLL, product and fixture, and the unsandboxed
+candidate), the guard, the App (product and fixture) and the plugin, with
+`cef/dox` (cef-dll-sys's build script, which needs the Windows SDK, skipped);
+the Linux browser build; the stage tests (both layouts, a missing DLL or
+bootstrap, a DLL without `RunWinMain`, the export table reader); the runner,
+observer and smoke unit tests.
+
+**Exit codes.** `process_main::run` returns the process's exit code (a CEF
+helper's from `execute_process`, the browser's 0, or 1 when a request
+failed). A CEF helper's `RunWinMain` returns it to the bootstrap, which
+returns it from its `wWinMain`. The sandboxed browser process does not come
+back: once CefShutdown has returned it ends itself with `ExitProcess` and
+that code (below). A panic reaching `RunWinMain` is caught; the process
+then flushes its standard output and error and ends with
+`ExitProcess(101)` (Rust's code for a panicking `main`), so a panic after
+the message loop does not run the broker's teardown and turn into 7014.
+Only panics on `run`'s own path get there: a panic inside a CEF callback
+(an `extern "C"` function) cannot unwind and aborts the process with
+0xC0000409 instead, before anything reaches `RunWinMain`. The executable (Linux, the unsandboxed candidate) exits with a
+non-zero code and returns from `main` on 0, as before. The stage refuses a
+client DLL that does not export `RunWinMain` (a library built without
+`windows-sandbox` is empty). The crate declares `rust-version = "1.89"` (its
+path dependency, the App's plugin, needs it).
+
+**How the browser ends after CefShutdown** (rounds 3 to 5). Runs of
+Photopea's sequential quit (W4), whose page leaves dozens of sandboxed
+targets (site-isolated ad frames, each a renderer, and utilities):
+
+- `c67a29c` (run 42363524297): the browser ended with `std::process::exit`
+  (`ExitProcess`) after CefShutdown, and so did every CEF helper process
+  after `execute_process`; Photopea passed 16/16.
+- `0f6fa36` (run 42366574526): the browser returned its code to the
+  bootstrap (round 2). Work's guard receipt had `rootExit` 7014 (`complete`,
+  nothing forced, 92 processes observed), so the App stopped the quit as an
+  abnormal end before asking Personal.
+- `7e90bfb` (run 42368077968): before returning, the browser waited for its
+  children: `{"children":65,"remaining":0,"waitedMs":7548,"boundMs":10000,"exitCode":0}`,
+  receipt `rootExit` 0, nothing forced, 77 observed; no 7014, but Work's end
+  then took so long that Personal's beforeunload did not open within the
+  observer's 20 s (`END_WAIT`), which stays as it is.
+- `0761843` (run 42369567617), the browser ending with `ExitProcess` after
+  CefShutdown (below): **an open RED, cause UNKNOWN.** Work ended as
+  designed (`end` `exit-process`, exit code 0, 46 children still running at
+  the end; guard receipt `rootExit` 0, nothing forced, 76 observed), but its
+  page frames detached only about 25 s after the partial quit was
+  requested, with no dialog, so Personal's beforeunload did not open within
+  `END_WAIT` (20 s). Work's CEF log shows page activity until about
+  11:49:40 and the cookie flush at 11:49:42, then the shutdown line. Whether
+  the time went to the page's close, to CefShutdown or to the guard's drain
+  is not known; the `closeMs`, `shutdownMs` and `totalMs` the line now
+  carries (below) split it on a recurrence. Excalidraw passed 8/8 in the
+  same run, and the real-site workflow is evidence, not a merge gate.
+
+From Chromium 154.0.8037.98's sources (the locked CEF 154.0.34):
+
+- Returning to the bootstrap runs the sandbox broker's teardown. The broker
+  lives in the bootstrap (`content::InitializeSandboxInfo` in
+  `bootstrap_win.cc`) as a `SingletonBase`, whose `_onexit` handler deletes
+  it once `wWinMain` returns (`sandbox/win/src/win_utils.h`);
+  `ExitProcess` skips an executable's `_onexit` handlers.
+  `BrokerServicesBase::~BrokerServicesBase` (`broker_services.cc`) posts
+  `THREAD_CTRL_QUIT` to its job-event thread and, if that thread has not
+  ended within 5000 ms, calls `TerminateProcess(GetCurrentProcess(),
+  SBOX_FATAL_BROKER_SHUTDOWN_HUNG)`, 7014, "Broker terminated in shutdown"
+  (`sandbox_types.h`). On the quit the thread destroys every job tracker
+  still listed (one per target whose job has not reported
+  `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO`), one after another: `~JobTracker`
+  terminates the job and `~TargetProcess` waits up to 50 ms for the process,
+  terminates it and resets its IPC server, which unregisters its waits with
+  `UnregisterWaitEx(..., INVALID_HANDLE_VALUE)` and so blocks on any
+  callback in flight. CefShutdown does not wait for its children: Chromium
+  terminates renderers with `Process::Terminate(RESULT_CODE_NORMAL_EXIT,
+  false)` (`child_process_launcher_helper_win.cc`) and deletes the other
+  child hosts (`BrowserChildProcessHostImpl::TerminateAll`). So on a heavy
+  page that ordered cleanup takes seconds: past the 5 s (7014), and waiting
+  for the children first took 7.5 s.
+- Every target's job ends with the broker: `BrokerServicesBase` creates a
+  job for each target (`PolicyBase::InitJob`, from `PreSpawnTarget` on the
+  way to `SpawnTargetAsync`), and
+  `Job::Init` (`sandbox/win/src/job.cc`) sets
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` for every job level (`kLockdown`,
+  `kLimitedUser` and `kInteractive` fall through to `kUnprotected`, which
+  sets it). The broker holds the job handles; when its process ends, the
+  kernel closes them and ends the targets still in those jobs.
+- CefShutdown has already shut the browser down and asked the profile to
+  flush before it returns. The network service, which holds the cookies, is
+  a separate (utility) process in a job of its own, ended through that job
+  like the other targets. That data survives is shown by W3's restart case
+  (each profile's storage, cookie and session after an App restart), not
+  guaranteed by this reasoning.
+
+So once CefShutdown has returned, the sandboxed browser ends with
+`ExitProcess` and the run's exit code (`src/children_windows.rs`, Windows
+only), and the kernel ends the remaining targets through their jobs; the
+guard then sees them end. That is the browser process's end at `c67a29c`;
+unlike then, CEF helper processes now return their code to the bootstrap
+(round 2), where they have no broker to tear down. There is no wait: just before
+ending, the browser counts its child processes still running (a Toolhelp
+snapshot; a child is a process whose parent id is its own and that was
+created after it; no wait) and writes one line to its standard error (the
+guard's `browser.log`):
+`takosumi-cef-browser-process: shutdown {"pid":…,"children":…,"unopened":…,"end":"exit-process","exitCode":…,"closeMs":…,"shutdownMs":…,"totalMs":…}`
+(`unopened`: children it could not open to tell; `closeMs`: from the App's
+latest Close or Shutdown request (or the end of its input) reaching the UI
+thread to the last window's `on_before_close`; `shutdownMs`: from the quit
+of the message loop to CefShutdown's return; `totalMs`: from that request
+to the line; `null` when a moment is missing). With the guard receipt and
+the App's own log this splits a slow end into the page's close, CefShutdown
+and the guard's drain. A failed write of the line is ignored. The unsandboxed candidate
+writes the same line with `"end":"return"` and returns its code as before;
+Linux is unchanged. Unsandboxed child processes, if any, are not in a
+sandbox job; they end on their own once their connection to the browser is
+gone, and the guard's drain covers the rest as before. No bound of the App,
+the guard or the observer changed, nor the App's policy (a non-zero
+`rootExit` is abnormal). The W3 runner keeps the line per profile in each
+launch's `execution*.json` (`guardRecords[].browserShutdown`), in each
+phase of `summary.json` (`shutdown`, with the guard receipt's `rootExit`)
+and prints it to the CI log (`shutdown-first`, `shutdown-restart`, ...); the
+W1 smoke records it in its summary (`shutdown`). The CI job `cef-windows`
+builds the module's tests with `rustc` alone and runs all six on Windows:
+the pure parts (children by parent id, the line, the durations), and the
+count of the test binary's own children (it re-executes itself as them),
+running and ended.
+
+**Not shown:** Authenticode signing (every PE file under `cef\` with the
+same certificate), SmartScreen, a release build, real devices and other
+Windows editions or ARM64 (the stage is x86-64 only); the sandbox of the GPU,
+network and utility processes (only renderers are checked); the job,
+desktop and restricting-SID restrictions individually (integrity level and
+command line only); AppContainer or LPAC renderers.
 
 ## Observations and limits
 

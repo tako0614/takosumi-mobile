@@ -44,6 +44,19 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(any(same.values()))
 
 
+class SmokeTests(unittest.TestCase):
+    def test_processes_left_in_the_apps_job_are_named_in_the_failure(self):
+        leftovers = [{"pid": 4120, "image": "msedgewebview2.exe", "parent": 3900,
+                      "created": "2026-11-07T11:49:40.123Z"},
+                     {"pid": 4188, "image": "msedgewebview2.exe", "parent": 4120, "created": None}]
+        self.assertEqual(package.leftover_message({"jobActive": 2, "leftovers": leftovers}),
+                         "2 processes were left in the App's job: 4120 msedgewebview2.exe (parent 3900, "
+                         "created 2026-11-07T11:49:40.123Z); 4188 msedgewebview2.exe (parent 4120, created ?)")
+        self.assertEqual(package.leftover_message({"jobActive": 1, "leftoversError": "denied"}),
+                         "1 processes were left in the App's job (not described: denied)")
+        self.assertEqual(package.leftover_message({"jobActive": 2}), "2 processes were left in the App's job")
+
+
 class UninstallTests(unittest.TestCase):
     def test_a_missing_key_or_shortcut_before_the_uninstall_fails(self):
         package.require_installed_entries("Takosumi", True, True)

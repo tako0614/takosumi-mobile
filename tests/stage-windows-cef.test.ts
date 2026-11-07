@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 const SCRIPT = path.join(import.meta.dir, "..", "scripts", "stage-windows-cef.mjs");
-const { cefLicenseFromHeader, peImports, systemDll, SYSTEM_DLLS } = await import(
+const { cefLicenseFromHeader, peExports, peImports, systemDll, SYSTEM_DLLS } = await import(
   path.join(import.meta.dir, "..", "scripts", "windows-cef-pe.mjs")
 );
 const root = mkdtempSync(path.join(tmpdir(), "stage-windows-cef-"));
@@ -36,14 +36,17 @@ interface Layout {
   pointer?: number;
   /** What the file holds past the section's file data. */
   fill?: number;
+  /** Names an export directory (at 0x800 in the section) exports, each with a function. */
+  exports?: string[];
 }
 
 /**
  * An x86-64 PE32+ image with one section (RVA 0x1000, file data at 0x200)
- * holding an import directory that names `imports`, then `trailer`.
+ * holding an import directory that names `imports` (and, with
+ * `layout.exports`, an export directory), then `trailer`.
  */
 function peWithImports(imports: string[], layout: Layout = {}, trailer = ""): Buffer {
-  const { descriptors = 0, names = 0x100, rawSize = 0x1000, pointer = 0x200, fill = 0 } = layout;
+  const { descriptors = 0, names = 0x100, rawSize = 0x1000, pointer = 0x200, fill = 0, exports } = layout;
   const file = Buffer.alloc(0x200 + 0x1000, fill);
   file.fill(0, 0, 0x200 + rawSize);
   file.write("MZ", 0, "latin1");
@@ -68,6 +71,28 @@ function peWithImports(imports: string[], layout: Layout = {}, trailer = ""): Bu
     file.write(`${dll}\0`, 0x200 + name, "latin1");
     name += dll.length + 1;
   });
+  if (exports) {
+    // IMAGE_EXPORT_DIRECTORY at 0x800, then the function, name and ordinal
+    // tables, the names from 0x900; every function at RVA 0x1f00.
+    const directory = 0x800;
+    const tables = directory + 40;
+    const count = exports.length;
+    file.writeUInt32LE(0x1000 + directory, optional + 112); // export directory RVA
+    file.writeUInt32LE(40, optional + 112 + 4);
+    file.writeUInt32LE(count, 0x200 + directory + 20); // NumberOfFunctions
+    file.writeUInt32LE(count, 0x200 + directory + 24); // NumberOfNames
+    file.writeUInt32LE(0x1000 + tables, 0x200 + directory + 28); // AddressOfFunctions
+    file.writeUInt32LE(0x1000 + tables + 4 * count, 0x200 + directory + 32); // AddressOfNames
+    file.writeUInt32LE(0x1000 + tables + 8 * count, 0x200 + directory + 36); // AddressOfNameOrdinals
+    let exportName = 0x900;
+    exports.forEach((symbol, index) => {
+      file.writeUInt32LE(0x1f00, 0x200 + tables + 4 * index);
+      file.writeUInt32LE(0x1000 + exportName, 0x200 + tables + 4 * count + 4 * index);
+      file.writeUInt16LE(index, 0x200 + tables + 8 * count + 2 * index);
+      file.write(`${symbol}\0`, 0x200 + exportName, "latin1");
+      exportName += symbol.length + 1;
+    });
+  }
   return Buffer.concat([file, Buffer.from(trailer)]);
 }
 
@@ -101,6 +126,8 @@ function distribution(extra: Record<string, Buffer | string> = {}) {
     "vk_swiftshader.dll": peWithImports(["KERNEL32.dll", "gdi32.dll"]),
     "CREDITS.html": "<html>credits</html>",
     "libcef.lib": "import library",
+    "bootstrap.exe": peWithImports(["KERNEL32.dll", "ntdll.dll"], {}, "bootstrap"),
+    "bootstrapc.exe": peWithImports(["KERNEL32.dll"], {}, "bootstrapc"),
     "README.txt": "readme",
     "archive.json": JSON.stringify({ name: "cef_binary_test_windows64_minimal.tar.bz2" }),
     "include/cef_base.h": CEF_BASE_H,
@@ -109,6 +136,11 @@ function distribution(extra: Record<string, Buffer | string> = {}) {
     ...extra,
   };
   for (const [name, content] of Object.entries(files)) writeFileSync(path.join(cef, name), content);
+  // The sandboxed browser (the client DLL), the unsandboxed candidate and the guard.
+  writeFileSync(
+    path.join(bin, "takosumi_cef_browser.dll"),
+    peWithImports(["KERNEL32.dll", "libcef.dll"], { exports: ["RunWinMain"] }, "client"),
+  );
   writeFileSync(path.join(bin, "takosumi-cef-browser-process.exe"), peWithImports(["KERNEL32.dll", "libcef.dll"]));
   writeFileSync(path.join(bin, "takosumi-browser-guard.exe"), peWithImports(["KERNEL32.dll", "ntdll.dll"]));
   return { base, cef, bin, out: path.join(base, "out") };
@@ -119,7 +151,7 @@ function stage(args: string[], script = SCRIPT, runtime = process.execPath) {
 }
 
 const sha256 = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
-const product = ["--unsandboxed-candidate"];
+const product: string[] = [];
 
 describe("windows-cef-pe", () => {
   test("reads a PE file's load-time imports", () => {
@@ -132,6 +164,27 @@ describe("windows-cef-pe", () => {
 
   test("an image without an optional header is refused", () => {
     expect(() => peImports(reader(pe()))).toThrow("no optional header");
+    expect(() => peExports(reader(pe()))).toThrow("no optional header");
+  });
+
+  test("reads a PE file's exported names", () => {
+    const image = peWithImports(["KERNEL32.dll"], { exports: ["RunWinMain", "rust_eh_personality"] });
+    expect(peExports(reader(image))).toEqual(["RunWinMain", "rust_eh_personality"]);
+    expect(peImports(reader(image))).toEqual(["KERNEL32.dll"]);
+    // No export directory: nothing exported.
+    expect(peExports(reader(peWithImports(["KERNEL32.dll"])))).toEqual([]);
+    // The name table outside every section, a name's ordinal past the
+    // function table, and a name naming a zero function RVA all throw.
+    const directory = 0x200 + 0x800;
+    const outside = Buffer.from(image);
+    outside.writeUInt32LE(0x9000, directory + 32);
+    expect(() => peExports(reader(outside))).toThrow("lies in no section");
+    const ordinal = Buffer.from(image);
+    ordinal.writeUInt16LE(5, directory + 40 + 8 * 2);
+    expect(() => peExports(reader(ordinal))).toThrow("names no function");
+    const empty = Buffer.from(image);
+    empty.writeUInt32LE(0, directory + 40);
+    expect(() => peExports(reader(empty))).toThrow("names no function");
   });
 
   test("bytes past SizeOfRawData read as zero, as the loader maps them", () => {
@@ -189,14 +242,21 @@ describe("stage-windows-cef", () => {
     expect(manifest.kind).toBe("takosumi.windows-cef-stage@v1");
     expect(manifest.fixture).toBe(false);
     expect(manifest.inspectionSeam).toBe(false);
-    expect(manifest.sandbox).toContain("unsandboxed");
-    expect(manifest.unsandboxedCandidate).toBe(true);
+    // The sandboxed browser: CEF's bootstrap under the browser's name and
+    // the client DLL beside it, under the same name.
+    expect(manifest.sandbox).toContain("bootstrap.exe");
+    expect(manifest.unsandboxedCandidate).toBe(false);
+    const staged = (name: string) => readFileSync(path.join(out, "cef", name));
+    expect(staged("takosumi-cef-browser-process.exe")).toEqual(readFileSync(path.join(cef, "bootstrap.exe")));
+    expect(staged("takosumi-cef-browser-process.dll")).toEqual(readFileSync(path.join(bin, "takosumi_cef_browser.dll")));
+    expect(manifest.imports["takosumi-cef-browser-process.dll"]).toEqual(["KERNEL32.dll", "libcef.dll"]);
     expect(manifest.imports["takosumi-browser-guard.exe"]).toEqual(["KERNEL32.dll", "ntdll.dll"]);
     expect(manifest.cef.archive.name).toBe("cef_binary_test_windows64_minimal.tar.bz2");
     expect(manifest.cefLicense).toEqual({ notice: "CEF-LICENSE.txt", from: "include/cef_base.h" });
     expect(manifest.files.map((file: { path: string }) => file.path).sort()).toEqual(
       [
         "takosumi-cef-browser-process.exe",
+        "takosumi-cef-browser-process.dll",
         "takosumi-browser-guard.exe",
         "libcef.dll",
         "chrome_elf.dll",
@@ -219,6 +279,52 @@ describe("stage-windows-cef", () => {
     expect(manifest.notStaged).toContain("libcef.lib (import library (SDK build input))");
     expect(manifest.notStaged).toContain("include (SDK build input)");
     expect(manifest.notStaged).toContain("README.txt (distribution documentation)");
+    expect(manifest.notStaged).toContain(
+      "bootstrapc.exe (CEF's console bootstrap; the browser is a Windows-subsystem program)",
+    );
+    expect(manifest.notStaged.join("\n")).not.toContain("bootstrap.exe (");
+  });
+
+  test("the unsandboxed candidate is staged for a fixture only", () => {
+    const { cef, bin, out } = distribution();
+    const refused = stage(["--cef", cef, "--bin", bin, "--out", out, "--unsandboxed-candidate"]);
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain("for a fixture only");
+    const fixture = stage(["--cef", cef, "--bin", bin, "--out", out, "--fixture", "--unsandboxed-candidate"]);
+    expect(fixture.status).toBe(0);
+    const manifest = JSON.parse(readFileSync(path.join(out, "stage.json"), "utf8"));
+    expect(manifest.unsandboxedCandidate).toBe(true);
+    expect(manifest.sandbox).toContain("none");
+    const paths = manifest.files.map((file: { path: string }) => file.path);
+    expect(paths).not.toContain("takosumi-cef-browser-process.dll");
+    expect(readFileSync(path.join(out, "cef", "takosumi-cef-browser-process.exe"))).toEqual(
+      readFileSync(path.join(bin, "takosumi-cef-browser-process.exe")),
+    );
+    expect(manifest.notStaged).toContain(
+      "bootstrap.exe (CEF's sandbox bootstrap, staged as the browser only for the sandboxed browser)",
+    );
+  });
+
+  test("the sandboxed browser needs the client DLL and the bootstrap", () => {
+    const noClient = distribution();
+    rmSync(path.join(noClient.bin, "takosumi_cef_browser.dll"));
+    const missing = stage(["--cef", noClient.cef, "--bin", noClient.bin, "--out", noClient.out]);
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain("takosumi_cef_browser.dll");
+    const noBootstrap = distribution();
+    rmSync(path.join(noBootstrap.cef, "bootstrap.exe"));
+    const absent = stage(["--cef", noBootstrap.cef, "--bin", noBootstrap.bin, "--out", noBootstrap.out]);
+    expect(absent.status).toBe(2);
+    expect(absent.stderr).toContain("bootstrap.exe");
+    // A library built without windows-sandbox is empty: no RunWinMain.
+    for (const exports of [undefined, ["something_else"]]) {
+      const empty = distribution();
+      writeFileSync(path.join(empty.bin, "takosumi_cef_browser.dll"), peWithImports(["KERNEL32.dll"], { exports }));
+      const refused = stage(["--cef", empty.cef, "--bin", empty.bin, "--out", empty.out]);
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain("exports no RunWinMain");
+      expect(refused.stderr).toContain("--features windows-sandbox --lib");
+    }
   });
 
   test("keeps CEF's license: its LICENSE.txt, CREDITS.html naming it, or nothing staged", () => {
@@ -238,13 +344,6 @@ describe("stage-windows-cef", () => {
     const refused = stage(["--cef", unlicensed.cef, "--bin", unlicensed.bin, "--out", unlicensed.out, ...product]);
     expect(refused.status).toBe(2);
     expect(refused.stderr).toContain("no CEF license notice");
-  });
-
-  test("a package stage must name the unsandboxed candidate", () => {
-    const { cef, bin, out } = distribution();
-    const refused = stage(["--cef", cef, "--bin", bin, "--out", out]);
-    expect(refused.status).toBe(2);
-    expect(refused.stderr).toContain("--unsandboxed-candidate");
   });
 
   test("runs its checks when started through a symbolic link", () => {
@@ -277,8 +376,8 @@ describe("stage-windows-cef", () => {
   test("refuses a fixture browser for a package and accepts it for a fixture stage", () => {
     const { cef, bin, out } = distribution();
     writeFileSync(
-      path.join(bin, "takosumi-cef-browser-process.exe"),
-      peWithImports(["KERNEL32.dll", "libcef.dll"], {}, "TAKOSUMI_BROWSER_PROCESS_INSPECT"),
+      path.join(bin, "takosumi_cef_browser.dll"),
+      peWithImports(["KERNEL32.dll", "libcef.dll"], { exports: ["RunWinMain"] }, "TAKOSUMI_BROWSER_PROCESS_INSPECT"),
     );
     const refused = stage(["--cef", cef, "--bin", bin, "--out", out, ...product]);
     expect(refused.status).toBe(2);
