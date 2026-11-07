@@ -21,11 +21,16 @@ mod process_main;
 /// The window arguments are not used; `cef::args::Args` reads the process's
 /// own module handle and command line, which are the bootstrap's.
 ///
-/// The exit code goes back to the bootstrap, which returns it from its
-/// `wWinMain`, so its teardown runs (the sandbox broker's cleanup is an
-/// `_onexit` handler in it) instead of `std::process::exit` here. A panic
-/// that reaches here is not unwound into the bootstrap: it is caught and
-/// returned as 101, Rust's own exit code for a panicking `main`.
+/// A CEF helper process (renderer, GPU, utility) returns its exit code to
+/// the bootstrap, which returns it from its `wWinMain`. The browser process
+/// itself does not come back once CefShutdown has returned: `run` ends it
+/// with `ExitProcess` (`children_windows`), so the bootstrap's teardown of
+/// the sandbox broker, which waits for every target still ending (up to
+/// 5 s, then 7014), does not run; the kernel ends the targets through their
+/// kill-on-close jobs. A panic that reaches here is not unwound into the
+/// bootstrap: it is caught and returned as 101, Rust's own exit code for a
+/// panicking `main`; the bootstrap's teardown then runs, which for a panic
+/// before CefShutdown (rare) may end in 7014 when targets remain.
 ///
 /// # Safety
 ///

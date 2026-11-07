@@ -606,21 +606,21 @@ jobs:
           cargo test --locked --features windows-sandbox --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
           if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed$' -Quiet)) { throw 'Not all thirteen guard self-tests ran' }
-      # The browser's orderly end after CefShutdown (W7,
-      # src/children_windows.rs, std only, built with rustc alone): its pure
-      # parts and the bounded wait for a process's own children, which the
-      # test binary starts by re-executing itself. All eight must run.
-      - name: Browser child wait tests (Windows)
+      # How the browser ends after CefShutdown (W7, src/children_windows.rs,
+      # std only, built with rustc alone): its pure parts and the count of a
+      # process's own running children, which the test binary starts by
+      # re-executing itself. All five must run.
+      - name: Browser child census tests (Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: |
           $exe = Join-Path $env:RUNNER_TEMP 'children-windows-tests.exe'
           rustc --edition 2021 --test native-tests/cef-candidate/src/children_windows.rs -o $exe
-          if ($LASTEXITCODE -ne 0) { throw "The child wait tests did not build (exit $LASTEXITCODE)" }
-          $log = Join-Path $env:RUNNER_TEMP 'child-wait-tests.log'
+          if ($LASTEXITCODE -ne 0) { throw "The child census tests did not build (exit $LASTEXITCODE)" }
+          $log = Join-Path $env:RUNNER_TEMP 'child-census-tests.log'
           & $exe --test-threads 1 | Tee-Object -FilePath $log
-          if ($LASTEXITCODE -ne 0) { throw "Child wait tests failed (exit $LASTEXITCODE)" }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 8 passed; 0 failed' -Quiet)) { throw 'Not all eight child wait tests ran' }
+          if ($LASTEXITCODE -ne 0) { throw "Child census tests failed (exit $LASTEXITCODE)" }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 5 passed; 0 failed' -Quiet)) { throw 'Not all five child census tests ran' }
       # The App's adapter on Windows with the staged sandboxed browser and the
       # guard: the plugin's Windows unit tests, then the two ignored
       # tests that start a profile through Process::spawn and the creation

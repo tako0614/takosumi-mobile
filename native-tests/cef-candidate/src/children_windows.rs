@@ -1,66 +1,66 @@
-//! Windows (W7): an orderly end for the browser process before it returns
-//! to CEF's bootstrap.
+//! Windows (W7): how the browser process ends after CefShutdown.
 //!
-//! The bootstrap owns Chromium's sandbox broker. When the browser's
-//! `RunWinMain` returns, the bootstrap returns from `wWinMain` and its C
-//! runtime runs the broker's `_onexit` handler (`SingletonBase::OnExit`,
-//! sandbox/win/src/win_utils.h), whose destructor
-//! (`BrokerServicesBase::~BrokerServicesBase`, broker_services.cc) posts
-//! `THREAD_CTRL_QUIT` to the broker's job-event thread and gives that thread
-//! 5000 ms to end, or terminates the process with
-//! `SBOX_FATAL_BROKER_SHUTDOWN_HUNG` (7014). Ending, the thread destroys
-//! every job tracker still listed: one per sandboxed target whose job has
-//! not yet reported its last process gone (`JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO`
-//! removes it earlier). Each such tracker terminates its job, then its
-//! target (`TargetProcess::~TargetProcess`) waits up to 50 ms for the
-//! process, terminates it and unregisters its IPC waits, which blocks on any
-//! callback in flight; one after another. A heavy page (many site-isolated
-//! frames, each a renderer, plus utilities) can leave dozens of targets
-//! still ending when CefShutdown returns, since Chromium terminates its
-//! children without waiting (`Process::Terminate(code, false)`), and their
-//! teardown then outlasts the 5 s.
+//! The sandboxed browser runs inside CEF's bootstrap, which owns Chromium's
+//! sandbox broker. Returning to the bootstrap runs the broker's teardown:
+//! the bootstrap's C runtime calls its `_onexit` handler
+//! (`SingletonBase::OnExit`, sandbox/win/src/win_utils.h) once `wWinMain`
+//! returns, and `BrokerServicesBase::~BrokerServicesBase`
+//! (broker_services.cc) posts `THREAD_CTRL_QUIT` to the broker's job-event
+//! thread and gives it 5000 ms to end, or terminates the process with
+//! `SBOX_FATAL_BROKER_SHUTDOWN_HUNG` (7014). Ending, that thread tears down
+//! every sandboxed target still listed, one after another (terminate its
+//! job, wait up to 50 ms for it, unregister its IPC waits). CefShutdown
+//! terminates its children without waiting for them, so a heavy page leaves
+//! dozens still ending: their teardown outlasted 5 s (7014), and waiting for
+//! them first took 7.5 s, too long for the App's sequential quit.
 //!
-//! So after CefShutdown, and before returning to the bootstrap, the browser
-//! waits, bounded, for its own child processes (every sandboxed target is
-//! one: the broker creates them) to have ended, so their trackers are gone
-//! by the time the broker's thread is told to quit. It then writes one
-//! evidence line to its standard error (the guard's log).
+//! So once CefShutdown has returned, the sandboxed browser ends itself with
+//! `ExitProcess` and the run's exit code, as it did before W7 round 2
+//! (`std::process::exit`), and never returns to the bootstrap. `ExitProcess`
+//! skips the executable's `_onexit` handlers (the broker's teardown) and
+//! closes the process's handles, among them every target's job handle; each
+//! job was created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (sandbox/win/src/
+//! job.cc: every job level includes it), so the kernel ends the targets
+//! still running. CefShutdown has already flushed the profile, so nothing
+//! that writes data is skipped. Before ending, the browser counts its child
+//! processes still running (no wait) and writes one evidence line to its
+//! standard error (the guard's log). The unsandboxed candidate (an
+//! executable, no bootstrap and no broker) writes the same line and returns
+//! its code as before.
 //!
 //! The pure parts build everywhere and are tested with plain
 //! `rustc --test` (std only, no CEF); the Win32 parts are Windows only.
 
-use std::time::{Duration, Instant};
-
-/// How long the browser waits for its children after CefShutdown. The App
-/// gives a browser that answered `stopped` 30 s (`STOP_FINISH` in the App's
-/// process adapter) to end with its guard's normal receipt; after `stopped`
-/// come CefShutdown, this wait, the broker's own teardown (at most 5 s, then
-/// 7014) and the guard's drain (0.5 s natural, then at most 2 s forced):
-/// 10 + 5 + 2.5 leaves 12.5 s for CefShutdown and the rest. Usually the
-/// children are gone well before it (Chromium has already terminated
-/// them); the W3/W4 observer gives the next profile's dialog 20 s after a
-/// partial quit (`END_WAIT`), which a full wait fits only with a short
-/// CefShutdown.
-pub const CHILD_WAIT: Duration = Duration::from_secs(10);
-
 /// The evidence line's prefix on the browser's standard error.
 pub const EVIDENCE_PREFIX: &str = "takosumi-cef-browser-process: shutdown ";
 
-/// What the wait found.
+/// How the browser process ends after CefShutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// The sandboxed browser: `ExitProcess` (no return to the bootstrap).
+    ExitProcess,
+    /// The unsandboxed candidate: it returns its code to `main`.
+    Return,
+}
+
+impl End {
+    pub fn name(self) -> &'static str {
+        match self {
+            End::ExitProcess => "exit-process",
+            End::Return => "return",
+        }
+    }
+}
+
+/// The child processes still running when the browser ends.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ChildWait {
-    /// Child processes still running after CefShutdown (each counted once,
-    /// also one seen only on a later look).
+pub struct Census {
+    /// Children seen running (each opened and not yet ended).
     pub children: usize,
-    /// Of those, still running (or not openable and still listed) when the
-    /// wait ended.
-    pub remaining: usize,
-    /// Children that could not be opened to wait on (not counted when their
-    /// id no longer named a process).
+    /// Children that could not be opened to tell (not counted when their id
+    /// no longer named a process).
     pub unopened: usize,
-    /// How long the wait took.
-    pub waited: Duration,
-    /// Why the wait could not look at all, if so.
+    /// Why the browser could not look at all, if so.
     pub error: Option<String>,
 }
 
@@ -76,15 +76,6 @@ pub fn children_of(entries: &[(u32, u32)], parent: u32) -> Vec<u32> {
     found.sort_unstable();
     found.dedup();
     found
-}
-
-/// Milliseconds from `now` until `deadline` for a Win32 wait: 0 once it has
-/// passed, and never `INFINITE` (`u32::MAX`).
-pub fn millis_left(now: Instant, deadline: Instant) -> u32 {
-    let left = deadline.saturating_duration_since(now).as_millis();
-    u32::try_from(left)
-        .unwrap_or(u32::MAX - 1)
-        .min(u32::MAX - 1)
 }
 
 /// `text` as a JSON string.
@@ -108,33 +99,39 @@ fn json_string(text: &str) -> String {
 
 /// The evidence line: `EVIDENCE_PREFIX` and one JSON object with the
 /// browser's pid (so a log shared by several launches attributes it), the
-/// wait's counts and duration, its bound and the exit code `RunWinMain`
-/// returns to the bootstrap.
-pub fn evidence_line(pid: u32, wait: &ChildWait, bound: Duration, exit_code: i32) -> String {
-    let error = wait
+/// children still running, how it ends and its exit code.
+pub fn evidence_line(pid: u32, census: &Census, end: End, exit_code: i32) -> String {
+    let error = census
         .error
         .as_deref()
         .map(|text| format!(",\"error\":{}", json_string(text)))
         .unwrap_or_default();
     format!(
-        "{EVIDENCE_PREFIX}{{\"pid\":{pid},\"children\":{},\"remaining\":{},\"unopened\":{},\
-         \"waitedMs\":{},\"boundMs\":{},\"exitCode\":{exit_code}{error}}}",
-        wait.children,
-        wait.remaining,
-        wait.unopened,
-        wait.waited.as_millis(),
-        bound.as_millis(),
+        "{EVIDENCE_PREFIX}{{\"pid\":{pid},\"children\":{},\"unopened\":{},\"end\":\"{}\",\
+         \"exitCode\":{exit_code}{error}}}",
+        census.children,
+        census.unopened,
+        end.name(),
     )
 }
 
-/// After CefShutdown: wait for this process's children (bounded by
-/// `CHILD_WAIT`) and write the evidence line with `exit_code`.
+/// After CefShutdown: count this process's running children, write the
+/// evidence line and, for the sandboxed browser (`exit`), end the process
+/// with `ExitProcess(exit_code)`; otherwise return.
 #[cfg(windows)]
-pub fn finish(exit_code: i32) {
-    let wait = wait_for_children(CHILD_WAIT);
+pub fn finish(exit_code: i32, exit: bool) {
+    use std::io::Write;
+    let end = if exit { End::ExitProcess } else { End::Return };
     // SAFETY: no arguments; always succeeds.
     let pid = unsafe { win32::GetCurrentProcessId() };
-    eprintln!("{}", evidence_line(pid, &wait, CHILD_WAIT, exit_code));
+    eprintln!("{}", evidence_line(pid, &census(), end, exit_code));
+    if exit {
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: ends the process; its handles (the targets' jobs among
+        // them) are closed by the kernel.
+        unsafe { win32::ExitProcess(exit_code as u32) }
+    }
 }
 
 #[cfg(windows)]
@@ -183,6 +180,7 @@ mod win32 {
         pub fn CloseHandle(handle: Handle) -> i32;
         pub fn GetCurrentProcess() -> Handle;
         pub fn GetCurrentProcessId() -> u32;
+        pub fn ExitProcess(exit_code: u32) -> !;
     }
 }
 
@@ -195,15 +193,6 @@ impl Drop for Owned {
     fn drop(&mut self) {
         // SAFETY: an owned handle, closed once.
         unsafe { win32::CloseHandle(self.0) };
-    }
-}
-
-#[cfg(windows)]
-impl Owned {
-    /// Whether it has ended, waiting at most `milliseconds`.
-    fn ended(&self, milliseconds: u32) -> bool {
-        // SAFETY: a valid handle with SYNCHRONIZE access.
-        unsafe { win32::WaitForSingleObject(self.0, milliseconds) == win32::WAIT_OBJECT_0 }
     }
 }
 
@@ -242,16 +231,12 @@ fn snapshot() -> std::io::Result<Vec<(u32, u32)>> {
     }
 }
 
-/// Wait until every child process of this one has ended, or `bound` has
-/// passed. A child is a process whose parent id is ours and that was created
-/// after us (an older process whose parent id merely names a reused id is
-/// not). Children that cannot be opened are looked for again every 20 ms.
+/// This process's children still running, now (no wait). A child is a
+/// process whose parent id is ours and that was created after us (an older
+/// process whose parent id merely names a reused id is not).
 #[cfg(windows)]
-pub fn wait_for_children(bound: Duration) -> ChildWait {
-    use std::collections::BTreeSet;
-    let started = Instant::now();
-    let deadline = started + bound;
-    let mut wait = ChildWait::default();
+pub fn census() -> Census {
+    let mut census = Census::default();
     // SAFETY: no arguments; the pseudo handle needs no closing.
     let (me, born) = unsafe {
         (
@@ -260,67 +245,38 @@ pub fn wait_for_children(bound: Duration) -> ChildWait {
         )
     };
     let Some(born) = born else {
-        wait.error = Some(format!(
+        census.error = Some(format!(
             "GetProcessTimes: {}",
             std::io::Error::last_os_error()
         ));
-        wait.waited = started.elapsed();
-        return wait;
+        return census;
     };
-    let mut counted = BTreeSet::new();
-    loop {
-        let entries = match snapshot() {
-            Ok(entries) => entries,
-            Err(error) => {
-                wait.error = Some(format!("CreateToolhelp32Snapshot: {error}"));
-                break;
+    let entries = match snapshot() {
+        Ok(entries) => entries,
+        Err(error) => {
+            census.error = Some(format!("CreateToolhelp32Snapshot: {error}"));
+            return census;
+        }
+    };
+    for pid in children_of(&entries, me) {
+        let access = win32::SYNCHRONIZE | win32::PROCESS_QUERY_LIMITED_INFORMATION;
+        // SAFETY: a plain OpenProcess; the handle is owned by `Owned`.
+        let handle = unsafe { win32::OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(win32::ERROR_INVALID_PARAMETER) {
+                census.unopened += 1;
             }
-        };
-        let mut live = Vec::new();
-        let mut unopened = 0;
-        for pid in children_of(&entries, me) {
-            let access = win32::SYNCHRONIZE | win32::PROCESS_QUERY_LIMITED_INFORMATION;
-            // SAFETY: a plain OpenProcess; the handle is owned by `Owned`.
-            let handle = unsafe { win32::OpenProcess(access, 0, pid) };
-            if handle.is_null() {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(win32::ERROR_INVALID_PARAMETER) {
-                    counted.insert(pid);
-                    unopened += 1;
-                }
-                continue;
-            }
-            let process = Owned(handle);
-            if created(process.0).is_some_and(|time| time < born) || process.ended(0) {
-                continue;
-            }
-            counted.insert(pid);
-            live.push(process);
+            continue;
         }
-        wait.children = counted.len();
-        wait.unopened = unopened;
-        if live.is_empty() && unopened == 0 {
-            wait.remaining = 0;
-            break;
-        }
-        for process in &live {
-            process.ended(millis_left(Instant::now(), deadline));
-        }
-        let still = live.iter().filter(|process| !process.ended(0)).count();
-        if Instant::now() >= deadline {
-            wait.remaining = still + unopened;
-            break;
-        }
-        // Children seen ended: look again at once (one started meanwhile?).
-        // Otherwise (one could not be opened, or a wait failed) look again
-        // shortly, never past the deadline.
-        if still > 0 || unopened > 0 {
-            let left = deadline.saturating_duration_since(Instant::now());
-            std::thread::sleep(Duration::from_millis(20).min(left));
+        let process = Owned(handle);
+        // SAFETY: a valid handle with SYNCHRONIZE access; no wait.
+        let ended = unsafe { win32::WaitForSingleObject(process.0, 0) == win32::WAIT_OBJECT_0 };
+        if !ended && created(process.0).is_none_or(|time| time >= born) {
+            census.children += 1;
         }
     }
-    wait.waited = started.elapsed();
-    wait
+    census
 }
 
 #[cfg(test)]
@@ -345,50 +301,28 @@ mod tests {
     }
 
     #[test]
-    fn the_time_left_never_waits_forever() {
-        let now = Instant::now();
-        assert_eq!(millis_left(now, now), 0);
-        assert_eq!(millis_left(now + Duration::from_secs(1), now), 0);
-        assert_eq!(millis_left(now, now + Duration::from_millis(1500)), 1500);
-        assert_eq!(
-            millis_left(now, now + Duration::from_secs(60 * 60 * 24 * 60)),
-            u32::MAX - 1
-        );
-    }
-
-    #[test]
     fn the_evidence_line_is_one_json_object_after_its_prefix() {
-        let wait = ChildWait {
-            children: 31,
-            remaining: 2,
+        let census = Census {
+            children: 65,
             unopened: 1,
-            waited: Duration::from_millis(10_000),
             error: None,
         };
         assert_eq!(
-            evidence_line(4242, &wait, CHILD_WAIT, 0),
-            "takosumi-cef-browser-process: shutdown {\"pid\":4242,\"children\":31,\"remaining\":2,\
-             \"unopened\":1,\"waitedMs\":10000,\"boundMs\":10000,\"exitCode\":0}"
+            evidence_line(4242, &census, End::ExitProcess, 0),
+            "takosumi-cef-browser-process: shutdown {\"pid\":4242,\"children\":65,\"unopened\":1,\
+             \"end\":\"exit-process\",\"exitCode\":0}"
         );
-        let failed = ChildWait {
+        let failed = Census {
             error: Some("CreateToolhelp32Snapshot: \"denied\"\n\\".into()),
-            ..ChildWait::default()
+            ..Census::default()
         };
         assert_eq!(
-            evidence_line(7, &failed, Duration::from_millis(250), 1),
-            "takosumi-cef-browser-process: shutdown {\"pid\":7,\"children\":0,\"remaining\":0,\
-             \"unopened\":0,\"waitedMs\":0,\"boundMs\":250,\"exitCode\":1,\
+            evidence_line(7, &failed, End::Return, 1),
+            "takosumi-cef-browser-process: shutdown {\"pid\":7,\"children\":0,\"unopened\":0,\
+             \"end\":\"return\",\"exitCode\":1,\
              \"error\":\"CreateToolhelp32Snapshot: \\\"denied\\\"\\n\\\\\"}"
         );
         assert_eq!(json_string("\u{1}é"), "\"\\u0001é\"");
-    }
-
-    /// The bound fits the App's 30 s for a browser that answered `stopped`,
-    /// with the broker's 5 s and the guard's 2.5 s drain after it.
-    #[test]
-    fn the_wait_fits_the_apps_stop_budget() {
-        let after_stopped = CHILD_WAIT + Duration::from_secs(5) + Duration::from_millis(2_500);
-        assert!(after_stopped <= Duration::from_secs(30) - Duration::from_secs(10));
     }
 
     /// Windows: this test binary's own children (it re-executes itself as
@@ -398,9 +332,10 @@ mod tests {
         use super::super::*;
         use std::process::{Child, Command};
         use std::sync::Mutex;
+        use std::time::Duration;
 
         static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-        const SLEEP: &str = "TAKOSUMI_CHILD_WAIT_SLEEP_MS";
+        const SLEEP: &str = "TAKOSUMI_CHILD_CENSUS_SLEEP_MS";
 
         /// Run as a child only: sleeps as long as its parent asked.
         #[test]
@@ -431,78 +366,53 @@ mod tests {
 
         /// Children this test binary already has that run on (a console
         /// host, when it was started without a console): the tests count
-        /// relative to them. A zero bound only looks.
+        /// relative to them.
         fn baseline() -> usize {
-            let wait = wait_for_children(Duration::ZERO);
-            assert_eq!(wait.error, None, "{wait:?}");
-            wait.remaining
+            let census = census();
+            assert_eq!(census.error, None, "{census:?}");
+            census.children
         }
 
         #[test]
-        fn children_that_end_are_waited_for() {
+        fn running_children_are_counted_without_waiting() {
             let _one = ONE_AT_A_TIME
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let before = baseline();
-            let mut children = sleepers(3, 400);
-            // With a child that runs on, the wait runs to its bound.
-            let bound = Duration::from_secs(if before == 0 { 10 } else { 3 });
-            let wait = wait_for_children(bound);
-            assert_eq!(
-                (wait.children, wait.remaining, wait.error.clone()),
-                (before + 3, before, None),
-                "{wait:?}"
-            );
-            if before == 0 {
-                assert!(wait.waited < bound, "{wait:?}");
-            }
-            for child in &mut children {
-                assert!(
-                    child.try_wait().unwrap().is_some(),
-                    "a child still runs after the wait"
-                );
-            }
-        }
-
-        #[test]
-        fn the_wait_stops_at_its_bound() {
-            let _one = ONE_AT_A_TIME
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let before = baseline();
-            let mut children = sleepers(2, 30_000);
-            let started = Instant::now();
-            let wait = wait_for_children(Duration::from_millis(300));
+            let mut children = sleepers(3, 30_000);
+            let started = std::time::Instant::now();
+            let census = census();
             let elapsed = started.elapsed();
             for child in &mut children {
                 let _ = child.kill();
                 let _ = child.wait();
             }
             assert_eq!(
-                (wait.children, wait.remaining, wait.error.clone()),
-                (before + 2, before + 2, None),
-                "{wait:?}"
+                (census.children, census.unopened, census.error.clone()),
+                (before + 3, 0, None),
+                "{census:?}"
             );
-            assert!(wait.waited >= Duration::from_millis(300), "{wait:?}");
-            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         }
 
         #[test]
-        fn no_children_is_no_wait() {
+        fn ended_children_are_not_counted() {
             let _one = ONE_AT_A_TIME
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let before = baseline();
-            let bound = Duration::from_secs(if before == 0 { 10 } else { 1 });
-            let wait = wait_for_children(bound);
-            assert_eq!(
-                (wait.children, wait.remaining, wait.error.clone()),
-                (before, before, None),
-                "{wait:?}"
-            );
-            if before == 0 {
-                assert!(wait.waited < Duration::from_secs(2), "{wait:?}");
+            let mut children = sleepers(2, 10);
+            for child in &mut children {
+                child.wait().unwrap();
             }
+            // Still held (not reaped by a dropped handle): ended, not counted.
+            let census = census();
+            assert_eq!(
+                (census.children, census.error.clone()),
+                (before, None),
+                "{census:?}"
+            );
+            drop(children);
         }
     }
 }

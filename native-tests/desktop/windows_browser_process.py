@@ -385,9 +385,8 @@ def sandbox_summary(observation, opened, required):
 
 def shutdown_summary(records):
     """Per profile of a phase: the guard receipt's rootExit and the
-    browser's own shutdown line (children left after CefShutdown, remaining
-    after the wait, its length, the exit code returned), for summary.json
-    and the CI log."""
+    browser's own shutdown line (children still running after CefShutdown,
+    how it ended, its exit code), for summary.json and the CI log."""
     found = []
     for record in records or []:
         receipt = record.get("receipt")
@@ -423,8 +422,8 @@ def guard_records(session, suffix):
     receipt, that guard's own forced-cleanup lines from the profile's
     browser.log (`forcedCleanupLines`; the receipt's `forcedCleanup` is the
     count) and, on Windows, that browser's own shutdown line
-    (`browserShutdown`, W7: children left after CefShutdown, the bounded
-    wait, the exit code it returned)."""
+    (`browserShutdown`, W7: children still running after CefShutdown, how
+    it ended, its exit code)."""
     marker = session / (f"app-browser-process{suffix}-open.json" if suffix else "app-browser-process-open.json")
     records = []
     for process in read_json(marker)["processes"]:

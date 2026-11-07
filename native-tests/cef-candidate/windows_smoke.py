@@ -36,8 +36,8 @@ session and process group. It then requires, each within a bound:
    observer of the actual App (desktop/windows_browser_observer.py) applies
    the same check to each profile's browser and its process tree;
 7. on Windows, the browser's own shutdown line from its log (W7: child
-   processes left after CefShutdown, the bounded wait for them, the exit
-   code it returned to CEF's bootstrap), recorded as `shutdown`.
+   processes still running after CefShutdown, how it ends, its exit code),
+   recorded as `shutdown`.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -331,8 +331,9 @@ def process_facts(kernel32, advapi32, ntdll, pid):
 
 # The browser's own line on its standard error after CefShutdown (Windows,
 # W7; src/children_windows.rs): its pid, how many child processes were still
-# running, how many remained after the bounded wait, the wait's length and
-# bound, and the exit code it returned to CEF's bootstrap.
+# running (and how many it could not open), how it ends ("exit-process" for
+# the sandboxed browser, "return" for the unsandboxed candidate) and its exit
+# code.
 BROWSER_SHUTDOWN = "takosumi-cef-browser-process: shutdown "
 
 
@@ -873,8 +874,8 @@ def main():
         summary["exitCode"] = code
         summary["seconds"]["exit"] = round(time.monotonic() - started, 3)
         if WINDOWS:
-            # Its own record of the orderly end (W7): children left after
-            # CefShutdown, the wait, and the code it returned.
+            # Its own record of its end (W7): children still running after
+            # CefShutdown, how it ended, and its exit code.
             summary["shutdown"] = browser_shutdown(tail(case / "browser.log"), pid)
         require(code == 0, f"The browser exited with {code}")
         session.reader.join(timeout=5)

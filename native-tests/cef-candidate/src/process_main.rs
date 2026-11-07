@@ -22,8 +22,8 @@ use tauri_plugin_app_screen::{
     OpenRequest,
 };
 
-/// Windows: the orderly end after CefShutdown (wait for the browser's own
-/// child processes before returning to CEF's bootstrap; W7).
+/// Windows: how the browser ends after CefShutdown (W7): it records its
+/// children still running and the sandboxed browser ends with ExitProcess.
 #[cfg(windows)]
 #[path = "children_windows.rs"]
 mod children_windows;
@@ -1121,9 +1121,12 @@ fn is_final(directory: &Path) -> bool {
 /// Returns the process's exit code: a helper's from `execute_process`, the
 /// browser's 0, or 1 when a request failed. The caller ends the process with
 /// it (the executable) or returns it to the bootstrap (the DLL), so the
-/// bootstrap's own teardown runs. On Windows the browser first waits, after
-/// CefShutdown, for its child processes to end (`children_windows`), so the
-/// sandbox broker's teardown finds no target still ending.
+/// bootstrap's own teardown runs. Once CefShutdown has returned, the
+/// sandboxed Windows browser instead ends with `ExitProcess` and that code
+/// (`children_windows`): the bootstrap's teardown of the sandbox broker
+/// would wait for every target still ending (up to 5 s, then 7014), while
+/// the kernel ends them through their kill-on-close jobs. A panic before
+/// that still reaches the bootstrap (101).
 pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     const {
         assert!(cfg!(any(target_os = "linux", windows)));
@@ -1216,6 +1219,6 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     shutdown();
     let code = i32::from(failed);
     #[cfg(windows)]
-    children_windows::finish(code);
+    children_windows::finish(code, cfg!(feature = "windows-sandbox"));
     code
 }
