@@ -108,6 +108,17 @@ async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
     eval(view,&format!("(()=>{{const url=document.querySelector('#connection-url'),name=document.querySelector('#connection-name');url.value={origin};url.dispatchEvent(new Event('input',{{bubbles:true}}));name.value={label};name.dispatchEvent(new Event('input',{{bubbles:true}}));document.querySelector('form').requestSubmit();return true}})()")).await?;
     ready(view,&format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')")).await
 }
+/// How long the first launch waits for the observer's first checkpoint: 30 s,
+/// as on Linux. The Windows real-site run (W4,
+/// `TAKOSUMI_BROWSER_PROCESS_REAL_SITE`) loads a third-party site in both
+/// profiles before it.
+fn inspect_bound() -> Duration {
+    #[cfg(windows)]
+    if shell::real_site() {
+        return Duration::from_secs(150);
+    }
+    Duration::from_secs(30)
+}
 async fn checkpoint(view: &impl Shell, case: &Path, name: &str) -> Result<()> {
     checkpoint_within(view, case, name, Duration::from_secs(30)).await
 }
@@ -488,7 +499,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     )
     .map_err(|error| error.to_string())?;
     println!("first: both browsers recorded; waiting for the observer");
-    checkpoint(view, case, "inspect-ready").await?;
+    checkpoint_within(view, case, "inspect-ready", inspect_bound()).await?;
     println!("first: observer ready; reopening Work from the home");
     resume_work(view).await?;
     let after = tauri_plugin_app_screen::browser_process_experiment_status(app)
