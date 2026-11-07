@@ -957,8 +957,9 @@ through `Process::spawn`, waits for the creation reply through
 20 s; the time is printed), restates the parent, image and cache checks
 against Windows' records, holds the browser's direct children open and
 requires at least one running CEF helper (running the browser's own
-executable) and no console host (`conhost.exe`) below the GUI-subsystem
-browser, and Chromium's `lockfile`
+executable) and no console host (`conhost.exe`) anywhere in the guard's
+process tree (the guard is detached, the browser and its helpers are a
+GUI-subsystem program), and Chromium's `lockfile`
 in the profile's cache root held, reopens the same key and requires the same
 native browser and window, shuts down through `Process::shutdown` and
 requires a normal receipt (complete, `rootExit` 0, no forced cleanup, the
