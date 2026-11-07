@@ -29,9 +29,12 @@ session and process group. It then requires, each within a bound:
 6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
    shutdown: at least one renderer process in the job, each without
    `--no-sandbox` and with a token integrity level of Low or Untrusted,
-   below the browser's own (read from its token), and the browser's own
-   command line read and without `--no-sandbox` either; recorded as
-   `sandbox` (with the processes whose command line could not be read).
+   below the browser's own (read from its token), the browser's own
+   command line read and without `--no-sandbox` either, and no other process
+   in the job whose command line could not be read unless it had already
+   exited; recorded as `sandbox` (with those unread processes). The
+   observer of the actual App (desktop/windows_browser_observer.py) applies
+   the same check to each profile's browser and its process tree.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -114,7 +117,16 @@ class ThreadEntry(ctypes.Structure):  # THREADENTRY32
                 ("tpDeltaPri", ctypes.c_int32), ("dwFlags", ctypes.c_uint32)]
 
 
-X64_SIZES = {BasicLimit: 64, IoCounters: 48, ExtendedLimit: 144, Accounting: 48, ThreadEntry: 28}
+class ProcessEntry(ctypes.Structure):  # PROCESSENTRY32W
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ProcessID", ctypes.c_uint32),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", ctypes.c_uint32),
+                ("cntThreads", ctypes.c_uint32), ("th32ParentProcessID", ctypes.c_uint32),
+                ("pcPriClassBase", ctypes.c_int32), ("dwFlags", ctypes.c_uint32),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+X64_SIZES = {BasicLimit: 64, IoCounters: 48, ExtendedLimit: 144, Accounting: 48, ThreadEntry: 28,
+             ProcessEntry: 568}
 
 CREATE_SUSPENDED = 0x4
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -164,6 +176,10 @@ def last_error(what):
 INTEGRITY = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium", 0x2100: "medium-plus", 0x3000: "high",
              0x4000: "system"}
 LOW_INTEGRITY = 0x1000
+# OpenProcess's error for a process id that no longer names a process.
+ERROR_INVALID_PARAMETER = 87
+STILL_ACTIVE = 259
+TH32CS_SNAPPROCESS = 0x2
 
 
 def windows_arguments(line):
@@ -231,11 +247,17 @@ def has_no_sandbox(arguments):
     return "--no-sandbox" in (rest[:rest.index("--")] if "--" in rest else rest)
 
 
-def sandbox_problems(browser, renderers):
+def sandbox_problems(browser, renderers, unread=()):
     """Why the sandbox is not shown (empty when it is): `browser` and each
     of `renderers` are {"integrity": RID or None, "noSandbox": bool}; the
-    browser's `argumentsRead` is False when its command line was not read."""
+    browser's `argumentsRead` is False when its command line was not read.
+    Each of `unread` ({"pid", "error", "exited"}) is a process whose command
+    line was not read, so whose type is unknown: a problem unless it had
+    already exited (the browser's own is reported above)."""
     problems = []
+    for process in unread:
+        if not process.get("exited") and process.get("pid") != browser.get("pid"):
+            problems.append(f"process {process.get('pid')}: command line not read ({process.get('error')})")
     if browser.get("argumentsRead") is False:
         problems.append(f"the browser's command line was not read ({browser.get('error')})")
     if browser.get("noSandbox"):
@@ -259,11 +281,15 @@ def sandbox_problems(browser, renderers):
 
 def process_facts(kernel32, advapi32, ntdll, pid):
     """A process's split command line and token integrity RID (Windows):
-    {"pid", "arguments", "integrity", "error"?}."""
+    {"pid", "arguments", "integrity", "error"?, "exited"?}. When either was
+    not read, `exited` says whether the process had already exited: its id
+    no longer opens (ERROR_INVALID_PARAMETER), or it has an exit code."""
     facts = {"pid": pid, "arguments": None, "integrity": None}
     process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not process:
-        facts["error"] = f"OpenProcess: Windows error {ctypes.get_last_error()}"
+        error = ctypes.get_last_error()
+        facts["error"] = f"OpenProcess: Windows error {error}"
+        facts["exited"] = error == ERROR_INVALID_PARAMETER
         return facts
     try:
         size = ctypes.c_uint32(0)
@@ -291,16 +317,78 @@ def process_facts(kernel32, advapi32, ntdll, pid):
                 kernel32.CloseHandle(token)
         else:
             facts["error"] = f"OpenProcessToken: Windows error {ctypes.get_last_error()}"
+        if facts["arguments"] is None or facts["integrity"] is None:
+            code = ctypes.c_uint32(0)
+            facts["exited"] = bool(kernel32.GetExitCodeProcess(process, ctypes.byref(code))
+                                   and code.value != STILL_ACTIVE)
     finally:
         kernel32.CloseHandle(process)
     return facts
 
 
+def descendant_pids(pairs, root):
+    """The ids of `root`'s descendants, from (pid, parent pid) pairs."""
+    children = {}
+    for pid, parent in pairs:
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+    found, queue, seen = [], [root], {root}
+    while queue:
+        for child in children.get(queue.pop(), ()):
+            if child not in seen:
+                seen.add(child)
+                found.append(child)
+                queue.append(child)
+    return sorted(found)
+
+
+class ProcessTree:
+    """A browser process and its descendants by parent process id (a
+    Toolhelp snapshot), the processes sandbox_evidence reads where no job of
+    the caller's own holds just that browser: in the App, each browser runs
+    in its guard's job inside the App's, and Chromium puts its sandboxed
+    processes in jobs of their own below those (Windows)."""
+
+    def __init__(self, kernel32, root):
+        require(not WINDOWS or ctypes.sizeof(ctypes.c_void_p) != 8
+                or ctypes.sizeof(ProcessEntry) == X64_SIZES[ProcessEntry], "Unexpected ProcessEntry layout")
+        self.kernel32, self.root = kernel32, root
+        handle = ctypes.c_void_p
+        kernel32.CreateToolhelp32Snapshot.restype = handle
+        kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        for name in ("Process32FirstW", "Process32NextW"):
+            function = getattr(kernel32, name)
+            function.restype, function.argtypes = ctypes.c_int, [handle, ctypes.POINTER(ProcessEntry)]
+
+    def pairs(self):
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (None, INVALID_HANDLE_VALUE):
+            raise last_error("CreateToolhelp32Snapshot")
+        try:
+            found = []
+            entry = ProcessEntry(dwSize=ctypes.sizeof(ProcessEntry))
+            more = self.kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID))
+                entry.dwSize = ctypes.sizeof(ProcessEntry)
+                more = self.kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            return found
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+
+    def process_ids(self):
+        return [self.root] + descendant_pids(self.pairs(), self.root)
+
+
 def sandbox_evidence(job, browser_pid, deadline):
     """Windows: the browser's and its renderers' integrity levels and
-    command lines, once at least one renderer is in the job (until
-    `deadline`); raises when they do not show Chromium's sandbox."""
+    command lines, once at least one renderer is among `job.process_ids()`
+    (until `deadline`): `job` is a WindowsJob holding just the browser, or a
+    ProcessTree of it, with its `kernel32`. The `problems` it returns say
+    why they do not show Chromium's sandbox (empty when they do)."""
     handle, dword = ctypes.c_void_p, ctypes.c_uint32
+    job.kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    job.kernel32.GetExitCodeProcess.argtypes = [handle, ctypes.POINTER(dword)]
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     ntdll = ctypes.WinDLL("ntdll")
     advapi32.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
@@ -328,9 +416,9 @@ def sandbox_evidence(job, browser_pid, deadline):
                                  if fact["arguments"]}),
                 # Processes whose command line could not be read (so their
                 # type is unknown), with the reason.
-                "unread": [{"pid": fact["pid"], "error": fact.get("error")} for fact in facts
-                           if fact.get("arguments") is None]}
-    evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"])
+                "unread": [{"pid": fact["pid"], "error": fact.get("error"), "exited": fact.get("exited", False)}
+                           for fact in facts if fact.get("arguments") is None]}
+    evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"], evidence["unread"])
     return evidence
 
 

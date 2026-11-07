@@ -14,6 +14,15 @@ attested native browser process. Pages are the runner's local fixture site.
 State is synthetic (a nonce in localStorage and a script cookie, and the
 site's HttpOnly session cookie set by the sign-in stand-in); no real login.
 
+W7: once each profile's page has loaded, its browser and every renderer
+below it in its process tree (which runs in its guard's job inside the
+App's, with Chromium's own jobs below) must show Chromium's sandbox, read
+with windows_smoke.py's sandbox_evidence: at least one renderer, each at
+Untrusted or Low integrity below the browser's, no `--no-sandbox`, no live
+process whose command line could not be read. The records go into the
+observation (`sandbox`); with --unsandboxed-candidate they are recorded,
+not required.
+
 Window switching uses SetForegroundWindow (then, if Windows refuses, the
 task switchers' AttachThreadInput route), and Work is minimized before the
 home reopens it with ShowWindowAsync. It never sends keyboard or mouse
@@ -38,7 +47,7 @@ from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
-from windows_smoke import Failure, require  # noqa: E402
+from windows_smoke import Failure, ProcessTree, require, sandbox_evidence  # noqa: E402
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -47,6 +56,8 @@ SETTLE_WAIT = 10
 # The fixture site's documents: a navigation within a profile, or the boot
 # load of a new browser (the cef-candidate popup probe's 25 s load bound).
 LOAD_WAIT = 25
+# W7: how long a loaded profile's browser may take to show a renderer.
+SANDBOX_WAIT = 15
 # Windows: a profile's browser and guard ending after its last window closed
 # (the Linux observer allows 10 s; process teardown is slower here).
 END_WAIT = 20
@@ -741,8 +752,12 @@ class Page:
 # --- Observation ---------------------------------------------------------------
 
 class Observer:
-    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None, installed=None):
+    def __init__(self, data, site, app_pid, phase, win32=None, real_site=None, installed=None,
+                 expect_sandbox=True):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
+        # W7: each profile's browser must show Chromium's sandbox (False:
+        # the unsandboxed candidate, recorded only).
+        self.expect_sandbox = expect_sandbox
         # W6 (--packaged): the installed App's directory; each guard and
         # browser must run from its cef\ (installed_from).
         self.installed = installed
@@ -878,6 +893,20 @@ class Observer:
             require(inside(image, cef), f"The {role} of {process['profile']} runs from {image}, not from {cef}")
         require(not problems, f"The installed processes of {process['profile']}: {problems}")
 
+    def sandbox(self, process):
+        """W7: this profile's browser and the renderers below it in its
+        process tree show Chromium's sandbox (windows_smoke's
+        sandbox_evidence); recorded in the observation and, unless the
+        browser is the unsandboxed candidate, required."""
+        pid = process["opened"]["nativePid"]
+        found = sandbox_evidence(ProcessTree(self.win.kernel32, pid), pid, time.monotonic() + SANDBOX_WAIT)
+        self.proof.setdefault("sandbox", []).append(dict(found, profile=process["profile"],
+                                                         required=self.expect_sandbox))
+        if self.expect_sandbox:
+            require(not found["problems"],
+                    f"The browser of {process['profile']} does not show Chromium's sandbox: {found['problems']}")
+        return found
+
     def attach(self, process):
         native = process["opened"]
         self.proof["stage"] = {"name": "attach", "pid": native["nativePid"], "profile": process["profile"]}
@@ -921,6 +950,8 @@ class Observer:
             except Failure as error:
                 self.proof["startupDocument"] = {"error": str(error)}
             raise
+        # The page has loaded, so a renderer runs it.
+        self.sandbox(process)
         window = native["windowId"]
         owner = self.win.owner(window)[0]
         require(owner == native["nativePid"], f"The browser window {window} belongs to {owner}")
@@ -1480,6 +1511,8 @@ def main():
     parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
     parser.add_argument("--installed", type=Path,
                         help="W6: the installed App's directory; its guards and browsers must run from its cef")
+    parser.add_argument("--unsandboxed-candidate", action="store_true",
+                        help="the browser is the unsandboxed candidate: record its sandbox evidence, do not require it")
     args = parser.parse_args()
     if args.real_site and args.phase:
         parser.error("--real-site runs the first launch only")
@@ -1487,7 +1520,8 @@ def main():
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
-    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site, args.installed).run()
+    Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site, args.installed,
+             expect_sandbox=not args.unsandboxed_candidate).run()
 
 
 if __name__ == "__main__":

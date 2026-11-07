@@ -498,6 +498,89 @@ class SandboxEvidenceTests(unittest.TestCase):
             self.assertTrue(any(problem in text for text in problems), (problem, problems))
 
 
+    def test_a_live_process_whose_command_line_was_not_read_is_a_problem(self):
+        import windows_smoke as smoke
+        browser = {"pid": 1, "integrity": 0x2000, "argumentsRead": True, "noSandbox": False}
+        renderer = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
+        exited = {"pid": 3, "error": "OpenProcess: Windows error 87", "exited": True}
+        live = {"pid": 4, "error": "NtQueryInformationProcess: 0xC0000022", "exited": False}
+        self.assertEqual(smoke.sandbox_problems(browser, [renderer], [exited]), [])
+        self.assertEqual(smoke.sandbox_problems(browser, [renderer], [exited, live]),
+                         ["process 4: command line not read (NtQueryInformationProcess: 0xC0000022)"])
+        # The browser's own unread command line is reported once, as the browser's.
+        unread_browser = dict(browser, argumentsRead=False, error="denied")
+        problems = smoke.sandbox_problems(unread_browser, [renderer], [{"pid": 1, "error": "denied"}])
+        self.assertEqual(problems, ["the browser's command line was not read (denied)"])
+        self.assertEqual(smoke.ERROR_INVALID_PARAMETER, 87)
+
+    def test_a_browsers_process_tree_is_its_descendants_by_parent(self):
+        import windows_smoke as smoke
+        pairs = [(0, 0), (4, 0), (10, 4), (20, 10), (21, 10), (30, 20), (40, 4), (50, 99), (60, 60), (61, 62),
+                 (62, 61)]
+        self.assertEqual(smoke.descendant_pids(pairs, 10), [20, 21, 30])
+        self.assertEqual(smoke.descendant_pids(pairs, 30), [])
+        self.assertEqual(smoke.descendant_pids(pairs, 60), [])
+        self.assertEqual(smoke.descendant_pids(pairs, 61), [62])
+
+        class Tree(smoke.ProcessTree):
+            def __init__(self, root):
+                self.root = root
+
+            def pairs(self):
+                return pairs
+
+        self.assertEqual(Tree(10).process_ids(), [10, 20, 21, 30])
+        # PROCESSENTRY32W: 568 bytes on x64 Windows (two-byte WCHAR).
+        ctypes = smoke.ctypes
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(smoke.ProcessEntry), (44 + 260 * ctypes.sizeof(ctypes.c_wchar) + 7) // 8 * 8)
+        self.assertEqual(smoke.X64_SIZES[smoke.ProcessEntry], 568)
+
+    def test_the_observer_requires_each_profiles_browser_to_show_the_sandbox(self):
+        found = {"browser": {"pid": 7, "integrityName": "high"}, "renderers": [], "problems": ["no renderer"]}
+        calls = []
+
+        def evidence(source, pid, deadline):
+            calls.append((source.root, pid))
+            return found
+
+        class Win:
+            kernel32 = None
+
+        process = {"profile": "p-work", "opened": {"nativePid": 7}}
+        with mock.patch.object(observer, "sandbox_evidence", evidence), \
+                mock.patch.object(observer.ProcessTree, "__init__",
+                                  lambda tree, kernel32, root: setattr(tree, "root", root)):
+            required = observer.Observer(Path("case"), "https://127.0.0.1:1", 1, "", win32=Win())
+            with self.assertRaises(Failure) as raised:
+                required.sandbox(process)
+            self.assertIn("The browser of p-work does not show Chromium's sandbox", str(raised.exception))
+            self.assertEqual(required.proof["sandbox"], [dict(found, profile="p-work", required=True)])
+            recorded = observer.Observer(Path("case"), "https://127.0.0.1:1", 1, "", win32=Win(), expect_sandbox=False)
+            self.assertEqual(recorded.sandbox(process), found)
+            self.assertEqual(recorded.proof["sandbox"], [dict(found, profile="p-work", required=False)])
+        self.assertEqual(calls, [(7, 7), (7, 7)])
+        self.assertIn("sandbox", runner.EVIDENCE_KEYS)
+
+    def test_the_runner_rechecks_every_opened_profiles_sandbox_record(self):
+        opened = {"processes": [{"profile": "work"}, {"profile": "personal"}]}
+        good = lambda profile: {"profile": profile, "browser": {"integrityName": "high"},
+                                "renderers": [{"integrityName": "untrusted"}], "problems": []}
+        observation = {"sandbox": [good("work"), good("personal")]}
+        self.assertEqual(runner.sandbox_summary(observation, opened, True), [
+            {"profile": "work", "browser": "high", "renderers": ["untrusted"], "problems": []},
+            {"profile": "personal", "browser": "high", "renderers": ["untrusted"], "problems": []},
+        ])
+        with self.assertRaisesRegex(Failure, "No sandbox evidence for the browser of personal"):
+            runner.sandbox_summary({"sandbox": [good("work")]}, opened, True)
+        bad = dict(good("personal"), problems=["no renderer process was found"])
+        with self.assertRaisesRegex(Failure, "personal does not show Chromium's sandbox"):
+            runner.sandbox_summary({"sandbox": [good("work"), bad]}, opened, True)
+        # The unsandboxed candidate: recorded, not required.
+        self.assertEqual(len(runner.sandbox_summary({"sandbox": [good("work"), bad]}, opened, False)), 2)
+        self.assertEqual(runner.sandbox_summary({}, opened, False), [])
+
+
 class RunnerTests(unittest.TestCase):
     def test_case_names_also_fit_the_app_identifier(self):
         for name in ("sumi-w3", "a", "x" * 24):

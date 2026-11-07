@@ -10,12 +10,15 @@ with the cef-candidate features fixture-inspection and windows-sandbox (W7:
 a fixture stage of scripts/stage-windows-cef.mjs, CEF's bootstrap.exe as
 takosumi-cef-browser-process.exe with takosumi-cef-browser-process.dll beside
 it; the unsandboxed candidate executable built with windows-unsandboxed-candidate
-also runs), and the guard is takosumi-browser-guard.exe.
+also runs, with --unsandboxed-candidate), and the guard is takosumi-browser-guard.exe.
 Each phase starts the App suspended, puts it into a kill-on-close Job Object
 this runner owns and resumes it, so the App, its WebView2, its guards and every
 browser process are accounted; it then runs windows_browser_observer.py
 against the App's CEF browsers and requires a normal App exit, every guard's
-normal receipt and an empty job. The phases share one case (the App's data):
+normal receipt and an empty job. The observer also requires each profile's
+browser to show Chromium's sandbox (W7; the runner checks its records again
+and keeps them in each phase's summary), unless --unsandboxed-candidate.
+The phases share one case (the App's data):
 the first launch, then with --restart and --reset the later launches.
 
 The App's own home (WebView2) is driven in-process by the fixture
@@ -120,7 +123,7 @@ GUARD_DIAGNOSTIC = "takosumi-browser-guard: forced-cleanup "
 BROWSER_LOG_TAIL = 4 * 1024 * 1024
 # The observer's evidence printed to the CI log (bindings and samples stay in
 # browser-observation.json).
-EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder")
+EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder", "sandbox")
 WINDOWS_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
@@ -358,6 +361,28 @@ def evidence(session, suffix):
     return json.dumps(digest, separators=(",", ":"))
 
 
+def sandbox_summary(observation, opened, required):
+    """W7: each opened profile's sandbox evidence from the observation
+    (the browser's integrity level, its renderers' and any problem). With
+    `required`, every opened profile must have evidence, all without a
+    problem (the observer also requires it)."""
+    records = observation.get("sandbox", [])
+    found = []
+    for process in opened["processes"]:
+        mine = [record for record in records if record.get("profile") == process["profile"]]
+        if required:
+            require(mine, f"No sandbox evidence for the browser of {process['profile']}")
+        for record in mine:
+            if required:
+                require(not record.get("problems"),
+                        f"The browser of {process['profile']} does not show Chromium's sandbox: {record['problems']}")
+            found.append({"profile": process["profile"],
+                          "browser": (record.get("browser") or {}).get("integrityName"),
+                          "renderers": [renderer.get("integrityName") for renderer in record.get("renderers", [])],
+                          "problems": record.get("problems")})
+    return found
+
+
 def guard_diagnostics(text, guard_pid=None):
     """The guard's forced-cleanup lines in a browser log, parsed: with
     `guard_pid`, only that guard's. One that does not parse is kept as
@@ -451,6 +476,9 @@ def run_phase(args, env, files, before, head, suffix):
             # A packaged run also requires each guard and browser to run from
             # the installed App's cef directory.
             real += ["--installed", str(args.binary.parent)] if args.packaged else []
+            # W7: the observer requires each profile's browser to show
+            # Chromium's sandbox, unless this is the unsandboxed candidate.
+            real += ["--unsandboxed-candidate"] if args.unsandboxed_candidate else []
             with create_exclusive(session / f"observer{suffix}.log") as observer:
                 subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
                                 "--app-pid", str(app.pid), "--phase", phase, *real],
@@ -465,6 +493,7 @@ def run_phase(args, env, files, before, head, suffix):
             require(observation["passed"] is True, "The browser observation must pass")
             opened = read_json(session / (f"app-browser-process{suffix}-open.json" if suffix
                                           else "app-browser-process-open.json"))
+            proof["sandbox"] = sandbox_summary(observation, opened, not args.unsandboxed_candidate)
             execution["browserGuards"] = []
             for process in opened["processes"]:
                 receipt = read_json(Path(process["guardReceipt"]))
@@ -552,6 +581,9 @@ def main():
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
     parser.add_argument("--real-site", choices=sorted(REAL_SITES),
                         help="W4: the app home links to this real site; first launch only, cases named <site>/<case>")
+    parser.add_argument("--unsandboxed-candidate", action="store_true",
+                        help="diagnostics only: the browser is the windows-unsandboxed-candidate executable; its "
+                             "sandbox evidence is recorded, not required (W7)")
     args = parser.parse_args()
     if args.real_site and (args.restart or args.reset):
         parser.error("--real-site runs the first launch only")
@@ -571,7 +603,8 @@ def main():
     stored = [directory for directory in app_data(args.data.name) if os.path.lexists(directory)]
     require(not stored, f"App data for this case name already exists: {stored}")
     summary = {"passed": False, "case": str(args.data), "appData": [str(path) for path in app_data(args.data.name)],
-               "cases": [], "phases": [], "realSite": args.real_site, "packaged": args.packaged}
+               "cases": [], "phases": [], "realSite": args.real_site, "packaged": args.packaged,
+               "unsandboxedCandidate": args.unsandboxed_candidate}
     args.data.mkdir()
     args.data.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     try:
@@ -689,7 +722,7 @@ def run(args, summary):
             phase_env = dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE=suffix[1:]) if suffix else env
             proof = run_phase(args, phase_env, files, before, head, suffix)
             summary["phases"].append({"phase": proof["phase"], "passed": proof["passed"],
-                                      "sessionJob": proof.get("sessionJob")})
+                                      "sessionJob": proof.get("sessionJob"), "sandbox": proof.get("sandbox")})
             require(proof["passed"] is True, f"The {proof['phase']} App launch did not pass")
             expected = list(OBSERVED_CASES[suffix[1:]])
             require(proof["cases"] == expected,
