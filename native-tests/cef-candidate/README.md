@@ -561,9 +561,13 @@ or of a release.
 
 ## Windows browser process (first candidate)
 
-`takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`, as an
-unsandboxed test candidate that must be asked for by name with the
-cef-candidate feature `windows-unsandboxed-candidate`. The first Windows step
+`takosumi-cef-browser-process` also builds for `x86_64-pc-windows-msvc`. Until
+W6 it did so as an unsandboxed test candidate that must be asked for by name
+with the cef-candidate feature `windows-unsandboxed-candidate`; since W7 the
+product browser runs in Chromium's sandbox, as the DLL that CEF's
+`bootstrap.exe` loads ([Windows sandbox (W7)](#windows-sandbox-w7)), and the
+unsandboxed candidate remains for fixtures and diagnostics. This section
+describes the candidate as W1 built it. The first Windows step
 (W1, this section) ran the browser on its own, started by `windows_smoke.py`
 or the CI job. The second (W2, [Windows guard and adapter](#windows-guard-and-adapter))
 adds the Windows `takosumi-browser-guard` and lets the App's adapter start
@@ -590,14 +594,14 @@ Linux-only dependency) and the `$ORIGIN` run path are compiled only for Linux,
 where the browser's behaviour and output are unchanged; the feature has no
 effect there. On Windows:
 
-- **Sandbox.** Off on Windows in this candidate, whatever the switches. CEF's
-  Windows sandbox needs cef-dll-sys's `sandbox` feature (`cef_sandbox`) and the
-  bootstrap layout: the browser built as a DLL that CEF's `bootstrap.exe`,
-  renamed to the browser, loads, with sandbox information passed to
-  `execute_process` and `initialize`. This build links none of that, so it sets
-  CEF's `no_sandbox` itself, and a Windows build without
-  `windows-unsandboxed-candidate` is a compile error. The sandbox must be
-  qualified before any Windows package (the TODO in `without_sandbox`).
+- **Sandbox.** Off in this candidate, whatever the switches: the executable
+  built with `windows-unsandboxed-candidate` has no sandbox information, so it
+  sets CEF's `no_sandbox` itself. CEF's Windows sandbox needs the bootstrap
+  layout: the browser built as a DLL that CEF's `bootstrap.exe`, renamed to
+  the browser, loads, with sandbox information passed to `execute_process`
+  and `initialize`. W7 builds exactly that (feature `windows-sandbox`, see
+  [Windows sandbox (W7)](#windows-sandbox-w7)); a Windows build with neither
+  feature, or with both, is a compile error.
 - **DLLs and resources.** cef-dll-sys copies the distribution's files
   (`libcef.dll`, `chrome_elf.dll`, the `.pak`, `icudtl.dat` and V8 snapshot
   files) and `locales/` into the Cargo profile directory beside the executable.
@@ -612,10 +616,12 @@ effect there. On Windows:
   compatibility entry of CEF's cefsimple manifest, without which Windows
   reports an older version to Chromium, plus Common Controls 6 and `asInvoker`.
   It panics for a Windows target that is not MSVC, which would otherwise build
-  without the manifest. The CI job reads the `RT_MANIFEST` resource back from
-  the executable with the Windows SDK's `mt.exe -inputresource:<exe>;#1` and
-  requires exactly that `supportedOS` entry, the Common Controls 6 dependency
-  and one `asInvoker` execution level.
+  without the manifest. Until W7 the CI job read the `RT_MANIFEST` resource
+  back from this executable with the Windows SDK's
+  `mt.exe -inputresource:<exe>;#1` and required exactly that `supportedOS`
+  entry, the Common Controls 6 dependency and one `asInvoker` execution level.
+  Since W7 the staged executable is CEF's bootstrap, whose manifest CEF
+  builds; the job reads that one instead (see W7).
 - **Profile directory.** `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` must be absolute
   and in its final form, as on Linux. On Windows the check drops the `\\?\`
   (or `\\?\UNC\`) prefix that `canonicalize` adds and then compares the OS
@@ -683,12 +689,13 @@ failure it prints the log tails and ends every owned process (terminating the
 Job Object on Windows, SIGKILL to the process group on Linux); closing the job
 also kills anything still in it.
 
-The CI job `cef-windows` on `windows-latest` builds the product browser with
+The CI job `cef-windows` on `windows-latest` built the product browser with
 `--locked --features windows-unsandboxed-candidate` (`CEF_PATH` is
-`${{ runner.temp }}\cef`, cached by the locked cef-dll-sys version), checks
-its embedded manifest and runs the harness. It then builds the
-`fixture-inspection` browser with the same feature and runs it with
-`--expect-load --reuse`.
+`${{ runner.temp }}\cef`, cached by the locked cef-dll-sys version), checked
+its embedded manifest and ran the harness, then built the `fixture-inspection`
+browser with the same feature and ran it with `--expect-load --reuse`. Since
+W7 it builds and stages the sandboxed browser instead and runs both smokes
+with `--expect-sandbox` as well (see W7).
 
 **2026-11-06 checks.** The browser type-checks for `x86_64-pc-windows-msvc`
 with `cargo check --features cef/dox,windows-unsandboxed-candidate`, and
@@ -943,9 +950,10 @@ Cases that require the App's job
 to be empty afterwards wait at most 3 s for processes whose exit is already
 under way (the stand-ins that must be ended sleep 60 s) and name every
 process still there with its image. `App adapter with the built
-guard and browser (Process API)` runs the plugin's Windows tests with
+guard and browser (Process API)` (since W7 `App adapter with the staged guard
+and sandboxed browser`) runs the plugin's Windows tests with
 `TAKOSUMI_WINDOWS_GUARD` and `TAKOSUMI_WINDOWS_BROWSER` pointing at the
-product build: unit tests of the pipe writer (a write the reader does not
+product build (since W7 its stage): unit tests of the pipe writer (a write the reader does not
 take times out; dropping the App's end during such a write cancels it, so the
 reader sees the end of its input before all the data; that reader is a
 Python one-liner, as Python is on the `windows-latest` image; and, with a fake
@@ -1235,6 +1243,9 @@ the App with mobile-kit and the takosumi contract, builds the home
 client, the DevTools bookkeeping, the TCP table parser, the fixture site, the
 receipt check and the case list). It names the installed WebView2 Runtime or
 stops, builds the `fixture-inspection,windows-unsandboxed-candidate` browser
+(since W7 the `fixture-inspection,windows-sandbox` DLL, staged with the
+bootstrap by `scripts/stage-windows-cef.mjs --fixture`; see
+[Windows sandbox (W7)](#windows-sandbox-w7))
 with the guard and the App with `native-browser-process-fixture` (line
 tables only), creates the TLS files and trusts their CA
 (`native-tests/desktop/windows_fixture_tls.ps1`), runs one case with
@@ -1256,12 +1267,13 @@ sites).
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"
 Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
-cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+cargo build --locked --features fixture-inspection,windows-sandbox --lib --bin takosumi-browser-guard   # W7: the sandboxed DLL
 Pop-Location
+node scripts/stage-windows-cef.mjs --fixture --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin <target>\debug --out C:\absolute\owned\w3-stage
 bun run build
 cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls
-python -B native-tests/desktop/windows_browser_process.py --binary <target>\debug\takosumi-mobile.exe --browser <target>\debug\takosumi-cef-browser-process.exe --guard <target>\debug\takosumi-browser-guard.exe --data "$env:TEMP\sumi-w3-local" --tls-cert C:\absolute\owned\w3-tls\cert.pem --tls-key C:\absolute\owned\w3-tls\key.pem --tls-ca C:\absolute\owned\w3-tls\ca.pem --restart --reset
+python -B native-tests/desktop/windows_browser_process.py --binary <target>\debug\takosumi-mobile.exe --browser C:\absolute\owned\w3-stage\cef\takosumi-cef-browser-process.exe --guard C:\absolute\owned\w3-stage\cef\takosumi-browser-guard.exe --data "$env:TEMP\sumi-w3-local" --tls-cert C:\absolute\owned\w3-tls\cert.pem --tls-key C:\absolute\owned\w3-tls\key.pem --tls-ca C:\absolute\owned\w3-tls\ca.pem --restart --reset
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls -Remove
 ```
 
@@ -1486,23 +1498,25 @@ and the Rust guard are bundled, the App resolves them without environment
 variables, the installer installs it, and the installed App launches
 normally. **Boundaries:** the installers are unsigned (no Authenticode, so
 Windows SmartScreen would warn) and are not published or uploaded anywhere;
-the browser is still the explicit unsandboxed candidate
-(`windows-unsandboxed-candidate`), and the Windows sandbox is a separate,
-later step; the CI installers are debug builds. Authenticode, SmartScreen
+in W6 the browser was still the explicit unsandboxed candidate
+(`windows-unsandboxed-candidate`); since W7 both stages hold the sandboxed
+browser ([Windows sandbox (W7)](#windows-sandbox-w7)); the CI installers are
+debug builds. Authenticode, SmartScreen
 reputation, updates and real devices remain operator inputs, as listed in the
 control repo's `docs/takosumi/app-release-inputs.md`.
 
-**Layout.** `scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
+**Layout.** `scripts/stage-windows-cef.mjs --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
 copies into `src-tauri/target/windows-cef/cef/`, the same `cef/` layout the
-Linux bundle uses: `takosumi-cef-browser-process.exe`,
+Linux bundle uses: `takosumi-cef-browser-process.exe` (since W7 CEF's
+`bootstrap.exe`, with `takosumi-cef-browser-process.dll` beside it),
 `takosumi-browser-guard.exe`, `libcef.dll`, `chrome_elf.dll` (which
 `libcef.dll` imports), `icudtl.dat`, the `.pak` files, the V8 snapshot, every
 `locales/*.pak` (`en-US.pak` required), `CREDITS.html`, and ANGLE
 (`libEGL.dll`, `libGLESv2.dll`), the shader compilers (`d3dcompiler_47.dll`,
 `dxcompiler.dll`, `dxil.dll`) and SwiftShader (`vk_swiftshader.dll`, its ICD
 file, `vulkan-1.dll`) when present. It never stages the import library, the
-sandbox library, CEF's bootstrap executables or SDK build inputs (they are
-named in the manifest), and stops at any entry it neither stages nor knows
+sandbox library, `bootstrapc.exe` (and, before W7, `bootstrap.exe`) or SDK
+build inputs (they are named in the manifest), and stops at any entry it neither stages nor knows
 as ignorable (`README.txt`) rather than leave a possible dependency or
 resource out. CEF's own BSD license travels with it: the distribution's
 `LICENSE.txt` when it has one, otherwise `CREDITS.html` when it names CEF's
@@ -1527,8 +1541,10 @@ and guard therefore link the C runtime statically: Cargo builds them from
 `+crt-static` for `x86_64-pc-windows-msvc` (like the `/MT` CEF wrapper), so
 an installed App needs no Visual C++ redistributable (`VCRUNTIME140.dll`,
 which a clean Windows lacks), and a build without it is refused at staging.
-A package stage must say `--unsandboxed-candidate`, so an unsandboxed
-installer is never made by accident; a browser with the fixture inspection
+In W6 a package stage had to say `--unsandboxed-candidate`, so an
+unsandboxed installer was never made by accident; since W7 a package stage
+takes the sandboxed browser and `--unsandboxed-candidate` is accepted only
+with `--fixture`. A browser with the fixture inspection
 seam is refused unless `--fixture`, whose stage
 (`src-tauri/target/windows-cef-fixture/`) never goes to the package path. Files are copied, never linked, and `stage.json` beside the stage lists
 each one's size and SHA-256. `src-tauri/tauri.windows-cef.conf.json` maps the
@@ -1545,9 +1561,9 @@ build keeps its console.
 
 ```powershell
 Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
-cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard   # W7: the sandboxed browser DLL
 Pop-Location
-node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+node scripts/stage-windows-cef.mjs --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
 bunx tauri build --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
 ```
 
@@ -1614,9 +1630,130 @@ not stop the rest.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows
-sandbox, and opening a connection in the installed product App (the
-packaged fixture App does that; the product App is only launched and
+sandbox (W7 adds it), and opening a connection in the installed product App
+(the packaged fixture App does that; the product App is only launched and
 closed).
+
+## Windows sandbox (W7)
+
+Status: implemented on 2026-11-07; the Windows evidence is the CI run of this
+change (nothing was linked or run for Windows on the Linux host). The seventh
+Windows step runs the per-profile browser in Chromium's sandbox, so the
+product path no longer needs `windows-unsandboxed-candidate` (on Linux, #28
+already runs the sandbox for non-root users).
+
+**Route.** Since CEF M138 a Windows embedder gets no `cef_sandbox.lib` (it
+links only with Chromium's own Clang and libc++); CEF 154's distribution has
+the prebuilt `bootstrap.exe` (GUI subsystem) and `bootstrapc.exe` (console)
+instead. Renamed to the client, the bootstrap starts every process (the
+browser and each subprocess, which run the same executable), sets Chromium's
+sandbox up (the broker in the browser process, the target side in sandboxed
+subprocesses), loads `<its own name>.dll` from its own directory and calls
+that DLL's exported `RunWinMain(HINSTANCE, LPWSTR, int, void *sandbox_info,
+cef_version_info_t *)`. The locked crates support that as they are: cef
+154.5.0's `execute_process` and `initialize` take the sandbox information
+pointer, its `sandbox` feature builds the wrapper with `USE_SANDBOX=ON`
+(cef-dll-sys's `/MT` wrapper, matching the static C runtime), and cef-rs's
+own cefsimple example uses the same layout. Nothing is forked or vendored.
+
+**Build.** The cef-candidate feature `windows-sandbox` (`cef/sandbox`) builds
+the crate's library target `takosumi_cef_browser` (`src/browser_dll.rs`, a
+cdylib): it exports `RunWinMain`, which passes `sandbox_info` to
+`process_main::run`, which hands it to `execute_process` and `initialize`,
+with CEF's `no_sandbox` left at 0. The library is empty on every other target
+and without the feature, so Linux builds the same browser as before from the
+new executable root `src/browser_main.rs`. The executable built with
+`windows-sandbox` refuses to run (exit 2: it would have no sandbox
+information). A Windows browser built with neither feature, or with both,
+stops at a compile error. `windows-unsandboxed-candidate` stays for fixtures
+and diagnostics: its executable can be staged only with
+`--fixture --unsandboxed-candidate`.
+
+```powershell
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard
+Pop-Location
+node scripts/stage-windows-cef.mjs --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+# A fixture: --features fixture-inspection,windows-sandbox --lib, then the stage with --fixture.
+```
+
+**Stage.** The product stage copies the distribution's `bootstrap.exe` as
+`takosumi-cef-browser-process.exe` and the built `takosumi_cef_browser.dll` as
+`takosumi-cef-browser-process.dll`, beside the guard and the CEF runtime of
+W6. Both go through the same PE checks (x86-64; load-time imports only from
+the system DLL list or files staged beside them): a bootstrap import outside
+the list stops the stage, and the list is then changed deliberately. The
+fixture inspection seam is looked for in the DLL, which holds the browser's
+code. `bootstrapc.exe` stays unstaged. `stage.json` records which browser it
+holds (`sandbox`, `unsandboxedCandidate`). The App is unchanged: it starts
+`cef\takosumi-cef-browser-process.exe` (now the bootstrap) through the guard,
+and the W3 runner also hashes the DLL beside a browser it is given.
+
+**Constraints.**
+
+- The bootstrap and the DLL must both be unsigned, or both be signed with the
+  same primary certificate thumbprint; the bootstrap refuses a mismatch. A
+  signed release must sign both with the same certificate (with the App and
+  the guard).
+- The DLL must keep the executable's base name and sit beside it; renaming the
+  browser executable means renaming its DLL with it.
+- The executable is CEF's prebuilt binary from the locked distribution, so it
+  moves with cef-dll-sys's version; its embedded manifest, icon and version
+  resources are CEF's (build.rs's manifest applies only to the unsandboxed
+  candidate). Changing those resources would need a resource editor and must
+  happen before signing.
+- The browser process itself runs at its caller's integrity level (medium);
+  the sandbox restricts its subprocesses, renderers to a restricted token at
+  Untrusted or Low integrity in their own job. Chromium's targets get nested
+  jobs (Windows 8 and later) inside the guard's and the App's kill-on-close
+  jobs; the CI runs below show whether that holds with the guard.
+
+**CI evidence** (to be read from this change's run). `cef-windows` builds the
+DLL and the guard, stages them (`--out $RUNNER_TEMP\w7-product`), requires
+the staged bootstrap's embedded manifest to name Windows 10/11 among its
+`supportedOS` entries and to ask for no elevation (`asInvoker`, or no level,
+which an x64 image treats the same), warns when it has no Common Controls 6
+dependency (CEF's binary, not ours), and runs
+`windows_smoke.py --expect-sandbox` against the staged executable, the guard
+self-tests, and the App's adapter tests with the staged browser and guard;
+then the `fixture-inspection` DLL, staged with `--fixture`, runs with
+`--expect-load --reuse --expect-sandbox`. The smoke summaries, their logs
+and the product `stage.json` are kept as the artifact `cef-windows-smoke`.
+`cef-windows-app` (W3) and `windows-real-sites.yml` (W4) stage the sandboxed
+fixture browser and hand the App those files; `cef-windows-package` (W6)
+stages the sandboxed browser in both installers, its packaged W3 run's
+observer also requires each installed browser (the bootstrap) to have loaded
+`takosumi-cef-browser-process.dll` from the installation's `cef\`, and it runs
+the installed product browser with `--expect-sandbox`.
+
+**`--expect-sandbox`** (`windows_smoke.py`). Before the shutdown it lists the
+job's processes (`JobObjectBasicProcessIdList`), reads each one's command
+line (`NtQueryInformationProcess`, `ProcessCommandLineInformation`, with
+`PROCESS_QUERY_LIMITED_INFORMATION`) and token integrity level
+(`OpenProcessToken`, `GetTokenInformation(TokenIntegrityLevel)`), and waits
+up to the open timeout for a `--type=renderer` process. It then requires the
+browser's integrity level and command line to be readable, without
+`--no-sandbox`, at least
+one renderer, and every renderer to carry no `--no-sandbox` and to run at
+Untrusted (0x0000) or Low (0x1000) integrity, below the browser's. The
+summary records it as `sandbox` (each process's pid, integrity level and
+the process types seen, and the processes whose command line could not be
+read, with the reason); any problem fails the run. Command lines are split
+like the C runtime (unit-tested).
+
+**Shown on the Linux host (2026-11-07):** the Windows-target clippy of the
+browser (the sandboxed DLL, product and fixture, and the unsandboxed
+candidate), the guard, the App (product and fixture) and the plugin, with
+`cef/dox` (cef-dll-sys's build script, which needs the Windows SDK, skipped);
+the Linux browser build; the stage tests (both layouts, a missing DLL or
+bootstrap); the runner and smoke unit tests.
+
+**Not shown:** Authenticode signing of the bootstrap and the DLL (with the
+same certificate), SmartScreen, a release build, real devices and other
+Windows editions or ARM64 (the stage is x86-64 only); the sandbox of the GPU,
+network and utility processes (only renderers are checked); the job,
+desktop and restricting-SID restrictions individually (integrity level and
+command line only); AppContainer or LPAC renderers.
 
 ## Observations and limits
 
