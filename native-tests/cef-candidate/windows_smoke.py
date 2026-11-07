@@ -2,8 +2,11 @@
 """Smoke test of takosumi-cef-browser-process on its own (no guard, no App).
 
 Written for Windows (the windows-latest CI job) and kept OS neutral, so it also
-runs against the Linux browser. Python 3 standard library only (ctypes for the
-Windows Job Object and window checks); no OS tools.
+runs against the Linux browser and, since M1, the macOS one (the executable
+inside its app bundle, `<bundle>.app/Contents/MacOS/takosumi-cef-browser-process`,
+scripts/bundle-macos-cef.mjs). Python 3 standard library only (ctypes for the
+Windows Job Object and window checks, and on macOS for `sandbox_check`); on
+macOS it also reads the process table with `ps`.
 
 It creates a new owned case directory and lays it out as the App's adapter
 (src-tauri/plugins/app-screen/src/desktop/process_adapter.rs) lays out a
@@ -11,8 +14,15 @@ browser's profile directory: `boot.json` holding the first Open request,
 `Downloads/`, and on Linux private HOME/XDG/TMPDIR directories. It starts the
 browser directly with `TAKOSUMI_BROWSER_PROCESS_DIRECTORY` and the App's
 switches: on Windows suspended, inside a kill-on-close Job Object, resumed
-once assigned, so every process it starts is accounted; on Linux in its own
-session and process group. It then requires, each within a bound:
+once assigned, so every process it starts is accounted; on Linux and macOS in
+its own session and process group (macOS has no Job Objects: before the
+shutdown it also records the browser's descendants by parent pid, and each
+must have ended afterwards, since an orphan is reparented to launchd). On
+macOS the browser also gets `--use-mock-keychain`, so Chromium never asks the
+login keychain (a prompt would block an unattended run), and
+`MallocNanoZone=0` in its environment, as CEF asks (the bundle's
+LSEnvironment applies only to a LaunchServices launch). It then requires,
+each within a bound:
 
 1. an `opened` reply for the boot request's key and profile, whose cache path
    is `<case>/cef-profiles/<profile>` and whose native pid is the started one;
@@ -25,7 +35,9 @@ session and process group. It then requires, each within a bound:
 4. after `{"operation":"shutdown","id":N}`, a `closed` reply for that browser,
    a `stopped` reply for N and process exit code 0;
 5. no process left: none still in the Job Object (Windows) or the process
-   group (Linux) within 10 s of the exit;
+   group (Linux, macOS), and none of the recorded descendants still there
+   as the same process (macOS: same id and command line in `ps`, so a reused
+   id is neither counted nor killed), within 10 s of the exit;
 6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
    shutdown: at least one renderer process in the job, each without
    `--no-sandbox` and with a token integrity level of Low or Untrusted,
@@ -36,7 +48,11 @@ session and process group. It then requires, each within a bound:
    command line while it still reads as running); recorded as `sandbox`
    (with those unread processes). The
    observer of the actual App (desktop/windows_browser_observer.py) applies
-   the same check to each profile's browser and its process tree;
+   the same check to each profile's browser and its process tree. On macOS
+   (M1) it requires at least one renderer among the browser's descendants,
+   each in the seatbelt sandbox (`sandbox_check(pid, NULL, 0)` from libSystem
+   answers 1) and without `--no-sandbox`, and no `--no-sandbox` for the
+   browser;
 7. on Windows, the browser's own shutdown line from its log (W7: child
    processes still running after CefShutdown, how it ends, its exit code),
    recorded as `shutdown`.
@@ -67,7 +83,19 @@ from pathlib import Path
 MAX_PACKET_BYTES = 64 * 1024  # browser_process::MAX_PACKET_BYTES
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
+MACOS = sys.platform == "darwin"
 LIBRARY = "libcef.dll" if WINDOWS else "libcef.so"
+# macOS (M1): what the app bundle's Contents/Frameworks must hold (its
+# `--runtime`): CEF's framework and the helper apps CEF starts its processes
+# from (scripts/bundle-macos-cef.mjs makes all five).
+MACOS_RUNTIME = ("Chromium Embedded Framework.framework/Chromium Embedded Framework",
+                 "Chromium Embedded Framework.framework/Libraries/libcef_sandbox.dylib",
+                 "takosumi-cef-browser-process Helper.app/Contents/MacOS/takosumi-cef-browser-process Helper",
+                 "takosumi-cef-browser-process Helper (Renderer).app/Contents/MacOS/"
+                 "takosumi-cef-browser-process Helper (Renderer)",
+                 "takosumi-cef-browser-process Helper (GPU).app/Contents/MacOS/takosumi-cef-browser-process Helper (GPU)")
+# A Unix socket path's limit: 108 bytes on Linux, 104 on macOS.
+SOCKET_LIMIT = 104 if MACOS else 108
 # A sockaddr_un path holds 107 bytes; Chromium puts its singleton socket in TMPDIR.
 SOCKET_SUFFIX = "/org.chromium.Chromium.XXXXXX/SingletonSocket"
 # The fixed switches process_adapter.rs passes (--password-store is Linux only).
@@ -370,6 +398,94 @@ def process_facts(kernel32, advapi32, ntdll, pid):
 # the sandboxed browser, "return" for the unsandboxed candidate) and its exit
 # code.
 BROWSER_SHUTDOWN = "takosumi-cef-browser-process: shutdown "
+
+
+def parse_ps(text):
+    """`ps -ww -A -o pid=,ppid=,command=` output as (pid, ppid, command)."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+    return rows
+
+
+def ps_rows():
+    """macOS: every process's (pid, ppid, command line) from `ps`."""
+    result = subprocess.run(["ps", "-ww", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True,
+                            timeout=30, check=True)
+    return parse_ps(result.stdout)
+
+
+def posix_tree(root, rows=None):
+    """`root` and its descendants by parent pid, each as (pid, command
+    line); the command line split on spaces is enough for its switches
+    (`--type=`, `--no-sandbox`), not for a program path with spaces."""
+    rows = ps_rows() if rows is None else rows
+    commands = {pid: command for pid, _, command in rows}
+    return [(pid, commands.get(pid, "")) for pid in [root] + descendant_pids([(pid, ppid) for pid, ppid, _ in rows], root)]
+
+
+def seatbelt_sandboxed(pid):
+    """macOS: whether `pid` runs in a seatbelt sandbox (libSystem's
+    `sandbox_check(pid, NULL, 0)`: 1 sandboxed, 0 not); None when it cannot
+    tell (the call failed, or the process is gone)."""
+    try:
+        check = ctypes.CDLL("/usr/lib/libSystem.B.dylib").sandbox_check
+    except (OSError, AttributeError):
+        return None
+    check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    check.restype = ctypes.c_int
+    answer = check(pid, None, 0)
+    return {1: True, 0: False}.get(answer)
+
+
+def seatbelt_problems(browser, renderers):
+    """Why the macOS sandbox is not shown (empty when it is): the browser
+    and each renderer are {"pid", "noSandbox", "sandboxed"?}."""
+    problems = []
+    if browser.get("noSandbox"):
+        problems.append("the browser runs with --no-sandbox")
+    if not renderers:
+        problems.append("no renderer process was found")
+    for renderer in renderers:
+        if renderer.get("noSandbox"):
+            problems.append(f"renderer {renderer.get('pid')} runs with --no-sandbox")
+        if renderer.get("sandboxed") is not True:
+            problems.append(f"renderer {renderer.get('pid')} is not in the seatbelt sandbox "
+                            f"(sandbox_check: {renderer.get('sandboxed')})")
+    return problems
+
+
+def seatbelt_evidence(browser_pid, deadline, tree=posix_tree, sandboxed=seatbelt_sandboxed):
+    """macOS: the browser's descendants once at least one renderer is among
+    them (until `deadline`), each renderer's sandbox state; `problems` says
+    why they do not show the sandbox (empty when they do)."""
+    while True:
+        processes = [(pid, command.split()) for pid, command in tree(browser_pid)]
+        renderers = [(pid, words) for pid, words in processes
+                     if pid != browser_pid and process_type(words) == "renderer"]
+        if renderers or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    browser_words = next((words for pid, words in processes if pid == browser_pid), [])
+    evidence = {"browser": {"pid": browser_pid, "noSandbox": has_no_sandbox(browser_words) if browser_words else False,
+                            "sandboxed": sandboxed(browser_pid)},
+                "renderers": [{"pid": pid, "noSandbox": has_no_sandbox(words), "sandboxed": sandboxed(pid)}
+                              for pid, words in renderers],
+                "types": sorted({process_type(words) or "browser" for _, words in processes if words})}
+    evidence["problems"] = seatbelt_problems(evidence["browser"], evidence["renderers"])
+    return evidence
+
+
+def surviving(recorded, rows):
+    """Of the recorded (pid, command line) descendants, the ids still
+    naming the same process in `rows` (`ps`): same id and same command line,
+    so an id the system reused for another process never counts, and is
+    never signalled. An orphan keeps its command line (its parent id becomes
+    launchd's); one that ended is gone or shows another command."""
+    commands = {pid: command for pid, _, command in rows}
+    return [pid for pid, command in recorded if commands.get(pid) == command]
 
 
 def browser_shutdown(text, pid=None):
@@ -717,6 +833,10 @@ class Browser:
                 self.process.wait()
                 self.job.close()
                 raise
+        # macOS: the browser's descendants recorded before the shutdown, as
+        # (pid, command line), each of which must have ended afterwards (an
+        # orphan leaves the tree, its command line stays).
+        self.descendants = []
         self.lines = queue.Queue()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -787,10 +907,18 @@ class Browser:
             if event is not None:
                 self.unsolicited(event)
 
+    def record_descendants(self):
+        """macOS: remember the browser's descendants now (by parent pid),
+        with their command lines; returns their ids."""
+        self.descendants = [(pid, command) for pid, command in posix_tree(self.process.pid)
+                            if pid != self.process.pid]
+        return [pid for pid, _ in self.descendants]
+
     def leftovers(self):
         """Processes still owned after the browser exited, waiting up to
         LEFTOVER_WAIT for them to end: ({"total", "active"} on Windows, the
-        Job Object's counts; {"groupAlive"} on Linux)."""
+        Job Object's counts; {"groupAlive"} on Linux; on macOS also
+        {"descendantsAlive"}, the recorded descendants still there)."""
         deadline = time.monotonic() + LEFTOVER_WAIT
         while True:
             if self.job is not None:
@@ -804,6 +932,10 @@ class Browser:
                 except ProcessLookupError:
                     done = True
                 result = {"groupAlive": not done}
+                if MACOS:
+                    remaining = surviving(self.descendants, ps_rows())
+                    result["descendantsAlive"] = remaining
+                    done = done and not remaining
             if done or time.monotonic() >= deadline:
                 return result, done
             time.sleep(0.5)
@@ -818,6 +950,13 @@ class Browser:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                # Only the recorded descendants `ps` still shows as the same
+                # process (id and command line): a reused id is never killed.
+                for pid in surviving(self.descendants, ps_rows()) if self.descendants else []:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
             self.process.wait(timeout=30)
         except (OSError, subprocess.SubprocessError) as error:
             print(f"windows_smoke: cleanup failed: {error}", file=sys.stderr)
@@ -867,7 +1006,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--browser", type=Path, required=True, help="takosumi-cef-browser-process executable")
     parser.add_argument("--runtime", type=Path,
-                        help=f"directory holding {LIBRARY} and the CEF resources (default: the executable's)")
+                        help=f"directory holding {LIBRARY} and the CEF resources (default: the executable's; on "
+                             "macOS the bundle's Contents/Frameworks)")
     parser.add_argument("--work", type=Path, help="parent of the new case directory (default: the system temp)")
     parser.add_argument("--url", default="https://example.com/", help="an https site root")
     parser.add_argument("--open-timeout", type=float, default=120)
@@ -878,17 +1018,19 @@ def main():
                         help="reopen the same screen and require the raise before shutting down")
     parser.add_argument("--expect-sandbox", action="store_true",
                         help="Windows (W7): require the renderers to run in Chromium's sandbox (token integrity "
-                             "low or untrusted, below the browser's; no --no-sandbox)")
+                             "low or untrusted, below the browser's; no --no-sandbox); macOS (M1): each renderer "
+                             "in the seatbelt sandbox")
     args = parser.parse_args()
-    if not (WINDOWS or LINUX):
-        parser.error("Only Windows and Linux browsers are supported")
-    if args.expect_sandbox and not WINDOWS:
-        parser.error("--expect-sandbox reads Windows tokens")
+    if not (WINDOWS or LINUX or MACOS):
+        parser.error("Only Windows, Linux and macOS browsers are supported")
+    if args.expect_sandbox and not (WINDOWS or MACOS):
+        parser.error("--expect-sandbox reads Windows tokens or macOS sandbox state")
     if not URL_SHAPE.fullmatch(args.url) or args.url.endswith(":443/"):
         parser.error("--url must be a lowercase https site root such as https://example.com/")
 
     browser = Path(os.path.realpath(args.browser))
-    runtime = Path(os.path.realpath(args.runtime or browser.parent))
+    runtime = Path(os.path.realpath(args.runtime or (browser.parent.parent / "Frameworks" if MACOS
+                                                     else browser.parent)))
     summary = {"passed": False, "platform": sys.platform, "browser": str(browser), "runtime": str(runtime),
                "url": args.url, "expectLoad": args.expect_load, "reuse": args.reuse,
                "expectSandbox": args.expect_sandbox, "seconds": {}, "error": None}
@@ -896,10 +1038,17 @@ def main():
     case = None
     try:
         require(browser.is_file(), f"No browser executable at {browser}")
-        for name in (LIBRARY, "icudtl.dat"):
-            require((runtime / name).is_file(),
-                    f"No {name} in {runtime}: build with cargo (cef-dll-sys copies the CEF runtime beside the "
-                    "executable) or pass --runtime")
+        if MACOS:
+            require(browser.parent.name == "MacOS" and browser.parent.parent.name == "Contents",
+                    f"Run the macOS browser from its app bundle (Contents/MacOS), not {browser}")
+            for name in MACOS_RUNTIME:
+                require((runtime / name).is_file(),
+                        f"No {name} in {runtime}: assemble the bundle with scripts/bundle-macos-cef.mjs")
+        else:
+            for name in (LIBRARY, "icudtl.dat"):
+                require((runtime / name).is_file(),
+                        f"No {name} in {runtime}: build with cargo (cef-dll-sys copies the CEF runtime beside the "
+                        "executable) or pass --runtime")
         summary["browserSha256"] = sha256(browser)
         work = os.path.realpath(args.work or tempfile.gettempdir())
         # realpath: the long, final spelling (no 8.3 names or links) the
@@ -926,8 +1075,19 @@ def main():
             env["TEMP"] = env["TMP"] = str(case / "tmp")
             # No --no-sandbox: the Windows browser decides that itself.
             command += APP_SWITCHES
+        elif MACOS:
+            require(len(str(case / "tmp") + SOCKET_SUFFIX) < SOCKET_LIMIT, "Case path too long for Chromium's socket")
+            env["TMPDIR"] = str(case / "tmp")
+            # CEF asks for the nano allocator off; its Info.plist's
+            # LSEnvironment applies only to a LaunchServices launch, not to
+            # this direct one (nor to the App's adapter, M2).
+            env["MallocNanoZone"] = "0"
+            # No --no-sandbox: the helpers enter the seatbelt sandbox
+            # themselves. The mock keychain keeps Chromium off the login
+            # keychain, whose prompt would block an unattended run.
+            command += APP_SWITCHES + ["--use-mock-keychain"]
         else:
-            require(len(str(case / "tmp") + SOCKET_SUFFIX) < 108, "Case path too long for Chromium's socket")
+            require(len(str(case / "tmp") + SOCKET_SUFFIX) < SOCKET_LIMIT, "Case path too long for Chromium's socket")
             for variable, name in (("HOME", "home"), ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),
                                    ("XDG_CACHE_HOME", "cache"), ("XDG_RUNTIME_DIR", "runtime")):
                 (case / name).mkdir(mode=0o700)
@@ -970,9 +1130,14 @@ def main():
             next_id += 1
 
         if args.expect_sandbox:
-            summary["sandbox"] = sandbox_evidence(session.job, pid, time.monotonic() + args.open_timeout)
+            if MACOS:
+                summary["sandbox"] = seatbelt_evidence(pid, time.monotonic() + args.open_timeout)
+            else:
+                summary["sandbox"] = sandbox_evidence(session.job, pid, time.monotonic() + args.open_timeout)
             require(not summary["sandbox"]["problems"],
                     f"The browser's processes do not show Chromium's sandbox: {summary['sandbox']['problems']}")
+        if MACOS:
+            summary["descendants"] = session.record_descendants()
 
         stop_deadline = time.monotonic() + args.stop_timeout
         session.send({"operation": "shutdown", "id": next_id})

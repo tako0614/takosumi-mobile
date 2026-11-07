@@ -1,5 +1,5 @@
-//! Opt-in browser service for Linux and Windows. Its only control input is
-//! the parent's pipe.
+//! Opt-in browser service for Linux, Windows and macOS. Its only control
+//! input is the parent's pipe.
 //! No remote-page IPC/V8 extension or permission handler. Explicit fixture
 //! inspection (`fixture-inspection` builds only) uses a loopback DevTools
 //! port, never the parent's control pipe.
@@ -8,7 +8,10 @@
 //! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
 //! the sandboxed Windows browser (W7, feature `windows-sandbox`), from the DLL
 //! CEF's `bootstrap.exe` loads (`browser_dll.rs`), which passes the sandbox
-//! information.
+//! information. On macOS (M1) the executable runs in the app bundle's
+//! `Contents/MacOS`, loads the CEF framework first and installs its
+//! `NSApplication` (`mac_front`); CEF's helper processes are the bundle's
+//! helper apps (`helper_main.rs`), not this executable.
 use cef::*;
 use std::{
     cell::RefCell,
@@ -28,6 +31,11 @@ use tauri_plugin_app_screen::{
 #[cfg(windows)]
 #[path = "children_windows.rs"]
 pub(crate) mod children_windows;
+
+/// macOS: the browser process's `NSApplication` and the raise (M1).
+#[cfg(target_os = "macos")]
+#[path = "mac_front.rs"]
+pub(crate) mod mac_front;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
@@ -542,9 +550,111 @@ fn raise(host: &BrowserHost) -> Result<(), &'static str> {
 fn raise(host: &BrowserHost) -> Result<(), &'static str> {
     win32_front::raise(win32_front::top_level(host.window_handle().0.cast()))
 }
+#[cfg(target_os = "macos")]
+fn raise(host: &BrowserHost) -> Result<(), &'static str> {
+    mac_front::raise(host.window_handle())
+}
+
+/// macOS: the wait for a new browser's NSWindow (its pure decisions).
+#[cfg(target_os = "macos")]
+#[path = "window_wait.rs"]
+mod window_wait;
+
+/// macOS: whether a new browser's view is not in an NSWindow yet (so its
+/// `opened` must wait); its window handle's state goes to standard error.
+#[cfg(target_os = "macos")]
+fn mac_window_pending(browser: &Browser) -> bool {
+    let handle = browser.host().unwrap().window_handle();
+    eprintln!(
+        "macOS: browser {} created: {}",
+        browser.identifier(),
+        mac_front::describe(handle)
+    );
+    mac_front::window_number(handle) == 0
+}
+
+/// macOS: send a new screen's `opened` once CEF's view is in an NSWindow
+/// (its `windowNumber` is the window id the App gets), looking again every
+/// `window_wait::POLL` on the UI thread. Until then the screen counts as
+/// opening (`pending`), as before its creation, so a Shutdown is answered
+/// CloseBlocked. Every end without `opened` answers the Open with an error
+/// (`window_wait::refusal`) and stops counting it as opening: the screen
+/// closed meanwhile (also by the end of the App's input, whose close_all
+/// closes every screen in `screens`, this one included), the browser is
+/// stopping (the screen is closed), or the window did not appear within
+/// `window_wait::BOUND` (15 s, before the adapter's 20 s Open wait; the
+/// screen is closed). A look that cannot be posted ends the same way.
+#[cfg(target_os = "macos")]
+fn await_window(id: u64, key: String, browser: Browser, started: std::time::Instant) {
+    use window_wait::Step;
+    let browser_id = browser.identifier();
+    let waited = started.elapsed();
+    let (screen_open, stopping) = with_state(|state| {
+        (
+            state.screens.contains_key(&browser_id),
+            state.shutdown.is_some() || state.quitting,
+        )
+    });
+    let host = browser.host().unwrap();
+    let window = screen_open && mac_front::window_number(host.window_handle()) != 0;
+    let step = window_wait::step(screen_open, stopping, window, waited);
+    match step {
+        Step::Again => {
+            let mut task = WindowTask::new(id, key, browser.clone(), started);
+            let delay = i64::try_from(window_wait::POLL.as_millis()).unwrap_or(i64::MAX);
+            if post_delayed_task(ThreadId::UI, Some(&mut task), delay) == 1 {
+                return;
+            }
+            eprintln!(
+                "macOS: the look for browser {browser_id}'s window could not be posted; closing it"
+            );
+            end_window_wait(id, &host, true, "The browser window could not be awaited");
+        }
+        Step::Ready => {
+            eprintln!(
+                "macOS: browser {browser_id} window after {} ms: {}",
+                waited.as_millis(),
+                mac_front::describe(host.window_handle())
+            );
+            let over_limit = with_state(|state| {
+                state.pending -= 1;
+                state.screens.len() > 48
+            });
+            if over_limit {
+                error(id, "Browser screen limit or context unavailable");
+                host.close_browser(1);
+                return;
+            }
+            opened(id, key, &browser);
+        }
+        Step::Closed | Step::Stopping | Step::Expired => {
+            eprintln!(
+                "macOS: browser {browser_id} window wait ended after {} ms: {step:?}",
+                waited.as_millis()
+            );
+            let message = window_wait::refusal(step).expect("An end without opened has its error");
+            end_window_wait(id, &host, step != Step::Closed, message);
+        }
+    }
+}
+
+/// macOS: end a window wait without `opened`: answer the Open, stop counting
+/// the screen as opening, close it when it is still open (its
+/// on_before_close lets the browser quit), and let a browser whose last
+/// screen has gone quit.
+#[cfg(target_os = "macos")]
+fn end_window_wait(id: u64, host: &BrowserHost, close: bool, message: &str) {
+    error(id, message);
+    with_state(|state| state.pending -= 1);
+    if close {
+        host.close_browser(1);
+    }
+    maybe_quit();
+}
 
 /// The native window id reported to the App: the X11 window CEF reports on
-/// Linux; on Windows the value of the top-level HWND the raise brings forward.
+/// Linux; on Windows the value of the top-level HWND the raise brings forward;
+/// on macOS the `windowNumber` of the NSWindow holding CEF's view.
 #[cfg(target_os = "linux")]
 fn window_id(host: &BrowserHost) -> u64 {
     host.window_handle()
@@ -552,6 +662,10 @@ fn window_id(host: &BrowserHost) -> u64 {
 #[cfg(windows)]
 fn window_id(host: &BrowserHost) -> u64 {
     win32_front::top_level(host.window_handle().0.cast()) as usize as u64
+}
+#[cfg(target_os = "macos")]
+fn window_id(host: &BrowserHost) -> u64 {
+    mac_front::window_number(host.window_handle())
 }
 
 fn opened(id: u64, key: String, browser: &Browser) {
@@ -567,7 +681,7 @@ fn opened(id: u64, key: String, browser: &Browser) {
     #[cfg(target_os = "linux")]
     assert_eq!(actual, expected);
     // Exactly the requested spelling, not merely the same components.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     assert_eq!(actual.as_os_str(), expected.as_os_str());
     reply(Reply::Opened {
         id,
@@ -589,14 +703,24 @@ wrap_life_span_handler! {
             let host=browser.host().unwrap();
             let mut observer=DialogEvents::new(browser.identifier());
             let registration=host.add_dev_tools_message_observer(Some(&mut observer)).expect("Owned browser lifecycle observer");
+            // macOS: a Chrome-style window is created and shown after this
+            // call, so CEF's view may not be in an NSWindow yet; `opened`
+            // waits for it (`await_window`), and the screen keeps counting
+            // as opening until then.
+            #[cfg(target_os = "macos")]
+            let awaiting=self.bound&&!popup&&mac_window_pending(browser);
+            #[cfg(not(target_os = "macos"))]
+            let awaiting=false;
             with_state(|state| {
                 state.live+=1;
                 if self.bound {
-                    if !popup { state.pending-=1; }
+                    if !popup&&!awaiting { state.pending-=1; }
                     assert!(state.screens.insert(browser.identifier(),Screen{browser:browser.clone(),key:self.key.clone(),popup,_observer:registration.clone(),observation:CloseObservation::Idle,load_noted:false}).is_none());
                 }
             });
             if !self.bound { browser.host().unwrap().close_browser(1);return; }
+            #[cfg(target_os = "macos")]
+            if awaiting { await_window(self.id,self.key.clone(),browser.clone(),std::time::Instant::now());return; }
             let (stopping,failed,over_limit)=with_state(|state|(state.shutdown.is_some(),state.failed,state.screens.len()>48));
             if stopping||over_limit { browser.host().unwrap().close_browser(i32::from(failed||over_limit));return; }
             if !popup { opened(self.id,self.key.clone(),browser); }
@@ -878,6 +1002,12 @@ wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
     impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
 }
+// macOS: the next look for a new browser's NSWindow (`await_window`).
+#[cfg(target_os = "macos")]
+wrap_task! {
+    struct WindowTask { id: u64, key: String, browser: Browser, started: std::time::Instant }
+    impl Task { fn execute(&self) { await_window(self.id, self.key.clone(), self.browser.clone(), self.started); } }
+}
 // Windows: keyboard focus for a reused browser, requested after its raise.
 #[cfg(windows)]
 wrap_task! {
@@ -912,7 +1042,7 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 wrap_app! {
     struct Application;
     impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
@@ -1062,6 +1192,14 @@ fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     let root = unsafe { libc::geteuid() } == 0;
     root || args.any(|arg| arg == "--no-sandbox")
 }
+/// macOS (M1): CEF's helper processes run in the seatbelt sandbox, which each
+/// helper enters itself (`helper_main.rs`, CEF's `libcef_sandbox.dylib`)
+/// before it loads the framework; the browser process is not sandboxed. Only
+/// a parent that passes `--no-sandbox` (a fixture's opt-out) turns it off.
+#[cfg(target_os = "macos")]
+fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.any(|arg| arg == "--no-sandbox")
+}
 /// Windows with the sandbox (W7, feature `windows-sandbox`): CEF 154 ships no
 /// `cef_sandbox` library for embedders; its prebuilt `bootstrap.exe`, renamed
 /// to the browser, initializes Chromium's sandbox and loads this browser as a
@@ -1102,6 +1240,13 @@ compile_error!("windows-sandbox and windows-unsandboxed-candidate exclude each o
 fn is_final(directory: &Path) -> bool {
     directory.canonicalize().unwrap() == directory
 }
+/// macOS: as on Linux, but the spelling must match exactly (as on Windows):
+/// `Path` equality would accept repeated or trailing separators. The parent
+/// passes the final path (`/private/var/...`, not the `/var` link).
+#[cfg(target_os = "macos")]
+fn is_final(directory: &Path) -> bool {
+    directory.canonicalize().unwrap().as_os_str() == directory.as_os_str()
+}
 /// On Windows `canonicalize` spells the final path in its verbatim form
 /// (`\\?\C:\…` or `\\?\UNC\server\share\…`); the parent and CEF use the
 /// ordinary spelling of the same path (`C:\…`, `\\server\share\…`). After
@@ -1140,7 +1285,7 @@ fn is_final(directory: &Path) -> bool {
 /// that still reaches the bootstrap (101).
 pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     const {
-        assert!(cfg!(any(target_os = "linux", windows)));
+        assert!(cfg!(any(target_os = "linux", windows, target_os = "macos")));
     }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = cef::args::Args::new();

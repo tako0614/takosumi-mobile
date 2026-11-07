@@ -652,6 +652,109 @@ class SandboxEvidenceTests(unittest.TestCase):
         self.assertEqual(runner.sandbox_summary({}, opened, False), [])
 
 
+class MacSmokeTests(unittest.TestCase):
+    """windows_smoke.py's macOS path (M1): the process table, the seatbelt
+    sandbox evidence and the descendants left after the exit. Platform
+    neutral: `ps`, `sandbox_check` and the process signals are stand-ins,
+    and a real call to either of the first two fails the test."""
+
+    def setUp(self):
+        import windows_smoke as smoke
+        for name in ("ps_rows", "seatbelt_sandboxed"):
+            patcher = mock.patch.object(smoke, name, mock.Mock(side_effect=AssertionError(f"real {name} called")))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    PS = ("    1     0 /sbin/launchd\n"
+          "  500     1 /Users/runner/work/_temp/m1/takosumi-cef-browser-process.app/Contents/MacOS/"
+          "takosumi-cef-browser-process --no-first-run --use-mock-keychain --lang=en-US\n"
+          "  501   500 /Users/runner/work/_temp/m1/takosumi-cef-browser-process.app/Contents/Frameworks/"
+          "takosumi-cef-browser-process Helper (GPU).app/Contents/MacOS/takosumi-cef-browser-process Helper (GPU)"
+          " --type=gpu-process --lang=en-US\n"
+          "  502   500 /Users/x/takosumi-cef-browser-process Helper (Renderer).app/Contents/MacOS/"
+          "takosumi-cef-browser-process Helper (Renderer) --type=renderer --seatbelt-client=40\n"
+          "  503   502 /bin/sleep 1\n"
+          "  600     1 /usr/bin/other --type=renderer\n"
+          "garbage line\n")
+
+    def test_the_process_table_and_the_browsers_tree(self):
+        import windows_smoke as smoke
+        rows = smoke.parse_ps(self.PS)
+        self.assertEqual([row[:2] for row in rows], [(1, 0), (500, 1), (501, 500), (502, 500), (503, 502), (600, 1)])
+        self.assertTrue(rows[3][2].endswith("--type=renderer --seatbelt-client=40"))
+        tree = smoke.posix_tree(500, rows)
+        self.assertEqual([pid for pid, _ in tree], [500, 501, 502, 503])
+        self.assertEqual(smoke.process_type(tree[2][1].split()), "renderer")
+        self.assertIsNone(smoke.process_type(tree[0][1].split()))
+
+    def test_only_sandboxed_renderers_without_no_sandbox_show_the_seatbelt(self):
+        import windows_smoke as smoke
+        rows = smoke.parse_ps(self.PS)
+        tree = lambda root: smoke.posix_tree(root, rows)
+        found = smoke.seatbelt_evidence(500, time.monotonic(), tree, lambda pid: pid == 502)
+        self.assertEqual(found["renderers"], [{"pid": 502, "noSandbox": False, "sandboxed": True}])
+        self.assertEqual(found["browser"], {"pid": 500, "noSandbox": False, "sandboxed": False})
+        self.assertEqual(found["types"], ["browser", "gpu-process", "renderer"])
+        self.assertEqual(found["problems"], [])
+        unsandboxed = smoke.seatbelt_evidence(500, time.monotonic(), tree, lambda pid: False)
+        self.assertEqual(unsandboxed["problems"], ["renderer 502 is not in the seatbelt sandbox (sandbox_check: False)"])
+        unknown = smoke.seatbelt_evidence(500, time.monotonic(), tree, lambda pid: None)
+        self.assertIn("(sandbox_check: None)", unknown["problems"][0])
+        opted_out = smoke.parse_ps(self.PS.replace("--type=renderer --seatbelt-client=40", "--type=renderer --no-sandbox")
+                                   .replace("--use-mock-keychain", "--no-sandbox"))
+        problems = smoke.seatbelt_problems(
+            {"pid": 500, "noSandbox": True}, [{"pid": 502, "noSandbox": True, "sandboxed": True}])
+        self.assertEqual(problems, ["the browser runs with --no-sandbox", "renderer 502 runs with --no-sandbox"])
+        none = smoke.seatbelt_evidence(501, time.monotonic(), lambda root: smoke.posix_tree(root, opted_out),
+                                       lambda pid: True)
+        self.assertEqual(none["problems"], ["no renderer process was found"])
+
+    def test_a_recorded_descendant_still_alive_is_a_leftover(self):
+        """Platform neutral: `ps` and os.killpg are stand-ins, so no real
+        process is looked at or signalled."""
+        import windows_smoke as smoke
+
+        def no_group(pid, signal_number):
+            raise ProcessLookupError(pid)
+
+        session = smoke.Browser.__new__(smoke.Browser)
+        session.job = None
+        session.process = type("Process", (), {"pid": 500})()
+        helper = "/b.app/Contents/Frameworks/b Helper (Renderer).app/Contents/MacOS/b Helper (Renderer) --type=renderer"
+        session.descendants = [(501, "/b.app/x --type=gpu-process"), (502, helper)]
+        rows = [(502, 1, helper)]  # an orphan: its parent is launchd now
+        with mock.patch.object(smoke, "MACOS", True), mock.patch.object(smoke, "LEFTOVER_WAIT", 0), \
+                mock.patch.object(smoke.os, "killpg", no_group, create=True), \
+                mock.patch.object(smoke, "ps_rows", lambda: rows):
+            self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": [502]}, False))
+            rows[:] = [(502, 1, "/usr/bin/reused --other")]  # the id now names another process
+            self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": []}, True))
+
+    def test_only_a_descendant_still_the_same_process_is_killed(self):
+        import windows_smoke as smoke
+        recorded = [(501, "/b x --type=gpu-process"), (502, "/b y --type=renderer"), (503, "/b z --type=utility")]
+        rows = [(501, 500, "/b x --type=gpu-process"), (502, 1, "/b y --type=renderer"),
+                (503, 77, "/usr/bin/somebody-else")]
+        self.assertEqual(smoke.surviving(recorded, rows), [501, 502])
+        self.assertEqual(smoke.surviving(recorded, []), [])
+        killed = []
+
+        def kill(pid, signal_number):
+            killed.append((pid, signal_number))
+
+        session = smoke.Browser.__new__(smoke.Browser)
+        session.job = None
+        session.descendants = recorded
+        session.process = mock.Mock(pid=500)
+        with mock.patch.object(smoke.os, "killpg", lambda pid, number: None, create=True), \
+                mock.patch.object(smoke.os, "kill", kill), \
+                mock.patch.object(smoke.signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(smoke, "ps_rows", lambda: rows):
+            session.end_all()
+        self.assertEqual(killed, [(501, 9), (502, 9)])
+        session.process.wait.assert_called_once()
+
+
 def main_source():
     return (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
 
@@ -740,7 +843,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_the_package_job_runs_the_packaged_cases_and_uploads_no_binary(self):
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        job = workflow[workflow.index("\n  cef-windows-package:\n"):]
+        job = workflow[workflow.index("\n  cef-windows-package:\n"):workflow.index("\n  cef-macos:\n")]
         cases = [name for phase in ("", "restart", "reset") for name in runner.OBSERVED_CASES[phase]]
         cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
         cases += list(runner.FINAL_CASES)
@@ -870,6 +973,40 @@ class RunnerTests(unittest.TestCase):
         tests = source.count("#[test]")
         self.assertIn("rustc --edition 2021 --test native-tests/cef-candidate/src/children_windows.rs -o $exe\n", job)
         self.assertIn(f"'^test result: ok\\. {tests} passed; 0 failed'", job)
+
+    def test_the_macos_job_bundles_and_smokes_the_browser(self):
+        """M1: cef-macos builds the browser and its helper, bundles them with
+        CEF's framework, runs both smokes with the seatbelt check and uploads
+        text only."""
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-macos:\n"):]
+        self.assertIn("    runs-on: macos-latest\n    timeout-minutes: 75\n", job)
+        self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper\n",
+                      job)
+        self.assertIn('node scripts/bundle-macos-cef.mjs --cef "$cef" --bin "$CARGO_TARGET_DIR/debug" '
+                      '--out "$RUNNER_TEMP/m1-product"\n', job)
+        self.assertIn("cargo build --locked --features fixture-inspection --bin takosumi-cef-browser-process)\n", job)
+        self.assertIn('node scripts/bundle-macos-cef.mjs --fixture --cef "$M1_CEF" --bin "$CARGO_TARGET_DIR/debug" '
+                      '--out "$RUNNER_TEMP/m1-fixture"\n', job)
+        app = "takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process"
+        smokes = [line.strip() for line in job.splitlines() if "windows_smoke.py" in line]
+        self.assertEqual(smokes, [
+            f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-product/{app}" '
+            '--work "$RUNNER_TEMP" --expect-sandbox',
+            f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-fixture/{app}" '
+            '--work "$RUNNER_TEMP" --expect-load --reuse --expect-sandbox',
+        ])
+        upload = job[job.index("name: cef-macos-smoke"):]
+        for path in ("sumi-cef-smoke-*/summary.json", "sumi-cef-smoke-*/*.log", "m1-product/bundle.json",
+                     "m1-fixture/bundle.json"):
+            self.assertIn(f"${{{{ runner.temp }}}}/{path}\n", upload)
+        self.assertNotIn(".app\n", upload)
+        self.assertNotIn("target-cef", upload)
+        self.assertNotIn("codesign", job)
+        # The window wait's decisions run, every test of them.
+        source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
+        self.assertIn('rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"\n', job)
+        self.assertIn(f"grep -q '^test result: ok\\. {source.count('#[test]')} passed; 0 failed'", job)
 
     def test_the_app_runs_take_a_staged_sandboxed_browser(self):
         """W7: the W3 job and the W4 real-site workflow stage the sandboxed

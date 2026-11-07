@@ -36,6 +36,13 @@ tauri-plugin-app-screen = { path = "../../src-tauri/plugins/app-screen", default
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# macOS (M1): the browser's NSApplication (CEF's CefAppProtocol) and the
+# raise of a reused NSWindow (src/mac_front.rs). The versions the lock
+# already holds through cef and tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
+
 # Windows (W7): the sandboxed browser, the DLL CEF's bootstrap.exe loads
 # (`--features windows-sandbox --lib`); staged as
 # takosumi-cef-browser-process.dll beside the renamed bootstrap. Empty on
@@ -45,13 +52,20 @@ name = "takosumi_cef_browser"
 path = "src/browser_dll.rs"
 crate-type = ["cdylib"]
 
-# Linux, and on Windows the unsandboxed test candidate
+# Linux, macOS (M1: the app bundle's Contents/MacOS executable, see
+# scripts/bundle-macos-cef.mjs), and on Windows the unsandboxed test candidate
 # (`--bin takosumi-cef-browser-process --features windows-unsandboxed-candidate`);
 # the standalone `takosumi-cef-candidate` (src/main.rs) is Linux only and
 # refuses to compile elsewhere.
 [[bin]]
 name = "takosumi-cef-browser-process"
 path = "src/browser_main.rs"
+
+# macOS (M1): the helper executable the app bundle's five helper apps hold
+# (src/helper_main.rs); it refuses to run on every other OS.
+[[bin]]
+name = "takosumi-cef-browser-helper"
+path = "src/helper_main.rs"
 
 # Product supervisor for one browser process: src/guard_main.rs on Linux
 # (pidfds, signalfd, the child subreaper) and src/guard_windows.rs on Windows
