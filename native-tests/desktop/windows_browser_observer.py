@@ -50,18 +50,28 @@ LOAD_WAIT = 25
 # (the Linux observer allows 10 s; process teardown is slower here).
 END_WAIT = 20
 RAISE_REFUSED = "Reused browser window was not raised:"
-# W4: real third-party sites behind the fixture home's app link, with the
-# readiness the Linux probes use (browser-process.mjs `contentOf`): the
-# Excalidraw editor's root, or Photopea's landing or editor. Anonymous only:
-# nothing signs in, no credential is typed.
+# W4: real third-party sites behind the fixture home's app link. A site is
+# ready only once its editor has rendered, which neither a browser error page
+# (another origin) nor the site's own shell satisfies: Excalidraw's canvas
+# without its crash screen (`ErrorSplash`, which also carries the `.excalidraw`
+# class), Photopea's editor start screen. Photopea first serves a static
+# landing page (shown even if the editor's code never loads), so the editor is
+# entered from it with its start button (`landing`, `enter`), as the Linux
+# probe does (browser-process.mjs). Anonymous only: nothing signs in, no
+# credential is typed.
 REAL_SITES = {
     "excalidraw": {"url": "https://excalidraw.com/", "origin": "https://excalidraw.com",
-                   "ready": "Boolean(document.querySelector('.excalidraw'))"},
+                   "ready": "Boolean(document.querySelector('.excalidraw canvas') "
+                            "&& !document.querySelector('.ErrorSplash'))"},
     "photopea": {"url": "https://www.photopea.com/", "origin": "https://www.photopea.com",
-                 "ready": "(document.body?.innerText.includes('Start using Photopea')"
-                          " || document.body?.innerText.includes('Open From Computer'))"},
+                 "ready": "Boolean(document.body?.innerText.includes('Open From Computer'))",
+                 "landing": "Boolean(document.body?.innerText.includes('Start using Photopea'))",
+                 "enter": "(()=>{const start=[...document.querySelectorAll('button')].find(e=>"
+                          "e.innerText.trim()==='Start using Photopea'&&!e.disabled);"
+                          "if(!start)throw Error('No Photopea start button');start.click();return true})()"},
 }
-# A real site's first load and its readiness (both profiles load at once).
+# Each stage of a real site in each profile (both profiles load at once): its
+# document (with a landing: landing or editor), then, from a landing, its editor.
 REAL_SITE_WAIT = 60
 # After the final quit request, a remaining real-site page may still ask its
 # own beforeunload; accept it within this bound so the quit can finish.
@@ -508,6 +518,9 @@ class Page:
         self.cdp, self.session, self.process, self.target = cdp, session, process, target
         self.native = process["opened"]
         self.window = self.native["windowId"]
+        # The fixture page's context (attach), and in a W4 run the real site's.
+        self.context = self.site_context = None
+        self.site_entry = None
 
     def send(self, method, params=None, timeout=5.0):
         return self.cdp.command(method, params, self.session, timeout)
@@ -720,31 +733,49 @@ class Observer:
             f"The {user} app did not open", LOAD_WAIT, tolerate=True)
         require(page.pages() == [page.target["targetId"]], f"The {user} app must stay in its one window")
 
+    def site_settled(self, page, test, message):
+        """Until the real site's `test` holds in `page` (REAL_SITE_WAIT); a
+        failure records the document the page was on."""
+        try:
+            self.settled(lambda: page.evaluate(test), message, REAL_SITE_WAIT, tolerate=True)
+        except Failure:
+            try:
+                self.proof["siteDocument"] = dict(page.evaluate(
+                    "({url:location.href,ready:document.readyState,title:document.title,"
+                    "errorSplash:Boolean(document.querySelector('.ErrorSplash')),"
+                    "body:document.body?.innerText.slice(0,500)})"), profile=page.process["profile"])
+            except Failure as error:
+                self.proof["siteDocument"] = {"profile": page.process["profile"], "error": str(error)}
+            raise
+
     def open_real_site(self, pages):
         """W4: from each signed-in app home, follow the app link to the real
-        site in the same window (both start before either is awaited), then
-        require the site's readiness, its origin in a secure context without
-        an App bridge, and still one page per profile."""
+        site in the same window (both start before either is awaited), enter
+        the editor from the site's landing page if it shows one, then require
+        the editor's readiness, its origin in a secure context without an App
+        bridge, and still one page per profile."""
+        on_site = f"location.origin==={json.dumps(self.app_origin)} && document.readyState==='complete'"
         for page in pages:
             self.step(f"{page.process['profile']} opens {self.real_name}", page)
             href = page.evaluate("document.querySelector('a[data-app=editor]')?.href ?? null")
             require(href == self.real["url"], f"The app home must link to {self.real['url']}, not {href}")
             page.evaluate("(()=>{document.querySelector('a[data-app=editor]').click();return true})()", True)
+        landing = self.real.get("landing")
+        for page in pages:
+            # "landing": entered with the landing's start button; "direct":
+            # the editor came up without it (no landing, or the site skipped it).
+            page.site_entry = "direct"
+            if not landing:
+                continue
+            self.step(f"{self.real_name} landing or editor", page)
+            self.site_settled(page, f"{on_site} && ({self.real['ready']} || {landing})",
+                              f"{self.real_name} did not load")
+            if not page.evaluate(self.real["ready"]) and page.evaluate(landing):
+                page.evaluate(self.real["enter"], True)
+                page.site_entry = "landing"
         for page in pages:
             self.step(f"{self.real_name} ready", page)
-            try:
-                self.settled(lambda: page.evaluate(
-                    f"location.origin==={json.dumps(self.app_origin)} && document.readyState==='complete' "
-                    f"&& {self.real['ready']}"), f"{self.real_name} did not become ready", REAL_SITE_WAIT,
-                    tolerate=True)
-            except Failure:
-                try:
-                    self.proof["siteDocument"] = page.evaluate(
-                        "({url:location.href,ready:document.readyState,title:document.title,"
-                        "body:document.body?.innerText.slice(0,500)})")
-                except Failure as error:
-                    self.proof["siteDocument"] = {"error": str(error)}
-                raise
+            self.site_settled(page, f"{on_site} && {self.real['ready']}", f"{self.real_name} did not become ready")
             context = page.evaluate(
                 "({origin:location.origin,secure:isSecureContext,tauri:typeof __TAURI_INTERNALS__,"
                 "ipc:typeof window.ipc,wry:typeof window.webkit?.messageHandlers?.ipc,"
@@ -754,7 +785,7 @@ class Observer:
             for field in ("tauri", "ipc", "wry", "webview2"):
                 require(context[field] == "undefined", f"{self.real_name} must not see the App's {field} bridge")
             require(page.pages() == [page.target["targetId"]], f"{self.real_name} must stay in its one window")
-            page.site_context = context
+            page.site_context = dict(context, entry=page.site_entry)
 
     def finish_final_quit(self, pages):
         """W4: after the final quit request, a real site may ask its own
@@ -852,8 +883,12 @@ class Observer:
                     "Each profile must keep its own signed-in session")
         require(work.native["nativePid"] != personal.native["nativePid"] and work.window != personal.window,
                 "Each connection must have its own browser process and window")
-        self.case("separate-profiles", {"bindings": [{"native": page.native, "context": page.context}
-                                                     for page in pages]})
+        bindings = [{"native": page.native, "context": page.context} for page in pages]
+        if self.real:
+            # The real site's own context, and how its editor was entered.
+            for binding, page in zip(bindings, pages):
+                binding["siteContext"] = page.site_context
+        self.case("separate-profiles", {"bindings": bindings})
 
         # The home comes back through the OS's window switching (the owner's
         # decision: no in-browser home button). A browser window is in front

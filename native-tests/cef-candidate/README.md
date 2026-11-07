@@ -1287,11 +1287,19 @@ be slow, so it is not part of `ci.yml`.
 `photopea`) runs the W3 first launch with the fixture home's app link
 pointing at `https://excalidraw.com/` (or `https://www.photopea.com/`); there
 is no restart or reset phase. Both profiles sign in to the fixture home as in
-W3, follow the app link at once, and must reach the site's readiness signal
-within 60 s: the Excalidraw editor root (`.excalidraw`), or Photopea's
-landing or editor text, the signals the Linux probes use
-(`browser-process.mjs`). The site must load in a secure context with no App
-bridge, in the profile's one window. Then, on the real pages:
+W3, follow the app link at once, and must reach the site's rendered editor,
+which neither a browser error page (another origin) nor the site's own shell
+satisfies: Excalidraw's canvas (`.excalidraw canvas`) without its crash
+screen (`.ErrorSplash`, which also carries the `.excalidraw` class), or
+Photopea's editor start screen ("Open From Computer"). Photopea first serves a
+static landing page, shown even if the editor's code never loads, so the
+observer enters the editor from it with its "Start using Photopea" button, as
+the Linux probe does (`browser-process.mjs`); here the click is a script
+`click()`, not CDP pointer input. Each stage (the document, then from a
+landing the editor) has 60 s per profile. The site must load in a secure
+context with no App bridge, in the profile's one window, and
+`separate-profiles` records each profile's site context and how the editor
+was entered. Then, on the real pages:
 
 | Case | What it shows on the real site |
 | --- | --- |
@@ -1327,8 +1335,9 @@ each; the second runs even if the first fails), requires each step's eight
 `summary.json`, removes the CA whatever happened and keeps both cases and
 the profiles' browser logs as the artifact `windows-real-sites-cases`.
 
-**Not shown by W4:** Photopea's editor entry (the Linux run clicked "Start
-using Photopea"; here its landing counts as ready), the long native alert,
+**Not shown by W4:** pointer input reaching a real site (Photopea's start
+button is clicked from script; the Linux run used CDP pointer input), the long
+native alert,
 downloads, popups, notifications and the native file chooser on the real
 sites; a real login; and anything W3 does not show (see above).
 

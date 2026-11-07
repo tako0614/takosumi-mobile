@@ -298,6 +298,22 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(entry["url"].startswith("https://") and entry["url"].endswith("/"), site)
             self.assertEqual(entry["url"].rstrip("/"), entry["origin"])
             self.assertTrue(entry["ready"])
+            self.assertEqual("landing" in entry, "enter" in entry, site)
+
+    def test_real_site_readiness_needs_the_rendered_editor(self):
+        # Excalidraw's crash screen also carries `.excalidraw`; Photopea's
+        # static landing shows even if the editor's code never loads.
+        excalidraw = observer.REAL_SITES["excalidraw"]["ready"]
+        self.assertIn("document.querySelector('.excalidraw canvas')", excalidraw)
+        self.assertIn("!document.querySelector('.ErrorSplash')", excalidraw)
+        photopea = observer.REAL_SITES["photopea"]
+        self.assertNotIn("Start using Photopea", photopea["ready"])
+        self.assertIn("Open From Computer", photopea["ready"])
+        self.assertIn("Start using Photopea", photopea["landing"])
+        probe = (HERE / "browser-process.mjs").read_text()
+        self.assertIn("document.querySelector('.excalidraw canvas')!==null && "
+                      "!document.querySelector('.ErrorSplash')", probe)
+        self.assertNotIn("Boolean(document.querySelector('.excalidraw'))", probe)
 
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.

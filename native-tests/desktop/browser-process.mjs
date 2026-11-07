@@ -14,7 +14,10 @@ assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser 
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 // The app's own document has rendered (not the initial about:blank of a new window).
-const contentOf=site=>site.includes('excalidraw')?"Boolean(document.querySelector('.excalidraw'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
+// Excalidraw: its canvas, and not its crash screen (`ErrorSplash`, which also
+// carries the `.excalidraw` class). Photopea: its landing or editor; the main
+// document then enters the editor below.
+const contentOf=site=>site.includes('excalidraw')?"(document.querySelector('.excalidraw canvas')!==null && !document.querySelector('.ErrorSplash'))":"(document.body?.innerText.includes('Start using Photopea') || document.body?.innerText.includes('Open From Computer'))";
 const appContent=contentOf(origin);
 const desktop=(program,args)=>execFileSync(program,args,{encoding:'utf8',timeout:5000}).trim();
 // Name the active operation and its exact page, so a failure snapshot inspects
