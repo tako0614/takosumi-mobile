@@ -991,8 +991,12 @@ jobs:
         run: |
           bunx tauri build --ci --debug --bundles nsis --features native-browser-process-fixture --config src-tauri/tauri.windows-cef-fixture.conf.json
           if ($LASTEXITCODE -ne 0) { throw "The fixture installer build failed (exit $LASTEXITCODE)" }
-          $setup = @(Get-ChildItem "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "Expected one NSIS installer, found $($setup.Count)" }
+          # This overlay's own installer only: the bundle directory may also
+          # hold the other installer (they differ by productName).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef-fixture.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          $setup = @(Get-ChildItem -LiteralPath "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -File | Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" })
+          if ($setup.Count -ne 1) { throw "Expected one NSIS installer of $product, found $($setup.Count)" }
           Copy-Item -LiteralPath $setup[0].FullName -Destination "$env:RUNNER_TEMP\w6-fixture-setup.exe"
           "Fixture installer: $($setup[0].Name), $([math]::Round($setup[0].Length / 1MB)) MiB"
       - name: Fixture site TLS (disposable CA trusted for this run)
@@ -1064,8 +1068,12 @@ jobs:
         run: |
           bunx tauri build --ci --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
           if ($LASTEXITCODE -ne 0) { throw "The product installer build failed (exit $LASTEXITCODE)" }
-          $setup = @(Get-ChildItem "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "Expected one NSIS installer, found $($setup.Count)" }
+          # This overlay's own installer only: the bundle directory may also
+          # hold the other installer (they differ by productName).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          $setup = @(Get-ChildItem -LiteralPath "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -File | Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" })
+          if ($setup.Count -ne 1) { throw "Expected one NSIS installer of $product, found $($setup.Count)" }
           Copy-Item -LiteralPath $setup[0].FullName -Destination "$env:RUNNER_TEMP\w6-setup.exe"
           "Product installer: $($setup[0].Name), $([math]::Round($setup[0].Length / 1MB)) MiB"
       - name: Install the product App (silent, per user)

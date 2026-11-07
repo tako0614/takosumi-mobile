@@ -513,6 +513,22 @@ class RunnerTests(unittest.TestCase):
             encoding="utf-8"))
         self.assertEqual((overlay["productName"], overlay["identifier"]),
                          ("TakosumiFixture", "com.takosumi.fixture.package"))
+        # Each installer step takes exactly its own overlay's installer, by
+        # productName (the base config's when the overlay has none).
+        for step, config in (("Build the fixture installer", "src-tauri/tauri.windows-cef-fixture.conf.json"),
+                             ("Build the product installer", "src-tauri/tauri.windows-cef.conf.json")):
+            body = job[job.index(f"- name: {step} (NSIS, unsigned)"):]
+            body = body[:body.index("\n      - name:")]
+            self.assertIn(f"--config {config}", body)
+            self.assertIn(f"$product = (Get-Content -Raw {config} | ConvertFrom-Json).productName", body)
+            self.assertIn("$product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName", body)
+            self.assertIn('Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" }', body)
+            self.assertIn("if ($setup.Count -ne 1)", body)
+            self.assertNotIn("-Filter '*-setup.exe'", body)
+        product = json.loads((HERE.parents[1] / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        # The product's installer name pattern cannot match the fixture's.
+        self.assertFalse(re.fullmatch(re.escape(product["productName"]) + r"_.*_x64-setup\.exe",
+                                      "TakosumiFixture_0.1.0_x64-setup.exe"))
         # The upload takes one gathered directory; the gathering copies only
         # the named evidence, through one copier that never takes an
         # executable, a library or an installer.
