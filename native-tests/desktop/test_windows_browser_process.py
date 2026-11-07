@@ -462,6 +462,125 @@ class SiteTests(unittest.TestCase):
         self.assertIn('data-page="login"', self.request("GET", "/", cookie="fixture_session=admin")[2])
 
 
+class SandboxEvidenceTests(unittest.TestCase):
+    """windows_smoke.py --expect-sandbox (W7): the pure parts."""
+
+    def test_command_lines_split_like_the_c_runtime(self):
+        import windows_smoke as smoke
+        self.assertEqual(smoke.windows_arguments('"C:\\a b\\x.exe" --type=renderer "--lang=en US" c\\d'),
+                         ["C:\\a b\\x.exe", "--type=renderer", "--lang=en US", "c\\d"])
+        self.assertEqual(smoke.windows_arguments('x.exe "e\\"f" g\\\\"h i" "j""k"'),
+                         ["x.exe", 'e"f', "g\\h i", 'j"k'])
+        self.assertEqual(smoke.process_type(smoke.windows_arguments("x.exe --type=renderer --x")), "renderer")
+        self.assertIsNone(smoke.process_type(smoke.windows_arguments("x.exe -- --type=renderer")))
+        self.assertIsNone(smoke.process_type(smoke.windows_arguments("--type=gpu-process x")))
+        self.assertTrue(smoke.has_no_sandbox(smoke.windows_arguments("x.exe --type=renderer --no-sandbox")))
+        self.assertFalse(smoke.has_no_sandbox(smoke.windows_arguments("x.exe -- --no-sandbox")))
+
+    def test_only_restricted_renderers_below_the_browser_show_the_sandbox(self):
+        import windows_smoke as smoke
+        browser = {"pid": 1, "integrity": 0x2000, "argumentsRead": True, "noSandbox": False}
+        untrusted = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
+        low = {"pid": 3, "integrity": 0x1000, "noSandbox": False}
+        self.assertEqual(smoke.sandbox_problems(browser, [untrusted, low]), [])
+        cases = (
+            (browser, [], "no renderer"),
+            (browser, [{"pid": 4, "integrity": 0x2000, "noSandbox": False}], "medium integrity"),
+            (browser, [{"pid": 5, "integrity": 0x0000, "noSandbox": True}], "--no-sandbox"),
+            (browser, [{"pid": 6, "integrity": None, "noSandbox": False, "error": "denied"}], "unknown"),
+            ({"pid": 1, "integrity": 0x2000, "noSandbox": True}, [untrusted], "the browser runs with --no-sandbox"),
+            ({"pid": 1, "integrity": 0x1000, "noSandbox": False}, [low], "not below the browser's"),
+            ({"pid": 1, "integrity": 0x2000, "argumentsRead": False, "noSandbox": False, "error": "denied"}, [low],
+             "the browser's command line was not read (denied)"),
+        )
+        for owner, renderers, problem in cases:
+            problems = smoke.sandbox_problems(owner, renderers)
+            self.assertTrue(any(problem in text for text in problems), (problem, problems))
+
+
+    def test_a_live_process_whose_command_line_was_not_read_is_a_problem(self):
+        import windows_smoke as smoke
+        browser = {"pid": 1, "integrity": 0x2000, "argumentsRead": True, "noSandbox": False}
+        renderer = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
+        exited = {"pid": 3, "error": "OpenProcess: Windows error 87", "exited": True}
+        live = {"pid": 4, "error": "NtQueryInformationProcess: 0xC0000022", "exited": False}
+        self.assertEqual(smoke.sandbox_problems(browser, [renderer], [exited]), [])
+        self.assertEqual(smoke.sandbox_problems(browser, [renderer], [exited, live]),
+                         ["process 4: command line not read (NtQueryInformationProcess: 0xC0000022)"])
+        # The browser's own unread command line is reported once, as the browser's.
+        unread_browser = dict(browser, argumentsRead=False, error="denied")
+        problems = smoke.sandbox_problems(unread_browser, [renderer], [{"pid": 1, "error": "denied"}])
+        self.assertEqual(problems, ["the browser's command line was not read (denied)"])
+        self.assertEqual(smoke.ERROR_INVALID_PARAMETER, 87)
+
+    def test_a_browsers_process_tree_is_its_descendants_by_parent(self):
+        import windows_smoke as smoke
+        pairs = [(0, 0), (4, 0), (10, 4), (20, 10), (21, 10), (30, 20), (40, 4), (50, 99), (60, 60), (61, 62),
+                 (62, 61)]
+        self.assertEqual(smoke.descendant_pids(pairs, 10), [20, 21, 30])
+        self.assertEqual(smoke.descendant_pids(pairs, 30), [])
+        self.assertEqual(smoke.descendant_pids(pairs, 60), [])
+        self.assertEqual(smoke.descendant_pids(pairs, 61), [62])
+
+        class Tree(smoke.ProcessTree):
+            def __init__(self, root):
+                self.root = root
+
+            def pairs(self):
+                return pairs
+
+        self.assertEqual(Tree(10).process_ids(), [10, 20, 21, 30])
+        # PROCESSENTRY32W: 568 bytes on x64 Windows (two-byte WCHAR).
+        ctypes = smoke.ctypes
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(smoke.ProcessEntry), (44 + 260 * ctypes.sizeof(ctypes.c_wchar) + 7) // 8 * 8)
+        self.assertEqual(smoke.X64_SIZES[smoke.ProcessEntry], 568)
+
+    def test_the_observer_requires_each_profiles_browser_to_show_the_sandbox(self):
+        found = {"browser": {"pid": 7, "integrityName": "high"}, "renderers": [], "problems": ["no renderer"]}
+        calls = []
+
+        def evidence(source, pid, deadline):
+            calls.append((source.root, pid))
+            return found
+
+        class Win:
+            kernel32 = None
+
+        process = {"profile": "p-work", "opened": {"nativePid": 7}}
+        with mock.patch.object(observer, "sandbox_evidence", evidence), \
+                mock.patch.object(observer.ProcessTree, "__init__",
+                                  lambda tree, kernel32, root: setattr(tree, "root", root)):
+            required = observer.Observer(Path("case"), "https://127.0.0.1:1", 1, "", win32=Win())
+            with self.assertRaises(Failure) as raised:
+                required.sandbox(process)
+            self.assertIn("The browser of p-work does not show Chromium's sandbox", str(raised.exception))
+            self.assertEqual(required.proof["sandbox"], [dict(found, profile="p-work", required=True)])
+            recorded = observer.Observer(Path("case"), "https://127.0.0.1:1", 1, "", win32=Win(), expect_sandbox=False)
+            self.assertEqual(recorded.sandbox(process), found)
+            self.assertEqual(recorded.proof["sandbox"], [dict(found, profile="p-work", required=False)])
+        self.assertEqual(calls, [(7, 7), (7, 7)])
+        self.assertIn("sandbox", runner.EVIDENCE_KEYS)
+
+    def test_the_runner_rechecks_every_opened_profiles_sandbox_record(self):
+        opened = {"processes": [{"profile": "work"}, {"profile": "personal"}]}
+        good = lambda profile: {"profile": profile, "browser": {"integrityName": "high"},
+                                "renderers": [{"integrityName": "untrusted"}], "problems": []}
+        observation = {"sandbox": [good("work"), good("personal")]}
+        self.assertEqual(runner.sandbox_summary(observation, opened, True), [
+            {"profile": "work", "browser": "high", "renderers": ["untrusted"], "problems": []},
+            {"profile": "personal", "browser": "high", "renderers": ["untrusted"], "problems": []},
+        ])
+        with self.assertRaisesRegex(Failure, "No sandbox evidence for the browser of personal"):
+            runner.sandbox_summary({"sandbox": [good("work")]}, opened, True)
+        bad = dict(good("personal"), problems=["no renderer process was found"])
+        with self.assertRaisesRegex(Failure, "personal does not show Chromium's sandbox"):
+            runner.sandbox_summary({"sandbox": [good("work"), bad]}, opened, True)
+        # The unsandboxed candidate: recorded, not required.
+        self.assertEqual(len(runner.sandbox_summary({"sandbox": [good("work"), bad]}, opened, False)), 2)
+        self.assertEqual(runner.sandbox_summary({}, opened, False), [])
+
+
 class RunnerTests(unittest.TestCase):
     def test_case_names_also_fit_the_app_identifier(self):
         for name in ("sumi-w3", "a", "x" * 24):
@@ -506,8 +625,17 @@ class RunnerTests(unittest.TestCase):
             self.assertIn(step, job)
         # The installed product browser alone, and each installer's own
         # uninstall key and shortcut (the fixture has its own productName).
-        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe"',
-                      job)
+        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe" '
+                      '--work $work --expect-sandbox ', job)
+        # W7: both stages are the sandboxed browser (the DLL CEF's bootstrap
+        # loads); the product stage no longer asks for the unsandboxed one.
+        product_stage = job[job.index("- name: Build and stage the product browser and guard"):]
+        product_stage = product_stage[:product_stage.index("\n      - name:")]
+        self.assertIn("cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard\n",
+                      product_stage)
+        self.assertIn('node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\\debug"\n',
+                      product_stage)
+        self.assertNotIn("unsandboxed-candidate", job.replace(".unsandboxedCandidate -ne $false", ""))
         # Each uninstall names the productName its installer was built with.
         for report, config in (("w6-fixture-uninstall.json", "src-tauri/tauri.windows-cef-fixture.conf.json"),
                                ("w6-uninstall.json", "src-tauri/tauri.windows-cef.conf.json")):
@@ -523,8 +651,7 @@ class RunnerTests(unittest.TestCase):
         # record the same one (the packaged run then runs the product guard).
         fixture = job[job.index("- name: Build and stage the fixture browser"):]
         fixture = fixture[:fixture.index("\n      - name:")]
-        self.assertIn("--features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process\n",
-                      fixture)
+        self.assertIn("--features fixture-inspection,windows-sandbox --lib\n", fixture)
         self.assertNotIn("--bin takosumi-browser-guard", fixture)
         self.assertIn("if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw", fixture)
         overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
@@ -581,6 +708,71 @@ class RunnerTests(unittest.TestCase):
         for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
             self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
 
+    def test_the_w1_job_runs_the_staged_sandboxed_browser(self):
+        """W7: cef-windows builds the browser DLL, stages it beside CEF's
+        bootstrap and runs every smoke, the guard and the adapter tests with
+        the staged files; each smoke requires the sandbox."""
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows:\n"):workflow.index("\n  cef-windows-app:\n")]
+        self.assertNotIn("unsandboxed-candidate", job.replace(".unsandboxedCandidate -ne $false", ""))
+        self.assertIn("run: cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard\n", job)
+        self.assertIn('node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\\debug" '
+                      '--out "$env:RUNNER_TEMP\\w7-product"\n', job)
+        self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib\n", job)
+        self.assertIn('node scripts/stage-windows-cef.mjs --fixture --cef $env:W7_CEF --bin "$env:CARGO_TARGET_DIR\\debug" '
+                      '--out "$env:RUNNER_TEMP\\w7-fixture"\n', job)
+        smokes = [line.strip() for line in job.splitlines() if "windows_smoke.py" in line]
+        self.assertEqual(smokes, [
+            'run: python -B native-tests/cef-candidate/windows_smoke.py --browser '
+            '"$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" '
+            '--expect-sandbox',
+            'run: python -B native-tests/cef-candidate/windows_smoke.py --browser '
+            '"$env:RUNNER_TEMP\\w7-fixture\\cef\\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" '
+            '--expect-load --reuse --expect-sandbox',
+        ])
+        self.assertIn("cargo test --locked --features windows-sandbox --bin takosumi-browser-guard |", job)
+        self.assertIn('$env:TAKOSUMI_WINDOWS_GUARD = "$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-browser-guard.exe"\n',
+                      job)
+        self.assertIn('$env:TAKOSUMI_WINDOWS_BROWSER = '
+                      '"$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
+        self.assertIn('$exe = "$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
+        self.assertIn("${{ runner.temp }}/sumi-cef-smoke-*/summary.json\n", job)
+        # W7: the browser's child census tests run, every one of them.
+        source = (HERE.parents[1] / "native-tests/cef-candidate/src/children_windows.rs").read_text(encoding="utf-8")
+        tests = source.count("#[test]")
+        self.assertIn("rustc --edition 2021 --test native-tests/cef-candidate/src/children_windows.rs -o $exe\n", job)
+        self.assertIn(f"'^test result: ok\\. {tests} passed; 0 failed'", job)
+
+    def test_the_app_runs_take_a_staged_sandboxed_browser(self):
+        """W7: the W3 job and the W4 real-site workflow stage the sandboxed
+        fixture browser and hand the App those files."""
+        root = HERE.parents[1] / ".github/workflows"
+        workflow = (root / "ci.yml").read_text(encoding="utf-8")
+        w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
+        w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
+        for job, stage, runs in ((w3, "w3-stage", 1), (w4, "w4-stage", 2)):
+            self.assertNotIn("unsandboxed-candidate", job)
+            self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
+                          "--bin takosumi-browser-guard\n", job)
+            self.assertIn('node scripts/stage-windows-cef.mjs --fixture --cef $cef[0].FullName '
+                          f'--bin "$env:CARGO_TARGET_DIR\\debug" --out "$env:RUNNER_TEMP\\{stage}"\n', job)
+            lines = [line for line in job.splitlines() if "windows_browser_process.py --binary" in line]
+            self.assertEqual(len(lines), runs)
+            for line in lines:
+                self.assertIn('--browser "$stage\\takosumi-cef-browser-process.exe" '
+                              '--guard "$stage\\takosumi-browser-guard.exe" ', line)
+            self.assertEqual(job.count(f"$stage = Join-Path $env:RUNNER_TEMP '{stage}\\cef'\n"), runs)
+            self.assertIn("key: cef-windows-app-cargo-w7-", job)
+
+    def test_the_sandboxed_browsers_dll_is_hashed_with_it(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            browser = Path(directory) / "takosumi-cef-browser-process.exe"
+            browser.write_bytes(b"MZ")
+            self.assertEqual(runner.browser_code(browser), [])
+            browser.with_suffix(".dll").write_bytes(b"MZ")
+            self.assertEqual(runner.browser_code(browser), [Path(directory) / "takosumi-cef-browser-process.dll"])
+
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         for site in sorted(runner.REAL_SITES):
@@ -610,6 +802,38 @@ class RunnerTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
         self.assertIn('"guardPid": std::process::id(),', rust)
+
+    def test_the_browsers_shutdown_lines_are_collected(self):
+        """W7: the browser's own line after CefShutdown (children still
+        running, how it ends, its exit code), attributed by its pid."""
+        import windows_smoke as smoke
+        ours = '{"pid":9212,"children":65,"unopened":0,"end":"exit-process","exitCode":0}'
+        earlier = '{"pid":5000,"children":4,"unopened":0,"end":"exit-process","exitCode":0}'
+        text = "\n".join(["DevTools listening on ws://127.0.0.1:1/x", smoke.BROWSER_SHUTDOWN + earlier,
+                          smoke.BROWSER_SHUTDOWN + ours, smoke.BROWSER_SHUTDOWN + "{cut", ""])
+        found = smoke.browser_shutdown(text, 9212)
+        self.assertEqual(found, [json.loads(ours), {"unparsed": "{cut"}])
+        self.assertEqual(len(smoke.browser_shutdown(text)), 3)
+        self.assertEqual(smoke.browser_shutdown("nothing\n", 9212), [])
+        records = [{"profile": "work", "receipt": {"rootExit": 0}, "browserShutdown": [json.loads(ours)]},
+                   {"profile": "personal", "receipt": "unreadable: x", "browserShutdown": []}]
+        self.assertEqual(runner.shutdown_summary(records), [
+            {"profile": "work", "rootExit": 0, "browser": json.loads(ours)},
+            {"profile": "personal", "rootExit": None, "browser": None},
+        ])
+        self.assertEqual(runner.shutdown_summary(None), [])
+        # The same prefix and fields as the browser writes.
+        rust = (HERE.parents[1] / "native-tests/cef-candidate/src/children_windows.rs").read_text(encoding="utf-8")
+        self.assertIn(f'pub const EVIDENCE_PREFIX: &str = "{smoke.BROWSER_SHUTDOWN}";', rust)
+        for field in ("pid", "children", "unopened", "end", "exitCode"):
+            self.assertIn(f'\\"{field}\\":', rust)
+        self.assertIn('End::ExitProcess => "exit-process"', rust)
+        self.assertIn("win32::ExitProcess(exit_code as u32)", rust)
+        # After CefShutdown: the sandboxed browser records and ends with
+        # ExitProcess; the unsandboxed candidate records and returns.
+        main = (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
+        self.assertIn("    shutdown();\n    let code = i32::from(failed);\n    #[cfg(windows)]\n"
+                      "    children_windows::finish(code, cfg!(feature = \"windows-sandbox\"));\n    code\n}", main)
 
     def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
         class Args:
@@ -661,6 +885,13 @@ class RunnerTests(unittest.TestCase):
                          [f"the browser loaded libcef.dll from {elsewhere}"])
         self.assertEqual(observer.module_problems("browser", system, cef), ["the browser has not loaded libcef.dll"])
         self.assertEqual(observer.module_problems("guard", None, cef), ["no module snapshot of the guard"])
+        # W7: the bootstrap must have loaded the installed browser DLL.
+        dll = observer.BROWSER_DLL
+        self.assertEqual(observer.module_problems("browser", [*browser, cef + "\\" + dll], cef, dll), [])
+        self.assertEqual(observer.module_problems("browser", browser, cef, dll), [f"the browser has not loaded {dll}"])
+        other = "D:\\a\\target-w3\\debug\\" + dll
+        self.assertEqual(observer.module_problems("browser", [*browser, other], cef, dll),
+                         [f"the browser loaded {dll} from {other}"])
         # MODULEENTRY32W: 1080 bytes on x64 Windows (two-byte WCHAR).
         ctypes = observer.ctypes
         if ctypes.sizeof(ctypes.c_void_p) == 8:

@@ -7,8 +7,8 @@
 // (scripts/stage-linux-cef.mjs); an installed App resolves both executables
 // there without environment variables.
 //
-//   node scripts/stage-windows-cef.mjs --cef <dir with libcef.dll> --bin <dir with the two .exe> --unsandboxed-candidate [--out <dir>]
-//   node scripts/stage-windows-cef.mjs --fixture --cef <dir> --bin <dir> [--out <dir>]
+//   node scripts/stage-windows-cef.mjs --cef <dir with libcef.dll> --bin <build dir> [--out <dir>]
+//   node scripts/stage-windows-cef.mjs --fixture --cef <dir> --bin <build dir> [--out <dir>] [--unsandboxed-candidate]
 //
 // `--cef` is the flattened distribution cef-dll-sys unpacks into CEF_PATH
 // (`cef_windows_x86_64`: Release and Resources together). `--out` defaults
@@ -23,10 +23,18 @@
 // `--fixture` is given. A fixture stage defaults to
 // src-tauri/target/windows-cef-fixture (mapped by
 // src-tauri/tauri.windows-cef-fixture.conf.json) and is never written to the
-// package stage path. Every Windows browser is the unsandboxed candidate
-// (cef-candidate feature `windows-unsandboxed-candidate`; a Windows build
-// without it does not compile), so a package stage must say so explicitly
-// (`--unsandboxed-candidate`); the manifest records it.
+// package stage path.
+//
+// The browser runs in Chromium's sandbox (W7): CEF's bootstrap.exe from the
+// distribution, staged as takosumi-cef-browser-process.exe, sets the sandbox
+// up and loads takosumi-cef-browser-process.dll from beside it, the browser
+// built with the cef-candidate feature `windows-sandbox` (`--lib`, built as
+// takosumi_cef_browser.dll), which must export RunWinMain (a library built
+// without the feature is empty and is refused); see
+// native-tests/cef-candidate/src/browser_dll.rs.
+// The unsandboxed test candidate (the browser executable built with
+// `windows-unsandboxed-candidate`) can still be staged, for a fixture only
+// (`--fixture --unsandboxed-candidate`); the manifest records which.
 //
 // Every staged executable and DLL must import at load time only Windows
 // system DLLs (the explicit list in scripts/windows-cef-pe.mjs, plus the
@@ -63,7 +71,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { cefLicenseFromHeader, peImports, systemDll } from "./windows-cef-pe.mjs";
+import { cefLicenseFromHeader, peExports, peImports, systemDll } from "./windows-cef-pe.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_OUT = path.join(REPO, "src-tauri", "target", "windows-cef");
@@ -74,7 +82,12 @@ const INSPECTION_SEAM = Buffer.from("TAKOSUMI_BROWSER_PROCESS_INSPECT");
 const AMD64 = 0x8664;
 
 /** Built by native-tests/cef-candidate. */
-const BINARIES = ["takosumi-cef-browser-process.exe", "takosumi-browser-guard.exe"];
+const BROWSER = "takosumi-cef-browser-process.exe";
+const GUARD = "takosumi-browser-guard.exe";
+/** The sandboxed browser: the client DLL (as built, as staged) beside the renamed bootstrap. */
+const CLIENT_DLL = "takosumi_cef_browser.dll";
+const STAGED_DLL = "takosumi-cef-browser-process.dll";
+const BOOTSTRAP = "bootstrap.exe";
 /** CEF runtime files the browser needs beside it. */
 const RUNTIME = {
   // libcef.dll imports chrome_elf.dll.
@@ -106,9 +119,9 @@ const RUNTIME = {
 /** Never staged. The rest of the distribution is SDK build input. */
 const EXCLUDED = new Map([
   ["libcef.lib", "import library (SDK build input)"],
-  ["cef_sandbox.lib", "sandbox build input; the Windows browser runs unsandboxed"],
-  ["bootstrap.exe", "CEF's sandbox bootstrap; the browser is its own executable"],
-  ["bootstrapc.exe", "CEF's sandbox bootstrap; the browser is its own executable"],
+  ["cef_sandbox.lib", "sandbox library that links only with Chromium's toolchain; the bootstrap is used"],
+  ["bootstrap.exe", "CEF's sandbox bootstrap, staged as the browser only for the sandboxed browser"],
+  ["bootstrapc.exe", "CEF's console bootstrap; the browser is a Windows-subsystem program"],
   ["CMakeLists.txt", "SDK build input"],
   ["archive.json", "SDK download record (copied into stage.json)"],
   ["cmake", "SDK build input"],
@@ -121,7 +134,7 @@ function usage(message) {
   if (message) console.error(`stage-windows-cef: ${message}`);
   console.error(
     "usage: stage-windows-cef.mjs --cef <dir with libcef.dll> --bin <dir with " +
-      `${BINARIES.join(" and ")}> (--unsandboxed-candidate | --fixture) [--out <dir>]`,
+      `${CLIENT_DLL} (or, with --fixture --unsandboxed-candidate, ${BROWSER}) and ${GUARD}> [--fixture] [--out <dir>]`,
   );
   process.exit(2);
 }
@@ -144,11 +157,8 @@ function parse(argv) {
     }
   }
   if (!options.cef || !options.bin) usage("--cef and --bin are required");
-  if (!options.fixture && !options.unsandboxed) {
-    usage(
-      "every Windows browser is the unsandboxed candidate; a package stage needs --unsandboxed-candidate " +
-        "to say so, so no unsandboxed installer is made by accident",
-    );
+  if (options.unsandboxed && !options.fixture) {
+    usage("the unsandboxed candidate is staged for a fixture only (--fixture --unsandboxed-candidate)");
   }
   options.out ??= options.fixture ? FIXTURE_OUT : DEFAULT_OUT;
   return options;
@@ -169,10 +179,11 @@ function peMachine(file) {
   }
 }
 
-function importsOf(file) {
+/** `parse(read)` (peImports or peExports) over a file's bytes. */
+function readPe(file, parse) {
   const handle = openSync(file, "r");
   try {
-    return peImports((offset, length) => {
+    return parse((offset, length) => {
       const buffer = Buffer.alloc(length);
       return buffer.subarray(0, readSync(handle, buffer, 0, length, offset));
     });
@@ -244,13 +255,34 @@ function main() {
 
   // [stage-relative path, source]
   const plan = [];
-  for (const name of BINARIES) {
-    const source = requireFile(path.join(bin, name), `built ${name}`);
-    requirePe(source);
-    plan.push([name, source]);
+  // The browser's code: the client DLL beside the renamed bootstrap, or the
+  // unsandboxed executable.
+  let code;
+  if (options.unsandboxed) {
+    code = requireFile(path.join(bin, BROWSER), `built ${BROWSER} (windows-unsandboxed-candidate)`);
+    plan.push([BROWSER, code]);
+  } else {
+    code = requireFile(path.join(bin, CLIENT_DLL), `built ${CLIENT_DLL} (windows-sandbox, --lib)`);
+    plan.push([BROWSER, requireFile(path.join(cef, BOOTSTRAP), "CEF's bootstrap.exe")]);
+    plan.push([STAGED_DLL, code]);
   }
-  const browser = plan[0][1];
-  const inspectionSeam = readFileSync(browser).includes(INSPECTION_SEAM);
+  plan.push([GUARD, requireFile(path.join(bin, GUARD), `built ${GUARD}`)]);
+  for (const [, source] of plan) requirePe(source);
+  // The bootstrap calls the client DLL's RunWinMain; a library built without
+  // windows-sandbox is empty and exports nothing.
+  if (!options.unsandboxed) {
+    let exported;
+    try {
+      exported = readPe(code, peExports);
+    } catch (error) {
+      usage(`${code}: unreadable export table (${error.message})`);
+    }
+    if (!exported.includes("RunWinMain")) {
+      usage(`${code} exports no RunWinMain (exports: ${exported.join(", ") || "none"}); build it with --features windows-sandbox --lib`);
+    }
+  }
+  const inspectionSeam = readFileSync(code).includes(INSPECTION_SEAM);
+  const browser = code;
   if (inspectionSeam && !options.fixture) {
     usage(
       `${browser} contains the fixture inspection seam (built with --features fixture-inspection); ` +
@@ -293,7 +325,12 @@ function main() {
   // Anything else in the distribution must be a known ignorable entry: an
   // unknown file may be a dependency or a resource this list does not know
   // yet, so it stops the stage.
-  const staged = new Set(plan.map(([name]) => name.split(path.sep)[0]));
+  // Distribution entries this stage uses, by their own names (the bootstrap
+  // is staged under the browser's name).
+  const staged = new Set(
+    plan.filter(([, source]) => path.dirname(source) === cef || source.startsWith(locales + path.sep))
+      .map(([name, source]) => (path.dirname(source) === cef ? path.basename(source) : name.split(path.sep)[0])),
+  );
   const unknown = readdirSync(cef).filter((name) => !staged.has(name) && !EXCLUDED.has(name));
   if (unknown.length > 0) {
     usage(`unknown entries in ${cef}: ${unknown.join(", ")}; decide whether to stage or ignore them`);
@@ -311,7 +348,7 @@ function main() {
     if (!/\.(exe|dll)$/i.test(name)) continue;
     let names;
     try {
-      names = importsOf(source);
+      names = readPe(source, peImports);
     } catch (error) {
       usage(`${source}: unreadable import table (${error.message})`);
     }
@@ -344,8 +381,10 @@ function main() {
     kind: "takosumi.windows-cef-stage@v1",
     fixture: options.fixture,
     inspectionSeam,
-    unsandboxedCandidate: true,
-    sandbox: "none: the Windows browser is the unsandboxed candidate (windows-unsandboxed-candidate)",
+    unsandboxedCandidate: options.unsandboxed,
+    sandbox: options.unsandboxed
+      ? "none: the unsandboxed test candidate (windows-unsandboxed-candidate)"
+      : `chromium: CEF's ${BOOTSTRAP} as ${BROWSER}, loading ${STAGED_DLL} (windows-sandbox)`,
     imports,
     cefLicense: { notice: cefLicense.notice, from: cefLicense.from },
     cef: { directory: cef, archive: existsSync(archive) ? JSON.parse(readFileSync(archive, "utf8")) : null },

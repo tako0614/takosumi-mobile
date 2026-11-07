@@ -2,6 +2,10 @@
 name = "takosumi-cef-candidate"
 version = "0.0.0"
 edition = "2021"
+# The App's plugin (a path dependency) needs 1.89; the DLL's RunWinMain also
+# relies on a panic at an extern "C" boundary aborting (1.81) and catches its
+# own.
+rust-version = "1.89"
 publish = false
 
 [features]
@@ -10,12 +14,17 @@ publish = false
 # TAKOSUMI_BROWSER_PROCESS_INSPECT=1. Build fixture browsers with it; a
 # browser staged for a package must be built without it.
 fixture-inspection = []
-# Windows only: the browser runs without Chromium's sandbox there (see
-# `without_sandbox` in src/process_main.rs). A Windows build without this
-# feature stops with a compile error, so an unsandboxed browser is built only
-# when asked for by name: test candidates, CI and W6's unsigned test
-# installers, whose stage must say so too (scripts/stage-windows-cef.mjs
-# --unsandboxed-candidate); never a release. No effect on Linux.
+# Windows only (W7): the sandboxed browser. CEF 154 ships no cef_sandbox
+# library for embedders; its bootstrap.exe, renamed to the browser, sets up
+# Chromium's sandbox and loads the browser as the DLL this crate's library
+# builds (src/browser_dll.rs), so build it with `--lib`. The product stage
+# (scripts/stage-windows-cef.mjs) takes this layout. No effect on Linux.
+windows-sandbox = ["cef/sandbox"]
+# Windows only: the executable without Chromium's sandbox (see
+# `without_sandbox` in src/process_main.rs), for fixtures and diagnostics
+# only; its stage needs --fixture --unsandboxed-candidate. A Windows browser
+# built with neither feature stops with a compile error, so an unsandboxed
+# browser is never built by accident. No effect on Linux.
 windows-unsandboxed-candidate = []
 
 [dependencies]
@@ -27,13 +36,22 @@ tauri-plugin-app-screen = { path = "../../src-tauri/plugins/app-screen", default
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# Linux and Windows (first candidate). On Windows build it with the guard,
-# `--bin takosumi-cef-browser-process --bin takosumi-browser-guard --features
-# windows-unsandboxed-candidate`: the standalone `takosumi-cef-candidate`
-# (src/main.rs) is Linux only and refuses to compile elsewhere.
+# Windows (W7): the sandboxed browser, the DLL CEF's bootstrap.exe loads
+# (`--features windows-sandbox --lib`); staged as
+# takosumi-cef-browser-process.dll beside the renamed bootstrap. Empty on
+# every other target and without the feature.
+[lib]
+name = "takosumi_cef_browser"
+path = "src/browser_dll.rs"
+crate-type = ["cdylib"]
+
+# Linux, and on Windows the unsandboxed test candidate
+# (`--bin takosumi-cef-browser-process --features windows-unsandboxed-candidate`);
+# the standalone `takosumi-cef-candidate` (src/main.rs) is Linux only and
+# refuses to compile elsewhere.
 [[bin]]
 name = "takosumi-cef-browser-process"
-path = "src/process_main.rs"
+path = "src/browser_main.rs"
 
 # Product supervisor for one browser process: src/guard_main.rs on Linux
 # (pidfds, signalfd, the child subreaper) and src/guard_windows.rs on Windows

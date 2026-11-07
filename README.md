@@ -74,11 +74,15 @@ explicit `desktop-cef` feature opens each connection in its own guarded CEF
 browser process packaged under the bundle's `cef/` resources; see
 [Linux packaging](native-tests/cef-candidate/README.md#linux-packaging-desktop-cef).
 On Windows the same adapter and a Job Object guard compile and are tested in
-CI with an unsandboxed browser candidate, and a CI job runs the actual App
-(its home in WebView2) through them end to end against a local fixture site,
-without a package yet; see
-[Windows guard and adapter](native-tests/cef-candidate/README.md#windows-guard-and-adapter)
-and [Windows actual App (W3)](native-tests/cef-candidate/README.md#windows-actual-app-w3).
+CI, with the browser in Chromium's sandbox (CEF's bootstrap with the browser
+as its DLL), and CI jobs run the actual App (its home in WebView2) through
+them end to end against a local fixture site, also from unsigned per-user
+NSIS installers that bundle the browser, the guard and the CEF runtime under
+`cef/`; see
+[Windows guard and adapter](native-tests/cef-candidate/README.md#windows-guard-and-adapter),
+[Windows actual App (W3)](native-tests/cef-candidate/README.md#windows-actual-app-w3),
+[Windows packaging (W6)](native-tests/cef-candidate/README.md#windows-packaging-w6)
+and [Windows sandbox (W7)](native-tests/cef-candidate/README.md#windows-sandbox-w7).
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
