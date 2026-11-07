@@ -1060,6 +1060,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(required), len(set(required)))
         self.assertIn('grep -qF "test $name ... ok" "$log"', adapter)
         self.assertIn(f"grep -q '^test result: ok\\. {len(tests)} passed; 0 failed; 0 ignored' \"$log\"", adapter)
+        # The socket check uses the browser bundle's identifier, as the
+        # bundler writes it.
+        bundler = (HERE.parents[1] / "scripts/bundle-macos-cef.mjs").read_text(encoding="utf-8")
+        identifier = re.search(r'^export const IDENTIFIER = "([^"]+)";$', bundler, re.M)
+        self.assertIsNotNone(identifier)
+        backend = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_macos.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(f'const BROWSER_BUNDLE_ID: &str = "{identifier.group(1)}";\n', backend)
         # The real opener is never started: the tests' open_externally only
         # records the link.
         self.assertIn("#[cfg(test)]\nfn open_externally(url: &str) {\n    OPENED.lock().unwrap().push(url.to_owned());\n}",

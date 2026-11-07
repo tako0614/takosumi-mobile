@@ -1416,7 +1416,7 @@ jobs:
       # The macOS guard (its process group, descendants by pid and start
       # time, kqueue, the freeze before the kill) with stand-in browsers:
       # the self-test binary re-executes itself as the guard, the browser
-      # and the App. A selection that runs fewer than all thirteen cases
+      # and the App. A selection that runs fewer than all fourteen cases
       # fails.
       - name: Guard self-tests (macOS)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -1428,7 +1428,7 @@ jobs:
           log="$RUNNER_TEMP/m2-guard-self-tests.log"
           cargo test --locked --bin takosumi-browser-guard | tee "$log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'Guard self-tests failed'; exit 1; }
-          grep -q '^test result: ok\. 13 passed; 0 failed$' "$log" || { echo 'Not all thirteen guard self-tests ran'; exit 1; }
+          grep -q '^test result: ok\. 14 passed; 0 failed$' "$log" || { echo 'Not all fourteen guard self-tests ran'; exit 1; }
       # The app-screen plugin has no lockfile of its own; the App's pins its
       # versions.
       - name: Plugin lockfile from the App's
