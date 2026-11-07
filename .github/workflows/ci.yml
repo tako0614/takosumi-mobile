@@ -1300,3 +1300,131 @@ jobs:
           path: ${{ runner.temp }}/w6-evidence
           if-no-files-found: warn
           retention-days: 14
+
+  # The per-profile CEF browser on macOS (M1), the counterpart of W1 on
+  # windows-latest: build takosumi-cef-browser-process and its helper
+  # executable takosumi-cef-browser-helper from native-tests/cef-candidate
+  # with their locked crates, assemble the app bundle CEF requires on macOS
+  # (scripts/bundle-macos-cef.mjs: the browser, CEF's framework and the five
+  # helper apps), then run the bundled browser alone through
+  # windows_smoke.py (boot Open, shutdown, stopped, exit 0, nothing left in
+  # its process group or among its recorded descendants), with every
+  # renderer required in the seatbelt sandbox (--expect-sandbox). The
+  # fixture-inspection build then adds the page load and the window reuse.
+  # Unsigned (the Rust linker's ad-hoc signatures only); only text evidence
+  # is uploaded. Independent of the other jobs.
+  cef-macos:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-cef
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Locked CEF version
+        id: cef
+        run: |
+          version=$(awk 'found && /^version = / { gsub(/^version = "|"$/, ""); print; exit } /^name = "cef-dll-sys"$/ { found = 1 }' native-tests/cef-candidate/Cargo.lock)
+          if [ -z "$version" ]; then echo 'cef-dll-sys is not locked'; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # cef-dll-sys downloads the CEF distribution into CEF_PATH on its first
+      # build. Cache the extracted distribution, not the archive beside it.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cef-sdk
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: cef-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.cef.outputs.version }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cef-cargo
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-cef
+          key: cef-macos-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
+          restore-keys: |
+            cef-macos-cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: CMake and Ninja for the CEF wrapper
+        run: |
+          cmake --version
+          if ! command -v ninja >/dev/null; then brew install ninja; fi
+          ninja --version
+          rustc --version
+          cargo --version
+          python3 --version
+          node --version
+          sw_vers
+      - name: Build takosumi-cef-browser-process and takosumi-cef-browser-helper (product)
+        id: build
+        working-directory: native-tests/cef-candidate
+        env:
+          CEF_PATH: ${{ runner.temp }}/cef
+        run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper
+      # Keep the SDK and the compiler work even when a smoke run below fails.
+      - name: Preserve CEF distribution
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: ${{ steps.cef-sdk.outputs.cache-primary-key }}
+      - name: Preserve CEF compiler cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-cargo.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-cef
+          key: ${{ steps.cef-cargo.outputs.cache-primary-key }}
+      # The distribution's Release directory (cef_macos_aarch64) holds the
+      # framework; its listing goes to the log as evidence of the layout.
+      - name: Bundle the browser (app bundle with its helper apps)
+        id: bundle
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cef=$(find "$RUNNER_TEMP/cef" -mindepth 2 -maxdepth 2 -type d -name cef_macos_aarch64)
+          if [ "$(printf '%s\n' "$cef" | grep -c .)" != 1 ]; then echo "Expected one CEF distribution under $RUNNER_TEMP/cef: $cef"; exit 1; fi
+          echo "M1_CEF=$cef" >> "$GITHUB_ENV"
+          ls -la "$cef" "$cef/Chromium Embedded Framework.framework" "$cef/Chromium Embedded Framework.framework/Libraries"
+          node scripts/bundle-macos-cef.mjs --cef "$cef" --bin "$CARGO_TARGET_DIR/debug" --out "$RUNNER_TEMP/m1-product"
+      - name: Browser smoke (product build, sandboxed helpers)
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-product/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process" --work "$RUNNER_TEMP" --expect-sandbox
+      # The fixture-inspection build adds the main-frame load marker, which
+      # shows a renderer ran; --reuse reopens the screen and requires the
+      # Cocoa raise to report no refusal. Only the browser is rebuilt; the
+      # helper is the same.
+      - name: Build and bundle the browser (fixture-inspection)
+        id: fixture-build
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        env:
+          CEF_PATH: ${{ runner.temp }}/cef
+        run: |
+          (cd native-tests/cef-candidate && cargo build --locked --features fixture-inspection --bin takosumi-cef-browser-process)
+          node scripts/bundle-macos-cef.mjs --fixture --cef "$M1_CEF" --bin "$CARGO_TARGET_DIR/debug" --out "$RUNNER_TEMP/m1-fixture"
+      - name: Browser smoke (page load and window reuse)
+        if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-fixture/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process" --work "$RUNNER_TEMP" --expect-load --reuse --expect-sandbox
+      # Each smoke's summary (with its `sandbox` and `descendants` records),
+      # its top-level logs and the bundle manifests: text only, no binary.
+      - name: Keep the smoke summaries
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cef-macos-smoke
+          path: |
+            ${{ runner.temp }}/sumi-cef-smoke-*/summary.json
+            ${{ runner.temp }}/sumi-cef-smoke-*/*.log
+            ${{ runner.temp }}/m1-product/bundle.json
+            ${{ runner.temp }}/m1-fixture/bundle.json
+          if-no-files-found: warn
+          retention-days: 14
