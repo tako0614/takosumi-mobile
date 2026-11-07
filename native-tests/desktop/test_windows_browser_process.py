@@ -308,9 +308,37 @@ class RunnerTests(unittest.TestCase):
         test_ref = ("github.event_name == 'workflow_dispatch' && inputs.ref || "
                     "github.event.pull_request.head.sha")
         self.assertIn(f"TEST_REF: ${{{{ {test_ref} }}}}", workflow)
-        self.assertIn(f"group: takosumi-mobile-windows-real-sites-${{{{ {test_ref} }}}}", workflow)
-        self.assertIn("ref: ${{ env.TEST_REF }}", workflow)
+        # The concurrency group is the job's, after its `if`: a run for any
+        # other label skips the job and cannot cancel a pending real run.
+        self.assertNotRegex(workflow, r"(?m)^concurrency:")
+        self.assertIn("    if: ${{ github.event_name == 'workflow_dispatch' || "
+                      "github.event.label.name == 'windows-real-sites' }}\n"
+                      "    # On the job, after its `if`: a run for any other label skips the job and\n"
+                      "    # so never enters this group (where it could cancel a pending real run).\n"
+                      "    concurrency:\n"
+                      f"      group: takosumi-mobile-windows-real-sites-${{{{ {test_ref} }}}}\n"
+                      "      cancel-in-progress: false\n", workflow)
         self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read$")
+
+    def test_a_dispatch_tests_only_this_repositorys_commits(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        steps = workflow[workflow.index("    steps:\n"):]
+        check = steps.index("      - name: This repository's branches (dispatch)\n"
+                            "        if: ${{ github.event_name == 'workflow_dispatch' }}\n")
+        resolve = steps.index("      - name: Revision under test\n        id: test-ref\n")
+        checkout = steps.index("          ref: ${{ steps.test-ref.outputs.sha }}\n          path: takosumi-mobile\n")
+        self.assertLess(check, resolve)
+        self.assertLess(resolve, checkout)
+        self.assertIn("          fetch-depth: 0\n", steps[check:resolve])
+        script = steps[resolve:checkout]
+        # The input reaches the script only through the environment.
+        self.assertNotIn("${{ inputs.ref }}", workflow)
+        self.assertIn("$ref = $env:TEST_REF", script)
+        self.assertIn("if ($ref -match '^(refs/)?pull/') {", script)
+        self.assertIn("rev-parse --verify --quiet", script)
+        self.assertIn("branch -r --contains $sha", script)
+        self.assertIn('"sha=$env:HEAD_SHA" >> $env:GITHUB_OUTPUT', script)
+        self.assertNotIn("ref: ${{ env.TEST_REF }}", workflow)
 
     def test_the_real_site_workflow_checks_out_the_ci_sibling_revisions(self):
         root = HERE.parents[1] / ".github/workflows"

@@ -1331,7 +1331,14 @@ GitHub offers once the file is on the default branch) with the
 takosumi-mobile ref to test as its input, or by adding the label
 `windows-real-sites` to a pull request, which tests that pull request's head
 commit (no other pull request event and no push runs it; it never uses
-`pull_request_target`, and its token reads contents only). It builds like
+`pull_request_target`, and its token reads contents only). A dispatch runs in
+the default branch's context and cache scope, so it tests only this
+repository's own commits: it refuses a pull request ref (`refs/pull/...`)
+and anything that does not resolve to a commit reachable from one of its
+branches, before building, and checks out the commit it resolved. Fork pull
+requests: use the label, after review. The concurrency group is the job's
+(after its `if`), so a run for another label never enters it and cannot
+cancel a pending real run. It builds like
 `cef-windows-app` (restoring its caches without saving), trusts the fixture
 CA, runs the Excalidraw and the Photopea cases in separate steps (25 minutes
 each; the second runs even if the first fails), requires each step's eight

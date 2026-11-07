@@ -4,15 +4,18 @@ name: Windows real sites
 # opens real third-party sites (Excalidraw, Photopea) in two connection
 # profiles through its home, as the Linux real-site runs did. Third-party
 # sites change and can be slow, so it runs only when asked: dispatched from
-# the default branch for a given ref, or by adding the label
+# the default branch for a ref of this repository, or by adding the label
 # `windows-real-sites` to a pull request (which tests that pull request's
-# head commit). No other pull request event and no push runs it.
+# head commit). A dispatch runs in the default branch's context and cache
+# scope, so its ref must be a branch, tag or commit reachable from a branch
+# of this repository, never a pull request ref; fork pull requests: use the
+# label, after review. No other pull request event and no push runs it.
 # Anonymous use only: synthetic markers, no sign-in anywhere real.
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: The takosumi-mobile ref (branch, tag or commit) to test
+        description: The takosumi-mobile ref to test (a branch, tag or commit reachable from a branch of this repository; not a pull request ref)
         required: true
         type: string
   pull_request:
@@ -20,10 +23,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: takosumi-mobile-windows-real-sites-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
-  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -35,6 +34,11 @@ jobs:
   windows-real-sites:
     # Only a dispatch, or the `windows-real-sites` label being added.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.label.name == 'windows-real-sites' }}
+    # On the job, after its `if`: a run for any other label skips the job and
+    # so never enters this group (where it could cancel a pending real run).
+    concurrency:
+      group: takosumi-mobile-windows-real-sites-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
+      cancel-in-progress: false
     runs-on: windows-latest
     timeout-minutes: 150
     env:
@@ -42,9 +46,53 @@ jobs:
       # The ref under test: the dispatch input, or the labeled pull request's head.
       TEST_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
     steps:
+      # A dispatch tests only this repository's own commits (see the header):
+      # its branches and tags, to resolve the input and check reachability.
+      - name: This repository's branches (dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: ref-check
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Revision under test
+        id: test-ref
+        shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ($env:EVENT -ne 'workflow_dispatch') {
+            # The labeled pull request's own head.
+            "sha=$env:HEAD_SHA" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $ref = $env:TEST_REF
+          if ($ref -match '^(refs/)?pull/') {
+            throw "inputs.ref '$ref' is a pull request ref. A dispatch runs in the default branch's context and cache scope, so it tests only commits reachable from this repository's branches: add the label windows-real-sites to the pull request instead (for a fork's, after review)."
+          }
+          if ($ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$') {
+            throw "inputs.ref '$ref' is not a branch, tag or commit name"
+          }
+          $sha = $null
+          foreach ($candidate in @("refs/remotes/origin/$($ref -replace '^refs/heads/', '')", "refs/tags/$($ref -replace '^refs/tags/', '')", $ref)) {
+            $resolved = git -C ref-check rev-parse --verify --quiet "$($candidate)^{commit}"
+            if ($LASTEXITCODE -eq 0 -and $resolved) { $sha = "$resolved".Trim(); break }
+          }
+          if (-not $sha) {
+            throw "inputs.ref '$ref' is not a branch, tag or commit of this repository's branches and tags. A fork's commit is tested with the label windows-real-sites on its pull request, after review."
+          }
+          $branches = @(git -C ref-check branch -r --contains $sha --format='%(refname)' | Where-Object { $_ -like 'refs/remotes/origin/*' -and $_ -ne 'refs/remotes/origin/HEAD' })
+          if ($LASTEXITCODE -ne 0 -or $branches.Count -eq 0) {
+            throw "inputs.ref '$ref' ($sha) is not reachable from a branch of this repository; push it to a branch, or for a pull request use the label windows-real-sites (for a fork's, after review)."
+          }
+          "Testing $sha, reachable from $($branches[0])"
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          exit 0
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ env.TEST_REF }}
+          ref: ${{ steps.test-ref.outputs.sha }}
           path: takosumi-mobile
           persist-credentials: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
