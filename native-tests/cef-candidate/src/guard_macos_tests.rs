@@ -54,6 +54,11 @@ fn helper(mode: &[&str]) -> Command {
 fn standin(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("exit") => ExitCode::from(args[1].parse::<u8>().unwrap()),
+        // Leave a mark that this browser started, then exit 0.
+        Some("touch") => {
+            std::fs::write(&args[1], b"started").unwrap();
+            ExitCode::SUCCESS
+        }
         // Echo one control-pipe line, then report its stop signals'
         // dispositions and blocked mask (the guard ignores both signals
         // itself; the browser must have them at their defaults).
@@ -107,6 +112,49 @@ fn standin(args: &[String]) -> ExitCode {
             std::thread::sleep(Duration::from_millis(1500));
             ExitCode::SUCCESS
         }
+        // A descendant outside the group (its own session) that forks long
+        // lived children of its own, as fast as it can, from just before
+        // the guard's kill begins: the browser exits after the guard has
+        // seen the breeder, the breeder waits to be orphaned, then 300 ms
+        // (the guard's natural phase is 500 ms), then forks every
+        // millisecond until it is stopped (at most 400 children).
+        Some("breed") => {
+            let mut command = helper(&["breeder"]);
+            // SAFETY: setsid in the forked child before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            #[allow(clippy::zombie_processes)]
+            let child = command.spawn().unwrap();
+            say(format!("breeder {}", child.id()));
+            std::thread::sleep(Duration::from_millis(400));
+            ExitCode::SUCCESS
+        }
+        Some("breeder") => {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            // SAFETY: getppid has no preconditions.
+            while unsafe { libc::getppid() } != 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            for _ in 0..400 {
+                // SAFETY: this stand-in is single-threaded; the child only
+                // waits for a signal and never returns into Rust.
+                if unsafe { libc::fork() } == 0 {
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_secs(60));
+            ExitCode::SUCCESS
+        }
         Some("sleep") => {
             say(format!("ready {}", std::process::id()));
             std::thread::sleep(Duration::from_secs(60));
@@ -158,11 +206,12 @@ const TESTS: &[Test] = tests![
     a_lingering_descendant_is_killed_and_counted,
     a_descendant_that_left_the_group_is_still_killed,
     a_descendant_that_ends_by_itself_is_not_forced,
+    a_tree_forking_as_the_kill_begins_is_frozen_then_killed,
     a_stop_request_drains_a_running_browser,
     the_apps_death_ends_the_guard_and_the_browser,
     refusals_create_no_receipt_and_start_nothing,
     a_browser_that_cannot_start_leaves_an_incomplete_receipt,
-    pid_reuse_and_zombie_rules,
+    pid_reuse_zombie_and_listing_rules,
     wait_status_as_root_exit,
 ];
 
@@ -423,6 +472,47 @@ fn a_descendant_that_ends_by_itself_is_not_forced() {
     assert_nothing_left(guard.id() as i32, &[helper]);
 }
 
+fn a_tree_forking_as_the_kill_begins_is_frozen_then_killed() {
+    let case = Case::new("breed");
+    let mut guard = case.guard(&["breed"]).spawn().unwrap();
+    let breeder = pid_in(&first_line(&mut guard));
+    let status = finish(&mut guard, Duration::from_secs(15));
+    let proof = case.receipt();
+    // The breeder's children never leave its group (its pid): none of them
+    // may outlive the guard, though their parent died with them.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let survivors = loop {
+        let left: Vec<i32> = group(breeder)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pid| running(*pid))
+            .collect();
+        if left.is_empty() || Instant::now() >= deadline {
+            break left;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if !survivors.is_empty() {
+        // SAFETY: the stand-ins' own group, still holding them.
+        unsafe { libc::killpg(breeder, libc::SIGKILL) };
+    }
+    assert!(
+        survivors.is_empty(),
+        "survived the kill: {survivors:?} {proof}"
+    );
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(clean(&proof), "{proof}");
+    assert_eq!(proof["rootExit"], 0, "{proof}");
+    assert_eq!(proof["complete"], true, "{proof}");
+    // Every process seen but the browser (which exited by itself) was the
+    // breeder or a child of it, none of which ends by itself: each was
+    // killed and counted once.
+    let forced = proof["forcedCleanup"].as_u64().unwrap();
+    let observed = proof["observed"].as_u64().unwrap();
+    assert!(forced >= 2, "no child was forked by the kill: {proof}");
+    assert_eq!(forced, observed - 1, "{proof}");
+}
+
 fn a_stop_request_drains_a_running_browser() {
     let case = Case::new("stop");
     let mut guard = case.guard(&["sleep"]).spawn().unwrap();
@@ -461,9 +551,12 @@ fn the_apps_death_ends_the_guard_and_the_browser() {
         assert!(Instant::now() < deadline, "the guard outlived its App");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The stand-in browser never reads its input, so only the guard's kill,
+    // after the App's exit woke it, can end it: SIGKILL, counted once.
     let proof = case.receipt();
     assert_eq!(proof["rootExit"], -libc::SIGKILL, "{proof}");
     assert_eq!(proof["complete"], true, "{proof}");
+    assert_eq!(proof["forcedCleanup"], 1, "{proof}");
     assert!(clean(&proof), "{proof}");
     assert_nothing_left(guard, &[browser]);
 }
@@ -475,6 +568,8 @@ fn refusals_create_no_receipt_and_start_nothing() {
     // its own process group.
     let existing = marker_case.receipt.clone();
     std::fs::write(&existing, b"{}").unwrap();
+    // The stand-in browser would leave this mark had it started.
+    let mark = marker_case.receipt.with_file_name("browser-started");
     for (receipt, own_group) in [
         (PathBuf::from("guard.json"), true),
         (existing.clone(), true),
@@ -484,7 +579,9 @@ fn refusals_create_no_receipt_and_start_nothing() {
         command
             .arg(&receipt)
             .arg(&exe)
-            .args([STANDIN, "exit", "0"])
+            .arg(STANDIN)
+            .arg("touch")
+            .arg(&mark)
             .env(AS_GUARD, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -497,6 +594,7 @@ fn refusals_create_no_receipt_and_start_nothing() {
         if receipt != existing {
             assert!(!receipt.is_absolute() || !receipt.exists(), "{receipt:?}");
         }
+        assert!(!mark.exists(), "the browser started: {receipt:?}");
     }
     assert_eq!(std::fs::read(&existing).unwrap(), b"{}");
 }
@@ -521,7 +619,7 @@ fn a_browser_that_cannot_start_leaves_an_incomplete_receipt() {
     assert!(proof["error"].is_string(), "{proof}");
 }
 
-fn pid_reuse_and_zombie_rules() {
+fn pid_reuse_zombie_and_listing_rules() {
     // A child found under a parent must not be older than it.
     assert!(plausible_child(2_000, 1_000));
     assert!(plausible_child(1_000, 1_000));
@@ -531,6 +629,7 @@ fn pid_reuse_and_zombie_rules() {
         pgid: 1,
         start,
         zombie,
+        stopped: false,
     };
     // The same process: same start time and not a zombie.
     assert!(still_running(5, Some(facts(5, false))));
@@ -540,10 +639,45 @@ fn pid_reuse_and_zombie_rules() {
         "a zombie has ended"
     );
     assert!(!still_running(5, None), "gone");
+    // A stopped process still runs (the freeze's processes until the kill).
+    assert!(still_running(
+        5,
+        Some(Facts {
+            stopped: true,
+            ..facts(5, false)
+        })
+    ));
     // This process's own facts are readable, and it runs.
     let me = std::process::id() as i32;
     let mine = super::facts(me).unwrap().expect("this process's facts");
-    assert!(!mine.zombie && mine.start > 0);
+    assert!(!mine.zombie && !mine.stopped && mine.start > 0);
+    // A group listing holds its leader. For a process that leads no group
+    // the listing is empty (as libproc also answers an error), which
+    // own_group refuses as incomplete.
+    let sleeper = |own_group: bool| {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([STANDIN, "sleep"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if own_group {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().unwrap();
+        first_line(&mut child);
+        child
+    };
+    let mut leader = sleeper(true);
+    let mut member = sleeper(false);
+    let listed = own_group(leader.id() as i32);
+    let refused = own_group(member.id() as i32);
+    for child in [&mut leader, &mut member] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert_eq!(listed.unwrap(), vec![leader.id() as i32]);
+    assert!(refused.is_err(), "{refused:?}");
 }
 
 fn wait_status_as_root_exit() {

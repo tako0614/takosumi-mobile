@@ -2,7 +2,7 @@
 //!
 //! `takosumi-browser-guard <absolute new receipt> <program> [args...]`
 //!
-//! The same command line, receipt and exit codes as the Linux guard
+//! The same command line, receipt fields and exit codes as the Linux guard
 //! (`guard_main.rs`) and the Windows guard (`guard_windows.rs`). macOS has
 //! neither Linux's child subreaper and pidfds nor Windows' Job Objects, and
 //! kqueue's `NOTE_TRACK` (following forks) is no longer supported, so the
@@ -11,45 +11,65 @@
 //! - **Process group.** The App starts the guard as the leader of its own
 //!   process group (it refuses otherwise); the browser and every process it
 //!   starts inherit that group unless they leave it. Every member of the
-//!   group other than the guard is the browser's (`proc_listpgrppids`).
+//!   group other than the guard is the browser's (`proc_listpgrppids`; a
+//!   listing that does not hold the guard itself is a failure, since libproc
+//!   answers an error with an empty list).
 //! - **Descendants, recorded while they run.** A descendant that leaves the
 //!   group (`setsid`, `setpgid`) is still found as a child of a process the
 //!   guard already tracks (`proc_listchildpids`). The browser's orphans are
 //!   reparented to launchd, so the guard records every descendant
-//!   continuously while the browser runs (each kqueue event, and at least
-//!   every 250 ms) and keeps tracking it afterwards by pid and start time.
+//!   continuously while the browser runs: on every kqueue event, at least
+//!   every 250 ms, and at once whenever a tracked process forks (`NOTE_FORK`
+//!   on each tracked process). It keeps tracking each one afterwards by pid
+//!   and start time.
 //! - **PID reuse.** Each tracked process is kept with its start time
 //!   (`proc_pidinfo`, `PROC_PIDTBSDINFO`); one whose start time differs, or
 //!   that started before the parent it was found under, is not the browser's
 //!   and is never signalled. A zombie counts as ended.
-//!
-//! Not covered: a process that leaves the group and is orphaned between two
-//! observations (under 250 ms, or before the next event) is not seen; a
-//! process the browser has started through a system service (launchd, XPC)
-//! is not its descendant, as on Linux one started by a session manager is
-//! not. CEF's helpers stay in the group (the M1 smoke's group check).
 //!
 //! The guard waits on one kqueue, without a lifetime cap: the browser's exit
 //! (`EVFILT_PROC`, `NOTE_EXIT`), a stop request (`SIGTERM` or `SIGINT`,
 //! `EVFILT_SIGNAL`, as the App sends `SIGTERM` on Linux), and the App's death
 //! (`NOTE_EXIT` on the guard's parent, the App: macOS has no parent-death
 //! signal; a parent already gone at start is a stop request before the
-//! browser starts). Both signals are ignored in the guard, which kqueue
-//! still records, and restored to their defaults in the browser.
+//! browser starts, and a changed parent at any later look is the App's death
+//! too). Both signals are blocked from the guard's start until kqueue
+//! watches them; one already pending then is a stop request. They are then
+//! ignored in the guard, which kqueue still records, and restored to their
+//! defaults in the browser.
 //!
 //! The drain then always runs, as on Windows: up to 0.5 s for the browser
-//! and every tracked process to end by themselves, then `SIGKILL` to each
-//! tracked process still running (its start time checked right before) and
-//! to every other member of the group, then up to 2 s. Forced cleanup counts
-//! the processes the kill actually ended: the browser when `waitpid` reports
-//! it ended by `SIGKILL`; any other process when it was running (not a
-//! zombie) right before the kill, the kill succeeded and it was gone
-//! afterwards. Such a process that ended by itself between that check and
-//! the signal is counted forced: macOS gives the guard no exit status for a
-//! process that is not its child, so the count can only err on the safe
-//! side. The completion proof (`kernelNoChildren`) is that, after the
-//! browser was reaped, the kernel lists no process in the guard's group but
-//! the guard and no tracked process is alive.
+//! and every tracked process to end by themselves. Then the guard freezes
+//! the tree before it kills anything: `SIGSTOP` to the unreaped browser, to
+//! each tracked process still the same (start time) and to every other
+//! running member of the group, each verified right before its signal; it
+//! looks again for processes they started before they stopped and stops
+//! those too, until a look taken after every stopped process showed stopped
+//! finds nothing new (at most 0.5 s). A stopped process cannot fork or exit
+//! by itself, and its children stay listed under it, so no part of the tree
+//! is orphaned unseen by the kill. Then `SIGKILL` to every stopped process,
+//! and for the rest of a 2 s window (counted from the freeze) every
+//! `DRAIN_TICK` the guard kills whatever it still finds the same way (one
+//! diagnostic line on standard error reports the freeze). Forced
+//! cleanup counts, for the browser and every other process alike, the
+//! processes the guard's `SIGKILL` reached while they ran (verified, not a
+//! zombie). For a process the freeze saw stopped this is exact: it could not
+//! have ended by itself. For one it did not see stopped (the freeze ran out,
+//! or it was found only after the kill) one that ended by itself at that
+//! moment is counted too: macOS gives the guard no exit status for a process
+//! that is not its child, so the count errs only on the safe side.
+//!
+//! **What completion means here.** `kernelNoChildren` and `complete` are, on
+//! macOS, "no survivor among the processes the guard observed": after the
+//! browser was reaped, the group lists only the guard and no tracked process
+//! is alive. That is not a kernel proof as on Linux (the subreaper's
+//! `waitid` answering `ECHILD`) or Windows (the job's accounting). Outside it
+//! are a process the browser started through a system service (launchd,
+//! XPC), which is not its descendant (as on Linux one started by a session
+//! manager is not), and a double fork faster than an observation: a process
+//! that leaves the group and whose parent ends before the guard's next look
+//! (the `NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen.
+//! CEF's helpers stay in the group (the M1 smoke's group check).
 //!
 //! Receipt, written once after the drain, with the other guards' fields:
 //! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
@@ -57,7 +77,7 @@
 //! still in the group or tracked; `observed` counts every process seen (the
 //! browser included, by pid and start time). `rootExit` is the browser's exit
 //! code, or minus the signal that ended it. The guard exits 0 only when the
-//! drain proved completion, the browser exited 0 and nothing failed; a
+//! drain found no survivor, the browser exited 0 and nothing failed; a
 //! forced cleanup alone does not change the exit status, and the App
 //! separately requires `forcedCleanup == 0`. A refusal before the receipt
 //! exists exits 2 and starts nothing.
@@ -78,9 +98,13 @@ use std::time::{Duration, Instant};
 const RUNNING_TICK: Duration = Duration::from_millis(250);
 /// While draining, re-observe at least this often.
 const DRAIN_TICK: Duration = Duration::from_millis(20);
-/// Natural end, then SIGKILL and this long for everything to be gone.
+/// Natural end, then the freeze and the kill, and this long (from the
+/// freeze) for everything to be gone.
 const NATURAL: Duration = Duration::from_millis(500);
 const FORCED: Duration = Duration::from_secs(2);
+/// The longest the freeze waits for its stopped processes to show stopped,
+/// within the forced window.
+const FREEZE: Duration = Duration::from_millis(500);
 /// Consecutive failed waits before the guard gives up waiting and drains.
 const MAX_RUNNING_FAULTS: u32 = 8;
 /// The most processes one listing call returns; a listing that fills it is
@@ -103,22 +127,26 @@ pub(super) fn main() -> ExitCode {
     }
 }
 
-/// A short, stable error name for the receipt; never a path or argv.
+/// A short, stable error name for the receipt; never a path or argv (the
+/// guard's own errors carry a fixed name).
 fn fault(error: &io::Error) -> String {
-    match error.raw_os_error() {
-        Some(code) => format!("{:?} (errno {code})", error.kind()),
-        None => format!("{:?}", error.kind()),
+    match (error.raw_os_error(), error.kind()) {
+        (Some(code), kind) => format!("{kind:?} (errno {code})"),
+        (None, io::ErrorKind::Other) => error.to_string(),
+        (None, kind) => format!("{kind:?}"),
     }
 }
 
 /// What the kernel says about one process: its parent, group, start time
-/// (microseconds since the epoch) and whether it is a zombie.
+/// (microseconds since the epoch), whether it is a zombie and whether it is
+/// stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Facts {
     ppid: i32,
     pgid: i32,
     start: u64,
     zombie: bool,
+    stopped: bool,
 }
 
 /// `proc_pidinfo(PROC_PIDTBSDINFO)`; `None` when no such process exists.
@@ -141,6 +169,7 @@ fn facts(pid: i32) -> io::Result<Option<Facts>> {
             pgid: info.pbi_pgid as i32,
             start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
             zombie: info.pbi_status == libc::SZOMB,
+            stopped: info.pbi_status == libc::SSTOP,
         }));
     }
     let error = io::Error::last_os_error();
@@ -153,15 +182,28 @@ fn facts(pid: i32) -> io::Result<Option<Facts>> {
 /// A process list call: `proc_listpgrppids` or `proc_listchildpids`.
 type Listing = unsafe extern "C" fn(libc::pid_t, *mut libc::c_void, libc::c_int) -> libc::c_int;
 
+/// libproc's listing calls answer a failed system call with 0 (and its
+/// errno), not -1: errno is cleared before each call and an empty answer
+/// with errno set is the failure.
 fn list(call: Listing, id: i32) -> io::Result<Vec<i32>> {
     let mut room = LISTING;
     loop {
         let mut pids = vec![0 as libc::pid_t; room];
         let bytes = (room * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // SAFETY: the buffer holds `room` pids and its size is passed.
-        let count = unsafe { call(id, pids.as_mut_ptr().cast(), bytes) };
+        // SAFETY: errno is this thread's; the buffer holds `room` pids and
+        // its size is passed.
+        let count = unsafe {
+            *libc::__error() = 0;
+            call(id, pids.as_mut_ptr().cast(), bytes)
+        };
         if count < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if count == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().is_some_and(|code| code != 0) {
+                return Err(error);
+            }
         }
         let count = count as usize;
         if count >= room {
@@ -177,6 +219,17 @@ fn list(call: Listing, id: i32) -> io::Result<Vec<i32>> {
 /// The members of a process group.
 fn group(pgid: i32) -> io::Result<Vec<i32>> {
     list(libc::proc_listpgrppids, pgid)
+}
+
+/// The members of the guard's own group: a listing without the guard itself
+/// (which leads the group and runs) is incomplete and fails.
+fn own_group(me: i32) -> io::Result<Vec<i32>> {
+    let members = group(me)?;
+    if members.contains(&me) {
+        Ok(members)
+    } else {
+        Err(io::Error::other("GroupListingWithoutTheGuard"))
+    }
 }
 
 /// The children of a process.
@@ -210,7 +263,8 @@ fn exit_code(status: libc::c_int) -> i32 {
     }
 }
 
-/// One kqueue: the browser's exit, the App's exit and stop signals.
+/// One kqueue: the browser's exit, the App's exit, stop signals and the
+/// forks of tracked processes.
 struct Queue(OwnedFd);
 
 /// What woke the guard.
@@ -261,6 +315,21 @@ impl Queue {
         self.change(pid as usize, libc::EVFILT_PROC, libc::NOTE_EXIT)
     }
 
+    /// The browser: its exit and its forks.
+    fn watch_browser(&self, pid: i32) -> io::Result<()> {
+        self.change(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::NOTE_EXIT | libc::NOTE_FORK,
+        )
+    }
+
+    /// Any other tracked process: its forks, so a new child is looked for at
+    /// once instead of at the next tick.
+    fn watch_forks(&self, pid: i32) -> io::Result<()> {
+        self.change(pid as usize, libc::EVFILT_PROC, libc::NOTE_FORK)
+    }
+
     fn watch_signal(&self, signal: libc::c_int) -> io::Result<()> {
         self.change(signal as usize, libc::EVFILT_SIGNAL, 0)
     }
@@ -292,14 +361,17 @@ impl Queue {
                 Err(error)
             };
         }
+        // Any event (a fork included) makes the caller look at the tree;
+        // only an exit of the browser or the App ends the wait.
         let mut woke = Woke::default();
         for event in &events[..count as usize] {
+            let exited = event.fflags & libc::NOTE_EXIT != 0;
             match event.filter {
                 libc::EVFILT_SIGNAL => woke.stop = true,
                 libc::EVFILT_PROC if Some(event.ident as i32) == browser => {
-                    woke.browser_exited = true
+                    woke.browser_exited |= exited
                 }
-                libc::EVFILT_PROC if event.ident as i32 == parent => woke.stop = true,
+                libc::EVFILT_PROC if event.ident as i32 == parent => woke.stop |= exited,
                 _ => {}
             }
         }
@@ -339,8 +411,48 @@ struct Prepared {
     stopping: bool,
 }
 
+/// The stop signals as a set.
+fn stop_signals() -> libc::sigset_t {
+    // SAFETY: sigset_t is plain data, filled by sigemptyset/sigaddset.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
+    }
+}
+
+/// Block, unblock (`SIG_BLOCK`, `SIG_UNBLOCK`) the stop signals.
+fn mask_stops(how: libc::c_int) -> io::Result<()> {
+    let set = stop_signals();
+    // SAFETY: a valid set; the old mask is not wanted.
+    if unsafe { libc::sigprocmask(how, &set, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether a stop signal is pending (sent while blocked).
+fn stop_pending() -> io::Result<bool> {
+    // SAFETY: sigpending fills a plain set.
+    unsafe {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        if libc::sigpending(&mut pending) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(libc::sigismember(&pending, libc::SIGTERM) == 1
+            || libc::sigismember(&pending, libc::SIGINT) == 1)
+    }
+}
+
 fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
     let refuse = |message: &str| Err((2, message.to_string()));
+    // A stop request from now on is kept pending until kqueue watches for
+    // it (the App also starts the guard with both blocked).
+    if let Err(error) = mask_stops(libc::SIG_BLOCK) {
+        return Err((2, format!("The stop signals cannot be blocked: {error}")));
+    }
     if args.len() < 3 {
         return refuse("usage: takosumi-browser-guard <absolute new receipt> <program> [args...]");
     }
@@ -372,9 +484,15 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
         .open(receipt)
         .map_err(|error| (2, format!("The receipt cannot be created: {error}")))?;
     let fail = |error: io::Error| (1, format!("Cannot guard the browser lifecycle: {error}"));
-    // Stop requests: ignored here (kqueue records them anyway), default in
-    // the browser. SIGCHLD keeps its default, so the browser's exit status
-    // is not discarded.
+    // Stop requests: kqueue records every one sent from now on, blocked or
+    // ignored; one sent before is pending. Then they are ignored here
+    // (which discards the pending ones, already counted) and unblocked;
+    // the browser gets them back at their defaults. SIGCHLD keeps its
+    // default, so the browser's exit status is not discarded.
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        queue.watch_signal(signal).map_err(fail)?;
+    }
+    let mut stopping = stop_pending().map_err(fail)?;
     // SAFETY: plain signal dispositions in a single-threaded process.
     unsafe {
         for (signal, action) in [
@@ -387,14 +505,12 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
             }
         }
     }
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        queue.watch_signal(signal).map_err(fail)?;
-    }
+    mask_stops(libc::SIG_UNBLOCK).map_err(fail)?;
     // The App's death: its exit, watched from now on. A parent already gone
     // (this guard was reparented to launchd) is a stop before the start.
     // SAFETY: getppid has no preconditions.
     let parent = unsafe { libc::getppid() };
-    let stopping = parent == 1
+    stopping |= parent == 1
         || match queue.watch_exit(parent) {
             Ok(()) => false,
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => true,
@@ -448,6 +564,13 @@ struct Run {
     non_fatal: BTreeSet<String>,
 }
 
+/// A process the freeze stopped: its start time and whether it has shown
+/// stopped since.
+struct Frozen {
+    start: u64,
+    stopped: bool,
+}
+
 impl Run {
     /// Record the browser's exit status once it has exited.
     fn reap(&mut self) {
@@ -473,9 +596,24 @@ impl Run {
     }
 
     fn track(&mut self, pid: i32, facts: Facts) {
-        if pid != self.me && !facts.zombie {
-            self.tracked.entry(pid).or_insert(facts.start);
-            self.observed.insert((pid, facts.start));
+        if pid == self.me || facts.zombie {
+            return;
+        }
+        self.observed.insert((pid, facts.start));
+        if self.tracked.contains_key(&pid) {
+            return;
+        }
+        self.tracked.insert(pid, facts.start);
+        // Its forks wake the guard at once (the browser's own watch, with
+        // its exit, is set when it starts).
+        if Some(pid) != self.child {
+            match self.queue.watch_forks(pid) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
+                    self.non_fatal.insert(fault(&error));
+                }
+            }
         }
     }
 
@@ -484,7 +622,7 @@ impl Run {
     /// whose pid now names another process. Returns the first failure.
     fn observe(&mut self) -> Result<(), String> {
         let mut problem = None;
-        match group(self.me) {
+        match own_group(self.me) {
             Ok(members) => {
                 for pid in members {
                     match facts(pid) {
@@ -551,14 +689,19 @@ impl Run {
         problem.map_or(Ok(()), Err)
     }
 
-    /// The group's members other than the guard.
+    /// The group's members other than the guard: those that run, and those
+    /// whose state cannot be read (they may still run).
     fn group_left(&mut self) -> Option<Vec<i32>> {
-        match group(self.me) {
+        match own_group(self.me) {
             Ok(mut members) => {
                 members.retain(|pid| *pid != self.me);
                 // A zombie whose parent is gone is reaped by launchd; it no
                 // longer runs.
-                members.retain(|pid| matches!(facts(*pid), Ok(Some(facts)) if !facts.zombie));
+                members.retain(|pid| match facts(*pid) {
+                    Ok(Some(facts)) => !facts.zombie,
+                    Ok(None) => false,
+                    Err(_) => true,
+                });
                 Some(members)
             }
             Err(error) => {
@@ -582,7 +725,8 @@ impl Run {
     }
 
     /// Wait for the browser to exit or a stop request (also the App's
-    /// death), observing on every event and every tick.
+    /// death), observing on every event (a tracked process's fork included)
+    /// and every tick.
     fn running(&mut self) -> Result<(), String> {
         let Some(child) = self.child else {
             return Ok(());
@@ -596,7 +740,11 @@ impl Run {
                         self.non_fatal.insert(error);
                     }
                     self.reap();
-                    if woke.stop || woke.browser_exited || self.root_exit.is_some() {
+                    // A changed parent is the App's death as well, should
+                    // its exit event be missed.
+                    // SAFETY: getppid has no preconditions.
+                    let orphaned = unsafe { libc::getppid() } != self.parent;
+                    if woke.stop || orphaned || woke.browser_exited || self.root_exit.is_some() {
                         return Ok(());
                     }
                 }
@@ -627,68 +775,169 @@ impl Run {
         }
     }
 
-    /// The bounded drain every run takes. Returns whether completion was
-    /// proven.
+    /// The processes to end now: the unreaped browser (always), every
+    /// tracked process and every member of the group.
+    fn candidates(&mut self) -> BTreeSet<i32> {
+        let mut pids: BTreeSet<i32> = self.tracked.keys().copied().collect();
+        pids.extend(self.group_left().unwrap_or_default());
+        if let (Some(child), None) = (self.child, self.root_exit) {
+            pids.insert(child);
+        }
+        pids.remove(&self.me);
+        pids
+    }
+
+    /// Whether `pid` is, right now, a running process of the browser's, and
+    /// its start time: the unreaped browser (its pid cannot be reused while
+    /// unreaped), a tracked process with its recorded start time, or a
+    /// member of the guard's group; never a zombie.
+    fn verify(&mut self, pid: i32) -> Option<u64> {
+        if pid == self.me {
+            return None;
+        }
+        let now = match facts(pid) {
+            Ok(Some(now)) if !now.zombie => now,
+            Ok(_) => return None,
+            Err(error) => {
+                self.cleanup_errors.insert(fault(&error));
+                return None;
+            }
+        };
+        let browser = Some(pid) == self.child && self.root_exit.is_none();
+        let same = self.tracked.get(&pid) == Some(&now.start);
+        (browser || same || now.pgid == self.me).then_some(now.start)
+    }
+
+    /// Send `signal`; a process that ended meanwhile (`ESRCH`) is no error.
+    fn signal(&mut self, pid: i32, signal: libc::c_int) -> bool {
+        // SAFETY: kill with a plain pid and signal, verified by the caller.
+        if unsafe { libc::kill(pid, signal) } == 0 {
+            return true;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            self.cleanup_errors.insert(fault(&error));
+        }
+        false
+    }
+
+    /// Stop every process of the browser's, then look again for any it
+    /// started before it stopped, until a look taken after every stopped
+    /// process showed stopped finds nothing new, or `until`.
+    fn freeze(&mut self, until: Instant) -> BTreeMap<i32, Frozen> {
+        let mut frozen: BTreeMap<i32, Frozen> = BTreeMap::new();
+        loop {
+            // Which stopped processes show stopped, before this look.
+            let mut all_stopped = true;
+            let mut ended = Vec::new();
+            for (pid, entry) in frozen.iter_mut().filter(|(_, entry)| !entry.stopped) {
+                match facts(*pid) {
+                    Ok(Some(now)) if now.start == entry.start && !now.zombie => {
+                        entry.stopped = now.stopped;
+                        all_stopped &= now.stopped;
+                    }
+                    // It ended after (or as) it was stopped, not by the kill.
+                    Ok(_) => ended.push(*pid),
+                    Err(error) => {
+                        self.cleanup_errors.insert(fault(&error));
+                        all_stopped = false;
+                    }
+                }
+            }
+            for pid in ended {
+                frozen.remove(&pid);
+            }
+            self.reap();
+            if let Err(error) = self.observe() {
+                self.cleanup_errors.insert(error);
+            }
+            let mut found = false;
+            for pid in self.candidates() {
+                if frozen.contains_key(&pid) {
+                    continue;
+                }
+                let Some(start) = self.verify(pid) else {
+                    continue;
+                };
+                if self.signal(pid, libc::SIGSTOP) {
+                    self.observed.insert((pid, start));
+                    frozen.insert(
+                        pid,
+                        Frozen {
+                            start,
+                            stopped: false,
+                        },
+                    );
+                    found = true;
+                }
+            }
+            if (!found && all_stopped) || Instant::now() >= until {
+                return frozen;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The bounded drain every run takes. Returns whether it found no
+    /// survivor among the observed processes.
     fn drain(&mut self) -> bool {
         if self.settle_until(Instant::now() + NATURAL) {
             return true;
         }
-        // Who runs now: each tracked process (its start time checked right
-        // before its signal) and every other member of the group.
-        let mut killed: Vec<(i32, u64)> = Vec::new();
-        let mut targets: BTreeMap<i32, Option<u64>> = self
-            .tracked
-            .iter()
-            .map(|(pid, start)| (*pid, Some(*start)))
-            .collect();
-        for pid in self.group_left().unwrap_or_default() {
-            targets.entry(pid).or_insert(None);
-        }
-        let mut child_killed = false;
-        for (pid, start) in targets {
-            if Some(pid) == self.child {
-                if self.root_exit.is_none() {
-                    // An unreaped child cannot have its pid reused; its own
-                    // wait status says whether the kill ended it.
-                    // SAFETY: kill with a plain pid and signal.
-                    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
-                        child_killed = true;
-                    }
-                }
-                continue;
-            }
-            let now = match facts(pid) {
-                Ok(now) => now,
+        let freezing = Instant::now();
+        let deadline = freezing + FORCED;
+        let frozen = self.freeze((freezing + FREEZE).min(deadline));
+        // One diagnostic line on standard error (the profile's browser.log):
+        // how many processes the freeze stopped, how many of them it saw
+        // stopped, and how long it took.
+        eprintln!(
+            "takosumi-browser-guard: freeze {{\"stopped\":{},\"shownStopped\":{},\"freezeMs\":{}}}",
+            frozen.len(),
+            frozen.values().filter(|entry| entry.stopped).count(),
+            freezing.elapsed().as_millis()
+        );
+        // Every kill the guard sends to a running process of the browser's,
+        // by pid and start time; each counts once as forced.
+        let mut killed: BTreeSet<(i32, u64)> = BTreeSet::new();
+        for (pid, entry) in frozen {
+            // A stopped process keeps its pid; one gone meanwhile was ended
+            // by someone else.
+            match facts(pid) {
+                Ok(Some(now)) if now.start == entry.start && !now.zombie => {}
+                Ok(_) => continue,
                 Err(error) => {
                     self.cleanup_errors.insert(fault(&error));
                     continue;
                 }
-            };
-            let current = match (start, now) {
-                (Some(recorded), now) if still_running(recorded, now) => recorded,
-                // A group member seen only now (not tracked yet).
-                (None, Some(facts)) if !facts.zombie && facts.pgid == self.me => facts.start,
-                _ => continue,
-            };
-            // SAFETY: kill with a plain pid and signal; checked just above.
-            if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
-                killed.push((pid, current));
-                self.observed.insert((pid, current));
-            } else {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    self.cleanup_errors.insert(fault(&error));
-                }
+            }
+            if self.signal(pid, libc::SIGKILL) {
+                killed.insert((pid, entry.start));
             }
         }
-        let empty = self.settle_until(Instant::now() + FORCED);
-        // The browser: its wait status says whether the kill ended it.
-        if child_killed && self.root_exit == Some(-libc::SIGKILL) {
-            self.forced += 1;
-        }
-        // Any other process: it ran right before a kill that succeeded. One
-        // still running after the forced budget counts too (the run is then
-        // not complete).
+        // For the rest of the window, whatever is still found (one that
+        // escaped the freeze) is killed the same way.
+        let empty = loop {
+            if self.settled() {
+                break true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            for pid in self.candidates() {
+                let Some(start) = self.verify(pid) else {
+                    continue;
+                };
+                if killed.contains(&(pid, start)) {
+                    continue;
+                }
+                if self.signal(pid, libc::SIGKILL) {
+                    self.observed.insert((pid, start));
+                    killed.insert((pid, start));
+                }
+            }
+            std::thread::sleep(DRAIN_TICK.min(deadline - now));
+        };
         self.forced += killed.len() as u32;
         empty
     }
@@ -735,7 +984,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
                         run.observed.insert((pid, 0));
                     }
                 }
-                match run.queue.watch_exit(pid) {
+                match run.queue.watch_browser(pid) {
                     Ok(()) => {}
                     // Already exited: the reap below records it.
                     Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
