@@ -1014,14 +1014,14 @@ since it is right for the real stacking.
 **Foreground.** Before it sends a reopen, the adapter now calls
 `AllowSetForegroundWindow` with the browser's native pid, so the browser may
 raise its window while the person uses the home (a refusal is harmless).
-The `windows-latest` runner keeps Windows' foreground lock active: run
-42292805130 read a lock timeout of 2147483647 ms, and the observer reached
-the home only through `AttachThreadInput` after a plain `SetForegroundWindow`
-was refused. A browser that is not in front cannot take the foreground there
-without being given the right, so `reuse-raises-window` records the lock
-(timeout and time since the last input) and the home's route and requires
-the lock to be active: Work's window coming to the front from the home then
-shows the grant at work.
+The App reports whether Windows accepted the grant (`foregroundGrant` in the
+experiment status, Windows only), and `reuse-raises-window` records it with
+Windows' foreground lock before and after the raise and requires the lock
+to be active. The runner keeps the lock active (timeout 2147483647 ms), but
+that does not show the grant was needed: in run 42312377621 the observer,
+which has no grant, took the foreground from the home with a plain
+`SetForegroundWindow` under the same lock (in run 42292805130 it had needed
+`AttachThreadInput`). Whether the grant is necessary is unproven in CI.
 
 **Browser stop race (fixed in W3).** In run 42292805130 the W2 test
 `windows_adapter_opens_reuses_and_shuts_down_a_profile` got `stopped` after a
@@ -1036,8 +1036,16 @@ over, so the loop returns later and the end of input could be posted in
 between. That task then ran during CEF's shutdown, after the browser state
 was taken, and `with_state`'s `expect` panicked in a CEF task callback,
 which cannot unwind. The reader's gate is now closed before the loop is
-asked to quit, and a request that still runs after the state is gone is
-ignored with a note on stderr. The test now prints `browser.log` (the
+asked to quit (and before `stopped` is replied), and a request that still
+runs after the state is gone is ignored with a note on stderr. A related
+case predates W3: when the person closes the last window (no `shutdown`, so
+no `stopped`), a request posted just before the gate closed could still run
+before the loop ended, and an Open then raised the pending count and the
+exit check panicked (exit 101). The browser now marks itself `quitting` when
+the last window has gone and refuses such a request with the usual "Stale
+command or browser stopping" error; an end of input then closes nothing.
+The admission rule is a pure function with a unit test, run on its own
+locally (the browser binary's tests need libcef to link). The test now prints `browser.log` (the
 browser's stderr, where a panic message lands) and the tail of
 `cef-native.log` when the reopen or shutdown fails or the receipt is
 abnormal, so a recurrence names its cause.
@@ -1110,8 +1118,8 @@ may take the cef-candidate popup probe's 25 s; the other bounds are Linux's.
 | Case | What it requires |
 | --- | --- |
 | `separate-profiles` | Work and Personal (one origin, two connections) open in two guarded browser processes with their own windows; each new profile starts signed out, signs in through the stand-in and opens the app; a nonce in `localStorage`, a script cookie and the HttpOnly session differ per profile |
-| `home-by-window-switch` | with Personal's window in front, an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
-| `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` within 10 s, and the browser logged no raise refusal. The Z-order around the reuse and both pages' visibility are recorded |
+| `home-by-window-switch` | with Personal's window in front and covering Work (Personal's rectangle contains Work's, Personal above Work in the Z-order), Work's page reports `visible`, so Chromium's native occlusion is really off; then an OS switch brings the App's own home window (HWND from the App, owned by the App's pid) to the front, visible |
+| `reuse-raises-window` | Work's window, minimized from the test side, is iconic and its page `hidden` (a desktop where minimizing does not hide the page fails here); then, with Windows' foreground lock active, the home's tap on Work reuses its browser process, window and documents (no new process or window), the window is restored and in the foreground within 2 s, Work's page is `visible` and has keyboard focus (`document.hasFocus()`) within 10 s, and the browser logged no raise refusal. The lock before and after the raise, the App's grant result, the Z-order around the reuse and both pages' visibility are recorded; whether the grant was needed is not shown |
 | `quit-cancel-stops` | the App's quit asks Work (oldest) first; its beforeunload opens on the fixture site while Personal is not asked and keeps running; the cancel stops the quit with both browsers and documents kept |
 | `quit-partial-order` | on the next quit Work closes with a normal receipt before Personal is asked; Personal's cancel keeps only Personal |
 | `quit-completes` | the final quit closes Personal; the App exits 0 with every guard receipt normal and its job empty |
@@ -1166,7 +1174,9 @@ long alert, notifications and the native file chooser stay Linux-only);
 the `ShellExecuteW` opener; native keyboard and mouse input in the browser's
 dialogs and windows (the cancel goes through DevTools, the switch through
 `SetForegroundWindow`, the minimize through `ShowWindowAsync`, the close
-through `WM_CLOSE`); Chromium's native occlusion tracking (off on Windows;
+through `WM_CLOSE`); whether the App's foreground grant is needed (its
+result is recorded, but the observer took the foreground without one);
+Chromium's native occlusion tracking (off on Windows;
 whether it would follow reorders on a real desktop is unknown); and other
 DPI or multi-monitor layouts.
 
@@ -1203,6 +1213,14 @@ and Personal's `visible`: the occlusion tracker recomputed in neither
 process. Native occlusion is now off on Windows (see above), and
 `reuse-raises-window` minimizes Work before the reopen and requires the
 raise to restore it and make its page visible again.
+
+**Fourth CI run (W3).** Run 42312377621 (head `065b78a`) passed all seven
+jobs with the ten cases. Its evidence showed Work restored and in front
+after the reuse but its page without keyboard focus: the browser gave focus
+before the raise, while the window was still minimized. On Windows it now
+gives focus again after a successful raise, and `reuse-raises-window`
+requires the page to report it. The same run showed the observer taking the
+foreground without a grant (see "Foreground").
 
 **2026-11-06 local checks (W3).** Nothing was linked or run for Windows on
 the Linux host. For `x86_64-pc-windows-msvc`, the App type-checks and passes
