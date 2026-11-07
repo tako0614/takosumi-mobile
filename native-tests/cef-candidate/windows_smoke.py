@@ -81,6 +81,7 @@ MAX_PACKET_BYTES = 64 * 1024  # browser_process::MAX_PACKET_BYTES
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
 MACOS = sys.platform == "darwin"
+POSIX = os.name == "posix"
 LIBRARY = "libcef.dll" if WINDOWS else "libcef.so"
 # macOS (M1): what the app bundle's Contents/Frameworks must hold (its
 # `--runtime`): CEF's framework and the helper apps CEF starts its processes
@@ -476,13 +477,23 @@ def seatbelt_evidence(browser_pid, deadline, tree=posix_tree, sandboxed=seatbelt
 
 
 def alive(pid):
-    """Whether a process id still names a process (also a zombie)."""
+    """POSIX (the macOS path): whether a process id still names a process
+    (also a zombie), by signal 0. Never asked on Windows, where
+    `os.kill(pid, 0)` would send CTRL_C_EVENT instead: there it answers
+    False without calling it. An id Windows rejects
+    (ERROR_INVALID_PARAMETER) also counts as gone."""
+    if not POSIX:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except OSError as error:
+        if getattr(error, "winerror", None) == ERROR_INVALID_PARAMETER:
+            return False
+        raise
     return True
 
 

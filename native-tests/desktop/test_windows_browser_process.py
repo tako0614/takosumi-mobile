@@ -701,20 +701,62 @@ class MacSmokeTests(unittest.TestCase):
         self.assertEqual(none["problems"], ["no renderer process was found"])
 
     def test_a_recorded_descendant_still_alive_is_a_leftover(self):
-        import os
+        """Platform neutral: os.kill, os.killpg and alive are stand-ins, so no
+        real process is signalled (on Windows os.kill(pid, 0) would send
+        CTRL_C_EVENT)."""
         import windows_smoke as smoke
-        self.assertTrue(smoke.alive(os.getpid()))
-        self.assertFalse(smoke.alive(2 ** 22 + 12345))
+
+        def no_group(pid, signal_number):
+            raise ProcessLookupError(pid)
+
         session = smoke.Browser.__new__(smoke.Browser)
         session.job = None
-        session.process = type("Process", (), {"pid": 2 ** 22 + 54321})()
-        session.descendants = [os.getpid()]
-        with mock.patch.object(smoke, "MACOS", True), mock.patch.object(smoke, "LEFTOVER_WAIT", 0):
-            result, done = session.leftovers()
-        self.assertEqual((result, done), ({"groupAlive": False, "descendantsAlive": [os.getpid()]}, False))
-        session.descendants = []
-        with mock.patch.object(smoke, "MACOS", True), mock.patch.object(smoke, "LEFTOVER_WAIT", 0):
+        session.process = type("Process", (), {"pid": 500})()
+        session.descendants = [501, 502]
+        living = {502}
+        with mock.patch.object(smoke, "MACOS", True), mock.patch.object(smoke, "LEFTOVER_WAIT", 0), \
+                mock.patch.object(smoke.os, "killpg", no_group, create=True), \
+                mock.patch.object(smoke, "alive", lambda pid: pid in living):
+            self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": [502]}, False))
+            living.clear()
             self.assertEqual(session.leftovers(), ({"groupAlive": False, "descendantsAlive": []}, True))
+
+    def test_alive_signals_only_on_posix_and_reads_the_answer(self):
+        import windows_smoke as smoke
+        sent = []
+
+        def windows_error(code, message):
+            # As Windows raises it (OSError's winerror argument is only
+            # honoured there, so the attribute is set by hand).
+            error = OSError(22, message)
+            error.winerror = code
+            return error
+
+        def kill(answer):
+            def send(pid, signal_number):
+                sent.append((pid, signal_number))
+                if answer is not None:
+                    raise answer
+            return send
+
+        with mock.patch.object(smoke, "POSIX", True):
+            with mock.patch.object(smoke.os, "kill", kill(None)):
+                self.assertTrue(smoke.alive(7))
+            with mock.patch.object(smoke.os, "kill", kill(ProcessLookupError(3, "No such process"))):
+                self.assertFalse(smoke.alive(8))
+            with mock.patch.object(smoke.os, "kill", kill(PermissionError(1, "Operation not permitted"))):
+                self.assertTrue(smoke.alive(9))
+            # As Windows answers an id it does not know: WinError 87.
+            with mock.patch.object(smoke.os, "kill", kill(windows_error(87, "The parameter is incorrect"))):
+                self.assertFalse(smoke.alive(10))
+            with mock.patch.object(smoke.os, "kill", kill(windows_error(5, "Access is denied"))):
+                with self.assertRaises(OSError):
+                    smoke.alive(11)
+        self.assertEqual(sent, [(7, 0), (8, 0), (9, 0), (10, 0), (11, 0)])
+        # Not POSIX: never signalled.
+        with mock.patch.object(smoke, "POSIX", False), mock.patch.object(smoke.os, "kill", kill(None)):
+            self.assertFalse(smoke.alive(12))
+        self.assertEqual(sent[-1], (11, 0))
 
 
 def main_source():
