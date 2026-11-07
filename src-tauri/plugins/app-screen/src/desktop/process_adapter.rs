@@ -1,10 +1,13 @@
 //! Explicit experiment behind the existing shell-only `open` command, on
-//! Linux and (an unsandboxed test candidate) Windows. The OS-specific pieces
-//! are small cfg'd functions here and in `process_windows.rs`.
+//! Linux, Windows and macOS (M2). The OS-specific pieces are small cfg'd
+//! functions here, in `process_windows.rs` and in `process_macos.rs`; macOS
+//! shares Linux's POSIX parts (process groups, pipes, signals, modes).
+#[cfg(target_os = "macos")]
+use super::process_macos as macos;
 #[cfg(windows)]
 use super::process_windows as windows;
 use super::{failure, private_directory, process_setup as setup};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::browser_process::write_until;
 use crate::{
     browser_process::{external_link, read_packet, Reply, Request, MAX_PACKET_BYTES},
@@ -22,7 +25,7 @@ use std::{
     },
     time::Duration,
 };
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::{
     os::fd::AsRawFd,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
@@ -57,7 +60,7 @@ struct State {
 type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
 /// The App's end of a browser's control pipe: non-blocking on Linux, a
 /// bounded writer thread on Windows (`process_windows::Input`).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 type Input = ChildStdin;
 #[cfg(windows)]
 type Input = windows::Input;
@@ -68,8 +71,10 @@ type Input = windows::Input;
 /// guards only from this thread, which stays alive for the whole App process.
 /// If it ever panicked, its guards drain their browsers and later opens fail
 /// as unavailable: closed, never an unowned browser. Requesters always wait
-/// for the reply, so a spawned guard is never left untracked.
-#[cfg(target_os = "linux")]
+/// for the reply, so a spawned guard is never left untracked. macOS has no
+/// parent-death signal (each guard watches the App's exit with kqueue
+/// itself); its guards are forked from the same kind of thread.
+#[cfg(unix)]
 fn spawner() -> Result<mpsc::Sender<SpawnRequest>> {
     let (send, requests) = mpsc::channel::<SpawnRequest>();
     std::thread::Builder::new()
@@ -215,6 +220,31 @@ fn open_externally(url: &str) {
         eprintln!("The external link could not be opened: {error}");
     }
 }
+/// macOS: the person's default browser through `/usr/bin/open`, in its own
+/// process group, reaped by the thread that starts it, within the same
+/// budget of openers. A fixture build records the link instead
+/// (`process_macos::open_url`); tests record it in `OPENED`.
+#[cfg(all(not(test), target_os = "macos"))]
+fn open_externally(url: &str) {
+    if OPENERS.fetch_add(1, Ordering::SeqCst) >= 8 {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("Too many external links are opening; this one was dropped.");
+        return;
+    }
+    let url = url.to_owned();
+    let started = std::thread::Builder::new()
+        .name("external-open".into())
+        .spawn(move || {
+            if !macos::open_url(&url) {
+                eprintln!("The external link could not be opened.");
+            }
+            OPENERS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if let Err(error) = started {
+        OPENERS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("The external link could not be opened: {error}");
+    }
+}
 /// Windows: the person's default browser through the shell's `open`, on a
 /// thread of its own, within the same budget of openers.
 #[cfg(all(not(test), windows))]
@@ -276,7 +306,7 @@ pub(super) fn install<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<()> {
 }
 
 fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let owner = {
         // SAFETY: these identity calls have no preconditions and cannot fail.
         let (uid, euid, gid, egid) = unsafe {
@@ -298,8 +328,9 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
     let owner = &identity;
     #[cfg(target_os = "linux")]
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-    // Windows has no XDG runtime directory: the root is `<app cache>\cef`.
-    #[cfg(windows)]
+    // Windows and macOS have no XDG runtime directory: the root is
+    // `<app cache>/cef`.
+    #[cfg(any(windows, target_os = "macos"))]
     let runtime_dir: Option<std::ffi::OsString> = None;
     let plan = setup::plan(
         &setup::Overrides::from_lookup(&setup::environment),
@@ -318,7 +349,7 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
     }
     // The sandbox opt-out is a fixture seam only; a product build runs
     // sandboxed unless it runs as root (which Chromium refuses to sandbox).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let no_sandbox = setup::without_sandbox(
         owner,
         setup::sandbox_opt_out(&setup::environment).as_deref(),
@@ -642,7 +673,7 @@ const STILL_OPEN: &str = "この接続先の画面をすべて閉じてから消
 /// another host, an unreadable or unparsable one, or a live PID counts as live.
 /// A reused PID refuses on the safe side; reopening the profile renews the lock.
 /// (Windows: Chromium's held `lockfile`, see `process_windows::singleton_live`.)
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn singleton_live(root: &std::path::Path) -> bool {
     let target = match std::fs::read_link(root.join("SingletonLock")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
@@ -656,8 +687,19 @@ fn singleton_live(root: &std::path::Path) -> bool {
     else {
         return true;
     };
-    let local = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    host != local.trim() || std::path::Path::new(&format!("/proc/{pid}")).exists()
+    host != hostname() || process_exists(pid)
+}
+/// This machine's host name, as Chromium writes it into SingletonLock.
+#[cfg(target_os = "linux")]
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+#[cfg(target_os = "linux")]
+fn process_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Remove detached cache roots left by an interrupted clear. Links are never
@@ -771,7 +813,7 @@ impl Process {
                 "Browser runtime directory is in use by another App instance.",
             ));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new()
@@ -794,7 +836,7 @@ impl Process {
         }
         let mut options = OpenOptions::new();
         options.create(true).truncate(true).write(true);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(directory.join("boot.json")).map_err(failure)?;
         file.write_all(&bytes).map_err(failure)?;
@@ -804,22 +846,28 @@ impl Process {
         command.arg(&guard_receipt).arg(&program);
         // The guard owns this process group and its exact descendants. Do not
         // put it in the App's or another runner's process group.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         command.process_group(0);
         // Tie the guard to the App from the moment it forks: if the App died
         // before this point, the guard would otherwise arm its parent-death
         // signal against its new parent and outlive the App. (Windows: the
-        // spawner starts the guard inside the App's job before it runs.)
-        #[cfg(target_os = "linux")]
+        // spawner starts the guard inside the App's job before it runs. macOS:
+        // the guard watches its parent's exit with kqueue from its start, and
+        // treats a parent already gone as a stop; this check refuses a fork
+        // whose parent is no longer this App.)
+        #[cfg(unix)]
         let app = std::process::id();
         // SAFETY: only async-signal-safe calls between fork and exec.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
                 // prctl is variadic and reads unsigned longs.
-                let (term, zero) = (libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong);
-                if libc::prctl(libc::PR_SET_PDEATHSIG, term, zero, zero, zero) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                #[cfg(target_os = "linux")]
+                {
+                    let (term, zero) = (libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong);
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, term, zero, zero, zero) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 if libc::getppid() as u32 != app {
                     return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
@@ -867,6 +915,19 @@ impl Process {
             private_directory(&runtime.join("tmp"))?;
             command.env("TMPDIR", runtime.join("tmp"));
         }
+        // macOS: the allowlist below, the system's per-user TMPDIR (Chromium's
+        // singleton socket must fit 104 bytes, which the App's cache
+        // directory would not), and the nano allocator off, as CEF asks: its
+        // bundle's LSEnvironment applies only to a LaunchServices launch.
+        #[cfg(target_os = "macos")]
+        {
+            for key in MACOS_ENVIRONMENT {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            command.env("MallocNanoZone", "0");
+        }
         #[cfg(windows)]
         let stop = {
             for key in WINDOWS_ENVIRONMENT {
@@ -886,7 +947,7 @@ impl Process {
         private_directory(&directory.join("Downloads"))?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         options.mode(0o600);
         let output = options
             .open(directory.join("browser.log"))
@@ -906,6 +967,11 @@ impl Process {
             ]);
         #[cfg(target_os = "linux")]
         command.arg("--password-store=basic");
+        // macOS: Chromium never asks the login keychain (whose prompt would
+        // block); its cookie encryption then uses a fixed key. Whether the
+        // App should use the login keychain instead is still open.
+        #[cfg(target_os = "macos")]
+        command.arg("--use-mock-keychain");
         command
             .arg("--lang=en-US")
             .stdin(Stdio::piped())
@@ -917,7 +983,7 @@ impl Process {
         let (send, replies) = mpsc::channel();
         let process = Self {
             child,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             input: Some(input),
             // Set just below, once this Process owns the started guard.
             #[cfg(windows)]
@@ -939,7 +1005,7 @@ impl Process {
             #[cfg(windows)]
             foreground_grant: None,
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         nonblocking(process.input.as_ref().unwrap())?;
         // A failure here drops the Process, which asks the guard to stop.
         #[cfg(windows)]
@@ -3053,6 +3119,13 @@ const WINDOWS_ENVIRONMENT: &[&str] = &[
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
 ];
+/// macOS (M2): the App's environment the browser keeps: its search path,
+/// identity, locale, home (Cocoa and CEF read it) and the system's per-user
+/// `TMPDIR`. `MallocNanoZone=0` is added. Nothing else passes.
+#[cfg(target_os = "macos")]
+const MACOS_ENVIRONMENT: &[&str] = &[
+    "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TMPDIR",
+];
 fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> Result<Child> {
     let (reply, spawned) = mpsc::sync_channel(1);
     spawner
@@ -3060,7 +3133,7 @@ fn spawn_from_parent(spawner: &mpsc::Sender<SpawnRequest>, command: Command) -> 
         .map_err(|_| Error::InvalidRequest("Browser process parent is unavailable."))?;
     spawned.recv().map_err(failure)?.map_err(failure)
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn write_input(
     input: &mut Input,
     bytes: &[u8],
@@ -3076,7 +3149,7 @@ fn write_input(
 ) -> std::io::Result<()> {
     input.write_until(bytes, deadline)
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn nonblocking(input: &ChildStdin) -> Result<()> {
     // SAFETY: this owned pipe is live and protected by the backend mutex.
     let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
@@ -3103,6 +3176,8 @@ fn native_owned(native_pid: u32, guard: &Child, program: &std::path::Path) -> bo
 fn same_path(reported: &str, expected: &std::path::Path) -> bool {
     std::path::Path::new(reported) == expected
 }
+#[cfg(target_os = "macos")]
+use macos::{hostname, native_owned, process_exists, same_path};
 #[cfg(windows)]
 use windows::{native_owned, same_path, singleton_live};
 #[cfg(target_os = "linux")]
@@ -3133,9 +3208,10 @@ impl Drop for Process {
         self.input.take();
         if matches!(self.child.try_wait(), Ok(None)) {
             // A live, unreaped direct Child cannot have its PID recycled.
-            // SIGTERM asks the dedicated pidfd/subreaper guard to drain all
-            // owned descendants; never SIGKILL that guard or scan by name.
-            #[cfg(target_os = "linux")]
+            // SIGTERM asks the dedicated guard (pidfd/subreaper on Linux, its
+            // process group and kqueue on macOS) to drain all owned
+            // descendants; never SIGKILL that guard or scan by name.
+            #[cfg(unix)]
             unsafe {
                 libc::kill(self.child.id() as i32, libc::SIGTERM);
             }
@@ -3161,5 +3237,386 @@ impl Drop for Process {
                 eprintln!("A browser runtime directory was not removed: {problem}");
             }
         }
+    }
+}
+
+/// macOS (M2): the adapter's macOS backend. The unit tests need nothing
+/// built; the ignored ones drive the real Process API with the built guard
+/// and the bundled browser, named by the CI job (`cef-macos`):
+/// `TAKOSUMI_MACOS_GUARD` (takosumi-browser-guard) and
+/// `TAKOSUMI_MACOS_BROWSER` (the bundle's `Contents/MacOS` executable).
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::{io::BufRead, path::Path, time::Instant};
+
+    /// Set (to a case directory) in the stand-in App of the death case.
+    const AS_APP: &str = "TAKOSUMI_MACOS_TEST_AS_APP";
+
+    #[test]
+    fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
+        let app = tauri::test::mock_app();
+        install(app.handle()).unwrap();
+        assert!(app.try_state::<Backend>().is_none());
+        let reason = unavailable(app.handle()).expect("an unavailable reason");
+        assert!(
+            reason.starts_with("The desktop browser is unavailable: ")
+                && reason.contains("Browser process executable is unavailable"),
+            "{reason}"
+        );
+        assert!(!super::super::capabilities_of(app.handle()).clear_profile);
+    }
+
+    #[test]
+    fn a_held_singleton_lock_refuses_the_clear_and_keeps_the_data() {
+        let root = std::env::temp_dir().join(format!("sumi-clear-mac-{}", std::process::id()));
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let cache = root.join(profile).join("cef-profiles");
+        private_directory(&cache.join(profile)).unwrap();
+        private_directory(&root.join(profile).join("Downloads")).unwrap();
+        std::fs::write(cache.join(profile).join("Cookies"), b"x").unwrap();
+        std::fs::write(
+            root.join(profile).join("Downloads").join("keep.txt"),
+            b"keep",
+        )
+        .unwrap();
+        let lock = cache.join("SingletonLock");
+        let free = singleton_live(&cache);
+        // As Chromium writes it: a link to "<host>-<pid>", here this process.
+        std::os::unix::fs::symlink(format!("{}-{}", hostname(), std::process::id()), &lock)
+            .unwrap();
+        let live = singleton_live(&cache);
+        let refused = clear_site_data(&root, profile);
+        let kept = cache.join(profile).join("Cookies").exists();
+        // Another host's lock, or one that cannot be read, counts as live.
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("elsewhere.example-1", &lock).unwrap();
+        let foreign = singleton_live(&cache);
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("no-pid-here", &lock).unwrap();
+        let garbled = singleton_live(&cache);
+        // A lock whose holder has ended is free.
+        let mut ended = Command::new("/usr/bin/true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(format!("{}-{ended_pid}", hostname()), &lock).unwrap();
+        let stale = singleton_live(&cache);
+        std::fs::remove_file(&lock).unwrap();
+        let cleared = clear_site_data(&root, profile);
+        let gone = !cache.exists();
+        let downloads = std::fs::read(root.join(profile).join("Downloads").join("keep.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!free && live && kept && foreign && garbled && !stale);
+        match refused {
+            Err(Error::InvalidRequest(message)) => assert_eq!(message, STILL_OPEN),
+            other => panic!("{other:?}"),
+        }
+        cleared.unwrap();
+        assert!(gone);
+        assert_eq!(downloads.unwrap(), b"keep");
+    }
+
+    #[test]
+    fn the_identity_checks_read_this_process() {
+        let me = std::process::id();
+        let (parent, started) = macos::parent_and_start(me).expect("this process's facts");
+        assert_eq!(parent, std::os::unix::process::parent_id());
+        assert!(started > 0);
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert_eq!(macos::image_of(me).as_deref(), Some(exe.as_path()));
+        assert!(macos::process_exists(me));
+        assert!(macos::same_path("/a/b", Path::new("/a/b")));
+        assert!(!macos::same_path("/a//b", Path::new("/a/b")));
+        assert!(!hostname().is_empty());
+    }
+
+    fn built(key: &str) -> PathBuf {
+        PathBuf::from(
+            std::env::var_os(key).unwrap_or_else(|| panic!("{key} must name the built executable")),
+        )
+    }
+
+    /// A new case directory (kept for inspection) with a private runtime root.
+    fn case(name: &str) -> PathBuf {
+        let base = std::env::var_os("TAKOSUMI_MACOS_WORK")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let case = base.join(format!("sumi-m2-{name}-{}-{nanos}", std::process::id()));
+        private_directory(&case.join("rt")).unwrap();
+        let case = setup::canonical(&case).unwrap();
+        println!("case directory: {}", case.display());
+        case
+    }
+
+    /// The executables and the case's runtime root as `prepare` locates them.
+    fn located(case: &Path) -> setup::Located {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        setup::locate(
+            setup::Plan {
+                program: built("TAKOSUMI_MACOS_BROWSER"),
+                guard: built("TAKOSUMI_MACOS_GUARD"),
+                runtime: setup::Runtime::Given(case.join("rt")),
+            },
+            euid,
+        )
+        .unwrap()
+    }
+
+    fn payload(profile: &str, resume: bool) -> OpenRequest {
+        serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://example.com"),
+            "url":"https://example.com/","title":"macOS adapter","profile":profile,
+            "webHome":true,"resume":resume
+        }))
+        .unwrap()
+    }
+
+    fn tail(path: &Path) -> String {
+        let text = std::fs::read(path).unwrap_or_default();
+        String::from_utf8_lossy(&text[text.len().saturating_sub(8192)..]).into_owned()
+    }
+
+    fn logs(process: &Process) {
+        for name in ["browser.log", "cef-native.log"] {
+            eprintln!(
+                "----- {name} -----\n{}",
+                tail(&process.directory.join(name))
+            );
+        }
+        eprintln!("receipt: {}", tail(&process.guard_receipt));
+    }
+
+    /// Start a profile through `Process::spawn` and wait for its creation
+    /// reply (`expect_open_until`, with a cold-start bound of 120 s).
+    fn opened(
+        case: &Path,
+        located: &setup::Located,
+        parent: &mpsc::Sender<SpawnRequest>,
+        profile: &str,
+    ) -> Process {
+        let started = Instant::now();
+        let mut process = Process::spawn(
+            located.program.clone(),
+            located.guard.clone(),
+            case.join("profiles").join(profile),
+            located.runtime.join(setup::runtime_name(
+                std::process::id(),
+                NEXT_RUNTIME.fetch_add(1, Ordering::SeqCst),
+            )),
+            payload(profile, false),
+            parent,
+            false,
+        )
+        .expect("the guard starts");
+        let key = format!("web-home:{profile}:https://example.com");
+        let result = process.expect_open_until(1, &key, started + Duration::from_secs(120));
+        println!("opened in {:.3} s", started.elapsed().as_secs_f64());
+        if result.is_err() {
+            logs(&process);
+        }
+        result.unwrap();
+        process
+    }
+
+    /// The pids below `root` (by parent pid, from `ps`).
+    fn descendants(root: u32) -> Vec<u32> {
+        let output = Command::new("/bin/ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .output()
+            .unwrap();
+        let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+            })
+            .collect();
+        let mut found = Vec::new();
+        let mut queue = vec![root];
+        while let Some(parent) = queue.pop() {
+            for (pid, ppid) in &pairs {
+                if *ppid == parent && !found.contains(pid) {
+                    found.push(*pid);
+                    queue.push(*pid);
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether a pid names a running process.
+    fn running(pid: u32) -> bool {
+        macos::parent_and_start(pid).is_some()
+    }
+
+    /// The given processes end within 10 s.
+    fn ended(pids: &[u32]) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left: Vec<u32> = pids.iter().copied().filter(|pid| running(*pid)).collect();
+            if left.is_empty() || Instant::now() >= deadline {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the built macOS guard and bundled browser (see the module comment)"]
+    fn macos_adapter_opens_reuses_and_shuts_down_a_profile() {
+        let case = case("open");
+        let located = located(&case);
+        let parent = spawner().unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let mut process = opened(&case, &located, &parent, profile);
+        let first = process.opened.clone();
+        let native_pid = first["nativePid"].as_u64().unwrap() as u32;
+        let guard = process.child.id();
+        // What confirm_opened accepted, restated against the kernel's records.
+        assert_ne!(native_pid, guard);
+        assert_eq!(
+            macos::parent_and_start(native_pid).map(|(parent, _)| parent),
+            Some(guard)
+        );
+        assert_eq!(
+            macos::image_of(native_pid).as_deref(),
+            Some(located.program.as_path())
+        );
+        let tree = descendants(guard);
+        println!("guard {guard}, browser {native_pid}, tree while open: {tree:?}");
+        assert!(tree.len() >= 2, "no CEF helper below the browser: {tree:?}");
+        // CEF's process singleton holds the profile's SingletonLock while
+        // the browser runs: what clear_profile's refusal relies on.
+        assert!(
+            singleton_live(&process.directory.join("cef-profiles")),
+            "the live profile's SingletonLock is not held"
+        );
+        // Reopening the same screen reuses its native browser and window.
+        let reopened = process.open(payload(profile, true));
+        if reopened.is_err() {
+            logs(&process);
+        }
+        reopened.expect("the same screen reopens");
+        for field in ["browserId", "windowId", "nativePid", "nativeCache"] {
+            assert_eq!(process.opened[field], first[field], "{field}");
+        }
+        // The adapter's ordinary shutdown: the browser stops and its guard
+        // ends normally with a complete receipt.
+        let stopping = Instant::now();
+        let stopped = process.shutdown();
+        let receipt = std::fs::read(&process.guard_receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        println!(
+            "{}",
+            serde_json::json!({"opened": first, "stopSeconds": stopping.elapsed().as_secs_f64(), "receipt": receipt})
+        );
+        if stopped.is_err() {
+            logs(&process);
+        }
+        assert!(
+            stopped.expect("an ordinary shutdown"),
+            "the browser did not stop"
+        );
+        require_normal_guard(receipt.as_ref().expect("the guard's receipt")).unwrap();
+        let left = ended(&[guard, native_pid]);
+        assert!(left.is_empty(), "left running: {left:?}");
+        let survivors: Vec<u32> = tree.iter().copied().filter(|pid| running(*pid)).collect();
+        assert!(
+            survivors.is_empty(),
+            "the browser's processes survived: {survivors:?}"
+        );
+    }
+
+    /// The stand-in App of the death case: started by that case with AS_APP
+    /// set, it opens a profile and waits to be killed. Without AS_APP (any
+    /// ordinary run) it does nothing.
+    #[test]
+    #[ignore = "the stand-in App of macos_adapter_the_apps_death_ends_guard_and_browser"]
+    fn app_stand_in_for_the_death_case() {
+        let Some(case) = std::env::var_os(AS_APP).map(PathBuf::from) else {
+            return;
+        };
+        let located = located(&case);
+        let parent = spawner().unwrap();
+        let process = opened(
+            &case,
+            &located,
+            &parent,
+            "22222222-2222-4222-8222-222222222222",
+        );
+        let native_pid = process.opened["nativePid"].as_u64().unwrap();
+        println!(
+            "app-stand-in guard {} browser {native_pid} receipt {}",
+            process.child.id(),
+            process.guard_receipt.display()
+        );
+        std::thread::sleep(Duration::from_secs(120));
+        drop(process);
+    }
+
+    #[test]
+    #[ignore = "needs the built macOS guard and bundled browser (see the module comment)"]
+    fn macos_adapter_the_apps_death_ends_guard_and_browser() {
+        let case = case("app-death");
+        let mut app = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "desktop::process_adapter::macos_tests::app_stand_in_for_the_death_case",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(AS_APP, &case)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let reader = std::io::BufReader::new(app.stdout.take().unwrap());
+        let mut line = None;
+        for text in reader.lines() {
+            let text = text.unwrap();
+            println!("stand-in App: {text}");
+            if text.starts_with("app-stand-in guard ") {
+                line = Some(text);
+                break;
+            }
+        }
+        let line = line.expect("the stand-in App opened a profile");
+        let words: Vec<&str> = line.split(' ').collect();
+        let guard: u32 = words[2].parse().unwrap();
+        let browser: u32 = words[4].parse().unwrap();
+        let receipt = PathBuf::from(words[6]);
+        let tree = descendants(guard);
+        // The App dies at once, without any cleanup of its own.
+        app.kill().unwrap();
+        app.wait().unwrap();
+        let left = ended(&[guard, browser]);
+        assert!(
+            left.is_empty(),
+            "the guard or the browser outlived the App: {left:?}"
+        );
+        let survivors: Vec<u32> = tree.iter().copied().filter(|pid| running(*pid)).collect();
+        assert!(
+            survivors.is_empty(),
+            "the browser's processes outlived the App: {survivors:?}"
+        );
+        let proof: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        println!("receipt after the App's death: {proof}");
+        assert_eq!(proof["complete"], true, "{proof}");
+        assert_eq!(proof["kernelNoChildren"], true, "{proof}");
+        assert!(
+            proof["remaining"].as_array().is_some_and(Vec::is_empty),
+            "{proof}"
+        );
     }
 }
