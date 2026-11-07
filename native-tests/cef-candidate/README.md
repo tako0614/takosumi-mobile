@@ -1691,10 +1691,29 @@ and the W3 runner also hashes the DLL beside a browser it is given.
 
 **Constraints.**
 
-- The bootstrap and the DLL must both be unsigned, or both be signed with the
-  same primary certificate thumbprint; the bootstrap refuses a mismatch. A
-  signed release must sign both with the same certificate (with the App and
-  the guard).
+- **Signing.** In the browser process, before it runs the client, CEF 154's
+  bootstrap checks three files (`libcef_dll/bootstrap/bootstrap_win.cc` at
+  CEF commit `14c5a08`, the locked 154.0.34: `CheckDllCodeSigning`, lines
+  164-193, and its callers, lines 918-993). The executable itself must be
+  unsigned or carry only valid signatures. `chrome_elf.dll`, which it
+  preloads, must lie in the executable's own directory. Then `chrome_elf.dll`
+  and the client DLL must each be unsigned when the executable is, or carry
+  only valid signatures with the executable's primary certificate thumbprint
+  (`ThumbprintsInfo::IsSame` with unsigned allowed); any mismatch is fatal.
+  Subprocesses skip these checks (the browser process made them). So
+  `takosumi-cef-browser-process.exe` (the bootstrap),
+  `takosumi-cef-browser-process.dll` and `chrome_elf.dll` must be all
+  unsigned or all signed with the same certificate; CI runs them all
+  unsigned, as CEF distributes them. The policy for a signed release: sign
+  every PE file under `cef\` (the bootstrap, the client DLL, `libcef.dll`,
+  `chrome_elf.dll`, the ANGLE, shader compiler and SwiftShader DLLs, the
+  guard) and the App with the same certificate. Signing changes their bytes,
+  so it comes before the stage manifest and the installer are made (or the
+  manifest is written again).
+- CEF 154's bootstrap also carries CEF's installer logic, run by
+  `/cef-update`, `/cef-uninstall` and related switches or by an installer
+  configuration loaded from the client DLL. The client DLL holds none and the
+  App passes no such switch; this was not examined further.
 - The DLL must keep the executable's base name and sit beside it; renaming the
   browser executable means renaming its DLL with it.
 - The executable is CEF's prebuilt binary from the locked distribution, so it
@@ -1702,13 +1721,19 @@ and the W3 runner also hashes the DLL beside a browser it is given.
   resources are CEF's (build.rs's manifest applies only to the unsandboxed
   candidate). Changing those resources would need a resource editor and must
   happen before signing.
-- The browser process itself runs at its caller's integrity level (medium);
-  the sandbox restricts its subprocesses, renderers to a restricted token at
-  Untrusted or Low integrity in their own job. Chromium's targets get nested
-  jobs (Windows 8 and later) inside the guard's and the App's kill-on-close
-  jobs; the CI runs below show whether that holds with the guard.
+- The browser process itself runs at its caller's integrity level (medium
+  for a standard user; high on the elevated CI runner, as the W1 evidence
+  shows); the sandbox restricts its subprocesses, renderers to a restricted
+  token at Untrusted or Low integrity. In the App each browser runs in its
+  guard's Job Object inside the App's, and Chromium puts its sandboxed
+  processes in jobs of their own below those (nested jobs, Windows 8 and
+  later). The checks read each renderer's integrity level and command line,
+  in W1 and the installed-browser smoke (the smoke's own job holds the
+  browser) and in the App's runs (W3, the W6 packaged run, W4: the guard's
+  job inside the App's; see [In the App](#in-the-app-w7)); they do not read
+  the jobs' limits, the desktop or the token's restricting SIDs.
 
-**CI evidence** (to be read from this change's run). `cef-windows` builds the
+**CI evidence** (the c67a29c run passed every Windows job). `cef-windows` builds the
 DLL and the guard, stages them (`--out $RUNNER_TEMP\w7-product`), requires
 the staged bootstrap's embedded manifest to name Windows 10/11 among its
 `supportedOS` entries and to ask for no elevation (`asInvoker`, or no level,
@@ -1734,21 +1759,55 @@ line (`NtQueryInformationProcess`, `ProcessCommandLineInformation`, with
 up to the open timeout for a `--type=renderer` process. It then requires the
 browser's integrity level and command line to be readable, without
 `--no-sandbox`, at least
-one renderer, and every renderer to carry no `--no-sandbox` and to run at
-Untrusted (0x0000) or Low (0x1000) integrity, below the browser's. The
-summary records it as `sandbox` (each process's pid, integrity level and
-the process types seen, and the processes whose command line could not be
-read, with the reason); any problem fails the run. Command lines are split
-like the C runtime (unit-tested).
+one renderer, every renderer to carry no `--no-sandbox` and to run at
+Untrusted (0x0000) or Low (0x1000) integrity, below the browser's, and every
+other process whose command line could not be read (so whose type is
+unknown) to have already exited (its id no longer opens,
+`ERROR_INVALID_PARAMETER`, or it has an exit code). The summary records it
+as `sandbox` (each process's pid, integrity level and the process types
+seen, and the processes whose command line could not be read, with the
+reason and whether they had exited); any problem fails the run. Command
+lines are split like the C runtime (unit-tested). The c67a29c run's W1
+evidence: browser high, every renderer untrusted, no `--no-sandbox`, no
+unread process.
+
+<a id="in-the-app-w7"></a>**In the App** (`windows_browser_observer.py`, so
+W3, the W6 packaged run and W4). Once each profile's page has loaded, the
+observer takes that profile's browser and its descendants by parent process
+id (a Toolhelp process snapshot: the browser runs in its guard's job inside
+the App's, so no job holds just it) and applies the same evidence function
+(`sandbox_evidence`), with the same requirements: at least one renderer per
+profile, each Untrusted or Low below the browser's, no `--no-sandbox`, no
+live unread process. Each record goes into the launch's
+`browser-observation*.json` (`sandbox`) and the CI log's evidence line; the
+runner checks again that every opened profile of the launch has a record
+without a problem and keeps a summary (the browser's and renderers'
+integrity levels) in each phase of `summary.json`. Any problem fails the
+launch. `--unsandboxed-candidate` (runner and observer) records without
+requiring, for diagnostics with the unsandboxed candidate only; CI never
+passes it.
 
 **Shown on the Linux host (2026-11-07):** the Windows-target clippy of the
 browser (the sandboxed DLL, product and fixture, and the unsandboxed
 candidate), the guard, the App (product and fixture) and the plugin, with
 `cef/dox` (cef-dll-sys's build script, which needs the Windows SDK, skipped);
 the Linux browser build; the stage tests (both layouts, a missing DLL or
-bootstrap); the runner and smoke unit tests.
+bootstrap, a DLL without `RunWinMain`, the export table reader); the runner,
+observer and smoke unit tests.
 
-**Not shown:** Authenticode signing of the bootstrap and the DLL (with the
+**Exit codes.** `process_main::run` returns the process's exit code (a CEF
+helper's from `execute_process`, the browser's 0, or 1 when a request
+failed). The DLL's `RunWinMain` returns it to the bootstrap, which returns it
+from its `wWinMain`, so the bootstrap's teardown runs (its comment: the
+sandbox broker's cleanup is an `_onexit` handler that runs after `wWinMain`
+returns); a panic reaching `RunWinMain` is caught and returned as 101. The
+executable (Linux, the unsandboxed candidate) exits with a non-zero code and
+returns from `main` on 0, as before. The stage refuses a client DLL that does
+not export `RunWinMain` (a library built without `windows-sandbox` is empty).
+The crate declares `rust-version = "1.89"` (its path dependency, the App's
+plugin, needs it).
+
+**Not shown:** Authenticode signing (every PE file under `cef\` with the
 same certificate), SmartScreen, a release build, real devices and other
 Windows editions or ARM64 (the stage is x86-64 only); the sandbox of the GPU,
 network and utility processes (only renderers are checked); the job,
