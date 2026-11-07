@@ -29,8 +29,9 @@ session and process group. It then requires, each within a bound:
 6. with `--expect-sandbox` (Windows, the sandboxed browser of W7), before the
    shutdown: at least one renderer process in the job, each without
    `--no-sandbox` and with a token integrity level of Low or Untrusted,
-   below the browser's own (read from its token), and no `--no-sandbox` in
-   the browser's command line either; recorded as `sandbox`.
+   below the browser's own (read from its token), and the browser's own
+   command line read and without `--no-sandbox` either; recorded as
+   `sandbox` (with the processes whose command line could not be read).
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -232,8 +233,11 @@ def has_no_sandbox(arguments):
 
 def sandbox_problems(browser, renderers):
     """Why the sandbox is not shown (empty when it is): `browser` and each
-    of `renderers` are {"integrity": RID or None, "noSandbox": bool}."""
+    of `renderers` are {"integrity": RID or None, "noSandbox": bool}; the
+    browser's `argumentsRead` is False when its command line was not read."""
     problems = []
+    if browser.get("argumentsRead") is False:
+        problems.append(f"the browser's command line was not read ({browser.get('error')})")
     if browser.get("noSandbox"):
         problems.append("the browser runs with --no-sandbox")
     if browser.get("integrity") is None:
@@ -316,11 +320,16 @@ def sandbox_evidence(job, browser_pid, deadline):
     browser = next((fact for fact in facts if fact["pid"] == browser_pid), {"pid": browser_pid})
     summarize = lambda fact: {"pid": fact["pid"], "integrity": fact.get("integrity"),
                               "integrityName": INTEGRITY.get(fact.get("integrity")),
+                              "argumentsRead": fact.get("arguments") is not None,
                               "noSandbox": bool(fact.get("arguments")) and has_no_sandbox(fact["arguments"]),
                               **({"error": fact["error"]} if "error" in fact else {})}
     evidence = {"browser": summarize(browser), "renderers": [summarize(fact) for fact in renderers],
                 "types": sorted({process_type(fact["arguments"]) or "browser" for fact in facts
-                                 if fact["arguments"]})}
+                                 if fact["arguments"]}),
+                # Processes whose command line could not be read (so their
+                # type is unknown), with the reason.
+                "unread": [{"pid": fact["pid"], "error": fact.get("error")} for fact in facts
+                           if fact.get("arguments") is None]}
     evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"])
     return evidence
 

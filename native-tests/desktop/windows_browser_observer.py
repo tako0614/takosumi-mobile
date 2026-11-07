@@ -589,21 +589,26 @@ def inside(image, directory):
 
 
 CRT_MODULES = ("vcruntime140", "msvcp140")
+# The sandboxed browser's code (W7), beside CEF's bootstrap in cef\.
+BROWSER_DLL = "takosumi-cef-browser-process.dll"
 
 
-def module_problems(role, modules, cef):
+def module_problems(role, modules, cef, code=None):
     """What a W6 process's loaded modules show against the static C runtime
     and the installed bundle: no Visual C++ runtime module in either process,
-    and the browser's libcef.dll from the installation's cef directory."""
+    and the browser's libcef.dll from the installation's cef directory. With
+    `code` (W7: the browser DLL CEF's bootstrap loads, when the installation
+    has one), the browser must have loaded that DLL from there as well."""
     if modules is None:
         return [f"no module snapshot of the {role}"]
     problems = [f"the {role} loaded {path}" for path in modules
                 if ntpath.basename(path).lower().startswith(CRT_MODULES)]
     if role == "browser":
-        libcef = [path for path in modules if ntpath.basename(path).lower() == "libcef.dll"]
-        if not libcef:
-            problems.append("the browser has not loaded libcef.dll")
-        problems += [f"the browser loaded libcef.dll from {path}" for path in libcef if not inside(path, cef)]
+        for name in ("libcef.dll",) + ((code,) if code else ()):
+            found = [path for path in modules if ntpath.basename(path).lower() == name.lower()]
+            if not found:
+                problems.append(f"the browser has not loaded {name}")
+            problems += [f"the browser loaded {name} from {path}" for path in found if not inside(path, cef)]
     return problems
 
 
@@ -861,7 +866,10 @@ class Observer:
         # Their loaded modules: the static C runtime (no vcruntime140 or
         # msvcp140) and the installed libcef.dll, at run time.
         modules = {role: self.win.modules(pid) for role, pid in pids.items()}
-        problems = [problem for role in pids for problem in module_problems(role, modules[role], cef)]
+        # W7: a sandboxed installation's browser is CEF's bootstrap, which
+        # must have loaded the browser DLL beside it.
+        code = BROWSER_DLL if Path(cef, BROWSER_DLL).is_file() else None
+        problems = [problem for role in pids for problem in module_problems(role, modules[role], cef, code)]
         libcef = [path for path in modules["browser"] or [] if ntpath.basename(path).lower() == "libcef.dll"]
         self.proof.setdefault("installedImages", []).append(dict(
             images, profile=process["profile"], libcef=libcef,

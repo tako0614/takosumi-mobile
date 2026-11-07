@@ -6,8 +6,11 @@ The Windows counterpart of browser_process.py. Python 3 standard library only
 besides git, which it reads the source revision from.
 
 The App is built with the feature native-browser-process-fixture, the browser
-with the cef-candidate features fixture-inspection and
-windows-unsandboxed-candidate, and the guard is takosumi-browser-guard.exe.
+with the cef-candidate features fixture-inspection and windows-sandbox (W7:
+a fixture stage of scripts/stage-windows-cef.mjs, CEF's bootstrap.exe as
+takosumi-cef-browser-process.exe with takosumi-cef-browser-process.dll beside
+it; the unsandboxed candidate executable built with windows-unsandboxed-candidate
+also runs), and the guard is takosumi-browser-guard.exe.
 Each phase starts the App suspended, puts it into a kill-on-close Job Object
 this runner owns and resumes it, so the App, its WebView2, its guards and every
 browser process are accounted; it then runs windows_browser_observer.py
@@ -527,8 +530,9 @@ def main():
     parser.add_argument("--binary", type=Path, required=True,
                         help="takosumi-mobile.exe built with --features native-browser-process-fixture")
     parser.add_argument("--browser", type=Path,
-                        help="takosumi-cef-browser-process.exe built with the cef-candidate features "
-                             "fixture-inspection,windows-unsandboxed-candidate (libcef.dll beside it); "
+                        help="takosumi-cef-browser-process.exe of a fixture stage: CEF's bootstrap with the "
+                             "browser DLL built with the cef-candidate features fixture-inspection,windows-sandbox "
+                             "beside it (or the windows-unsandboxed-candidate executable), libcef.dll beside it; "
                              "not with --packaged")
     parser.add_argument("--guard", type=Path, help="takosumi-browser-guard.exe; not with --packaged")
     parser.add_argument("--packaged", action="store_true",
@@ -621,6 +625,14 @@ def packaged_files(binary):
     return cef / PACKAGED_BROWSER, cef / PACKAGED_GUARD
 
 
+def browser_code(browser):
+    """The sandboxed browser's code beside its executable (W7): the DLL
+    CEF's bootstrap loads, named like the executable; none for the
+    unsandboxed candidate, whose code is the executable itself."""
+    code = browser.with_suffix(".dll")
+    return [code] if code.is_file() else []
+
+
 def browser_env(base, args, session, log):
     """The App's environment: the caller's without any TAKOSUMI_ or
     WEBVIEW2_ variable, then the fixture's. A packaged run (`--packaged`)
@@ -662,7 +674,8 @@ def run(args, summary):
         env = browser_env(os.environ, args, session, log)
         runtime = args.browser.parent / "libcef.dll"
         require(runtime.is_file(), f"No libcef.dll beside {args.browser}")
-        files = sorted(set([args.binary, args.browser, runtime, args.guard] + source_files(REPO)))
+        files = sorted(set([args.binary, args.browser, runtime, args.guard] + browser_code(args.browser) +
+                           source_files(REPO)))
         before = {str(file): digest(file) for file in files}
         snapshot = args.data / "source-snapshot"
         for file in files:

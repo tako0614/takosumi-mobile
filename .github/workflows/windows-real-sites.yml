@@ -161,8 +161,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
@@ -182,12 +183,24 @@ jobs:
           rustc --version
           cargo --version
           python --version
-      - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
+      # The sandboxed browser (W7): the DLL built with windows-sandbox, staged
+      # beside CEF's bootstrap.exe renamed to takosumi-cef-browser-process.exe
+      # (scripts/stage-windows-cef.mjs --fixture), as in ci.yml's W3 job.
+      - name: Build and stage the sandboxed browser (fixture-inspection) and takosumi-browser-guard
         id: browser-build
-        working-directory: takosumi-mobile/native-tests/cef-candidate
+        working-directory: takosumi-mobile
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: |
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features fixture-inspection,windows-sandbox --lib --bin takosumi-browser-guard
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The browser build failed (exit $built)" }
+          $cef = @(Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
+          if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:CEF_PATH, found $($cef.Count)" }
+          node scripts/stage-windows-cef.mjs --fixture --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug" --out "$env:RUNNER_TEMP\w4-stage"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
       # Line tables keep panics' locations while the App's debug build (and
       # its cache) stays small.
       - name: Build the App with native-browser-process-fixture
@@ -218,7 +231,8 @@ jobs:
           "W4_APP_DATA_EXCALIDRAW=$env:LOCALAPPDATA\com.takosumi.fixture.browserprocess.$name" >> $env:GITHUB_ENV
           $tls = Join-Path $env:RUNNER_TEMP 'w4-tls'
           $log = Join-Path $env:RUNNER_TEMP 'w4-excalidraw.log'
-          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --guard "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --real-site excalidraw | Tee-Object -FilePath $log
+          $stage = Join-Path $env:RUNNER_TEMP 'w4-stage\cef'
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --real-site excalidraw | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Excalidraw real-site cases failed (exit $LASTEXITCODE)" }
           $excalidrawCases = @(
             'excalidraw/separate-profiles',
@@ -260,7 +274,8 @@ jobs:
           "W4_APP_DATA_PHOTOPEA=$env:LOCALAPPDATA\com.takosumi.fixture.browserprocess.$name" >> $env:GITHUB_ENV
           $tls = Join-Path $env:RUNNER_TEMP 'w4-tls'
           $log = Join-Path $env:RUNNER_TEMP 'w4-photopea.log'
-          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --guard "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --real-site photopea | Tee-Object -FilePath $log
+          $stage = Join-Path $env:RUNNER_TEMP 'w4-stage\cef'
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --real-site photopea | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Photopea real-site cases failed (exit $LASTEXITCODE)" }
           $photopeaCases = @(
             'photopea/separate-profiles',

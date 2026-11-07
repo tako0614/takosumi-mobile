@@ -479,7 +479,7 @@ class SandboxEvidenceTests(unittest.TestCase):
 
     def test_only_restricted_renderers_below_the_browser_show_the_sandbox(self):
         import windows_smoke as smoke
-        browser = {"pid": 1, "integrity": 0x2000, "noSandbox": False}
+        browser = {"pid": 1, "integrity": 0x2000, "argumentsRead": True, "noSandbox": False}
         untrusted = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
         low = {"pid": 3, "integrity": 0x1000, "noSandbox": False}
         self.assertEqual(smoke.sandbox_problems(browser, [untrusted, low]), [])
@@ -490,6 +490,8 @@ class SandboxEvidenceTests(unittest.TestCase):
             (browser, [{"pid": 6, "integrity": None, "noSandbox": False, "error": "denied"}], "unknown"),
             ({"pid": 1, "integrity": 0x2000, "noSandbox": True}, [untrusted], "the browser runs with --no-sandbox"),
             ({"pid": 1, "integrity": 0x1000, "noSandbox": False}, [low], "not below the browser's"),
+            ({"pid": 1, "integrity": 0x2000, "argumentsRead": False, "noSandbox": False, "error": "denied"}, [low],
+             "the browser's command line was not read (denied)"),
         )
         for owner, renderers, problem in cases:
             problems = smoke.sandbox_problems(owner, renderers)
@@ -540,8 +542,17 @@ class RunnerTests(unittest.TestCase):
             self.assertIn(step, job)
         # The installed product browser alone, and each installer's own
         # uninstall key and shortcut (the fixture has its own productName).
-        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe"',
-                      job)
+        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe" '
+                      '--work $work --expect-sandbox ', job)
+        # W7: both stages are the sandboxed browser (the DLL CEF's bootstrap
+        # loads); the product stage no longer asks for the unsandboxed one.
+        product_stage = job[job.index("- name: Build and stage the product browser and guard"):]
+        product_stage = product_stage[:product_stage.index("\n      - name:")]
+        self.assertIn("cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard\n",
+                      product_stage)
+        self.assertIn('node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\\debug"\n',
+                      product_stage)
+        self.assertNotIn("unsandboxed-candidate", job.replace(".unsandboxedCandidate -ne $false", ""))
         # Each uninstall names the productName its installer was built with.
         for report, config in (("w6-fixture-uninstall.json", "src-tauri/tauri.windows-cef-fixture.conf.json"),
                                ("w6-uninstall.json", "src-tauri/tauri.windows-cef.conf.json")):
@@ -557,8 +568,7 @@ class RunnerTests(unittest.TestCase):
         # record the same one (the packaged run then runs the product guard).
         fixture = job[job.index("- name: Build and stage the fixture browser"):]
         fixture = fixture[:fixture.index("\n      - name:")]
-        self.assertIn("--features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process\n",
-                      fixture)
+        self.assertIn("--features fixture-inspection,windows-sandbox --lib\n", fixture)
         self.assertNotIn("--bin takosumi-browser-guard", fixture)
         self.assertIn("if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw", fixture)
         overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
@@ -614,6 +624,66 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 5, "no other source is gathered")
         for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
             self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
+
+    def test_the_w1_job_runs_the_staged_sandboxed_browser(self):
+        """W7: cef-windows builds the browser DLL, stages it beside CEF's
+        bootstrap and runs every smoke, the guard and the adapter tests with
+        the staged files; each smoke requires the sandbox."""
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows:\n"):workflow.index("\n  cef-windows-app:\n")]
+        self.assertNotIn("unsandboxed-candidate", job.replace(".unsandboxedCandidate -ne $false", ""))
+        self.assertIn("run: cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard\n", job)
+        self.assertIn('node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\\debug" '
+                      '--out "$env:RUNNER_TEMP\\w7-product"\n', job)
+        self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib\n", job)
+        self.assertIn('node scripts/stage-windows-cef.mjs --fixture --cef $env:W7_CEF --bin "$env:CARGO_TARGET_DIR\\debug" '
+                      '--out "$env:RUNNER_TEMP\\w7-fixture"\n', job)
+        smokes = [line.strip() for line in job.splitlines() if "windows_smoke.py" in line]
+        self.assertEqual(smokes, [
+            'run: python -B native-tests/cef-candidate/windows_smoke.py --browser '
+            '"$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" '
+            '--expect-sandbox',
+            'run: python -B native-tests/cef-candidate/windows_smoke.py --browser '
+            '"$env:RUNNER_TEMP\\w7-fixture\\cef\\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" '
+            '--expect-load --reuse --expect-sandbox',
+        ])
+        self.assertIn("cargo test --locked --features windows-sandbox --bin takosumi-browser-guard |", job)
+        self.assertIn('$env:TAKOSUMI_WINDOWS_GUARD = "$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-browser-guard.exe"\n',
+                      job)
+        self.assertIn('$env:TAKOSUMI_WINDOWS_BROWSER = '
+                      '"$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
+        self.assertIn('$exe = "$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
+        self.assertIn("${{ runner.temp }}/sumi-cef-smoke-*/summary.json\n", job)
+
+    def test_the_app_runs_take_a_staged_sandboxed_browser(self):
+        """W7: the W3 job and the W4 real-site workflow stage the sandboxed
+        fixture browser and hand the App those files."""
+        root = HERE.parents[1] / ".github/workflows"
+        workflow = (root / "ci.yml").read_text(encoding="utf-8")
+        w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
+        w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
+        for job, stage, runs in ((w3, "w3-stage", 1), (w4, "w4-stage", 2)):
+            self.assertNotIn("unsandboxed-candidate", job)
+            self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
+                          "--bin takosumi-browser-guard\n", job)
+            self.assertIn('node scripts/stage-windows-cef.mjs --fixture --cef $cef[0].FullName '
+                          f'--bin "$env:CARGO_TARGET_DIR\\debug" --out "$env:RUNNER_TEMP\\{stage}"\n', job)
+            lines = [line for line in job.splitlines() if "windows_browser_process.py --binary" in line]
+            self.assertEqual(len(lines), runs)
+            for line in lines:
+                self.assertIn('--browser "$stage\\takosumi-cef-browser-process.exe" '
+                              '--guard "$stage\\takosumi-browser-guard.exe" ', line)
+            self.assertEqual(job.count(f"$stage = Join-Path $env:RUNNER_TEMP '{stage}\\cef'\n"), runs)
+            self.assertIn("key: cef-windows-app-cargo-w7-", job)
+
+    def test_the_sandboxed_browsers_dll_is_hashed_with_it(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            browser = Path(directory) / "takosumi-cef-browser-process.exe"
+            browser.write_bytes(b"MZ")
+            self.assertEqual(runner.browser_code(browser), [])
+            browser.with_suffix(".dll").write_bytes(b"MZ")
+            self.assertEqual(runner.browser_code(browser), [Path(directory) / "takosumi-cef-browser-process.dll"])
 
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
@@ -695,6 +765,13 @@ class RunnerTests(unittest.TestCase):
                          [f"the browser loaded libcef.dll from {elsewhere}"])
         self.assertEqual(observer.module_problems("browser", system, cef), ["the browser has not loaded libcef.dll"])
         self.assertEqual(observer.module_problems("guard", None, cef), ["no module snapshot of the guard"])
+        # W7: the bootstrap must have loaded the installed browser DLL.
+        dll = observer.BROWSER_DLL
+        self.assertEqual(observer.module_problems("browser", [*browser, cef + "\\" + dll], cef, dll), [])
+        self.assertEqual(observer.module_problems("browser", browser, cef, dll), [f"the browser has not loaded {dll}"])
+        other = "D:\\a\\target-w3\\debug\\" + dll
+        self.assertEqual(observer.module_problems("browser", [*browser, other], cef, dll),
+                         [f"the browser loaded {dll} from {other}"])
         # MODULEENTRY32W: 1080 bytes on x64 Windows (two-byte WCHAR).
         ctypes = observer.ctypes
         if ctypes.sizeof(ctypes.c_void_p) == 8:

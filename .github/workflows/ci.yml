@@ -353,8 +353,8 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
         working-directory: takosumi-mobile
-      # The per-profile CEF adapter also compiles on Windows (an unsandboxed
-      # test candidate there; the cef-windows job runs it).
+      # The per-profile CEF adapter also compiles on Windows (the cef-windows
+      # job runs it with the sandboxed browser).
       - name: Compile desktop App with the per-profile CEF adapter
         if: runner.os == 'Windows'
         env:
@@ -441,16 +441,17 @@ jobs:
             takosumi-mobile/src-tauri/target
           key: ${{ steps.desktop-cache.outputs.cache-primary-key }}
 
-  # The per-profile CEF browser on Windows (first candidate): build
-  # takosumi-cef-browser-process and takosumi-browser-guard from
-  # native-tests/cef-candidate with their locked crates, run the browser alone
-  # through windows_smoke.py, run the guard's self-tests, then drive both
-  # through the App's adapter (its Process API, no App UI) in the app-screen
-  # plugin's Windows tests. The browser runs without Chromium's sandbox on
-  # Windows, which the build must ask for by name
-  # (windows-unsandboxed-candidate); it is a test candidate, not a package.
-  # The standalone candidate is Linux only and is not built. Independent of
-  # the other jobs.
+  # The per-profile CEF browser on Windows: build the sandboxed browser (W7:
+  # the DLL takosumi_cef_browser.dll, cef-candidate feature windows-sandbox)
+  # and takosumi-browser-guard from native-tests/cef-candidate with their
+  # locked crates, stage them with CEF's bootstrap.exe renamed to
+  # takosumi-cef-browser-process.exe (scripts/stage-windows-cef.mjs), run the
+  # staged browser alone through windows_smoke.py, which requires every
+  # renderer to run in Chromium's sandbox (--expect-sandbox: a Low or
+  # Untrusted token below the browser's, no --no-sandbox), run the guard's
+  # self-tests, then drive both through the App's adapter (its Process API, no
+  # App UI) in the app-screen plugin's Windows tests. The standalone candidate
+  # is Linux only and is not built. Independent of the other jobs.
   cef-windows:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -485,10 +486,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-cef
-          # crt: built with the static C runtime since W6 (a new key, so the
-          # cache is saved once with it).
-          key: cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
+          # w7: the sandboxed browser (cef's sandbox feature) since W7, built
+          # with the static C runtime since W6 (a new key, so the cache is
+          # saved once with it).
+          key: cef-windows-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
           restore-keys: |
+            cef-windows-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
@@ -508,14 +511,17 @@ jobs:
           rustc --version
           cargo --version
           python --version
+          node --version
       # From native-tests/cef-candidate, whose .cargo/config.toml links the
       # C runtime statically (no VCRUNTIME140.dll needed on a clean Windows).
-      - name: Build takosumi-cef-browser-process (product, unsandboxed candidate) and takosumi-browser-guard
+      # The sandboxed browser is the library (--lib), the DLL CEF's
+      # bootstrap.exe loads; its executable is the bootstrap, staged below.
+      - name: Build the sandboxed browser (product, takosumi_cef_browser.dll) and takosumi-browser-guard
         id: build
         working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
@@ -535,12 +541,35 @@ jobs:
             ~/.cargo/git/db
             target-cef
           key: ${{ steps.cef-cargo.outputs.cache-primary-key }}
-      # build.rs embeds the application manifest with MSVC linker flags; read
-      # the RT_MANIFEST resource back from the executable with the SDK's mt.exe.
-      - name: Embedded application manifest
+      # CEF's bootstrap.exe from the distribution, renamed to
+      # takosumi-cef-browser-process.exe, with the DLL built above beside it
+      # as takosumi-cef-browser-process.dll, the guard and the CEF runtime: the
+      # layout the App bundles (the stage's own PE import check included).
+      - name: Stage the sandboxed browser (bootstrap.exe and the DLL)
+        id: stage
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: |
-          $exe = "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe"
+          $cef = @(Get-ChildItem -Path "$env:RUNNER_TEMP\cef" -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
+          if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:RUNNER_TEMP\cef, found $($cef.Count)" }
+          "W7_CEF=$($cef[0].FullName)" >> $env:GITHUB_ENV
+          node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug" --out "$env:RUNNER_TEMP\w7-product"
+          if ($LASTEXITCODE -ne 0) { throw "The sandboxed stage failed (exit $LASTEXITCODE)" }
+          $stage = Get-Content -Raw "$env:RUNNER_TEMP\w7-product\stage.json" | ConvertFrom-Json
+          if ($stage.unsandboxedCandidate -ne $false) { throw 'The product stage is not the sandboxed browser' }
+          "Sandbox: $($stage.sandbox)"
+      # The staged executable is CEF's prebuilt bootstrap, whose manifest CEF
+      # builds (build.rs's applies only to the unsandboxed candidate); read its
+      # RT_MANIFEST resource back with the SDK's mt.exe. Windows 10/11 must be
+      # among its supportedOS entries (Chromium sees the real OS version) and
+      # it must not ask for elevation (asInvoker, or no level: an x64 image
+      # gets no installer detection); a missing Common Controls 6 dependency
+      # is reported as a warning, as the binary is CEF's.
+      - name: Embedded application manifest
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\w7-product\cef\takosumi-cef-browser-process.exe"
           $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $mt) { throw 'mt.exe from the Windows SDK is not available' }
           $out = Join-Path $env:RUNNER_TEMP 'takosumi-cef-browser-process.manifest'
@@ -549,17 +578,20 @@ jobs:
           Get-Content -Raw $out
           [xml]$manifest = Get-Content -Raw $out
           $os = @($manifest.SelectNodes("//*[local-name()='supportedOS']") | ForEach-Object { $_.GetAttribute('Id') })
-          if (($os -join ',') -ne '{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}') { throw "Unexpected supportedOS: $($os -join ',')" }
+          if ($os -notcontains '{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}') { throw "No Windows 10/11 supportedOS: $($os -join ',')" }
           $controls = @($manifest.SelectNodes("//*[local-name()='assemblyIdentity' and @name='Microsoft.Windows.Common-Controls' and @version='6.0.0.0']"))
-          if ($controls.Count -ne 1) { throw 'No Common Controls 6 dependency' }
+          if ($controls.Count -ne 1) { "::warning title=Bootstrap manifest::CEF's bootstrap.exe declares no Common Controls 6 dependency" }
           $levels = @($manifest.SelectNodes("//*[local-name()='requestedExecutionLevel']") | ForEach-Object { $_.GetAttribute('level') })
-          if (($levels -join ',') -ne 'asInvoker') { throw "Unexpected requestedExecutionLevel: $($levels -join ',')" }
-      # cef-dll-sys copies libcef.dll and the CEF resources beside the
-      # executable, where Windows looks first.
-      - name: Browser smoke (product build)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+          if ($levels.Count -gt 1 -or ($levels.Count -eq 1 -and $levels[0] -ne 'asInvoker')) { throw "Unexpected requestedExecutionLevel: $($levels -join ',')" }
+          "supportedOS: $($os -join ', '); Common Controls 6: $($controls.Count -eq 1); requestedExecutionLevel: $(if ($levels.Count) { $levels[0] } else { 'none' })"
+      # The stage holds libcef.dll and the CEF resources beside the
+      # executable, where Windows looks first. --expect-sandbox reads every
+      # renderer's token before the shutdown and fails unless each runs in
+      # Chromium's sandbox; the summary records it (`sandbox`).
+      - name: Browser smoke (product build, sandboxed)
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
         timeout-minutes: 15
-        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP"
+        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w7-product\cef\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" --expect-sandbox
       # The Windows guard (Job Objects) with stand-in browsers: the self-test
       # binary re-executes itself as the guard and as the browser. A selection
       # that runs fewer than all thirteen cases fails.
@@ -571,21 +603,21 @@ jobs:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
-          cargo test --locked --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
+          cargo test --locked --features windows-sandbox --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
           if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed$' -Quiet)) { throw 'Not all thirteen guard self-tests ran' }
-      # The App's adapter on Windows with the product browser and the guard
-      # built above: the plugin's Windows unit tests, then the two ignored
+      # The App's adapter on Windows with the staged sandboxed browser and the
+      # guard: the plugin's Windows unit tests, then the two ignored
       # tests that start a profile through Process::spawn and the creation
       # reply check, reopen it, shut it down through the adapter and require a
       # normal guard receipt, and end the App's Job Object to require that the
       # guard and every browser process end with it. Every one must have run.
-      - name: App adapter with the built guard and browser (Process API)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      - name: App adapter with the staged guard and sandboxed browser (Process API)
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
         timeout-minutes: 40
         run: |
-          $env:TAKOSUMI_WINDOWS_GUARD = "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe"
-          $env:TAKOSUMI_WINDOWS_BROWSER = "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe"
+          $env:TAKOSUMI_WINDOWS_GUARD = "$env:RUNNER_TEMP\w7-product\cef\takosumi-browser-guard.exe"
+          $env:TAKOSUMI_WINDOWS_BROWSER = "$env:RUNNER_TEMP\w7-product\cef\takosumi-cef-browser-process.exe"
           # The plugin has no lockfile of its own; the app's pins its versions.
           Copy-Item src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
           # The copied lock also lists crates the plugin's graph does not use,
@@ -633,24 +665,46 @@ jobs:
           if (-not (Select-String -Path $log -Pattern '^test result: ok\. 14 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all fourteen Windows adapter tests ran' }
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the Win32
-      # raise to make its top-level window the foreground window.
-      - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate)
+      # raise to make its top-level window the foreground window. Only the
+      # DLL is rebuilt; the fixture stage keeps the product guard.
+      - name: Build and stage the sandboxed browser (fixture-inspection)
         id: fixture-build
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: native-tests/cef-candidate
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
-      - name: Browser smoke (page load and window reuse)
+        run: |
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features fixture-inspection,windows-sandbox --lib
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The fixture browser build failed (exit $built)" }
+          node scripts/stage-windows-cef.mjs --fixture --cef $env:W7_CEF --bin "$env:CARGO_TARGET_DIR\debug" --out "$env:RUNNER_TEMP\w7-fixture"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
+      - name: Browser smoke (page load and window reuse, sandboxed)
         if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
         timeout-minutes: 15
-        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" --expect-load --reuse
+        run: python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w7-fixture\cef\takosumi-cef-browser-process.exe" --work "$env:RUNNER_TEMP" --expect-load --reuse --expect-sandbox
+      # Each smoke's summary (with its `sandbox` record: the browser's and
+      # every renderer's integrity level and command-line check) and logs.
+      - name: Keep the smoke summaries
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cef-windows-smoke
+          path: |
+            ${{ runner.temp }}/sumi-cef-smoke-*/summary.json
+            ${{ runner.temp }}/sumi-cef-smoke-*/*.log
+            ${{ runner.temp }}/w7-product/stage.json
+          if-no-files-found: warn
+          retention-days: 14
 
   # The actual App on Windows (W3): the real home in WebView2 drives the
   # per-profile CEF browser through the App's own adapter, as the Linux
-  # actual-App fixture does. It builds the fixture-inspection browser and the
-  # guard (the unsandboxed candidate) and the App with
-  # native-browser-process-fixture, then windows_browser_process.py runs one
+  # actual-App fixture does. It builds the sandboxed fixture-inspection
+  # browser (W7: the DLL CEF's bootstrap.exe loads) and the guard, stages
+  # them with the bootstrap (scripts/stage-windows-cef.mjs --fixture), builds
+  # the App with native-browser-process-fixture, then
+  # windows_browser_process.py runs one
   # case in three launches (first, restart, reset) against its local HTTPS
   # fixture site. The site's disposable CA is trusted on the runner only for
   # this run. Real sites run on Windows only in the manual evidence workflow
@@ -728,8 +782,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
@@ -750,12 +805,23 @@ jobs:
           cargo --version
           python --version
       # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
-      - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
+      # The sandboxed browser is the library (--lib), the DLL CEF's
+      # bootstrap.exe loads; the stage puts the bootstrap, renamed, beside it.
+      - name: Build and stage the sandboxed browser (fixture-inspection) and takosumi-browser-guard
         id: browser-build
-        working-directory: takosumi-mobile/native-tests/cef-candidate
+        working-directory: takosumi-mobile
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: |
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features fixture-inspection,windows-sandbox --lib --bin takosumi-browser-guard
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The browser build failed (exit $built)" }
+          $cef = @(Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
+          if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:CEF_PATH, found $($cef.Count)" }
+          node scripts/stage-windows-cef.mjs --fixture --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug" --out "$env:RUNNER_TEMP\w3-stage"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
       # Line tables keep panics' locations while the App's debug build (and
       # its cache) stays small.
       - name: Build the App with native-browser-process-fixture
@@ -806,7 +872,8 @@ jobs:
           "W3_APP_DATA=$env:LOCALAPPDATA\com.takosumi.fixture.browserprocess.$name" >> $env:GITHUB_ENV
           $tls = Join-Path $env:RUNNER_TEMP 'w3-tls'
           $log = Join-Path $env:RUNNER_TEMP 'w3-cases.log'
-          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$env:CARGO_TARGET_DIR\debug\takosumi-cef-browser-process.exe" --guard "$env:CARGO_TARGET_DIR\debug\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset | Tee-Object -FilePath $log
+          $stage = Join-Path $env:RUNNER_TEMP 'w3-stage\cef'
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "W3 actual App cases failed (exit $LASTEXITCODE)" }
           $w3Cases = @(
             'separate-profiles',
@@ -854,7 +921,10 @@ jobs:
   # (--packaged); the product installer (tauri.windows-cef.conf.json) is
   # installed, its browser run alone (windows_smoke.py) and the installed App
   # launched once (window, a few seconds up, no unavailable browser, WM_CLOSE,
-  # empty job). Each is then uninstalled silently. The browser stays the unsandboxed candidate. No installer or
+  # empty job). Each is then uninstalled silently. Both stage the sandboxed
+  # browser (W7): CEF's bootstrap.exe as takosumi-cef-browser-process.exe
+  # with the DLL built with windows-sandbox beside it; the installed browser's
+  # run requires its renderers to run in Chromium's sandbox. No installer or
   # binary is uploaded: logs, reports, stage manifests and the case only.
   # Independent of the other jobs.
   cef-windows-package:
@@ -925,8 +995,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
             cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
@@ -947,8 +1018,9 @@ jobs:
           cargo --version
           python --version
           node --version
-      # The product browser (no inspection seam) and the guard, staged first:
-      # the fixture build below replaces the browser in the build directory.
+      # The sandboxed product browser (the DLL, no inspection seam) and the
+      # guard, staged first: the fixture build below replaces the DLL in the
+      # build directory.
       - name: Build and stage the product browser and guard
         id: product-stage
         working-directory: takosumi-mobile
@@ -957,15 +1029,16 @@ jobs:
         run: |
           # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
           Push-Location native-tests/cef-candidate
-          cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+          cargo build --locked --features windows-sandbox --lib --bin takosumi-browser-guard
           $built = $LASTEXITCODE
           Pop-Location
           if ($built -ne 0) { throw "The product browser build failed (exit $built)" }
           $cef = @(Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
           if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:CEF_PATH, found $($cef.Count)" }
           "W6_CEF=$($cef[0].FullName)" >> $env:GITHUB_ENV
-          node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug"
+          node scripts/stage-windows-cef.mjs --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug"
           if ($LASTEXITCODE -ne 0) { throw "The product stage failed (exit $LASTEXITCODE)" }
+          if ((Get-Content -Raw src-tauri/target/windows-cef/stage.json | ConvertFrom-Json).unsandboxedCandidate -ne $false) { throw 'The product stage is not the sandboxed browser' }
       - name: Build and stage the fixture browser
         id: fixture-stage
         if: ${{ !cancelled() && steps.product-stage.outcome == 'success' }}
@@ -973,10 +1046,10 @@ jobs:
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
-          # Only the browser: the guard in the build directory stays the
-          # product one, so the packaged W3 run exercises the product guard.
+          # Only the browser (the DLL): the guard in the build directory stays
+          # the product one, so the packaged W3 run exercises the product guard.
           Push-Location native-tests/cef-candidate
-          cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+          cargo build --locked --features fixture-inspection,windows-sandbox --lib
           $built = $LASTEXITCODE
           Pop-Location
           if ($built -ne 0) { throw "The fixture browser build failed (exit $built)" }
@@ -1098,8 +1171,9 @@ jobs:
           $installed = Get-Content -Raw $report | ConvertFrom-Json
           "W6_APP=$(Join-Path $dir $installed.app)" >> $env:GITHUB_ENV
       # The installed product browser (no inspection seam) on its own, as
-      # W1 runs the built one: boot open, shutdown, stopped, exit 0, nothing
-      # left in its job.
+      # W1 runs the staged one: boot open, every renderer in Chromium's
+      # sandbox (--expect-sandbox), shutdown, stopped, exit 0, nothing left in
+      # its job.
       - name: Run the installed product browser alone
         if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
         timeout-minutes: 10
@@ -1107,7 +1181,7 @@ jobs:
         run: |
           $work = Join-Path $env:RUNNER_TEMP 'w6-browser-smoke'
           New-Item -ItemType Directory -Force -Path $work | Out-Null
-          python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w6-app\cef\takosumi-cef-browser-process.exe" --work $work | Tee-Object -FilePath "$env:RUNNER_TEMP\w6-browser-smoke.log"
+          python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w6-app\cef\takosumi-cef-browser-process.exe" --work $work --expect-sandbox | Tee-Object -FilePath "$env:RUNNER_TEMP\w6-browser-smoke.log"
           if ($LASTEXITCODE -ne 0) { throw "The installed browser smoke failed (exit $LASTEXITCODE)" }
       - name: Launch the installed product App once
         if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
