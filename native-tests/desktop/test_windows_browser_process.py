@@ -316,7 +316,7 @@ class RunnerTests(unittest.TestCase):
         cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
         cases += list(runner.FINAL_CASES)
         self.assertEqual(len(cases), len(set(cases)))
-        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text()
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         block = re.search(r"\$w3Cases = @\(\n(.*?)\n\s*\)", workflow, re.S)
         count = re.search(r"\$w3Count -ne (\d+)\)", workflow)
         self.assertIsNotNone(block, "The cef-windows-app job lists its required cases")
@@ -325,7 +325,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(int(count.group(1)), len(cases))
 
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
-        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         for site in sorted(runner.REAL_SITES):
             block = re.search(r"\$%sCases = @\(\n(.*?)\n\s*\)" % site, workflow, re.S)
             count = re.search(r"\$%sCount -ne (\d+)\)" % site, workflow)
@@ -336,7 +336,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(int(count.group(1)), len(cases))
 
     def test_the_real_site_workflow_runs_only_when_asked(self):
-        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         on = re.search(r"^on:\n(.*?)\n(?=\S)", workflow, re.S | re.M).group(1)
         self.assertEqual(re.findall(r"^  (\w+):", on, re.M), ["workflow_dispatch", "pull_request"])
         self.assertRegex(on, r"  pull_request:\n    types: \[labeled\]\n?$")
@@ -359,7 +359,7 @@ class RunnerTests(unittest.TestCase):
         self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read$")
 
     def test_a_dispatch_tests_only_this_repositorys_commits(self):
-        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         steps = workflow[workflow.index("    steps:\n"):]
         check = steps.index("      - name: This repository's branches (dispatch)\n"
                             "        if: ${{ github.event_name == 'workflow_dispatch' }}\n")
@@ -380,7 +380,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_the_real_site_workflow_checks_out_the_ci_sibling_revisions(self):
         root = HERE.parents[1] / ".github/workflows"
-        refs = [dict(re.findall(r"^  (MOBILE_KIT_SOURCE_REF|TAKOSUMI_SOURCE_REF): (\S+)$", (root / name).read_text(), re.M))
+        refs = [dict(re.findall(r"^  (MOBILE_KIT_SOURCE_REF|TAKOSUMI_SOURCE_REF): (\S+)$",
+                                (root / name).read_text(encoding="utf-8"), re.M))
                 for name in ("ci.yml", "windows-real-sites.yml")]
         self.assertEqual(len(refs[0]), 2)
         self.assertEqual(refs[0], refs[1])
@@ -395,9 +396,9 @@ class RunnerTests(unittest.TestCase):
     def test_the_real_site_bounds_cover_the_observers_worst_case(self):
         tests = HERE.parents[1] / "src-tauri/tests/desktop"
         inspect = re.search(r"if shell::real_site\(\) \{\s*return Duration::from_secs\((\d+)\);",
-                            (tests / "browser_process.rs").read_text())
+                            (tests / "browser_process.rs").read_text(encoding="utf-8"))
         watchdog = re.search(r"from_secs\(if real_site\(\) \{ (\d+) \} else \{ (\d+) \}\)",
-                             (tests / "browser_process_windows.rs").read_text())
+                             (tests / "browser_process_windows.rs").read_text(encoding="utf-8"))
         self.assertIsNotNone(inspect, "browser_process.rs names the real-site first-checkpoint bound")
         self.assertIsNotNone(watchdog, "browser_process_windows.rs names the real-site watchdog")
         inspect = int(inspect.group(1))
@@ -424,7 +425,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("Start using Photopea", photopea["ready"])
         self.assertIn("Open From Computer", photopea["ready"])
         self.assertIn("Start using Photopea", photopea["landing"])
-        probe = (HERE / "browser-process.mjs").read_text()
+        probe = (HERE / "browser-process.mjs").read_text(encoding="utf-8")
         self.assertIn("document.querySelector('.excalidraw canvas')!==null && "
                       "!document.querySelector('.ErrorSplash')", probe)
         self.assertNotIn("Boolean(document.querySelector('.excalidraw'))", probe)

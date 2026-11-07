@@ -481,7 +481,7 @@ def main():
     summary = {"passed": False, "case": str(args.data), "appData": [str(path) for path in app_data(args.data.name)],
                "cases": [], "phases": [], "realSite": args.real_site}
     args.data.mkdir()
-    args.data.joinpath(".owned-browser-reference").write_text(args.data.name)
+    args.data.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     try:
         run(args, summary)
         summary["passed"] = True
@@ -515,7 +515,7 @@ def run(args, summary):
     # synthetic nonce and the App's data identifier).
     session = args.session = args.data / args.data.name
     session.mkdir()
-    session.joinpath(".owned-browser-reference").write_text(args.data.name)
+    session.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     for name in ("r", "tmp"):
         (session / name).mkdir()
     server, args.site = start_site(args.tls_cert, args.tls_key,
