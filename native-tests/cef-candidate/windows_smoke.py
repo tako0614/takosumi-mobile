@@ -34,7 +34,10 @@ session and process group. It then requires, each within a bound:
    in the job whose command line could not be read unless it had already
    exited; recorded as `sandbox` (with those unread processes). The
    observer of the actual App (desktop/windows_browser_observer.py) applies
-   the same check to each profile's browser and its process tree.
+   the same check to each profile's browser and its process tree;
+7. on Windows, the browser's own shutdown line from its log (W7: child
+   processes left after CefShutdown, the bounded wait for them, the exit
+   code it returned to CEF's bootstrap), recorded as `shutdown`.
 
 Requests use browser_process::Request's serde form (compact JSON, one line).
 It prints one JSON summary on stdout, writes it to `<case>/summary.json` and
@@ -324,6 +327,32 @@ def process_facts(kernel32, advapi32, ntdll, pid):
     finally:
         kernel32.CloseHandle(process)
     return facts
+
+
+# The browser's own line on its standard error after CefShutdown (Windows,
+# W7; src/children_windows.rs): its pid, how many child processes were still
+# running, how many remained after the bounded wait, the wait's length and
+# bound, and the exit code it returned to CEF's bootstrap.
+BROWSER_SHUTDOWN = "takosumi-cef-browser-process: shutdown "
+
+
+def browser_shutdown(text, pid=None):
+    """The browser's shutdown lines in a log, parsed (with `pid`, only that
+    browser's); one that does not parse is kept as `unparsed`."""
+    found = []
+    for line in text.splitlines():
+        index = line.find(BROWSER_SHUTDOWN)
+        if index < 0:
+            continue
+        payload = line[index + len(BROWSER_SHUTDOWN):]
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            found.append({"unparsed": payload[:500]})
+            continue
+        if pid is None or (isinstance(parsed, dict) and parsed.get("pid") == pid):
+            found.append(parsed)
+    return found
 
 
 def descendant_pids(pairs, root):
@@ -843,6 +872,10 @@ def main():
             raise Failure("The browser did not exit within the bound after stopped") from None
         summary["exitCode"] = code
         summary["seconds"]["exit"] = round(time.monotonic() - started, 3)
+        if WINDOWS:
+            # Its own record of the orderly end (W7): children left after
+            # CefShutdown, the wait, and the code it returned.
+            summary["shutdown"] = browser_shutdown(tail(case / "browser.log"), pid)
         require(code == 0, f"The browser exited with {code}")
         session.reader.join(timeout=5)
         summary["stdoutClosed"] = not session.reader.is_alive()

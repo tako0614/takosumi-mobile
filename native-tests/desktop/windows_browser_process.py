@@ -72,7 +72,7 @@ from urllib.parse import parse_qs
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
-from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, require, tail  # noqa: E402
+from windows_smoke import CREATE_SUSPENDED, Failure, WindowsJob, browser_shutdown, require, tail  # noqa: E402
 from windows_browser_observer import REAL_SITES  # noqa: E402
 
 WINDOWS = os.name == "nt"
@@ -383,6 +383,21 @@ def sandbox_summary(observation, opened, required):
     return found
 
 
+def shutdown_summary(records):
+    """Per profile of a phase: the guard receipt's rootExit and the
+    browser's own shutdown line (children left after CefShutdown, remaining
+    after the wait, its length, the exit code returned), for summary.json
+    and the CI log."""
+    found = []
+    for record in records or []:
+        receipt = record.get("receipt")
+        lines = record.get("browserShutdown") or []
+        found.append({"profile": record.get("profile"),
+                      "rootExit": receipt.get("rootExit") if isinstance(receipt, dict) else None,
+                      "browser": lines[-1] if lines else None})
+    return found
+
+
 def guard_diagnostics(text, guard_pid=None):
     """The guard's forced-cleanup lines in a browser log, parsed: with
     `guard_pid`, only that guard's. One that does not parse is kept as
@@ -405,15 +420,18 @@ def guard_diagnostics(text, guard_pid=None):
 
 def guard_records(session, suffix):
     """Each browser process of a phase: its profile, its guard's pid and
-    receipt, and that guard's own forced-cleanup lines from the profile's
+    receipt, that guard's own forced-cleanup lines from the profile's
     browser.log (`forcedCleanupLines`; the receipt's `forcedCleanup` is the
-    count)."""
+    count) and, on Windows, that browser's own shutdown line
+    (`browserShutdown`, W7: children left after CefShutdown, the bounded
+    wait, the exit code it returned)."""
     marker = session / (f"app-browser-process{suffix}-open.json" if suffix else "app-browser-process-open.json")
     records = []
     for process in read_json(marker)["processes"]:
         log = tail(Path(process["directory"]) / "browser.log", BROWSER_LOG_TAIL)
         record = {"profile": process["profile"], "guardPid": process["pid"],
-                  "forcedCleanupLines": guard_diagnostics(log, process["pid"])}
+                  "forcedCleanupLines": guard_diagnostics(log, process["pid"]),
+                  "browserShutdown": browser_shutdown(log, process.get("opened", {}).get("nativePid"))}
         try:
             record["receipt"] = read_json(Path(process["guardReceipt"]))
         except (OSError, ValueError, Failure) as error:
@@ -721,8 +739,11 @@ def run(args, summary):
         for suffix in phases:
             phase_env = dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE=suffix[1:]) if suffix else env
             proof = run_phase(args, phase_env, files, before, head, suffix)
+            shutdown = shutdown_summary(proof.get("guardRecords"))
             summary["phases"].append({"phase": proof["phase"], "passed": proof["passed"],
-                                      "sessionJob": proof.get("sessionJob"), "sandbox": proof.get("sandbox")})
+                                      "sessionJob": proof.get("sessionJob"), "sandbox": proof.get("sandbox"),
+                                      "shutdown": shutdown})
+            print(f"shutdown{suffix or '-first'} {json.dumps(shutdown, separators=(',', ':'))}", flush=True)
             require(proof["passed"] is True, f"The {proof['phase']} App launch did not pass")
             expected = list(OBSERVED_CASES[suffix[1:]])
             require(proof["cases"] == expected,

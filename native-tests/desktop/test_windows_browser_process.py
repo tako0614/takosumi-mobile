@@ -737,6 +737,11 @@ class RunnerTests(unittest.TestCase):
                       '"$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
         self.assertIn('$exe = "$env:RUNNER_TEMP\\w7-product\\cef\\takosumi-cef-browser-process.exe"\n', job)
         self.assertIn("${{ runner.temp }}/sumi-cef-smoke-*/summary.json\n", job)
+        # W7: the browser's child wait tests run, every one of them.
+        source = (HERE.parents[1] / "native-tests/cef-candidate/src/children_windows.rs").read_text(encoding="utf-8")
+        tests = source.count("#[test]")
+        self.assertIn("rustc --edition 2021 --test native-tests/cef-candidate/src/children_windows.rs -o $exe\n", job)
+        self.assertIn(f"'^test result: ok\\. {tests} passed; 0 failed'", job)
 
     def test_the_app_runs_take_a_staged_sandboxed_browser(self):
         """W7: the W3 job and the W4 real-site workflow stage the sandboxed
@@ -797,6 +802,34 @@ class RunnerTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
         self.assertIn('"guardPid": std::process::id(),', rust)
+
+    def test_the_browsers_shutdown_lines_are_collected(self):
+        """W7: the browser's own line after CefShutdown (children left, the
+        bounded wait, the code it returned), attributed by its pid."""
+        import windows_smoke as smoke
+        ours = '{"pid":9212,"children":31,"remaining":0,"unopened":0,"waitedMs":840,"boundMs":10000,"exitCode":0}'
+        earlier = '{"pid":5000,"children":4,"remaining":0,"unopened":0,"waitedMs":12,"boundMs":10000,"exitCode":0}'
+        text = "\n".join(["DevTools listening on ws://127.0.0.1:1/x", smoke.BROWSER_SHUTDOWN + earlier,
+                          smoke.BROWSER_SHUTDOWN + ours, smoke.BROWSER_SHUTDOWN + "{cut", ""])
+        found = smoke.browser_shutdown(text, 9212)
+        self.assertEqual(found, [json.loads(ours), {"unparsed": "{cut"}])
+        self.assertEqual(len(smoke.browser_shutdown(text)), 3)
+        self.assertEqual(smoke.browser_shutdown("nothing\n", 9212), [])
+        records = [{"profile": "work", "receipt": {"rootExit": 0}, "browserShutdown": [json.loads(ours)]},
+                   {"profile": "personal", "receipt": "unreadable: x", "browserShutdown": []}]
+        self.assertEqual(runner.shutdown_summary(records), [
+            {"profile": "work", "rootExit": 0, "browser": json.loads(ours)},
+            {"profile": "personal", "rootExit": None, "browser": None},
+        ])
+        self.assertEqual(runner.shutdown_summary(None), [])
+        # The same prefix and fields as the browser writes.
+        rust = (HERE.parents[1] / "native-tests/cef-candidate/src/children_windows.rs").read_text(encoding="utf-8")
+        self.assertIn(f'pub const EVIDENCE_PREFIX: &str = "{smoke.BROWSER_SHUTDOWN}";', rust)
+        for field in ("pid", "children", "remaining", "unopened", "waitedMs", "boundMs", "exitCode"):
+            self.assertIn(f'\\"{field}\\":', rust)
+        main = (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
+        self.assertIn("    shutdown();\n    let code = i32::from(failed);\n    #[cfg(windows)]\n"
+                      "    children_windows::finish(code);\n    code\n}", main)
 
     def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
         class Args:
