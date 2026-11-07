@@ -521,6 +521,33 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
         self.assertIn('"guardPid": std::process::id(),', rust)
 
+    def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
+        class Args:
+            site, real_site, packaged = "https://127.0.0.1:1", None, True
+            browser, guard = Path("C:/b.exe"), Path("C:/g.exe")
+        base = {"PATH": "p", "TAKOSUMI_BROWSER_PROCESS_PROGRAM": "inherited", "WebView2_X": "1"}
+        session = Path("C:/case/sumi-w6")
+        env = runner.browser_env(base, Args, session, session / "external-open.log")
+        for key in ("TAKOSUMI_BROWSER_PROCESS_PROGRAM", "TAKOSUMI_BROWSER_PROCESS_GUARD",
+                    "TAKOSUMI_BROWSER_PROCESS_RUNTIME", "WebView2_X"):
+            self.assertNotIn(key, env)
+        self.assertEqual((env["PATH"], env["TAKOSUMI_BROWSER_PROCESS_INSPECT"],
+                          env["TAKOSUMI_BROWSER_PROCESS_CASE"]), ("p", "1", str(session)))
+        Args.packaged = False
+        env = runner.browser_env(base, Args, session, session / "external-open.log")
+        self.assertEqual((env["TAKOSUMI_BROWSER_PROCESS_PROGRAM"], env["TAKOSUMI_BROWSER_PROCESS_RUNTIME"]),
+                         (str(Args.browser), str(session / "r")))
+        installed = Path("C:/Users/runner/install/Takosumi.exe")
+        self.assertEqual(runner.packaged_files(installed),
+                         (installed.parent / "cef" / "takosumi-cef-browser-process.exe",
+                          installed.parent / "cef" / "takosumi-browser-guard.exe"))
+        # The same names the App resolves (process_setup.rs).
+        rust = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_setup.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(f'pub(super) const BROWSER: &str = "{runner.PACKAGED_BROWSER}";', rust)
+        self.assertIn(f'pub(super) const GUARD: &str = "{runner.PACKAGED_GUARD}";', rust)
+        self.assertIn('pub(super) const PACKAGED: &str = "cef";', rust)
+
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:
             real_site = "photopea"
