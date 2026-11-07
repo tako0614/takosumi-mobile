@@ -66,6 +66,9 @@ thread_local! {
     /// its creation (the last 40), for the fixture's failure lines.
     static FIXTURE_VIEW_EVENTS: RefCell<HashMap<String, std::collections::VecDeque<String>>> =
         RefCell::new(HashMap::new());
+    /// Fixture diagnostics only: the URL each view was asked to load first,
+    /// logged next to every URI it commits.
+    static FIXTURE_VIEW_TARGETS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 /// Fixture diagnostics only: log one event of a view (shared monotonic clock
@@ -99,28 +102,73 @@ pub(crate) fn fixture_view_events(label: &str) -> String {
     })
 }
 
-/// Fixture diagnostics only: name the GTK view after its window label (read
-/// back by the navigation record) and, from its creation, log when it is
-/// realized and mapped and every load event, load failure (URI and the
-/// error's domain, code and message), TLS failure (the fact and its flags)
-/// and web-process termination. The failure handlers let WebKit's default
-/// run; nothing here changes what the view does. No cookie, storage value,
-/// credential or argv is logged.
+/// Fixture diagnostics only: the view's first requested URL, for the
+/// Committed lines.
 #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
-fn trace_fixture_view(label: &str, popup: bool, view: &webkit2gtk::WebView) {
+fn note_fixture_target(label: &str, target: &str) {
+    FIXTURE_VIEW_TARGETS.with(|targets| {
+        targets
+            .borrow_mut()
+            .insert(label.to_owned(), target.to_owned())
+    });
+}
+
+/// Fixture diagnostics only: name the GTK view after its window label (read
+/// back by the navigation record) and, from its creation, log its browsing
+/// profile, the identities (object addresses) of its WebKitWebContext and
+/// WebKitWebsiteDataManager, the view it was created related to (a popup's
+/// opener), WebKit's page id, then when it is realized and mapped and every
+/// load event (Committed also names the first requested URL), load failure
+/// (URI and the error's domain, code and message), TLS failure (the fact and
+/// its flags) and web-process termination. The failure handlers let WebKit's
+/// default run; nothing here changes what the view does. No cookie, storage
+/// value, credential, path or argv is logged.
+#[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+fn trace_fixture_view(
+    label: &str,
+    popup: bool,
+    related_to: Option<String>,
+    profile: &str,
+    view: &webkit2gtk::WebView,
+) {
+    use gtk::glib::object::ObjectType;
     use gtk::prelude::*;
-    use webkit2gtk::WebViewExt;
+    use webkit2gtk::{WebContextExt, WebViewExt};
     view.set_widget_name(label);
-    note_fixture_view(label, format!("event=created popup={popup}"));
+    let context = view.context();
+    let manager = view.website_data_manager();
+    note_fixture_view(
+        label,
+        format!(
+            "event=created popup={popup} related_to={related_to:?} profile={profile} \
+             web_context={:?} data_manager={:?} context_data_manager={:?} page_id={}",
+            context.as_ref().map(|context| context.as_ptr()),
+            manager.as_ref().map(|manager| manager.as_ptr()),
+            context
+                .as_ref()
+                .and_then(|context| context.website_data_manager())
+                .map(|manager| manager.as_ptr()),
+            view.page_id()
+        ),
+    );
     let named = label.to_owned();
     view.connect_realize(move |_| note_fixture_view(&named, "event=realized".into()));
     let named = label.to_owned();
     view.connect_map(move |_| note_fixture_view(&named, "event=mapped".into()));
     let named = label.to_owned();
     view.connect_load_changed(move |view, event| {
+        let requested = if event == webkit2gtk::LoadEvent::Committed {
+            FIXTURE_VIEW_TARGETS
+                .with(|targets| format!(" requested={:?}", targets.borrow().get(&named).cloned()))
+        } else {
+            String::new()
+        };
         note_fixture_view(
             &named,
-            format!("event=load-changed {event:?} uri={:?}", view.uri()),
+            format!(
+                "event=load-changed {event:?} uri={:?}{requested}",
+                view.uri()
+            ),
         );
     });
     let named = label.to_owned();
@@ -525,6 +573,11 @@ fn create_screen(
             use wry::WebViewBuilderExtWindows;
             builder = builder.with_environment(features.opener.environment);
         }
+        // The opener a popup is created related to, by its label.
+        #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+        let related_to = popup.as_ref().map(|features| {
+            gtk::prelude::WidgetExt::widget_name(&features.opener.webview).to_string()
+        });
         #[cfg(target_os = "linux")]
         if let Some(features) = popup {
             use wry::WebViewBuilderExtUnix;
@@ -537,7 +590,13 @@ fn create_screen(
             let container = window.default_vbox().map_err(failure)?;
             let view = builder.build_gtk(&container).map_err(failure)?;
             #[cfg(feature = "desktop-fixture")]
-            trace_fixture_view(&label, is_popup, &wry::WebViewExtUnix::webview(&view));
+            trace_fixture_view(
+                &label,
+                is_popup,
+                related_to,
+                &profile,
+                &wry::WebViewExtUnix::webview(&view),
+            );
             container.show_all();
             view
         };
@@ -560,6 +619,8 @@ fn create_screen(
             .transpose()?;
         let native_handlers = native_close_handler(&view, &window)?;
         if !is_popup {
+            #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+            note_fixture_target(&label, &start);
             let loaded = view.load_url(&start);
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
             note_fixture_view(
