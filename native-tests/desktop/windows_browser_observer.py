@@ -510,6 +510,21 @@ class Cdp:
             pass
 
 
+def url_origin(url):
+    """The origin part (scheme and authority) of a dialog's URL."""
+    return urlsplit(url)._replace(path="", query="", fragment="").geturl()
+
+
+def final_quit_dialog(params, app_origin):
+    """W4: the one dialog the final quit may accept on its own, the real
+    site's beforeunload on that site; any other type or origin fails. Returns
+    what is accepted."""
+    found = {"type": params.get("type"), "origin": url_origin(params.get("url") or "")}
+    require(found["type"] == "beforeunload" and found["origin"] == app_origin,
+            f"At the final quit only a beforeunload of {app_origin} may be accepted, not {found}")
+    return found
+
+
 class Page:
     """The one top-level document of a profile's browser, through a flattened
     target session on that browser's own DevTools connection."""
@@ -789,9 +804,11 @@ class Observer:
 
     def finish_final_quit(self, pages):
         """W4: after the final quit request, a real site may ask its own
-        beforeunload (the quit then waits for an answer). Accept any such
-        dialog (recorded) until every remaining profile's guard has ended."""
-        accepted, marks = [], {id(page): page.cdp.mark() for page in pages}
+        beforeunload (the quit then waits for an answer). Accept only that
+        (final_quit_dialog; recorded, as is a refused one) until every
+        remaining profile's guard has ended."""
+        accepted = self.proof["finalQuitDialogsAccepted"] = []
+        marks = {id(page): page.cdp.mark() for page in pages}
         deadline = time.monotonic() + FINAL_QUIT_WAIT
         remaining = list(pages)
         while remaining:
@@ -807,13 +824,20 @@ class Observer:
                 for event in page.cdp.since(marks[id(page)]):
                     if event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session:
                         try:
+                            dialog = dict(final_quit_dialog(event["params"], self.app_origin),
+                                          profile=page.process["profile"])
+                        except Failure:
+                            self.proof["finalQuitDialogRefused"] = {
+                                "profile": page.process["profile"], "type": event["params"].get("type"),
+                                "url": event["params"].get("url")}
+                            raise
+                        try:
                             page.send("Page.handleJavaScriptDialog", {"accept": True})
                         except Failure:
                             continue  # already closed, or the browser is ending
-                        accepted.append({"profile": page.process["profile"], "type": event["params"].get("type")})
+                        accepted.append(dialog)
                 marks[id(page)] = page.cdp.mark()
             time.sleep(0.1)
-        self.proof["finalQuitDialogsAccepted"] = accepted
 
     def visibility(self, page, when):
         """The page's own visibility and focus and Windows' view of its
@@ -1025,8 +1049,8 @@ class Observer:
         self.step("Work beforeunload on sequential quit", work)
         dialog = self.dialog(work, unload, "beforeunload", "The beforeunload dialog did not open")
         self.proof["dialog"] = {"type": dialog["params"]["type"], "url": dialog["params"].get("url")}
-        require(urlsplit(dialog["params"]["url"])._replace(path="", query="", fragment="").geturl()
-                == self.app_origin, f"The dialog must belong to {self.app_origin}")
+        require(url_origin(dialog["params"]["url"]) == self.app_origin,
+                f"The dialog must belong to {self.app_origin}")
         personal.cdp.drain()
         require(not any(event["method"].startswith("Page.javascriptDialog")
                         for event in personal.cdp.since(personal_mark)),

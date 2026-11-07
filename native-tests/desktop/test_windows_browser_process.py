@@ -161,6 +161,32 @@ class CdpTests(unittest.TestCase):
         with self.assertRaisesRegex(Failure, "nothing more"):
             cdp.wait_event(lambda e: e["method"] == "Page.javascriptDialogClosed", mark, 0.1, "nothing more")
 
+    def test_the_final_quit_accepts_only_the_sites_own_beforeunload(self):
+        origin = observer.REAL_SITES["excalidraw"]["origin"]
+        self.assertEqual(observer.final_quit_dialog({"type": "beforeunload", "url": "https://excalidraw.com/#x"},
+                                                    origin), {"type": "beforeunload", "origin": origin})
+        for params in ({"type": "alert", "url": "https://excalidraw.com/"},
+                       {"type": "confirm", "url": "https://excalidraw.com/"},
+                       {"type": "beforeunload", "url": "https://evil.example/"},
+                       {"type": "beforeunload", "url": "http://excalidraw.com/"},
+                       {"type": "beforeunload"}):
+            with self.assertRaises(Failure, msg=params):
+                observer.final_quit_dialog(params, origin)
+
+    def test_the_final_quit_refuses_another_dialog_unanswered(self):
+        alert = {"method": "Page.javascriptDialogOpening", "sessionId": "S",
+                 "params": {"type": "alert", "url": "https://excalidraw.com/", "message": "x"}}
+        cdp = observer.Cdp(FakeSocket([alert]), "personal")
+        process = {"opened": {"windowId": 1, "nativePid": 2}, "profile": "P",
+                   "guardReceipt": str(HERE / "no-such-receipt.json")}
+        page = observer.Page(cdp, "S", process, {"targetId": "T"})
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "only a beforeunload"):
+            watch.finish_final_quit([page])
+        self.assertEqual(watch.proof["finalQuitDialogsAccepted"], [])
+        self.assertEqual(watch.proof["finalQuitDialogRefused"]["type"], "alert")
+        self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
+
     def test_marks_stay_absolute_when_old_events_are_dropped(self):
         cdp = observer.Cdp(FakeSocket([{"method": f"E{index}"} for index in range(4200)]), "w")
         cdp.drain(5)
