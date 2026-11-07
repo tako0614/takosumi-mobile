@@ -18,7 +18,7 @@ use std::{
 #[path = "process_setup_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub(super) use windows::{canonical, locate, lock_runtime, sweep_runtime, Identity};
+pub(super) use windows::{canonical, locate, lock_runtime, recheck, sweep_runtime, Identity};
 #[cfg(windows)]
 use windows::{spelled, stale_lock};
 
@@ -214,6 +214,10 @@ pub(super) struct Located {
     pub program: PathBuf,
     pub guard: PathBuf,
     pub runtime: PathBuf,
+    /// Windows: the canonical bundle directory when an executable came from
+    /// it, re-checked before each spawn (`process_setup_windows::recheck`).
+    #[cfg(windows)]
+    pub bundle: Option<PathBuf>,
 }
 
 /// Check the planned files and directories: both executables must resolve to

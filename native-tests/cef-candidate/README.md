@@ -1541,9 +1541,13 @@ directory on Windows is the App executable's directory, so an installed App
 finds its own installation's `cef\`. Both must be plain files (no link,
 junction or other reparse point) whose canonical path lies directly in that
 directory, itself a plain directory: a link or junction cannot make anything
-outside the installation stand in for them. A fixture override
-(`fixture-overrides` builds only) only has to resolve to a file, and an
-executable left to the bundle beside an override is still checked. The
+outside the installation stand in for them. The same checks run again
+before each browser is started (the same canonical paths, still plain files
+in the plain directory), so a change to the installation after the App
+started is refused; only the moment between that check and the process
+creation remains. A fixture override (`fixture-overrides` builds only) only
+has to resolve to a file, and an executable left to the bundle beside an
+override is still checked. The
 runtime root stays `<app cache>\cef` (`%LOCALAPPDATA%\<identifier>\cef`),
 a plain directory inside the user's profile, created when missing, as in
 W2. If anything does not qualify, the App still starts with the browser

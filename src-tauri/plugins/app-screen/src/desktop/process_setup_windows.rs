@@ -94,6 +94,11 @@ pub(in crate::desktop) fn locate(plan: Plan, identity: &Identity) -> Result<Loca
         "Browser process executable is unavailable.",
     )?;
     let guard = executable(&plan.guard, bundle, "Browser guard is unavailable.")?;
+    let bundled = |path: &Path| bundle.is_some_and(|bundle| path.parent() == Some(bundle));
+    let bundle = match bundle {
+        Some(bundle) if bundled(&plan.program) || bundled(&plan.guard) => Some(canonical(bundle)?),
+        _ => None,
+    };
     let runtime = match plan.runtime {
         Runtime::Given(path) => private_runtime(&path, identity)?,
         Runtime::Search(candidates) => search(&candidates, identity)?,
@@ -102,7 +107,34 @@ pub(in crate::desktop) fn locate(plan: Plan, identity: &Identity) -> Result<Loca
         program,
         guard,
         runtime,
+        bundle,
     })
+}
+
+/// Before each spawn: every executable located in the bundle directory must
+/// still be a plain file directly in that plain directory, at the same
+/// canonical path, so the installation cannot have been changed to lead
+/// elsewhere since the App started. (Only the moment between this check and
+/// the process creation remains.)
+pub(in crate::desktop) fn recheck(
+    bundle: Option<&Path>,
+    program: &Path,
+    guard: &Path,
+) -> Result<()> {
+    let Some(bundle) = bundle else {
+        return Ok(());
+    };
+    for (path, missing) in [
+        (program, "Browser process executable is unavailable."),
+        (guard, "Browser guard is unavailable."),
+    ] {
+        if path.parent() == Some(bundle) && bundled_file(bundle, path, missing)? != path {
+            return Err(Error::InvalidRequest(
+                "A bundled browser executable changed after the App started.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// An executable of the plan: one from the App's bundle must be a plain file
@@ -331,6 +363,20 @@ mod windows_tests {
         // The installed App resolves both from its own bundle.
         let install = installed("install");
         let found = resolve(&Overrides::default(), &install);
+        // Before each spawn the same checks run again: they pass while the
+        // installation is unchanged and fail once a bundled file is gone.
+        let recheck_found = || {
+            found.as_ref().ok().map(|found| {
+                recheck(found.bundle.as_deref(), &found.program, &found.guard)
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let rechecked = recheck_found();
+        let guard_file = install.join(PACKAGED).join(GUARD);
+        let renamed = install.join(PACKAGED).join("moved.exe");
+        std::fs::rename(&guard_file, &renamed).unwrap();
+        let after_change = recheck_found();
+        std::fs::rename(&renamed, &guard_file).unwrap();
         // A bundle directory that is a junction to files elsewhere (no
         // privilege needed) is refused, even though the files exist.
         let elsewhere = installed("elsewhere");
@@ -369,6 +415,10 @@ mod windows_tests {
         let found = found.unwrap();
         assert_eq!(found.program, install.join(PACKAGED).join(BROWSER));
         assert_eq!(found.guard, install.join(PACKAGED).join(GUARD));
+        assert_eq!(found.bundle, Some(install.join(PACKAGED)));
+        rechecked.unwrap().unwrap();
+        let reason = after_change.unwrap().unwrap_err();
+        assert!(reason.contains("Browser guard is unavailable"), "{reason}");
         let reason = through_junction.unwrap_err().to_string();
         assert!(reason.contains("plain directory"), "{reason}");
         let reason = missing.unwrap_err().to_string();
@@ -376,6 +426,7 @@ mod windows_tests {
         let mixed_found = mixed_found.unwrap();
         assert_eq!(mixed_found.program, outside);
         assert_eq!(mixed_found.guard, install.join(PACKAGED).join(GUARD));
+        assert_eq!(mixed_found.bundle, Some(install.join(PACKAGED)));
         assert!(mixed_missing.is_err());
         if let Some(symlink) = symlink {
             let reason = symlink.unwrap_err().to_string();
