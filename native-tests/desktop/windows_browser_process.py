@@ -36,6 +36,13 @@ and the cases are named <site>/<case>. A manual evidence run
 (.github/workflows/windows-real-sites.yml), not part of CI; anonymous only,
 no credential is ever typed.
 
+With --packaged (W6) --binary is an installed fixture App (built with
+src-tauri/tauri.windows-cef-fixture.conf.json and installed from its NSIS
+installer): no --browser, --guard or runtime override is given, so the App
+resolves the bundled browser and guard in its installation's cef directory
+and its runtime root in its app cache's cef directory itself, and the same
+cases run against it.
+
 It prints `PASS case <name>` for each verified case and writes summary.json
 into the case directory, which it never removes.
 """
@@ -116,7 +123,8 @@ WINDOWS_SOURCES = (
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
     "native-tests/desktop/windows_fixture_tls.ps1", "native-tests/cef-candidate/windows_smoke.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
-    "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/src/process_main.rs",
+    "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/.cargo/config.toml",
+    "native-tests/cef-candidate/src/process_main.rs",
     "native-tests/cef-candidate/src/guard_entry.rs", "native-tests/cef-candidate/src/guard_windows.rs",
     "native-tests/cef-candidate/src/guard_windows_identity.rs", "native-tests/cef-candidate/src/process_type.rs",
     "native-tests/cef-candidate/windows/takosumi-cef-browser-process.exe.manifest",
@@ -436,6 +444,9 @@ def run_phase(args, env, files, before, head, suffix):
         proof["appPid"] = app.pid
         try:
             real = ["--real-site", args.real_site] if args.real_site else []
+            # A packaged run also requires each guard and browser to run from
+            # the installed App's cef directory.
+            real += ["--installed", str(args.binary.parent)] if args.packaged else []
             with create_exclusive(session / f"observer{suffix}.log") as observer:
                 subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
                                 "--app-pid", str(app.pid), "--phase", phase, *real],
@@ -514,10 +525,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--binary", type=Path, required=True,
                         help="takosumi-mobile.exe built with --features native-browser-process-fixture")
-    parser.add_argument("--browser", type=Path, required=True,
+    parser.add_argument("--browser", type=Path,
                         help="takosumi-cef-browser-process.exe built with the cef-candidate features "
-                             "fixture-inspection,windows-unsandboxed-candidate (libcef.dll beside it)")
-    parser.add_argument("--guard", type=Path, required=True, help="takosumi-browser-guard.exe")
+                             "fixture-inspection,windows-unsandboxed-candidate (libcef.dll beside it); "
+                             "not with --packaged")
+    parser.add_argument("--guard", type=Path, help="takosumi-browser-guard.exe; not with --packaged")
+    parser.add_argument("--packaged", action="store_true",
+                        help="W6: --binary is an installed fixture App (tauri.windows-cef-fixture.conf.json); it "
+                             "resolves its bundled browser and guard (cef\\ beside it) and its runtime root "
+                             "itself, without the fixture's overrides")
     parser.add_argument("--data", type=Path, required=True,
                         help="a new case directory inside the user's profile, named with at most 24 lowercase "
                              "letters, digits and hyphens (the App's browser runtime root must lie in the profile)")
@@ -534,8 +550,15 @@ def main():
     args = parser.parse_args()
     if args.real_site and (args.restart or args.reset):
         parser.error("--real-site runs the first launch only")
+    if args.packaged and (args.browser or args.guard):
+        parser.error("--packaged resolves the browser and guard from the installed App; omit --browser and --guard")
+    if not args.packaged and not (args.browser and args.guard):
+        parser.error("--browser and --guard are required unless --packaged")
     if not WINDOWS:
         parser.error("windows_browser_process.py runs on Windows; browser_process.py is the Linux runner")
+    if args.packaged:
+        args.binary = Path(os.path.realpath(args.binary))
+        args.browser, args.guard = packaged_files(args.binary)
     for name in ("binary", "browser", "guard", "tls_cert", "tls_key", "tls_ca"):
         setattr(args, name, Path(os.path.realpath(getattr(args, name))))
         require(getattr(args, name).is_file(), f"No file at {getattr(args, name)}")
@@ -543,7 +566,7 @@ def main():
     stored = [directory for directory in app_data(args.data.name) if os.path.lexists(directory)]
     require(not stored, f"App data for this case name already exists: {stored}")
     summary = {"passed": False, "case": str(args.data), "appData": [str(path) for path in app_data(args.data.name)],
-               "cases": [], "phases": [], "realSite": args.real_site}
+               "cases": [], "phases": [], "realSite": args.real_site, "packaged": args.packaged}
     args.data.mkdir()
     args.data.joinpath(".owned-browser-reference").write_text(args.data.name, encoding="utf-8")
     try:
@@ -584,6 +607,42 @@ def real_site_cases(site):
     return [f"{site}/{name}" for name in list(OBSERVED_CASES[""]) + [QUIT_CASE] + list(FINAL_CASES)]
 
 
+# The executables a packaged App resolves itself (`cef\` in its install).
+PACKAGED_BROWSER = "takosumi-cef-browser-process.exe"
+PACKAGED_GUARD = "takosumi-browser-guard.exe"
+
+
+def packaged_files(binary):
+    """The browser and guard an installed App resolves without environment
+    variables: the cef directory beside its executable (Tauri's resource directory on
+    Windows is the executable's)."""
+    cef = binary.parent / "cef"
+    return cef / PACKAGED_BROWSER, cef / PACKAGED_GUARD
+
+
+def browser_env(base, args, session, log):
+    """The App's environment: the caller's without any TAKOSUMI_ or
+    WEBVIEW2_ variable, then the fixture's. A packaged run (`--packaged`)
+    names no executable or runtime root: the App resolves its bundled
+    browser and guard and its runtime root (its app cache's cef directory)
+    itself."""
+    env = {key: value for key, value in base.items() if not key.upper().startswith(("TAKOSUMI_", "WEBVIEW2_"))}
+    env.update(TEMP=str(session / "tmp"), TMP=str(session / "tmp"),
+               TAKOSUMI_BROWSER_PROCESS_CASE=str(session),
+               TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
+               TAKOSUMI_BROWSER_PROCESS_APP="local",
+               TAKOSUMI_BROWSER_PROCESS_SITE=args.site,
+               # The fixture build appends any link it would open outside here.
+               TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(log))
+    if not args.packaged:
+        env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
+                   TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard),
+                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(session / "r"))
+    if args.real_site:
+        env["TAKOSUMI_BROWSER_PROCESS_REAL_SITE"] = args.real_site
+    return env
+
+
 def run(args, summary):
     # Everything the App, the observer and the browsers write lives in the
     # session directory, named like the case (its name is the observer's
@@ -599,20 +658,7 @@ def run(args, summary):
     try:
         check_site(args.site, args.tls_ca)
         log = session / "external-open.log"
-        env = {key: value for key, value in os.environ.items()
-               if not key.upper().startswith(("TAKOSUMI_", "WEBVIEW2_"))}
-        env.update(TEMP=str(session / "tmp"), TMP=str(session / "tmp"),
-                   TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
-                   TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard),
-                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(session / "r"),
-                   TAKOSUMI_BROWSER_PROCESS_CASE=str(session),
-                   TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
-                   TAKOSUMI_BROWSER_PROCESS_APP="local",
-                   TAKOSUMI_BROWSER_PROCESS_SITE=args.site,
-                   # The fixture build appends any link it would open outside here.
-                   TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(log))
-        if args.real_site:
-            env["TAKOSUMI_BROWSER_PROCESS_REAL_SITE"] = args.real_site
+        env = browser_env(os.environ, args, session, log)
         runtime = args.browser.parent / "libcef.dll"
         require(runtime.is_file(), f"No libcef.dll beside {args.browser}")
         files = sorted(set([args.binary, args.browser, runtime, args.guard] + source_files(REPO)))

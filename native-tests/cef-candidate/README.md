@@ -351,9 +351,9 @@ support. Retain each exact-source receipt when comparing later candidates.
 
 The App feature `desktop-cef` enables this per-profile browser path in a normal
 App build, without the fixture driver; `native-browser-process-fixture` now
-implies it. This section is about Linux; on Windows the feature compiles for
-the unsandboxed candidate without a package (see
-[Windows guard and adapter](#windows-guard-and-adapter)). It is never enabled
+implies it. This section is about Linux; on Windows the feature builds the
+unsandboxed candidate, packaged since W6 (see
+[Windows packaging (W6)](#windows-packaging-w6)). It is never enabled
 by default, and nothing here publishes or signs a package. The first local packaging default (chosen by the
 coordinator, not an approval to publish or distribute) is a deb plus an AppImage.
 
@@ -571,7 +571,10 @@ both; nothing is staged or packaged.
 
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"   # the first build downloads the Windows distribution here
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+# From native-tests\cef-candidate: its .cargo\config.toml links the C runtime statically.
+Push-Location native-tests\cef-candidate
+cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
 python -B native-tests/cef-candidate/windows_smoke.py --browser <target>\debug\takosumi-cef-browser-process.exe --work C:\absolute\owned\cases
 ```
 
@@ -973,7 +976,8 @@ drops the App's spawner (closing the App's job) and requires every process
 held to end within 15 s, naming each survivor with its image, and no normal
 receipt. A missing helper prints a fresh view of the browser's tree with
 each process's parent and image and the expected program. The step fails
-unless each named test passed and exactly thirteen ran. The `desktop` job also checks the App with `--features desktop-cef` on
+unless each named test passed and exactly fourteen ran (the W6 bundle
+resolution test included). The `desktop` job also checks the App with `--features desktop-cef` on
 Windows.
 
 **2026-11-06 local checks (W2).** On the Linux host the plugin type-checks for
@@ -1251,7 +1255,9 @@ sites).
 
 ```powershell
 $env:CEF_PATH = "C:\absolute\owned\cef"
-cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
 bun run build
 cargo build --locked --manifest-path src-tauri/Cargo.toml --features native-browser-process-fixture
 pwsh -File native-tests/desktop/windows_fixture_tls.ps1 -Out C:\absolute\owned\w3-tls
@@ -1471,6 +1477,146 @@ button is clicked from script; the Linux run used CDP pointer input), the long
 native alert,
 downloads, popups, notifications and the native file chooser on the real
 sites; a real login; and anything W3 does not show (see above).
+
+## Windows packaging (W6)
+
+The sixth Windows step (W6) is the Windows counterpart of the Linux product
+path ([Linux packaging](#linux-packaging-desktop-cef), #28): the CEF runtime
+and the Rust guard are bundled, the App resolves them without environment
+variables, the installer installs it, and the installed App launches
+normally. **Boundaries:** the installers are unsigned (no Authenticode, so
+Windows SmartScreen would warn) and are not published or uploaded anywhere;
+the browser is still the explicit unsandboxed candidate
+(`windows-unsandboxed-candidate`), and the Windows sandbox is a separate,
+later step; the CI installers are debug builds. Authenticode, SmartScreen
+reputation, updates and real devices remain operator inputs, as listed in the
+control repo's `docs/takosumi/app-release-inputs.md`.
+
+**Layout.** `scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef <CEF_PATH>/<version>/cef_windows_x86_64 --bin <target>/debug`
+copies into `src-tauri/target/windows-cef/cef/`, the same `cef/` layout the
+Linux bundle uses: `takosumi-cef-browser-process.exe`,
+`takosumi-browser-guard.exe`, `libcef.dll`, `chrome_elf.dll` (which
+`libcef.dll` imports), `icudtl.dat`, the `.pak` files, the V8 snapshot, every
+`locales/*.pak` (`en-US.pak` required), `CREDITS.html`, and ANGLE
+(`libEGL.dll`, `libGLESv2.dll`), the shader compilers (`d3dcompiler_47.dll`,
+`dxcompiler.dll`, `dxil.dll`) and SwiftShader (`vk_swiftshader.dll`, its ICD
+file, `vulkan-1.dll`) when present. It never stages the import library, the
+sandbox library, CEF's bootstrap executables or SDK build inputs (they are
+named in the manifest), and stops at any entry it neither stages nor knows
+as ignorable (`README.txt`) rather than leave a possible dependency or
+resource out. CEF's own BSD license travels with it: the distribution's
+`LICENSE.txt` when it has one, otherwise `CREDITS.html` when it names CEF's
+copyright holder, otherwise a `CEF-LICENSE.txt` written from the license
+comment that opens `include/cef_base.h`; without any of them the stage
+stops (the manifest's `cefLicense` says which). Both executables must be
+x86-64 PE files, and every staged executable and DLL may import at load
+time only Windows system DLLs or files staged beside it; the manifest
+records each one's imports. The system DLL list (`scripts/windows-cef-pe.mjs`)
+is exactly what the staged CEF 154 runtime, browser and guard import in CI
+(run 42355214657): `advapi32`, `cfgmgr32`, `crypt32`, `dwrite`, `gdi32`,
+`kernel32`, `ntdll`, `ole32`, `oleaut32`, `rpcrt4`, `user32`, `version`,
+`winmm` and `ws2_32`, all on every Windows 10/11 edition (no Media
+Foundation, which the N and KN editions lack), plus the `api-ms-win-*` and
+`ext-ms-win-*` API sets by prefix (a set newer than the oldest supported
+Windows would not be caught). The import tables are read as the loader
+maps the image (file data from PointerToRawData rounded down to 0x200,
+zeros past SizeOfRawData; an image without an optional header is refused),
+and delay-loaded DLLs are not checked. The browser
+and guard therefore link the C runtime statically: Cargo builds them from
+`native-tests/cef-candidate`, whose `.cargo/config.toml` sets
+`+crt-static` for `x86_64-pc-windows-msvc` (like the `/MT` CEF wrapper), so
+an installed App needs no Visual C++ redistributable (`VCRUNTIME140.dll`,
+which a clean Windows lacks), and a build without it is refused at staging.
+A package stage must say `--unsandboxed-candidate`, so an unsandboxed
+installer is never made by accident; a browser with the fixture inspection
+seam is refused unless `--fixture`, whose stage
+(`src-tauri/target/windows-cef-fixture/`) never goes to the package path. Files are copied, never linked, and `stage.json` beside the stage lists
+each one's size and SHA-256. `src-tauri/tauri.windows-cef.conf.json` maps the
+stage to the NSIS bundle's `cef/` and installs per user (`installMode:
+currentUser`, by default into `%LOCALAPPDATA%\Takosumi`);
+`tauri.windows-cef-fixture.conf.json` does the same for the fixture stage,
+uncompressed for CI, under its own product name and identifier
+(`TakosumiFixture`, `com.takosumi.fixture.package`), so the two installers
+never share an uninstall key, a Start menu entry or a default directory
+(the fixture App still takes a per-case identifier at run time). The installed tree is `<install dir>\<App>.exe`,
+`uninstall.exe` and `cef\`. A release build of the App on Windows is a
+GUI-subsystem program (no console window when launched normally); a debug
+build keeps its console.
+
+```powershell
+Push-Location native-tests\cef-candidate   # static C runtime (.cargo\config.toml)
+cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+Pop-Location
+node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef "$env:CEF_PATH\154.0.34\cef_windows_x86_64" --bin "$env:CARGO_TARGET_DIR\debug"
+bunx tauri build --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
+```
+
+**Resolution** (`process_setup.rs`, `process_setup_windows.rs`). A product
+build (`desktop-cef`) never reads the fixture's overrides; it takes the
+browser and guard from `<resource_dir>\cef\`, and Tauri's resource
+directory on Windows is the App executable's directory, so an installed App
+finds its own installation's `cef\`. Both must be plain files (no link,
+junction or other reparse point) whose canonical path lies directly in that
+directory, itself a plain directory: a link or junction cannot make anything
+outside the installation stand in for them. The same checks run again
+before each browser is started (the same canonical paths, still plain files
+in the plain directory): links, junctions, moves and deletions after the App
+started are refused. An in-place overwrite of a plain file is not detected
+(nothing holds the files open), and the moment between that check and the
+process creation remains. A fixture override (`fixture-overrides` builds only) only
+has to resolve to a file, and an executable left to the bundle beside an
+override is still checked. The
+runtime root stays `<app cache>\cef` (`%LOCALAPPDATA%\<identifier>\cef`),
+a plain directory inside the user's profile, created when missing, as in
+W2. If anything does not qualify, the App still starts with the browser
+backend unavailable and its reason (as on Linux). A Windows unit test covers
+the installed case, a bundle directory that is a junction to files elsewhere,
+a missing guard, a mixed override and a file symbolic link.
+
+**CI evidence** (`cef-windows-package`, windows-latest, 150 min). It builds
+the product browser and guard and stages them, then the fixture-inspection
+browser into the fixture stage. It builds the fixture installer, installs it
+silently into a fresh directory (`/S /D=`), requires the installed `cef\` to
+hold exactly the staged files (paths, sizes, SHA-256), and runs the W3 cases
+against the installed App with `windows_browser_process.py --packaged`: no
+browser, guard or runtime override, so the App resolves its bundle and
+runtime root itself, the observer requires every guard and browser to run
+from the installation's `cef\` (their image paths) and, from a snapshot of
+their loaded modules, the browser's `libcef.dll` to come from there and
+neither process to have loaded `vcruntime140*` or `msvcp140*` (the static C
+runtime at run time), and exactly the ten W3 cases must pass. The fixture
+installer carries the product guard: the fixture build rebuilds only the
+browser, and the two stage manifests must record the same guard. It uninstalls it silently. It then builds the product
+installer (`desktop-cef`), installs it the same way, runs the installed
+product browser alone through `windows_smoke.py` (boot open, shutdown,
+`stopped`, exit 0, nothing left in its job), and launches the installed App
+once (`windows_package.py smoke`): on a runner where it has no runtime root
+yet, with no `TAKOSUMI_` or `WEBVIEW2_` variable, inside a kill-on-close
+job, its window must appear, it must stay up for 8 s, must not report its
+browser unavailable and must have created its runtime root; `WM_CLOSE` must
+end it with exit code 0 and the job must empty. Each uninstall first
+requires the per-user uninstall key and the Start menu shortcut of the
+productName its installer was built with (read from its Tauri config) to
+exist, so their absence afterwards is the uninstaller's doing; it must then
+remove the installation directory, that key and that shortcut and leave no
+process running from it (run 42351529951 read the key
+and shortcut right after the directory went, before the uninstaller had
+removed them; the check now waits for all three). What remains is reported, not removed: the App's data
+directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime
+root and browser profiles, and the fixture's per-case
+`com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any). The
+artifact keeps only reports, logs, the stage manifests, the packaged case
+and the installed browser's smoke case, gathered into one directory: text
+files only (`.json`, `.log`, `.txt`, `.html`, `.md`), never anything that is
+an executable, a library or an archive by its name or its first bytes (MZ,
+ELF, ZIP); each skipped file and failed copy is logged, and one failure does
+not stop the rest.
+
+**Not shown by W6:** a signed or release installer, SmartScreen, an update
+over a running App, a machine-wide install, real devices, the Windows
+sandbox, and opening a connection in the installed product App (the
+packaged fixture App does that; the product App is only launched and
+closed).
 
 ## Observations and limits
 

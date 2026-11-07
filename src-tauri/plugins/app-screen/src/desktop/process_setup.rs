@@ -18,7 +18,7 @@ use std::{
 #[path = "process_setup_windows.rs"]
 mod windows;
 #[cfg(windows)]
-pub(super) use windows::{canonical, locate, lock_runtime, sweep_runtime, Identity};
+pub(super) use windows::{canonical, locate, lock_runtime, recheck, sweep_runtime, Identity};
 #[cfg(windows)]
 use windows::{spelled, stale_lock};
 
@@ -148,6 +148,11 @@ pub(super) struct Plan {
     pub program: PathBuf,
     pub guard: PathBuf,
     pub runtime: Runtime,
+    /// Windows: `<resources>\cef` when the browser or the guard comes from
+    /// the App's bundle. Each such executable must then be a plain file
+    /// directly in that plain directory (`process_setup_windows.rs`).
+    #[cfg(windows)]
+    pub bundle: Option<PathBuf>,
 }
 
 /// Decide where the browser, its guard and the runtime root are, without
@@ -191,10 +196,16 @@ pub(super) fn plan(
             Runtime::Search(xdg.into_iter().chain(cache).collect())
         }
     };
+    #[cfg(windows)]
+    let bundle = (overrides.program.is_none() || overrides.guard.is_none())
+        .then(|| resources.map(|resources| resources.join(PACKAGED)))
+        .flatten();
     Ok(Plan {
         program,
         guard,
         runtime,
+        #[cfg(windows)]
+        bundle,
     })
 }
 
@@ -203,6 +214,10 @@ pub(super) struct Located {
     pub program: PathBuf,
     pub guard: PathBuf,
     pub runtime: PathBuf,
+    /// Windows: the canonical bundle directory when an executable came from
+    /// it, re-checked before each spawn (`process_setup_windows::recheck`).
+    #[cfg(windows)]
+    pub bundle: Option<PathBuf>,
 }
 
 /// Check the planned files and directories: both executables must resolve to

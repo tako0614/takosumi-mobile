@@ -42,6 +42,10 @@ struct ExitPhase {
 struct State {
     program: PathBuf,
     guard: PathBuf,
+    /// Windows: the bundle directory the executables were located in, if
+    /// any; re-checked before each spawn (`setup::recheck`).
+    #[cfg(windows)]
+    bundle: Option<PathBuf>,
     directory: PathBuf,
     runtime_root: PathBuf,
     /// Root, or the fixture's explicit opt-out: see `setup::without_sandbox`.
@@ -303,11 +307,10 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
         runtime_dir.as_deref(),
         paths.app_cache_dir().ok().as_deref(),
     )?;
-    let setup::Located {
-        program,
-        guard,
-        runtime: runtime_root,
-    } = setup::locate(plan, owner)?;
+    let located = setup::locate(plan, owner)?;
+    let (program, guard, runtime_root) = (located.program, located.guard, located.runtime);
+    #[cfg(windows)]
+    let bundle = located.bundle;
     // Runtime directories of ended App instances, judged by their locks
     // (tmpfs keeps them until logout; the cache fallback across reboots).
     for problem in setup::sweep_runtime(&runtime_root, owner) {
@@ -334,6 +337,8 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
     Ok(State {
         program,
         guard,
+        #[cfg(windows)]
+        bundle,
         directory,
         runtime_root,
         no_sandbox,
@@ -387,6 +392,10 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 return Err(Error::InvalidRequest("Browser profile limit reached."));
             }
             let key = payload.key.clone();
+            // Windows: the bundled executables are checked again now, not
+            // only when the App started.
+            #[cfg(windows)]
+            setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
             let runtime = free_runtime(&state.runtime_root)?;
             let mut process = Process::spawn(
                 state.program.clone(),
@@ -2647,6 +2656,8 @@ mod windows_tests {
                 program: built("TAKOSUMI_WINDOWS_BROWSER"),
                 guard: built("TAKOSUMI_WINDOWS_GUARD"),
                 runtime: setup::Runtime::Given(case.join("rt")),
+                // The built executables, as a fixture's overrides name them.
+                bundle: None,
             },
             &identity,
         )

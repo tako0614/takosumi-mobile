@@ -1,0 +1,9 @@
+# The Windows browser and guard link the C runtime statically (/MT), like the
+# CEF wrapper cef-dll-sys builds (CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded):
+# an installed App then needs no Visual C++ redistributable
+# (VCRUNTIME140.dll), which a clean Windows lacks. Cargo reads this file when
+# it runs in this directory (or below), so build these binaries from here;
+# scripts/stage-windows-cef.mjs refuses a binary that still imports the
+# runtime. No effect on Linux.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

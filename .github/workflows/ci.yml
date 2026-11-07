@@ -485,8 +485,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-cef
-          key: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
-          restore-keys: cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
+          # crt: built with the static C runtime since W6 (a new key, so the
+          # cache is saved once with it).
+          key: cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-tests/cef-candidate/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -504,11 +508,14 @@ jobs:
           rustc --version
           cargo --version
           python --version
+      # From native-tests/cef-candidate, whose .cargo/config.toml links the
+      # C runtime statically (no VCRUNTIME140.dll needed on a clean Windows).
       - name: Build takosumi-cef-browser-process (product, unsandboxed candidate) and takosumi-browser-guard
         id: build
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
@@ -559,11 +566,12 @@ jobs:
       - name: Guard self-tests (Windows)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'guard-self-tests.log'
-          cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
+          cargo test --locked --features windows-unsandboxed-candidate --bin takosumi-browser-guard | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "Guard self-tests failed (exit $LASTEXITCODE)" }
           if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed$' -Quiet)) { throw 'Not all thirteen guard self-tests ran' }
       # The App's adapter on Windows with the product browser and the guard
@@ -616,21 +624,23 @@ jobs:
             'desktop::process_adapter::windows_tests::a_held_chromium_lockfile_refuses_the_clear_and_keeps_the_data',
             'desktop::process_adapter::windows_tests::an_unresolvable_browser_leaves_the_app_running_with_its_reason',
             'desktop::process_setup::windows::windows_tests::a_held_runtime_lock_is_never_judged_stale_and_its_directory_can_go',
-            'desktop::process_setup::windows::windows_tests::a_missing_cache_runtime_root_is_created_and_located'
+            'desktop::process_setup::windows::windows_tests::a_missing_cache_runtime_root_is_created_and_located',
+            'desktop::process_setup::windows::windows_tests::bundled_executables_must_be_plain_files_in_the_installation'
           )
           foreach ($name in $required) {
             if (-not (Select-String -Path $log -SimpleMatch "test $name ... ok" -Quiet)) { throw "$name did not pass" }
           }
-          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 13 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all thirteen Windows adapter tests ran' }
+          if (-not (Select-String -Path $log -Pattern '^test result: ok\. 14 passed; 0 failed; 0 ignored' -Quiet)) { throw 'Not all fourteen Windows adapter tests ran' }
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the Win32
       # raise to make its top-level window the foreground window.
       - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate)
         id: fixture-build
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
       - name: Browser smoke (page load and window reuse)
         if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
         timeout-minutes: 15
@@ -718,8 +728,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
-          restore-keys: cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -737,12 +749,13 @@ jobs:
           rustc --version
           cargo --version
           python --version
+      # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
       - name: Build takosumi-cef-browser-process (fixture-inspection, unsandboxed candidate) and takosumi-browser-guard
         id: browser-build
-        working-directory: takosumi-mobile
+        working-directory: takosumi-mobile/native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}\cef
-        run: cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+        run: cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
       # Line tables keep panics' locations while the App's debug build (and
       # its cache) stays small.
       - name: Build the App with native-browser-process-fixture
@@ -829,5 +842,372 @@ jobs:
           path: |
             ${{ env.W3_CASE }}
             ${{ env.W3_APP_DATA }}/browser-process-experiment/*/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # W6, the Windows counterpart of the Linux product path (#28), unsigned and
+  # unpublished: the CEF runtime, the browser and the Rust guard are staged
+  # (scripts/stage-windows-cef.mjs) into an NSIS bundle's cef/, the App
+  # resolves them there without environment variables, and the installer
+  # installs per user. A fixture installer (tauri.windows-cef-fixture.conf.json)
+  # is installed silently and the W3 cases run against the installed App
+  # (--packaged); the product installer (tauri.windows-cef.conf.json) is
+  # installed, its browser run alone (windows_smoke.py) and the installed App
+  # launched once (window, a few seconds up, no unavailable browser, WM_CLOSE,
+  # empty job). Each is then uninstalled silently. The browser stays the unsandboxed candidate. No installer or
+  # binary is uploaded: logs, reports, stage manifests and the case only.
+  # Independent of the other jobs.
+  cef-windows-package:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      # The W3 job's compiler cache (restored, never saved here).
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: takosumi-mobile
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tako0614/mobile-kit
+          ref: ${{ env.MOBILE_KIT_SOURCE_REF }}
+          path: mobile-kit
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tako0614/takosumi
+          ref: ${{ env.TAKOSUMI_SOURCE_REF }}
+          path: takosumi
+          sparse-checkout: contract
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+        working-directory: takosumi-mobile
+      - name: W6 runner unit tests
+        working-directory: takosumi-mobile
+        run: |
+          python -B native-tests/desktop/test_windows_browser_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw "W3 runner unit tests failed (exit $LASTEXITCODE)" }
+          python -B native-tests/desktop/test_windows_package.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Package check unit tests failed (exit $LASTEXITCODE)" }
+      - name: WebView2 Runtime
+        shell: pwsh
+        run: |
+          $client = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $versions = foreach ($key in @("HKLM:\SOFTWARE\WOW6432Node\$client", "HKLM:\SOFTWARE\$client", "HKCU:\Software\$client")) {
+            (Get-ItemProperty -Path $key -Name pv -ErrorAction SilentlyContinue).pv
+          }
+          $version = @($versions | Where-Object { $_ -and $_ -ne '0.0.0.0' }) | Select-Object -First 1
+          if (-not $version) { throw 'The WebView2 Runtime is not installed on this runner' }
+          "WebView2 Runtime $version"
+      - name: Locked CEF version
+        id: cef
+        shell: pwsh
+        working-directory: takosumi-mobile
+        run: |
+          $lock = Get-Content native-tests/cef-candidate/Cargo.lock
+          $index = [array]::IndexOf($lock, 'name = "cef-dll-sys"')
+          if ($index -lt 0 -or $lock[$index + 1] -notmatch '^version = "(.+)"$') { throw 'cef-dll-sys is not locked' }
+          "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cef
+            !${{ runner.temp }}/cef/*/*.tar.bz2
+          key: cef-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.cef.outputs.version }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-w3
+          key: cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: CMake and Ninja for the CEF wrapper
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            # Visual Studio ships Ninja with its CMake tools.
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+            if (-not (Test-Path (Join-Path $ninja 'ninja.exe'))) { throw 'Ninja is not available' }
+            Add-Content -Path $env:GITHUB_PATH -Value $ninja
+            & (Join-Path $ninja 'ninja.exe') --version
+          } else {
+            ninja --version
+          }
+          rustc --version
+          cargo --version
+          python --version
+          node --version
+      # The product browser (no inspection seam) and the guard, staged first:
+      # the fixture build below replaces the browser in the build directory.
+      - name: Build and stage the product browser and guard
+        id: product-stage
+        working-directory: takosumi-mobile
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: |
+          # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features windows-unsandboxed-candidate --bin takosumi-cef-browser-process --bin takosumi-browser-guard
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The product browser build failed (exit $built)" }
+          $cef = @(Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 1 -Filter cef_windows_x86_64)
+          if ($cef.Count -ne 1) { throw "Expected one CEF distribution under $env:CEF_PATH, found $($cef.Count)" }
+          "W6_CEF=$($cef[0].FullName)" >> $env:GITHUB_ENV
+          node scripts/stage-windows-cef.mjs --unsandboxed-candidate --cef $cef[0].FullName --bin "$env:CARGO_TARGET_DIR\debug"
+          if ($LASTEXITCODE -ne 0) { throw "The product stage failed (exit $LASTEXITCODE)" }
+      - name: Build and stage the fixture browser
+        id: fixture-stage
+        if: ${{ !cancelled() && steps.product-stage.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        env:
+          CEF_PATH: ${{ runner.temp }}\cef
+        run: |
+          # Only the browser: the guard in the build directory stays the
+          # product one, so the packaged W3 run exercises the product guard.
+          Push-Location native-tests/cef-candidate
+          cargo build --locked --features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process
+          $built = $LASTEXITCODE
+          Pop-Location
+          if ($built -ne 0) { throw "The fixture browser build failed (exit $built)" }
+          node scripts/stage-windows-cef.mjs --fixture --cef $env:W6_CEF --bin "$env:CARGO_TARGET_DIR\debug"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture stage failed (exit $LASTEXITCODE)" }
+          $guards = foreach ($stage in @('src-tauri/target/windows-cef/stage.json', 'src-tauri/target/windows-cef-fixture/stage.json')) {
+            @((Get-Content -Raw $stage | ConvertFrom-Json).files | Where-Object { $_.path -eq 'takosumi-browser-guard.exe' }).sha256
+          }
+          if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw "The product and fixture stages hold different guards: $guards" }
+          "Both stages hold the product guard $($guards[0])"
+      # Both installers share Tauri's bundle path, so each is copied aside
+      # (never uploaded) before the next build.
+      - name: Build the fixture installer (NSIS, unsigned)
+        id: fixture-installer
+        if: ${{ !cancelled() && steps.fixture-stage.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          bunx tauri build --ci --debug --bundles nsis --features native-browser-process-fixture --config src-tauri/tauri.windows-cef-fixture.conf.json
+          if ($LASTEXITCODE -ne 0) { throw "The fixture installer build failed (exit $LASTEXITCODE)" }
+          # This overlay's own installer only: the bundle directory may also
+          # hold the other installer (they differ by productName).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef-fixture.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          $setup = @(Get-ChildItem -LiteralPath "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -File | Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" })
+          if ($setup.Count -ne 1) { throw "Expected one NSIS installer of $product, found $($setup.Count)" }
+          Copy-Item -LiteralPath $setup[0].FullName -Destination "$env:RUNNER_TEMP\w6-fixture-setup.exe"
+          "Fixture installer: $($setup[0].Name), $([math]::Round($setup[0].Length / 1MB)) MiB"
+      - name: Fixture site TLS (disposable CA trusted for this run)
+        id: w6-tls
+        if: ${{ !cancelled() && steps.fixture-installer.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w6-tls"
+          if ($LASTEXITCODE -ne 0) { throw "The fixture TLS setup failed (exit $LASTEXITCODE)" }
+      - name: Install the fixture App (silent, per user)
+        id: fixture-install
+        if: ${{ !cancelled() && steps.w6-tls.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'w6-fixture-app'
+          $report = Join-Path $env:RUNNER_TEMP 'w6-fixture-install.json'
+          python -B native-tests/desktop/windows_package.py install --installer "$env:RUNNER_TEMP\w6-fixture-setup.exe" --dir $dir --manifest src-tauri/target/windows-cef-fixture/stage.json --report $report
+          if ($LASTEXITCODE -ne 0) { throw "The fixture install failed (exit $LASTEXITCODE)" }
+          $installed = Get-Content -Raw $report | ConvertFrom-Json
+          "W6_FIXTURE_APP=$(Join-Path $dir $installed.app)" >> $env:GITHUB_ENV
+      # The W3 case against the installed App: it resolves its bundled browser,
+      # guard and runtime root itself (no fixture override). Every required
+      # case must pass and exactly these ten run.
+      - name: Packaged actual App cases (home, per-profile CEF, reuse, quit, restart, clear)
+        id: w6-run
+        if: ${{ !cancelled() && steps.fixture-install.outcome == 'success' }}
+        timeout-minutes: 20
+        working-directory: takosumi-mobile
+        run: |
+          $name = 'sumi-w6'
+          $case = Join-Path ([System.IO.Path]::GetTempPath()) $name
+          "W6_CASE=$case" >> $env:GITHUB_ENV
+          "W6_APP_DATA=$env:LOCALAPPDATA\com.takosumi.fixture.browserprocess.$name" >> $env:GITHUB_ENV
+          $tls = Join-Path $env:RUNNER_TEMP 'w6-tls'
+          $log = Join-Path $env:RUNNER_TEMP 'w6-cases.log'
+          python -B native-tests/desktop/windows_browser_process.py --packaged --binary $env:W6_FIXTURE_APP --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "Packaged W3 cases failed (exit $LASTEXITCODE)" }
+          $w6Cases = @(
+            'separate-profiles',
+            'home-by-window-switch',
+            'reuse-raises-window',
+            'quit-cancel-stops',
+            'quit-partial-order',
+            'quit-completes',
+            'restart-keeps-separation',
+            'clear-only-one-profile',
+            'no-process-left',
+            'no-opener-request'
+          )
+          foreach ($case_name in $w6Cases) {
+            if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "Packaged case $case_name did not pass" }
+          }
+          $w6Count = @(Select-String -Path $log -Pattern '^PASS case ').Count
+          if ($w6Count -ne 10) { throw "Expected exactly ten packaged cases, saw $w6Count" }
+          $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
+          if ($summary.passed -ne $true -or $summary.packaged -ne $true) { throw 'The packaged summary did not pass' }
+      - name: Uninstall the fixture App (silent)
+        if: ${{ !cancelled() && steps.fixture-install.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          # The productName its installer was built with (its uninstall key and shortcut).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef-fixture.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-fixture-app" --report "$env:RUNNER_TEMP\w6-fixture-uninstall.json" --product $product
+          if ($LASTEXITCODE -ne 0) { throw "The fixture uninstall failed (exit $LASTEXITCODE)" }
+      - name: Build the product installer (NSIS, unsigned)
+        id: product-installer
+        if: ${{ !cancelled() && steps.product-stage.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          bunx tauri build --ci --debug --bundles nsis --features desktop-cef --config src-tauri/tauri.windows-cef.conf.json
+          if ($LASTEXITCODE -ne 0) { throw "The product installer build failed (exit $LASTEXITCODE)" }
+          # This overlay's own installer only: the bundle directory may also
+          # hold the other installer (they differ by productName).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          $setup = @(Get-ChildItem -LiteralPath "$env:CARGO_TARGET_DIR\debug\bundle\nsis" -File | Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" })
+          if ($setup.Count -ne 1) { throw "Expected one NSIS installer of $product, found $($setup.Count)" }
+          Copy-Item -LiteralPath $setup[0].FullName -Destination "$env:RUNNER_TEMP\w6-setup.exe"
+          "Product installer: $($setup[0].Name), $([math]::Round($setup[0].Length / 1MB)) MiB"
+      - name: Install the product App (silent, per user)
+        id: product-install
+        if: ${{ !cancelled() && steps.product-installer.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'w6-app'
+          $report = Join-Path $env:RUNNER_TEMP 'w6-install.json'
+          python -B native-tests/desktop/windows_package.py install --installer "$env:RUNNER_TEMP\w6-setup.exe" --dir $dir --manifest src-tauri/target/windows-cef/stage.json --report $report
+          if ($LASTEXITCODE -ne 0) { throw "The product install failed (exit $LASTEXITCODE)" }
+          $installed = Get-Content -Raw $report | ConvertFrom-Json
+          "W6_APP=$(Join-Path $dir $installed.app)" >> $env:GITHUB_ENV
+      # The installed product browser (no inspection seam) on its own, as
+      # W1 runs the built one: boot open, shutdown, stopped, exit 0, nothing
+      # left in its job.
+      - name: Run the installed product browser alone
+        if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
+        timeout-minutes: 10
+        working-directory: takosumi-mobile
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'w6-browser-smoke'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          python -B native-tests/cef-candidate/windows_smoke.py --browser "$env:RUNNER_TEMP\w6-app\cef\takosumi-cef-browser-process.exe" --work $work | Tee-Object -FilePath "$env:RUNNER_TEMP\w6-browser-smoke.log"
+          if ($LASTEXITCODE -ne 0) { throw "The installed browser smoke failed (exit $LASTEXITCODE)" }
+      - name: Launch the installed product App once
+        if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
+        timeout-minutes: 5
+        working-directory: takosumi-mobile
+        run: |
+          python -B native-tests/desktop/windows_package.py smoke --exe $env:W6_APP --log "$env:RUNNER_TEMP\w6-smoke-app.log" --report "$env:RUNNER_TEMP\w6-smoke.json" --seconds 8
+          if ($LASTEXITCODE -ne 0) { throw "The installed App smoke failed (exit $LASTEXITCODE)" }
+      - name: Uninstall the product App (silent)
+        if: ${{ !cancelled() && steps.product-install.outcome == 'success' }}
+        working-directory: takosumi-mobile
+        run: |
+          # The productName its installer was built with (its uninstall key and shortcut).
+          $product = (Get-Content -Raw src-tauri/tauri.windows-cef.conf.json | ConvertFrom-Json).productName
+          if (-not $product) { $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName }
+          python -B native-tests/desktop/windows_package.py uninstall --dir "$env:RUNNER_TEMP\w6-app" --report "$env:RUNNER_TEMP\w6-uninstall.json" --product $product
+          if ($LASTEXITCODE -ne 0) { throw "The product uninstall failed (exit $LASTEXITCODE)" }
+      - name: Remove the fixture CA
+        if: ${{ always() && steps.w6-tls.outcome != 'skipped' }}
+        working-directory: takosumi-mobile
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w6-tls" -Remove
+          if ($LASTEXITCODE -ne 0) { throw "The fixture CA was not removed (exit $LASTEXITCODE)" }
+      # One directory for the evidence (the upload needs one root): the
+      # reports and logs, both stage manifests, the packaged case and the
+      # profiles' logs. No executable, library or installer is ever copied.
+      - name: Gather the W6 evidence
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'w6-evidence'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')
+          $text = @('.json', '.log', '.txt', '.html', '.md')
+          $skipped = [System.Collections.Generic.List[string]]::new()
+          # An executable, a library or an archive by its first bytes (MZ,
+          # ELF, ZIP), whatever its name says.
+          function Test-Binary([string]$path) {
+            $head = [byte[]]::new(4)
+            $stream = [System.IO.File]::OpenRead($path)
+            try { $read = $stream.Read($head, 0, 4) } finally { $stream.Dispose() }
+            if ($read -ge 2 -and $head[0] -eq 0x4D -and $head[1] -eq 0x5A) { return $true }
+            if ($read -ge 4 -and $head[0] -eq 0x7F -and $head[1] -eq 0x45 -and $head[2] -eq 0x4C -and $head[3] -eq 0x46) { return $true }
+            if ($read -ge 4 -and $head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 0x03 -and $head[3] -eq 0x04) { return $true }
+            return $false
+          }
+          # One copier for everything: never by extension or content, only
+          # the allowed extensions where given; a failed copy is logged and
+          # the rest go on.
+          function Copy-Evidence([System.IO.FileInfo]$file, [string]$target, [string[]]$allowed) {
+            try {
+              $extension = $file.Extension.ToLowerInvariant()
+              if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) -or (Test-Binary $file.FullName)) {
+                $skipped.Add($file.FullName)
+                return
+              }
+              New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+              Copy-Item -LiteralPath $file.FullName -Destination $target
+            } catch {
+              $skipped.Add("$($file.FullName) (copy failed: $($_.Exception.Message))")
+            }
+          }
+          foreach ($pattern in @('w6-*.json', 'w6-*.log')) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -File -Filter $pattern)) {
+              Copy-Evidence $file (Join-Path $out $file.Name) $text
+            }
+          }
+          $stages = @{
+            'product-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef/stage.json'
+            'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'
+          }
+          foreach ($name in $stages.Keys) {
+            if (Test-Path -LiteralPath $stages[$name] -PathType Leaf) { Copy-Evidence (Get-Item -LiteralPath $stages[$name]) (Join-Path $out $name) $text }
+          }
+          # The packaged case and the installed browser's smoke case: text only.
+          $trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }
+          foreach ($name in $trees.Keys) {
+            $tree = $trees[$name]
+            if (-not $tree -or -not (Test-Path -LiteralPath $tree -PathType Container)) { continue }
+            $tree = (Get-Item -LiteralPath $tree).FullName.TrimEnd('\')
+            foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -File)) {
+              Copy-Evidence $file (Join-Path (Join-Path $out $name) $file.FullName.Substring($tree.Length + 1)) $text
+            }
+          }
+          $profiles = if ($env:W6_APP_DATA) { Join-Path $env:W6_APP_DATA 'browser-process-experiment' } else { '' }
+          if ($profiles -and (Test-Path -LiteralPath $profiles -PathType Container)) {
+            foreach ($profile in @(Get-ChildItem -LiteralPath $profiles -Directory)) {
+              foreach ($file in @(Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log')) {
+                Copy-Evidence $file (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $file.Name) $text
+              }
+            }
+          }
+          foreach ($path in $skipped) { "skipped: $path" }
+          $kept = @(Get-ChildItem -LiteralPath $out -Recurse -File)
+          "Gathered $($kept.Count) evidence files, skipped $($skipped.Count)"
+      - name: Keep the W6 evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cef-windows-package-evidence
+          path: ${{ runner.temp }}/w6-evidence
           if-no-files-found: warn
           retention-days: 14

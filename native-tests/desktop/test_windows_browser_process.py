@@ -491,6 +491,96 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
         self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_package_job_runs_the_packaged_cases_and_uploads_no_binary(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows-package:\n"):]
+        cases = [name for phase in ("", "restart", "reset") for name in runner.OBSERVED_CASES[phase]]
+        cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
+        cases += list(runner.FINAL_CASES)
+        block = re.search(r"\$w6Cases = @\(\n(.*?)\n\s*\)", job, re.S)
+        self.assertIsNotNone(block, "The package job lists its required cases")
+        self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
+        self.assertIn(f"if ($w6Count -ne {len(cases)})", job)
+        self.assertIn("windows_browser_process.py --packaged --binary $env:W6_FIXTURE_APP ", job)
+        for step in ("windows_package.py install", "windows_package.py smoke", "windows_package.py uninstall"):
+            self.assertIn(step, job)
+        # The installed product browser alone, and each installer's own
+        # uninstall key and shortcut (the fixture has its own productName).
+        self.assertIn('windows_smoke.py --browser "$env:RUNNER_TEMP\\w6-app\\cef\\takosumi-cef-browser-process.exe"',
+                      job)
+        # Each uninstall names the productName its installer was built with.
+        for report, config in (("w6-fixture-uninstall.json", "src-tauri/tauri.windows-cef-fixture.conf.json"),
+                               ("w6-uninstall.json", "src-tauri/tauri.windows-cef.conf.json")):
+            line = next(line for line in job.splitlines() if f'--report "$env:RUNNER_TEMP\\{report}"' in line)
+            self.assertTrue(line.rstrip().endswith("--product $product"), line)
+            before = job[:job.index(line)]
+            self.assertTrue(before.rstrip().endswith("(Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json)"
+                                                     ".productName }"), before[-300:])
+            self.assertIn(f"$product = (Get-Content -Raw {config} | ConvertFrom-Json).productName",
+                          before[before.rindex("- name:"):])
+        self.assertNotIn("--product TakosumiFixture", job)
+        # The fixture stage keeps the product guard, and the two stages must
+        # record the same one (the packaged run then runs the product guard).
+        fixture = job[job.index("- name: Build and stage the fixture browser"):]
+        fixture = fixture[:fixture.index("\n      - name:")]
+        self.assertIn("--features fixture-inspection,windows-unsandboxed-candidate --bin takosumi-cef-browser-process\n",
+                      fixture)
+        self.assertNotIn("--bin takosumi-browser-guard", fixture)
+        self.assertIn("if ($guards.Count -ne 2 -or $guards[0] -ne $guards[1]) { throw", fixture)
+        overlay = json.loads((HERE.parents[1] / "src-tauri/tauri.windows-cef-fixture.conf.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual((overlay["productName"], overlay["identifier"]),
+                         ("TakosumiFixture", "com.takosumi.fixture.package"))
+        # Each installer step takes exactly its own overlay's installer, by
+        # productName (the base config's when the overlay has none).
+        for step, config in (("Build the fixture installer", "src-tauri/tauri.windows-cef-fixture.conf.json"),
+                             ("Build the product installer", "src-tauri/tauri.windows-cef.conf.json")):
+            body = job[job.index(f"- name: {step} (NSIS, unsigned)"):]
+            body = body[:body.index("\n      - name:")]
+            self.assertIn(f"--config {config}", body)
+            self.assertIn(f"$product = (Get-Content -Raw {config} | ConvertFrom-Json).productName", body)
+            self.assertIn("$product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName", body)
+            self.assertIn('Where-Object { $_.Name -like "$($product)_*_x64-setup.exe" }', body)
+            self.assertIn("if ($setup.Count -ne 1)", body)
+            self.assertNotIn("-Filter '*-setup.exe'", body)
+        product = json.loads((HERE.parents[1] / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        # The product's installer name pattern cannot match the fixture's.
+        self.assertFalse(re.fullmatch(re.escape(product["productName"]) + r"_.*_x64-setup\.exe",
+                                      "TakosumiFixture_0.1.0_x64-setup.exe"))
+        # The upload takes one gathered directory; the gathering copies only
+        # the named evidence, through one copier that never takes an
+        # executable, a library or an installer.
+        upload = job[job.index("name: cef-windows-package-evidence"):]
+        self.assertIn("path: ${{ runner.temp }}/w6-evidence\n          if-no-files-found", upload)
+        gather = job[job.index("- name: Gather the W6 evidence"):job.index("- name: Keep the W6 evidence")]
+        self.assertIn("if: ${{ always() }}", gather)
+        self.assertIn("$never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')", gather)
+        self.assertIn("$text = @('.json', '.log', '.txt', '.html', '.md')", gather)
+        self.assertEqual(gather.count("Copy-Item"), 1, "every copy goes through Copy-Evidence")
+        self.assertIn("if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) "
+                      "-or (Test-Binary $file.FullName)) {", gather)
+        # MZ, ELF and ZIP by content; a failed copy is logged, not fatal.
+        for magic in ("$head[0] -eq 0x4D -and $head[1] -eq 0x5A",
+                      "$head[0] -eq 0x7F -and $head[1] -eq 0x45 -and $head[2] -eq 0x4C -and $head[3] -eq 0x46",
+                      "$head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 0x03 -and $head[3] -eq 0x04"):
+            self.assertIn(magic, gather)
+        self.assertIn("} catch {\n              $skipped.Add(", gather)
+        self.assertIn('foreach ($path in $skipped) { "skipped: $path" }', gather)
+        # Every source passes the text allowlist.
+        self.assertEqual(gather.count("Copy-Evidence $file") + gather.count("Copy-Evidence (Get-Item"),
+                         gather.count(" $text\n") + gather.count(" $text }"))
+        sources = ["foreach ($pattern in @('w6-*.json', 'w6-*.log'))",
+                   "'product-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef/stage.json'",
+                   "'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'",
+                   "$trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }",
+                   "Get-ChildItem -LiteralPath $tree -Recurse -File",
+                   "Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log'"]
+        for source in sources:
+            self.assertIn(source, gather)
+        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 5, "no other source is gathered")
+        for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
+            self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
+
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         for site in sorted(runner.REAL_SITES):
@@ -520,6 +610,61 @@ class RunnerTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn(f'pub(super) const FORCED_DIAGNOSTIC: &str = "{runner.GUARD_DIAGNOSTIC}";', rust)
         self.assertIn('"guardPid": std::process::id(),', rust)
+
+    def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
+        class Args:
+            site, real_site, packaged = "https://127.0.0.1:1", None, True
+            browser, guard = Path("C:/b.exe"), Path("C:/g.exe")
+        base = {"PATH": "p", "TAKOSUMI_BROWSER_PROCESS_PROGRAM": "inherited", "WebView2_X": "1"}
+        session = Path("C:/case/sumi-w6")
+        env = runner.browser_env(base, Args, session, session / "external-open.log")
+        for key in ("TAKOSUMI_BROWSER_PROCESS_PROGRAM", "TAKOSUMI_BROWSER_PROCESS_GUARD",
+                    "TAKOSUMI_BROWSER_PROCESS_RUNTIME", "WebView2_X"):
+            self.assertNotIn(key, env)
+        self.assertEqual((env["PATH"], env["TAKOSUMI_BROWSER_PROCESS_INSPECT"],
+                          env["TAKOSUMI_BROWSER_PROCESS_CASE"]), ("p", "1", str(session)))
+        Args.packaged = False
+        env = runner.browser_env(base, Args, session, session / "external-open.log")
+        self.assertEqual((env["TAKOSUMI_BROWSER_PROCESS_PROGRAM"], env["TAKOSUMI_BROWSER_PROCESS_RUNTIME"]),
+                         (str(Args.browser), str(session / "r")))
+        installed = Path("C:/Users/runner/install/Takosumi.exe")
+        self.assertEqual(runner.packaged_files(installed),
+                         (installed.parent / "cef" / "takosumi-cef-browser-process.exe",
+                          installed.parent / "cef" / "takosumi-browser-guard.exe"))
+        # The same names the App resolves (process_setup.rs).
+        rust = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_setup.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(f'pub(super) const BROWSER: &str = "{runner.PACKAGED_BROWSER}";', rust)
+        self.assertIn(f'pub(super) const GUARD: &str = "{runner.PACKAGED_GUARD}";', rust)
+        self.assertIn('pub(super) const PACKAGED: &str = "cef";', rust)
+
+    def test_a_packaged_process_must_run_from_the_installed_cef(self):
+        cef = "D:\\a\\_temp\\w6-fixture-app\\cef"
+        self.assertTrue(observer.inside("D:\\a\\_temp\\w6-fixture-app\\cef\\takosumi-browser-guard.exe", cef))
+        self.assertTrue(observer.inside("d:\\A\\_TEMP\\w6-fixture-app\\CEF\\takosumi-cef-browser-process.exe", cef))
+        for image in ("D:\\a\\target-w3\\debug\\takosumi-browser-guard.exe",
+                      "D:\\a\\_temp\\w6-fixture-app\\cef-other\\x.exe",
+                      "D:\\a\\_temp\\w6-fixture-app\\cef", None):
+            self.assertFalse(observer.inside(image, cef), image)
+
+    def test_installed_processes_load_no_crt_and_the_installed_libcef(self):
+        cef = "D:\\a\\_temp\\w6-fixture-app\\cef"
+        system = ["C:\\Windows\\SYSTEM32\\ntdll.dll", "C:\\Windows\\System32\\KERNEL32.DLL"]
+        browser = [cef + "\\takosumi-cef-browser-process.exe", cef + "\\libcef.dll", *system]
+        self.assertEqual(observer.module_problems("browser", browser, cef), [])
+        self.assertEqual(observer.module_problems("guard", [cef + "\\takosumi-browser-guard.exe", *system], cef), [])
+        crt = "C:\\Windows\\System32\\VCRUNTIME140.dll"
+        self.assertEqual(observer.module_problems("guard", [*system, crt], cef), [f"the guard loaded {crt}"])
+        self.assertEqual(len(observer.module_problems("browser", [*browser, "C:\\x\\msvcp140_1.dll"], cef)), 1)
+        elsewhere = "D:\\a\\target-w3\\debug\\libcef.dll"
+        self.assertEqual(observer.module_problems("browser", [cef + "\\b.exe", elsewhere, *system], cef),
+                         [f"the browser loaded libcef.dll from {elsewhere}"])
+        self.assertEqual(observer.module_problems("browser", system, cef), ["the browser has not loaded libcef.dll"])
+        self.assertEqual(observer.module_problems("guard", None, cef), ["no module snapshot of the guard"])
+        # MODULEENTRY32W: 1080 bytes on x64 Windows (two-byte WCHAR).
+        ctypes = observer.ctypes
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(observer.ModuleEntry), 48 + 516 * ctypes.sizeof(ctypes.c_wchar))
 
     def test_each_quit_case_names_who_closed_its_dialog(self):
         class Args:

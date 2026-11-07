@@ -13,8 +13,9 @@ fixture-inspection = []
 # Windows only: the browser runs without Chromium's sandbox there (see
 # `without_sandbox` in src/process_main.rs). A Windows build without this
 # feature stops with a compile error, so an unsandboxed browser is built only
-# when asked for by name: test candidates and CI, never a package. No effect
-# on Linux.
+# when asked for by name: test candidates, CI and W6's unsigned test
+# installers, whose stage must say so too (scripts/stage-windows-cef.mjs
+# --unsandboxed-candidate); never a release. No effect on Linux.
 windows-unsandboxed-candidate = []
 
 [dependencies]
