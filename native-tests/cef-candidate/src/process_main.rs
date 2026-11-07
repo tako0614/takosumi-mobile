@@ -46,6 +46,9 @@ struct State {
     chain: Option<i32>,
     failed: bool,
     unload_dialogs: BTreeSet<i32>,
+    /// Set once the last window has gone and the message loop is asked to
+    /// quit; no later request may start anything.
+    quitting: bool,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 /// Whether the control pipe's reader may still post a request to the UI
@@ -77,20 +80,27 @@ fn error(id: u64, message: &str) {
 fn maybe_quit() {
     let done = with_state(|state| {
         if state.live == 0 && state.pending == 0 {
-            if let Some(id) = state.shutdown {
-                reply(Reply::Stopped { id });
-            }
+            state.quitting = true;
             true
         } else {
             false
         }
     });
     if done {
-        // The parent closes its end of the pipe once it reads `stopped`; the
-        // end of input must not reach the UI thread after the loop ends.
+        // The parent closes its end of the pipe once it reads `stopped`, so
+        // the reader stops posting first; a request it already posted is
+        // refused (`quitting`) or, after the loop, ignored (`dispatch`).
         close_control();
+        if let Some(id) = with_state(|state| state.shutdown) {
+            reply(Reply::Stopped { id });
+        }
         quit_message_loop();
     }
+}
+/// Whether a control request may run: newer than the last one, and the
+/// browser neither stopping (`shutdown`) nor quitting after its last window.
+fn admits(last_id: u64, id: u64, stopping: bool) -> bool {
+    id > last_id && !stopping
 }
 fn close_all(id: Option<u64>, failed: bool) {
     let browsers = with_state(|state| {
@@ -728,7 +738,9 @@ fn dispatch(bytes: Option<&[u8]>) {
         return;
     }
     let Some(bytes) = bytes else {
-        if with_state(|state| state.shutdown.is_none()) {
+        // The end of input while running is an abnormal stop; after the last
+        // window has gone there is nothing left to close.
+        if with_state(|state| state.shutdown.is_none() && !state.quitting) {
             close_all(None, true);
         }
         return;
@@ -744,7 +756,14 @@ fn dispatch(bytes: Option<&[u8]>) {
     };
     let id = request.id();
     let allowed = with_state(|state| {
-        if id <= state.last_id || state.shutdown.is_some() {
+        // A request posted just before the last window went (the person
+        // closed it, so no `shutdown` is set) must not start a browser
+        // after `maybe_quit`: the pending count would trip the exit check.
+        if !admits(
+            state.last_id,
+            id,
+            state.shutdown.is_some() || state.quitting,
+        ) {
             return false;
         }
         state.last_id = id;
@@ -872,6 +891,17 @@ fn with_feature(current: &str, feature: &str) -> String {
         features.push(feature);
     }
     features.join(",")
+}
+#[cfg(test)]
+mod control_tests {
+    #[test]
+    fn only_a_newer_request_runs_and_never_while_stopping_or_quitting() {
+        assert!(super::admits(0, 1, false));
+        assert!(super::admits(4, 5, false));
+        assert!(!super::admits(5, 5, false));
+        assert!(!super::admits(5, 4, false));
+        assert!(!super::admits(4, 5, true));
+    }
 }
 #[cfg(test)]
 mod feature_tests {
@@ -1032,6 +1062,7 @@ fn main() {
             chain: None,
             failed: false,
             unload_dialogs: BTreeSet::new(),
+            quitting: false,
         }))
     });
     let port = inspection_port(&directory);
