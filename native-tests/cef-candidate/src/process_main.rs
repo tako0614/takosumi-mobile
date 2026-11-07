@@ -1,15 +1,14 @@
-//! Opt-in browser service for Linux and (first candidate) Windows. Its only
-//! control input is the parent's pipe.
+//! Opt-in browser service for Linux and Windows. Its only control input is
+//! the parent's pipe.
 //! No remote-page IPC/V8 extension or permission handler. Explicit fixture
 //! inspection (`fixture-inspection` builds only) uses a loopback DevTools
 //! port, never the parent's control pipe.
 //!
-//! On Windows this is a GUI-subsystem program: Windows gives it, and the CEF
-//! helpers that run the same executable, no console and so no console host
-//! (`conhost.exe`), which the guard's drain would otherwise have to end. The
-//! standard handles stay the ones its parent passes explicitly (the control
-//! pipe, the reply pipe and the log).
-#![cfg_attr(windows, windows_subsystem = "windows")]
+//! The browser itself, entered through `run`: from the executable
+//! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
+//! the sandboxed Windows browser (W7, feature `windows-sandbox`), from the DLL
+//! CEF's `bootstrap.exe` loads (`browser_dll.rs`), which passes the sandbox
+//! information.
 use cef::*;
 use std::{
     cell::RefCell,
@@ -1046,26 +1045,39 @@ fn without_sandbox(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     let root = unsafe { libc::geteuid() } == 0;
     root || args.any(|arg| arg == "--no-sandbox")
 }
-/// Windows (first candidate): the browser always runs without Chromium's
-/// sandbox, whatever its switches. CEF's Windows sandbox needs the
-/// `cef_sandbox` library (cef-dll-sys `sandbox`) and its bootstrap layout: the
-/// browser built as a DLL that CEF's `bootstrap.exe`, renamed to the browser,
-/// loads, with sandbox information passed to `execute_process` and
-/// `initialize`. This build links none of that and passes no sandbox
-/// information, so CEF is told so explicitly. Such a build must be asked for
-/// by name (the feature `windows-unsandboxed-candidate`), so an unsandboxed
-/// browser is never built, and staged, by accident.
-/// TODO(TASK-0119 Windows): qualify the bootstrap/cef_sandbox layout and
-/// enable the sandbox before any Windows package.
-#[cfg(windows)]
+/// Windows with the sandbox (W7, feature `windows-sandbox`): CEF 154 ships no
+/// `cef_sandbox` library for embedders; its prebuilt `bootstrap.exe`, renamed
+/// to the browser, initializes Chromium's sandbox and loads this browser as a
+/// DLL (`browser_dll.rs`), passing the sandbox information that `run` hands
+/// to `execute_process` and `initialize`. CEF's own setting therefore asks
+/// for the sandbox.
+#[cfg(all(windows, feature = "windows-sandbox"))]
+fn without_sandbox(_args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    false
+}
+/// Windows without it (the explicit test candidate,
+/// `windows-unsandboxed-candidate`): the executable gets no sandbox
+/// information, so CEF is told so. Such a build must be asked for by name, so
+/// an unsandboxed browser is never built, and staged, by accident.
+#[cfg(all(windows, not(feature = "windows-sandbox")))]
 fn without_sandbox(_args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     true
 }
-#[cfg(all(windows, not(feature = "windows-unsandboxed-candidate")))]
+#[cfg(all(
+    windows,
+    not(feature = "windows-sandbox"),
+    not(feature = "windows-unsandboxed-candidate")
+))]
 compile_error!(
-    "The Windows browser runs without Chromium's sandbox. Build it only as a test candidate, \
-     with the feature windows-unsandboxed-candidate; it is not for packages."
+    "Build the Windows browser with the feature windows-sandbox (the DLL CEF's bootstrap.exe loads), \
+     or, for a test candidate only, with windows-unsandboxed-candidate."
 );
+#[cfg(all(
+    windows,
+    feature = "windows-sandbox",
+    feature = "windows-unsandboxed-candidate"
+))]
+compile_error!("windows-sandbox and windows-unsandboxed-candidate exclude each other.");
 
 /// The parent passes the directory in its final form, so the cache path CEF
 /// reports back compares exactly with the one requested.
@@ -1097,13 +1109,16 @@ fn is_final(directory: &Path) -> bool {
     std::ffi::OsStr::new(&ordinary) == directory.as_os_str()
 }
 
-fn main() {
+/// Every process of the browser starts here: the browser itself and each CEF
+/// helper (renderer, GPU, utility). `sandbox_info` is what CEF's
+/// `bootstrap.exe` passes on Windows with the sandbox, otherwise null.
+pub(crate) fn run(sandbox_info: *mut u8) {
     const {
         assert!(cfg!(any(target_os = "linux", windows)));
     }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = cef::args::Args::new();
-    let status = execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
+    let status = execute_process(Some(args.as_main_args()), None, sandbox_info);
     if status >= 0 {
         std::process::exit(status);
     }
@@ -1158,7 +1173,7 @@ fn main() {
             Some(args.as_main_args()),
             Some(&settings),
             Some(&mut app),
-            std::ptr::null_mut()
+            sandbox_info
         ),
         1
     );
