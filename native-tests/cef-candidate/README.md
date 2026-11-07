@@ -2007,12 +2007,30 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
 - `process_main.rs` on macOS: the cache path CEF reports and the profile
   directory compare exactly (as on Windows; the parent passes the final
   path, `/private/var/…` rather than the `/var` link); the window id in
-  `opened` is the `windowNumber` of the NSWindow holding CEF's view;
+  `opened` is the `windowNumber` of the NSWindow holding CEF's view (its
+  window handle is that window's content view);
   reopening a live screen raises that window (`mac_front::raise`: restore
   when minimized, `activate` on macOS 14 and later or
   `activateIgnoringOtherApps:`, `makeKeyAndOrderFront:`,
   `orderFrontRegardless`); CEF's own sandbox setting is on unless the
   parent passes `--no-sandbox`. Linux and Windows are unchanged.
+- **Waiting for the window.** The first CI run (`e2c6bd9`, run 42378830347)
+  built, downloaded CEF and bundled (238 entries, the sandbox library
+  present), but both smokes stopped at "The opened reply has no native
+  browser window": `opened` carried window id 0. A Chrome-style window is
+  created and shown after `on_after_created`, so CEF's view may not be in an
+  NSWindow yet (or its handle not set) at that point; which of the two
+  happened is unknown. The browser now logs, at `on_after_created`, whether
+  the window handle is null, its class, whether it is in an NSWindow and the
+  window number (`macOS: browser <id> created: …` on standard error), and
+  on macOS sends `opened` only once the window is there, looking again every
+  25 ms on the UI thread (`post_delayed_task`); it logs when it appeared
+  (`… window after <ms> ms: …`). Until then the screen counts as opening, as
+  before its creation (a Shutdown is answered CloseBlocked), and a screen
+  closed meanwhile stops the wait. The wait has no bound of its own: the
+  parent's wait for `opened` bounds it (the smoke's `--open-timeout`, 120 s;
+  in the App the adapter's 20 s for an Open reply), whose timeout is the
+  existing error path. The raise resolves the window again each time.
 - `scripts/bundle-macos-cef.mjs --cef <cef_macos_aarch64> --bin <target>/debug --out <dir> [--fixture]`
   writes `<dir>/takosumi-cef-browser-process.app` (the layout above; each
   helper app holds a copy of the helper executable under its own name; the
