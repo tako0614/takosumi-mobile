@@ -30,8 +30,9 @@ use std::{
 pub const STOP_EVENT_ENV: &str = "TAKOSUMI_BROWSER_GUARD_STOP_EVENT";
 /// `CreateProcess` flag: a console program gets a console without a window
 /// (and so a windowless console host, `conhost.exe`, as its child). The guard
-/// starts the browser this way: CEF's helper processes, console programs
-/// too, then share that one hidden console instead of each getting a new one.
+/// starts the browser with it; since the browser is a GUI-subsystem program
+/// (no console, so no console host, for it or its CEF helpers), the flag has
+/// no effect there and only keeps any console program it might start hidden.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `CreateProcess` flag: a console program gets no console at all, and so no
 /// console host. The App starts the guard this way; its standard handles

@@ -10,15 +10,14 @@
 //! parent-death signal. The guard refuses to run outside any job.
 //!
 //! The guard creates a kill-on-close Job Object of its own (no breakaway) and
-//! starts the browser in it before it runs any code (created suspended with
-//! a console that has no window, assigned, resumed), passing its own standard
-//! input, output and error: the App's control pipe, reply pipe and log. Every
-//! process the browser starts is then in the guard's job, and so is the
-//! windowless console host (`conhost.exe`) Windows starts for the browser's
-//! console: CEF's helpers are console programs too and share that console
-//! rather than each getting a new one. `observed` counts that host, and the
-//! drain waits for it like any other process in the job. The App starts the
-//! guard itself detached from any console, so it has no console host. It waits for the
+//! starts the browser in it before it runs any code (created suspended,
+//! assigned, resumed), passing its own standard input, output and error: the
+//! App's control pipe, reply pipe and log. Every process the browser starts
+//! is then in the guard's job. The browser is a GUI-subsystem program, so
+//! neither it nor its CEF helpers (the same executable) have a console or a
+//! console host; `CREATE_NO_WINDOW` stays, and would only matter for a
+//! console program. The App starts the guard itself detached from any
+//! console, so it has no console host either. It waits for the
 //! browser to exit or for a stop request: the App sets a named event it
 //! created and passed in `TAKOSUMI_BROWSER_GUARD_STOP_EVENT` (removed from
 //! the browser's environment). There is no lifetime cap and no polling while

@@ -2741,9 +2741,10 @@ mod windows_tests {
     /// The browser's direct children, each held open before it is examined
     /// (so its id cannot name another process meanwhile): CEF helpers run
     /// the browser's own executable; console hosts are `conhost.exe`, which
-    /// Windows starts for the browser's windowless console. Only helpers
-    /// still running when held count. Waits up to 30 s for the first helper
-    /// (the page's renderer, if not already the GPU or a utility process).
+    /// Windows would start for a console browser (the browser is a
+    /// GUI-subsystem program, so there must be none). Only helpers still
+    /// running when held count. Waits up to 30 s for the first helper (the
+    /// page's renderer, if not already the GPU or a utility process).
     struct Children {
         helpers: Vec<(u32, std::os::windows::io::OwnedHandle)>,
         hosts: Vec<(u32, std::os::windows::io::OwnedHandle)>,
@@ -2847,9 +2848,10 @@ mod windows_tests {
             "no CEF helper below the browser:\n{}",
             describe(native_pid, &located.program)
         );
+        // A GUI-subsystem browser has no console, so no console host.
         assert!(
-            !children.hosts.is_empty(),
-            "no console host below the browser:\n{}",
+            children.hosts.is_empty(),
+            "a console host below the browser (is it a console program?):\n{}",
             describe(native_pid, &located.program)
         );
         // CEF's process singleton holds the profile's lockfile while the
@@ -2902,17 +2904,14 @@ mod windows_tests {
             receipt["kernelNoChildren"], true,
             "the guard's job is empty"
         );
-        // The browser, its console host(s) and the helpers held while it ran
-        // were all in the guard's job: a helper outside it would leave the
-        // count short, since the browser and its console host alone make
-        // two.
-        let expected = 1 + children.hosts.len() + children.helpers.len();
+        // The browser and the helpers held while it ran were all in the
+        // guard's job: a helper outside it would leave the count short.
+        let expected = 1 + children.helpers.len();
         let observed = receipt["observed"].as_u64().unwrap();
         assert!(
             observed >= expected as u64,
-            "the guard's job counted {observed} processes, fewer than the browser, \
-             {} console host(s) and {} CEF helper(s)",
-            children.hosts.len(),
+            "the guard's job counted {observed} processes, fewer than the browser and \
+             {} CEF helper(s)",
             children.helpers.len()
         );
         assert!(process

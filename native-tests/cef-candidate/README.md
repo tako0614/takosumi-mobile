@@ -639,9 +639,14 @@ effect there. On Windows:
   Otherwise Windows flashes the taskbar button and the browser prints
   `Reused browser window was not raised: Windows refused the foreground change`
   to stderr, as it does for an X11 refusal.
-- **Console.** The executable keeps the console subsystem. The App starts the
-  guard, and the guard the browser, with `CREATE_NO_WINDOW` (W2), so neither
-  opens a console window.
+- **Console.** Since W5 the executable is a GUI-subsystem program on Windows
+  (`windows_subsystem = "windows"` in `process_main.rs`, Windows only): it and
+  its CEF helpers, which run the same executable, get no console and so no
+  console host, and its standard handles stay the ones its parent passes
+  explicitly (the JSON-lines pipes, the log). Until then it kept the console
+  subsystem and was started with `CREATE_NO_WINDOW` (W2), so no console
+  window opened, but a windowless console host ran with it (see the W5
+  finding under the guard).
 
 **Smoke harness.** `windows_smoke.py` uses only the Python 3 standard library
 (`ctypes` for Win32) and runs on both OSes. It creates a new case directory
@@ -717,14 +722,13 @@ breakaway, reserves the receipt (`CREATE_NEW`, never through a link), and
 starts the browser in the job before it runs any code: created
 `CREATE_SUSPENDED | CREATE_NO_WINDOW` with the guard's own stdin, stdout and
 stderr (the App's control pipe, reply pipe and log), assigned, then resumed.
-`CREATE_NO_WINDOW` gives the browser a console without a window, and with it
-a windowless console host (`conhost.exe`) child in the guard's job. CEF's
-helper processes run the same console program and share that one hidden
-console. Started detached (`DETACHED_PROCESS`, no console), each helper would
-instead get a new console of its own, possibly a visible one, and a console
-host each, so the browser keeps its hidden console. `observed` therefore also
-counts that console host, and the drain waits for it like any other process
-in the job. It then waits, without polling or a lifetime cap, for the browser's exit or a
+Since W5 the browser is a GUI-subsystem program, so it and its CEF helpers
+have no console and no console host, and `CREATE_NO_WINDOW` has no effect on
+it. Until then `CREATE_NO_WINDOW` gave the console browser a console without
+a window, with a windowless console host (`conhost.exe`) child in the guard's
+job that `observed` counted and the drain had to end (CEF's helpers shared
+that one hidden console; started detached, each would have got a console of
+its own). It then waits, without polling or a lifetime cap, for the browser's exit or a
 stop request. A stop request is the App setting a manual-reset named event
 (`Local\takosumi-browser-guard-stop-<App pid>-<runtime>-<nanos>`) that the App
 created (an existing name is refused) and named in
@@ -810,16 +814,19 @@ because the count read the exit with a zero wait on the handle, which can
 still read a process as running just after the job has dropped it (the
 self-test of 8044abe showed the same race for the diagnostic's own read).
 The only real kill was the browser's console host. The earlier counts
-(483dbe4: 12 of 57) were therefore inflated the same way. Repair: the
-count now reads `GetExitCodeProcess` (above), the same read the diagnostic
-shows, so the two cannot disagree. The budgets, the receipt fields
+(483dbe4: 12 of 57) were therefore inflated the same way. Two repairs:
+the count now reads `GetExitCodeProcess` (above), the same read the
+diagnostic shows, so the two cannot disagree; and the browser has no console
+host to end any more (`takosumi-cef-browser-process` is a Windows
+GUI-subsystem program, see the W1 notes). The budgets, the receipt fields
 and the App's refusal of any forced cleanup are unchanged: a real kill still
 makes the receipt abnormal for the App.
 
 **Parent death.** Windows has no `PR_SET_PDEATHSIG`. The adapter's spawner
 thread owns one kill-on-close Job Object for the App and starts every guard
 inside it (suspended, assigned, resumed). The guard is started
-`DETACHED_PROCESS`: it needs no console, so it has no console host either;
+`DETACHED_PROCESS`: it needs no console, so it has no console host (nor does
+the browser, a GUI-subsystem program);
 its standard handles are the pipes and log passed explicitly. Jobs nest, so a
 browser is in its guard's job and, through it, in the App's. When the App
 process ends, however it ends, the system closes the App's job and ends every
@@ -933,15 +940,16 @@ through `Process::spawn`, waits for the creation reply through
 20 s; the time is printed), restates the parent, image and cache checks
 against Windows' records, holds the browser's direct children open and
 requires at least one running CEF helper (running the browser's own
-executable) and its console host (`conhost.exe`), and Chromium's `lockfile`
+executable) and no console host (`conhost.exe`) below the GUI-subsystem
+browser, and Chromium's `lockfile`
 in the profile's cache root held, reopens the same key and requires the same
 native browser and window, shuts down through `Process::shutdown` and
 requires a normal receipt (complete, `rootExit` 0, no forced cleanup, the
-job empty, and `observed` at least the browser plus the console hosts and
-helpers held, so a helper outside the guard's job leaves it short), the
+job empty, and `observed` at least the browser plus the helpers held, so a
+helper outside the guard's job leaves it short), the
 `lockfile` released and the runtime directory's removal.
 `windows_adapter_ending_the_app_job_ends_guard_and_browser` starts a
-profile, holds a running CEF helper and the console host open (a helper that
+profile, holds a running CEF helper open (a helper that
 then ends by itself has still ended), records the guard's process tree,
 drops the App's spawner (closing the App's job) and requires every process
 held to end within 15 s, naming each survivor with its image, and no normal
@@ -994,8 +1002,9 @@ check waits a short, stated bound and names what is left.
   request ends a browser that stopped reading). A pending write exists only
   after a write timed out, which can happen before the 20 s bound when an
   earlier write settled close to its own deadline.
-- `observed` includes the browser's console host, so it is one higher than
-  on Linux for the same browser.
+- Until W5 `observed` included the browser's console host, so it was one
+  higher than on Linux for the same browser; the GUI-subsystem browser has
+  none.
 
 ## Windows actual App (W3)
 

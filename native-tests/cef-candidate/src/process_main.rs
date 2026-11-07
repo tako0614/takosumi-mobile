@@ -3,6 +3,13 @@
 //! No remote-page IPC/V8 extension or permission handler. Explicit fixture
 //! inspection (`fixture-inspection` builds only) uses a loopback DevTools
 //! port, never the parent's control pipe.
+//!
+//! On Windows this is a GUI-subsystem program: Windows gives it, and the CEF
+//! helpers that run the same executable, no console and so no console host
+//! (`conhost.exe`), which the guard's drain would otherwise have to end. The
+//! standard handles stay the ones its parent passes explicitly (the control
+//! pipe, the reply pipe and the log).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use cef::*;
 use std::{
     cell::RefCell,
