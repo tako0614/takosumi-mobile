@@ -47,9 +47,21 @@
 //! `forcedCleanup == 0`. A refusal before the receipt exists exits 2 and
 //! starts nothing.
 //!
+//! Diagnostics only (`guard_windows_identity.rs`): when the drain reaches the
+//! termination, the guard reads each listed process's image file name and
+//! Chromium process type just before it, and afterwards writes one
+//! `takosumi-browser-guard: forced-cleanup {...}` line to its standard error
+//! for the processes it counted as forced. The bounds, the count, the
+//! receipt and the exit status are unchanged.
+//!
 //! Not covered: a process that the browser has created outside its tree
 //! through a system service (COM, WMI, the task scheduler) is not in the job,
 //! as on Linux a process started by a session manager is not a descendant.
+
+#[path = "guard_windows_identity.rs"]
+mod identity;
+#[path = "process_type.rs"]
+mod process_type;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -292,6 +304,11 @@ impl Run {
             .into_iter()
             .map(|pid| (pid, open_process(pid)))
             .collect();
+        // Diagnostics only: who each one is, read while it still runs.
+        let identities: Vec<identity::Identity> = held
+            .iter()
+            .map(|(_, handle)| identity::identify(handle))
+            .collect();
         if injected("TERMINATE_LATE") {
             self.wait_empty();
         }
@@ -299,7 +316,7 @@ impl Run {
             self.cleanup_errors.insert(fault(&error));
         }
         let empty = self.settle_within(FORCED);
-        self.count_forced(held, before);
+        self.count_forced(held, identities, before);
         empty
     }
 
@@ -309,16 +326,26 @@ impl Run {
     /// read. A listed process that had already gone before it could be
     /// opened ended by itself. Any other failure leaves the count unknown:
     /// it is recorded in `cleanupErrors`, which makes the receipt abnormal,
-    /// as a failed signal does on Linux.
+    /// as a failed signal does on Linux. The forced processes are then named
+    /// on the guard's standard error (`identity::report`, diagnostics only).
     fn count_forced(
         &mut self,
         held: Vec<(u32, io::Result<OwnedHandle>)>,
+        identities: Vec<identity::Identity>,
         before: io::Result<(u32, u32)>,
     ) {
-        for (_, handle) in held {
+        let mut named = Vec::new();
+        for ((pid, handle), who) in held.into_iter().zip(&identities) {
             let ended = handle.and_then(|handle| exit_code(&handle));
             match ended {
-                Ok(Some(FORCED_EXIT)) | Ok(None) => self.forced += 1,
+                Ok(Some(FORCED_EXIT)) => {
+                    self.forced += 1;
+                    named.push(identity::entry(pid, who, Some(FORCED_EXIT)));
+                }
+                Ok(None) => {
+                    self.forced += 1;
+                    named.push(identity::entry(pid, who, None));
+                }
                 Ok(Some(_)) => {}
                 Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => {}
                 Err(error) => {
@@ -327,12 +354,19 @@ impl Run {
                 }
             }
         }
+        let mut entered = 0;
         match (before, self.job.processes()) {
-            (Ok((before, _)), Ok((after, _))) => self.forced += after.saturating_sub(before),
+            (Ok((before, _)), Ok((after, _))) => {
+                entered = after.saturating_sub(before);
+                self.forced += entered;
+            }
             (Err(error), _) | (_, Err(error)) => {
                 self.cleanup_errors
                     .insert(format!("ForcedCleanupUnknown: {}", fault(&error)));
             }
+        }
+        if self.forced > 0 {
+            identity::report(self.forced, named, entered);
         }
     }
 

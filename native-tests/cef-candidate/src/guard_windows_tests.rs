@@ -109,6 +109,7 @@ const TESTS: &[Test] = tests![
     a_pending_stop_starts_no_browser,
     refusals_create_no_receipt_and_start_nothing,
     a_browser_that_cannot_start_leaves_an_incomplete_receipt,
+    chromium_process_type_tokens,
 ];
 
 /// Runs the selected tests one at a time. Arguments without a leading `-`
@@ -383,13 +384,46 @@ fn the_browser_keeps_the_pipes_but_not_the_stop_event() {
 fn a_lingering_descendant_is_terminated_with_the_job() {
     let case = Case::new("linger");
     let started = Instant::now();
-    let mut guard = case.start(case.guard(&["linger"]));
+    let mut command = case.guard(&["linger"]);
+    command.stderr(Stdio::piped());
+    let mut guard = case.start(command);
     let lines = Lines::of(&mut guard);
     let line = lines.next(Duration::from_secs(10)).unwrap();
     assert!(line.starts_with("linger "), "{line}");
+    let helper: u64 = line["linger ".len()..].parse().unwrap();
     let status = finish(&mut guard, Duration::from_secs(10));
     let elapsed = started.elapsed();
     let proof = case.receipt();
+    // The diagnostic line names what was forced: the descendant, by its
+    // image file name and its process type (a stand-in has no --type).
+    let mut stderr = String::new();
+    guard
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let diagnostic = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(identity::FORCED_DIAGNOSTIC))
+        .unwrap_or_else(|| panic!("no forced-cleanup line in {stderr:?}"));
+    let diagnostic: Value = serde_json::from_str(diagnostic).unwrap();
+    assert_eq!(diagnostic["forced"], proof["forcedCleanup"], "{diagnostic}");
+    let image = std::env::current_exe().unwrap();
+    let image = image.file_name().unwrap().to_string_lossy();
+    let named = diagnostic["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pid"] == helper)
+        .unwrap_or_else(|| panic!("the descendant is not named: {diagnostic}"));
+    assert_eq!(named["image"], image.as_ref(), "{diagnostic}");
+    assert_eq!(named["type"], "none", "{diagnostic}");
+    assert_eq!(named["exit"], "0xE0007462", "{diagnostic}");
+    assert!(
+        !stderr.contains("--standin"),
+        "no command line may be written: {stderr:?}"
+    );
     // As on Linux, a forced cleanup alone does not change the exit status;
     // the App refuses it through `forcedCleanup`.
     assert_eq!(status.code(), Some(0), "{proof}");
@@ -571,4 +605,9 @@ fn a_browser_that_cannot_start_leaves_an_incomplete_receipt() {
     assert!(proof["rootExit"].is_null());
     assert_eq!(proof["complete"], false);
     assert_eq!(proof["kernelNoChildren"], true);
+}
+
+/// The process type parser behind the forced-cleanup diagnostic.
+fn chromium_process_type_tokens() {
+    process_type::tests::all();
 }
