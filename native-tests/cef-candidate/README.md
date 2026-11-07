@@ -1503,11 +1503,25 @@ Linux bundle uses: `takosumi-cef-browser-process.exe`,
 file, `vulkan-1.dll`) when present. It never stages the import library, the
 sandbox library, CEF's bootstrap executables or SDK build inputs (they are
 named in the manifest), and stops at any entry it neither stages nor knows
-as ignorable (`README.txt`, `LICENSE.txt`) rather than leave a possible
-dependency or resource out. Both executables must be x86-64 PE files, and
-every staged executable and DLL may import at load time only Windows system
-DLLs (an explicit list plus the `api-ms-win-*`/`ext-ms-win-*` API sets) or
-files staged beside it; the manifest records each one's imports. The browser
+as ignorable (`README.txt`) rather than leave a possible dependency or
+resource out. CEF's own BSD license travels with it: the distribution's
+`LICENSE.txt` when it has one, otherwise `CREDITS.html` when it names CEF's
+copyright holder, otherwise a `CEF-LICENSE.txt` written from the license
+comment that opens `include/cef_base.h`; without any of them the stage
+stops (the manifest's `cefLicense` says which). Both executables must be
+x86-64 PE files, and every staged executable and DLL may import at load
+time only Windows system DLLs or files staged beside it; the manifest
+records each one's imports. The system DLL list (`scripts/windows-cef-pe.mjs`)
+is exactly what the staged CEF 154 runtime, browser and guard import in CI
+(run 42355214657): `advapi32`, `cfgmgr32`, `crypt32`, `dwrite`, `gdi32`,
+`kernel32`, `ntdll`, `ole32`, `oleaut32`, `rpcrt4`, `user32`, `version`,
+`winmm` and `ws2_32`, all on every Windows 10/11 edition (no Media
+Foundation, which the N and KN editions lack), plus the `api-ms-win-*` and
+`ext-ms-win-*` API sets by prefix (a set newer than the oldest supported
+Windows would not be caught). The import tables are read as the loader
+maps the image (file data from PointerToRawData rounded down to 0x200,
+zeros past SizeOfRawData; an image without an optional header is refused),
+and delay-loaded DLLs are not checked. The browser
 and guard therefore link the C runtime statically: Cargo builds them from
 `native-tests/cef-candidate`, whose `.cargo/config.toml` sets
 `+crt-static` for `x86_64-pc-windows-msvc` (like the `/MT` CEF wrapper), so

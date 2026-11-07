@@ -29,12 +29,17 @@
 // (`--unsandboxed-candidate`); the manifest records it.
 //
 // Every staged executable and DLL must import at load time only Windows
-// system DLLs (an explicit list, plus the api-ms-win-*/ext-ms-win-* API sets)
-// or files staged beside it: a browser or guard built without the static C
+// system DLLs (the explicit list in scripts/windows-cef-pe.mjs, plus the
+// api-ms-win-*/ext-ms-win-* API sets) or files staged beside it: a browser or guard built without the static C
 // runtime would need VCRUNTIME140.dll, which a clean Windows lacks
 // (native-tests/cef-candidate/.cargo/config.toml builds them with it). Any
 // file in the distribution that is neither staged nor on the list of known
 // ignorable entries stops the stage.
+//
+// CEF's own BSD license travels with it: the distribution's LICENSE.txt when
+// it has one, otherwise CREDITS.html when it names CEF's copyright holder,
+// otherwise a CEF-LICENSE.txt written from the license comment of
+// include/cef_base.h; without any of them the stage stops.
 //
 // Node or Bun. Only file copies: it runs on any OS, so it can be checked
 // away from Windows (tests/stage-windows-cef.test.ts).
@@ -58,6 +63,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { cefLicenseFromHeader, peImports, systemDll } from "./windows-cef-pe.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_OUT = path.join(REPO, "src-tauri", "target", "windows-cef");
@@ -109,26 +115,6 @@ const EXCLUDED = new Map([
   ["include", "SDK build input"],
   ["libcef_dll", "SDK build input"],
   ["README.txt", "distribution documentation"],
-  ["LICENSE.txt", "distribution documentation"],
-]);
-/**
- * Windows system DLLs a staged file may import at load time (lower case),
- * besides the api-ms-win-* and ext-ms-win-* API sets. Not the Visual C++
- * runtime (vcruntime140*.dll, msvcp140*.dll and the like): a clean Windows
- * does not have it.
- */
-const SYSTEM_DLLS = new Set([
-  "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll", "comctl32.dll", "comdlg32.dll",
-  "credui.dll", "crypt32.dll", "d2d1.dll", "d3d11.dll", "d3d12.dll", "d3d9.dll", "dbghelp.dll", "dcomp.dll",
-  "dhcpcsvc.dll", "dnsapi.dll", "dwmapi.dll", "dwrite.dll", "dxgi.dll", "dxva2.dll", "esent.dll", "evr.dll",
-  "fwpuclnt.dll", "gdi32.dll", "gdiplus.dll", "hid.dll", "iphlpapi.dll", "imm32.dll", "kernel32.dll",
-  "kernelbase.dll", "mf.dll", "mfplat.dll", "mfreadwrite.dll", "mpr.dll", "mscms.dll", "msdmo.dll", "msimg32.dll",
-  "msvcrt.dll", "ncrypt.dll", "netapi32.dll", "normaliz.dll", "ntdll.dll", "ole32.dll", "oleacc.dll",
-  "oleaut32.dll", "opengl32.dll", "pdh.dll", "powrprof.dll", "propsys.dll", "psapi.dll", "rpcrt4.dll",
-  "secur32.dll", "setupapi.dll", "shcore.dll", "shell32.dll", "shlwapi.dll", "sspicli.dll", "ucrtbase.dll",
-  "uiautomationcore.dll", "urlmon.dll", "user32.dll", "userenv.dll", "usp10.dll", "uxtheme.dll", "version.dll",
-  "wevtapi.dll", "winhttp.dll", "wininet.dll", "winmm.dll", "winspool.drv", "wintrust.dll", "winusb.dll",
-  "wldap32.dll", "ws2_32.dll", "wsock32.dll", "wtsapi32.dll", "xinput1_4.dll",
 ]);
 
 function usage(message) {
@@ -181,66 +167,6 @@ function peMachine(file) {
   } finally {
     closeSync(handle);
   }
-}
-
-/**
- * The DLL names a PE file imports at load time (its import directory; the
- * delay-loaded ones are loaded on first use and not listed), read through
- * `read(offset, length)`, which returns a Buffer (shorter at the end of the
- * file). A file without an optional header or an import directory imports
- * nothing; a malformed one throws.
- */
-export function peImports(read) {
-  const dos = read(0, 64);
-  if (dos.length < 64 || dos.toString("latin1", 0, 2) !== "MZ") throw new Error("no MZ header");
-  const pe = dos.readUInt32LE(0x3c);
-  const coff = read(pe, 24);
-  if (coff.length < 24 || coff.toString("latin1", 0, 4) !== "PE\0\0") throw new Error("no PE header");
-  const sectionCount = coff.readUInt16LE(6);
-  const optionalSize = coff.readUInt16LE(20);
-  if (optionalSize === 0) return [];
-  const optional = read(pe + 24, optionalSize);
-  if (optional.length < optionalSize) throw new Error("truncated optional header");
-  const magic = optional.readUInt16LE(0);
-  // NumberOfRvaAndSizes, then the data directories (PE32+ or PE32).
-  const directories = magic === 0x20b ? 112 : magic === 0x10b ? 96 : -1;
-  if (directories < 0 || optionalSize < directories) throw new Error(`unknown optional header 0x${magic.toString(16)}`);
-  const count = optional.readUInt32LE(directories - 4);
-  if (count < 2 || optionalSize < directories + 16) return [];
-  const importRva = optional.readUInt32LE(directories + 8);
-  if (importRva === 0) return [];
-  const sections = read(pe + 24 + optionalSize, sectionCount * 40);
-  if (sections.length < sectionCount * 40) throw new Error("truncated section table");
-  const offsetOf = (rva) => {
-    for (let index = 0; index < sectionCount; index += 1) {
-      const base = index * 40;
-      const virtualSize = sections.readUInt32LE(base + 8);
-      const virtualAddress = sections.readUInt32LE(base + 12);
-      const rawSize = sections.readUInt32LE(base + 16);
-      const rawOffset = sections.readUInt32LE(base + 20);
-      if (rva >= virtualAddress && rva < virtualAddress + Math.max(virtualSize, rawSize)) {
-        return rawOffset + (rva - virtualAddress);
-      }
-    }
-    throw new Error(`RVA 0x${rva.toString(16)} lies in no section`);
-  };
-  const names = [];
-  for (let index = 0; index < 4096; index += 1) {
-    const descriptor = read(offsetOf(importRva + index * 20), 20);
-    if (descriptor.length < 20) throw new Error("truncated import directory");
-    if (descriptor.every((byte) => byte === 0)) return names;
-    const raw = read(offsetOf(descriptor.readUInt32LE(12)), 260);
-    const end = raw.indexOf(0);
-    if (end <= 0) throw new Error("unterminated import name");
-    names.push(raw.toString("latin1", 0, end));
-  }
-  throw new Error("import directory without an end");
-}
-
-/** Whether a load-time import is a Windows system DLL. */
-export function systemDll(name) {
-  const lower = name.toLowerCase();
-  return SYSTEM_DLLS.has(lower) || lower.startsWith("api-ms-win-") || lower.startsWith("ext-ms-win-");
 }
 
 function importsOf(file) {
@@ -349,6 +275,21 @@ function main() {
   if (!paks.includes("en-US.pak")) usage(`locales/en-US.pak is missing in ${cef}`);
   for (const name of paks) plan.push([path.join("locales", name), requireFile(path.join(locales, name), "locale")]);
 
+  // CEF's own license notice: its LICENSE.txt, else CREDITS.html naming its
+  // copyright holder, else one written from include/cef_base.h.
+  let cefLicense;
+  if (existsSync(path.join(cef, "LICENSE.txt"))) {
+    plan.push(["LICENSE.txt", requireFile(path.join(cef, "LICENSE.txt"), "CEF license")]);
+    cefLicense = { notice: "LICENSE.txt", from: "the distribution" };
+  } else if (readFileSync(path.join(cef, "CREDITS.html"), "latin1").includes("Marshall A. Greenblatt")) {
+    cefLicense = { notice: "CREDITS.html", from: "the distribution" };
+  } else {
+    const header = path.join(cef, "include", "cef_base.h");
+    const text = existsSync(header) ? cefLicenseFromHeader(readFileSync(header, "utf8")) : null;
+    if (!text) usage(`no CEF license notice: no LICENSE.txt, none in CREDITS.html, none in ${header}`);
+    cefLicense = { notice: "CEF-LICENSE.txt", from: "include/cef_base.h", text };
+  }
+
   // Anything else in the distribution must be a known ignorable entry: an
   // unknown file may be a dependency or a resource this list does not know
   // yet, so it stops the stage.
@@ -391,6 +332,12 @@ function main() {
     copyFileSync(source, target, constants.COPYFILE_EXCL);
     files.push({ path: name.split(path.sep).join("/"), source, size: statSync(target).size, sha256: sha256(target) });
   }
+  if (cefLicense.text) {
+    const target = path.join(stage, cefLicense.notice);
+    writeFileSync(target, cefLicense.text, { flag: "wx" });
+    files.push({ path: cefLicense.notice, source: `generated from ${cefLicense.from}`, size: statSync(target).size,
+                 sha256: sha256(target) });
+  }
 
   const archive = path.join(cef, "archive.json");
   const manifest = {
@@ -400,6 +347,7 @@ function main() {
     unsandboxedCandidate: true,
     sandbox: "none: the Windows browser is the unsandboxed candidate (windows-unsandboxed-candidate)",
     imports,
+    cefLicense: { notice: cefLicense.notice, from: cefLicense.from },
     cef: { directory: cef, archive: existsSync(archive) ? JSON.parse(readFileSync(archive, "utf8")) : null },
     bin,
     stage,
@@ -421,5 +369,7 @@ function main() {
   }
 }
 
-// Run only as a program: tests import the pure helpers above.
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+// Always: the pure helpers tests use are in windows-cef-pe.mjs, so nothing
+// here depends on how the script was invoked (a link or junction to it
+// included).
+main();
