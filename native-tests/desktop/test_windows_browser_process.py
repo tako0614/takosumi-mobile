@@ -491,6 +491,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
         self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_package_job_runs_the_packaged_cases_and_uploads_no_binary(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows-package:\n"):]
+        cases = [name for phase in ("", "restart", "reset") for name in runner.OBSERVED_CASES[phase]]
+        cases.insert(len(runner.OBSERVED_CASES[""]), runner.QUIT_CASE)
+        cases += list(runner.FINAL_CASES)
+        block = re.search(r"\$w6Cases = @\(\n(.*?)\n\s*\)", job, re.S)
+        self.assertIsNotNone(block, "The package job lists its required cases")
+        self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
+        self.assertIn(f"if ($w6Count -ne {len(cases)})", job)
+        self.assertIn("windows_browser_process.py --packaged --binary $env:W6_FIXTURE_APP ", job)
+        for step in ("windows_package.py install", "windows_package.py smoke", "windows_package.py uninstall"):
+            self.assertIn(step, job)
+        upload = job[job.index("name: cef-windows-package-evidence"):]
+        paths = upload[upload.index("path: |"):upload.index("if-no-files-found")]
+        for forbidden in (".exe", ".dll", "setup", "bundle", "target-w3", "/cef/"):
+            self.assertNotIn(forbidden, paths, f"the evidence must not include {forbidden}")
+
     def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
         workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text(encoding="utf-8")
         for site in sorted(runner.REAL_SITES):
