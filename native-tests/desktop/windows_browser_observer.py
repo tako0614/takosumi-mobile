@@ -19,9 +19,11 @@ below it in its process tree (which runs in its guard's job inside the
 App's, with Chromium's own jobs below) must show Chromium's sandbox, read
 with windows_smoke.py's sandbox_evidence: at least one renderer, each at
 Untrusted or Low integrity below the browser's, no `--no-sandbox`, no live
-process whose command line could not be read. The records go into the
-observation (`sandbox`); with --unsandboxed-candidate they are recorded,
-not required.
+process whose command line could not be read. A real-site run (W4) checks
+again once the real site is ready in both profiles, so its own renderers
+(site isolation, ad frames) are covered. The records go into the
+observation (`sandbox`, each with its `stage`: attach or real-site); with
+--unsandboxed-candidate they are recorded, not required.
 
 Window switching uses SetForegroundWindow (then, if Windows refuses, the
 task switchers' AttachThreadInput route), and Work is minimized before the
@@ -893,18 +895,19 @@ class Observer:
             require(inside(image, cef), f"The {role} of {process['profile']} runs from {image}, not from {cef}")
         require(not problems, f"The installed processes of {process['profile']}: {problems}")
 
-    def sandbox(self, process):
+    def sandbox(self, process, stage="attach"):
         """W7: this profile's browser and the renderers below it in its
         process tree show Chromium's sandbox (windows_smoke's
-        sandbox_evidence); recorded in the observation and, unless the
-        browser is the unsandboxed candidate, required."""
+        sandbox_evidence); recorded in the observation with its `stage` and,
+        unless the browser is the unsandboxed candidate, required."""
         pid = process["opened"]["nativePid"]
         found = sandbox_evidence(ProcessTree(self.win.kernel32, pid), pid, time.monotonic() + SANDBOX_WAIT)
-        self.proof.setdefault("sandbox", []).append(dict(found, profile=process["profile"],
+        self.proof.setdefault("sandbox", []).append(dict(found, profile=process["profile"], stage=stage,
                                                          required=self.expect_sandbox))
         if self.expect_sandbox:
             require(not found["problems"],
-                    f"The browser of {process['profile']} does not show Chromium's sandbox: {found['problems']}")
+                    f"The browser of {process['profile']} does not show Chromium's sandbox ({stage}): "
+                    f"{found['problems']}")
         return found
 
     def attach(self, process):
@@ -1051,6 +1054,11 @@ class Observer:
                 require(context[field] == "undefined", f"{self.real_name} must not see the App's {field} bridge")
             require(page.pages() == [page.target["targetId"]], f"{self.real_name} must stay in its one window")
             page.site_context = dict(context, entry=page.site_entry)
+        # W7: the real site's own renderers (site isolation, ad frames) are
+        # sandboxed too, in each profile.
+        for page in pages:
+            self.step(f"{self.real_name} sandbox", page)
+            self.sandbox(page.process, "real-site")
 
     def finish_final_quit(self, pages):
         """W4: after the final quit request, a real site may ask its own

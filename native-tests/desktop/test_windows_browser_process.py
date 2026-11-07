@@ -236,14 +236,20 @@ class CdpTests(unittest.TestCase):
             def pages(self):
                 return [self.target["targetId"]]
 
+        checked = []
+        sandbox = lambda watch, process, stage="attach": checked.append((process["profile"], stage))
         for site, entry, clicks in (("photopea", "landing", [True]), ("excalidraw", "direct", [])):
             watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site=site)
             pages = [FakePage(site, "W"), FakePage(site, "P")]
-            watch.open_real_site(pages)
+            checked.clear()
+            with mock.patch.object(observer.Observer, "sandbox", sandbox):
+                watch.open_real_site(pages)
             for page in pages:
                 self.assertEqual(page.clicks, clicks, site)
                 self.assertEqual(page.site_context["entry"], entry, site)
                 self.assertEqual(page.site_context["origin"], observer.REAL_SITES[site]["origin"])
+            # W7: each profile's sandbox is checked again on the real site.
+            self.assertEqual(checked, [("W", "real-site"), ("P", "real-site")], site)
         # A fresh Photopea profile whose editor is up without its landing fails.
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="photopea")
         pages = [FakePage("photopea", "W", editor_first=True), FakePage("photopea", "P")]
@@ -513,6 +519,53 @@ class SandboxEvidenceTests(unittest.TestCase):
         self.assertEqual(problems, ["the browser's command line was not read (denied)"])
         self.assertEqual(smoke.ERROR_INVALID_PARAMETER, 87)
 
+    def test_an_unread_process_that_ends_within_a_second_has_exited(self):
+        """One being terminated can lose its readable command line while it
+        still reads as running: it is waited for (UNREAD_WAIT) before it
+        counts as a problem; the browser's own is never waited for."""
+        import windows_smoke as smoke
+        asked = []
+
+        def ended(pid):
+            asked.append(pid)
+            return pid == 4
+
+        unread = [{"pid": 1, "error": "x", "exited": False}, {"pid": 3, "error": "y", "exited": True},
+                  {"pid": 4, "error": "z", "exited": False}, {"pid": 5, "error": "w", "exited": False}]
+        settled = smoke.settle_unread(unread, 1, ended)
+        self.assertEqual(asked, [4, 5])
+        self.assertEqual(settled[2], {"pid": 4, "error": "z", "exited": True, "endedAfterWait": True})
+        self.assertEqual([process["exited"] for process in settled], [False, True, True, False])
+        browser = {"pid": 1, "integrity": 0x2000, "argumentsRead": True, "noSandbox": False}
+        renderer = {"pid": 2, "integrity": 0x0000, "noSandbox": False}
+        self.assertEqual(smoke.sandbox_problems(browser, [renderer], settled),
+                         ["process 5: command line not read (w)"])
+        self.assertEqual(smoke.UNREAD_WAIT, 1.0)
+
+        class Kernel32:
+            def __init__(self, handle, signaled):
+                self.handle, self.signaled, self.closed, self.waits = handle, signaled, 0, []
+
+            def OpenProcess(self, access, inherit, pid):
+                self.access = access
+                return self.handle
+
+            def WaitForSingleObject(self, handle, milliseconds):
+                self.waits.append(milliseconds)
+                return 0 if self.signaled else 0x102  # WAIT_TIMEOUT
+
+            def CloseHandle(self, handle):
+                self.closed += 1
+
+        running = Kernel32(7, False)
+        self.assertFalse(smoke.ended_within(running, 9, 1.0))
+        self.assertEqual((running.access, running.waits, running.closed), (0x00100000, [1000], 1))
+        self.assertTrue(smoke.ended_within(Kernel32(7, True), 9, 1.0))
+        with mock.patch.object(smoke.ctypes, "get_last_error", lambda: 87, create=True):
+            self.assertTrue(smoke.ended_within(Kernel32(None, False), 9, 1.0))
+        with mock.patch.object(smoke.ctypes, "get_last_error", lambda: 5, create=True):
+            self.assertFalse(smoke.ended_within(Kernel32(None, False), 9, 1.0))
+
     def test_a_browsers_process_tree_is_its_descendants_by_parent(self):
         import windows_smoke as smoke
         pairs = [(0, 0), (4, 0), (10, 4), (20, 10), (21, 10), (30, 20), (40, 4), (50, 99), (60, 60), (61, 62),
@@ -523,13 +576,23 @@ class SandboxEvidenceTests(unittest.TestCase):
         self.assertEqual(smoke.descendant_pids(pairs, 61), [62])
 
         class Tree(smoke.ProcessTree):
-            def __init__(self, root):
-                self.root = root
+            def __init__(self, root, times=None):
+                self.root, self.times = root, times or {}
 
             def pairs(self):
                 return pairs
 
+            def created(self, pid):
+                return self.times.get(pid)
+
         self.assertEqual(Tree(10).process_ids(), [10, 20, 21, 30])
+        # PID reuse: a process created before its parent is not its child
+        # (21 is older than 10; 30 is older than 20, so not reached either).
+        times = {10: 100, 20: 150, 21: 90, 30: 120}
+        self.assertEqual(smoke.descendant_pids(pairs, 10, times.get), [20])
+        self.assertEqual(Tree(10, times).process_ids(), [10, 20])
+        # An unknown creation time keeps the edge.
+        self.assertEqual(smoke.descendant_pids(pairs, 10, {10: 100, 21: 90}.get), [20, 30])
         # PROCESSENTRY32W: 568 bytes on x64 Windows (two-byte WCHAR).
         ctypes = smoke.ctypes
         if ctypes.sizeof(ctypes.c_void_p) == 8:
@@ -555,23 +618,31 @@ class SandboxEvidenceTests(unittest.TestCase):
             with self.assertRaises(Failure) as raised:
                 required.sandbox(process)
             self.assertIn("The browser of p-work does not show Chromium's sandbox", str(raised.exception))
-            self.assertEqual(required.proof["sandbox"], [dict(found, profile="p-work", required=True)])
+            self.assertEqual(required.proof["sandbox"], [dict(found, profile="p-work", stage="attach", required=True)])
             recorded = observer.Observer(Path("case"), "https://127.0.0.1:1", 1, "", win32=Win(), expect_sandbox=False)
-            self.assertEqual(recorded.sandbox(process), found)
-            self.assertEqual(recorded.proof["sandbox"], [dict(found, profile="p-work", required=False)])
+            self.assertEqual(recorded.sandbox(process, "real-site"), found)
+            self.assertEqual(recorded.proof["sandbox"],
+                             [dict(found, profile="p-work", stage="real-site", required=False)])
         self.assertEqual(calls, [(7, 7), (7, 7)])
         self.assertIn("sandbox", runner.EVIDENCE_KEYS)
 
     def test_the_runner_rechecks_every_opened_profiles_sandbox_record(self):
         opened = {"processes": [{"profile": "work"}, {"profile": "personal"}]}
-        good = lambda profile: {"profile": profile, "browser": {"integrityName": "high"},
-                                "renderers": [{"integrityName": "untrusted"}], "problems": []}
+        good = lambda profile, stage="attach": {"profile": profile, "stage": stage, "browser": {"integrityName": "high"},
+                                                "renderers": [{"integrityName": "untrusted"}], "problems": []}
         observation = {"sandbox": [good("work"), good("personal")]}
         self.assertEqual(runner.sandbox_summary(observation, opened, True), [
-            {"profile": "work", "browser": "high", "renderers": ["untrusted"], "problems": []},
-            {"profile": "personal", "browser": "high", "renderers": ["untrusted"], "problems": []},
+            {"profile": "work", "stage": "attach", "browser": "high", "renderers": ["untrusted"], "problems": []},
+            {"profile": "personal", "stage": "attach", "browser": "high", "renderers": ["untrusted"],
+             "problems": []},
         ])
-        with self.assertRaisesRegex(Failure, "No sandbox evidence for the browser of personal"):
+        # A real-site run needs both stages for every profile.
+        stages = ("attach", "real-site")
+        with self.assertRaisesRegex(Failure, "No real-site sandbox evidence for the browser of work"):
+            runner.sandbox_summary(observation, opened, True, stages)
+        both = {"sandbox": observation["sandbox"] + [good("work", "real-site"), good("personal", "real-site")]}
+        self.assertEqual(len(runner.sandbox_summary(both, opened, True, stages)), 4)
+        with self.assertRaisesRegex(Failure, "No attach sandbox evidence for the browser of personal"):
             runner.sandbox_summary({"sandbox": [good("work")]}, opened, True)
         bad = dict(good("personal"), problems=["no renderer process was found"])
         with self.assertRaisesRegex(Failure, "personal does not show Chromium's sandbox"):
@@ -579,6 +650,10 @@ class SandboxEvidenceTests(unittest.TestCase):
         # The unsandboxed candidate: recorded, not required.
         self.assertEqual(len(runner.sandbox_summary({"sandbox": [good("work"), bad]}, opened, False)), 2)
         self.assertEqual(runner.sandbox_summary({}, opened, False), [])
+
+
+def main_source():
+    return (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
 
 
 class RunnerTests(unittest.TestCase):
@@ -807,8 +882,10 @@ class RunnerTests(unittest.TestCase):
         """W7: the browser's own line after CefShutdown (children still
         running, how it ends, its exit code), attributed by its pid."""
         import windows_smoke as smoke
-        ours = '{"pid":9212,"children":65,"unopened":0,"end":"exit-process","exitCode":0}'
-        earlier = '{"pid":5000,"children":4,"unopened":0,"end":"exit-process","exitCode":0}'
+        ours = ('{"pid":9212,"children":46,"unopened":0,"end":"exit-process","exitCode":0,'
+                '"closeMs":23810,"shutdownMs":2140,"totalMs":26020}')
+        earlier = ('{"pid":5000,"children":4,"unopened":0,"end":"exit-process","exitCode":0,'
+                   '"closeMs":null,"shutdownMs":800,"totalMs":null}')
         text = "\n".join(["DevTools listening on ws://127.0.0.1:1/x", smoke.BROWSER_SHUTDOWN + earlier,
                           smoke.BROWSER_SHUTDOWN + ours, smoke.BROWSER_SHUTDOWN + "{cut", ""])
         found = smoke.browser_shutdown(text, 9212)
@@ -825,8 +902,11 @@ class RunnerTests(unittest.TestCase):
         # The same prefix and fields as the browser writes.
         rust = (HERE.parents[1] / "native-tests/cef-candidate/src/children_windows.rs").read_text(encoding="utf-8")
         self.assertIn(f'pub const EVIDENCE_PREFIX: &str = "{smoke.BROWSER_SHUTDOWN}";', rust)
-        for field in ("pid", "children", "unopened", "end", "exitCode"):
+        for field in ("pid", "children", "unopened", "end", "exitCode", "closeMs", "shutdownMs", "totalMs"):
             self.assertIn(f'\\"{field}\\":', rust)
+        # The moments the durations come from are marked where they happen.
+        for marked in ("Mark::CloseRequested", "Mark::BrowserClosed", "Mark::Quit"):
+            self.assertIn(f"children_windows::mark(children_windows::{marked});", main_source())
         self.assertIn('End::ExitProcess => "exit-process"', rust)
         self.assertIn("win32::ExitProcess(exit_code as u32)", rust)
         # After CefShutdown: the sandboxed browser records and ends with

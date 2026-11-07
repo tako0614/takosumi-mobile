@@ -32,7 +32,9 @@ session and process group. It then requires, each within a bound:
    below the browser's own (read from its token), the browser's own
    command line read and without `--no-sandbox` either, and no other process
    in the job whose command line could not be read unless it had already
-   exited; recorded as `sandbox` (with those unread processes). The
+   exited or ends within 1 s (one being terminated can lose its readable
+   command line while it still reads as running); recorded as `sandbox`
+   (with those unread processes). The
    observer of the actual App (desktop/windows_browser_observer.py) applies
    the same check to each profile's browser and its process tree;
 7. on Windows, the browser's own shutdown line from its log (W7: child
@@ -250,13 +252,45 @@ def has_no_sandbox(arguments):
     return "--no-sandbox" in (rest[:rest.index("--")] if "--" in rest else rest)
 
 
+# How long a process whose command line could not be read is given to end:
+# one being terminated can lose its readable command line while its exit
+# code still reads STILL_ACTIVE.
+UNREAD_WAIT = 1.0
+
+
+def settle_unread(unread, browser_pid, ended):
+    """`unread` with each live process other than the browser given
+    `ended(pid)` (it waits up to UNREAD_WAIT for the process to end): one
+    that ends then counts as exited (`endedAfterWait`)."""
+    settled = []
+    for process in unread:
+        if not process.get("exited") and process.get("pid") != browser_pid and ended(process["pid"]):
+            process = dict(process, exited=True, endedAfterWait=True)
+        settled.append(process)
+    return settled
+
+
+def ended_within(kernel32, pid, seconds):
+    """Whether a process ends within `seconds` (Windows): reopened with
+    SYNCHRONIZE and waited for; an id that no longer opens
+    (ERROR_INVALID_PARAMETER) has ended."""
+    process = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not process:
+        return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+    try:
+        return kernel32.WaitForSingleObject(process, int(seconds * 1000)) == 0  # WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(process)
+
+
 def sandbox_problems(browser, renderers, unread=()):
     """Why the sandbox is not shown (empty when it is): `browser` and each
     of `renderers` are {"integrity": RID or None, "noSandbox": bool}; the
     browser's `argumentsRead` is False when its command line was not read.
     Each of `unread` ({"pid", "error", "exited"}) is a process whose command
     line was not read, so whose type is unknown: a problem unless it had
-    already exited (the browser's own is reported above)."""
+    already exited, or ended within UNREAD_WAIT (settle_unread; the
+    browser's own is reported above)."""
     problems = []
     for process in unread:
         if not process.get("exited") and process.get("pid") != browser.get("pid"):
@@ -356,19 +390,28 @@ def browser_shutdown(text, pid=None):
     return found
 
 
-def descendant_pids(pairs, root):
-    """The ids of `root`'s descendants, from (pid, parent pid) pairs."""
+def descendant_pids(pairs, root, created=lambda pid: None):
+    """The ids of `root`'s descendants, from (pid, parent pid) pairs. With
+    `created(pid)` (a creation time, or None when unknown), a process counts
+    as its parent's child only if it was not created before that parent: an
+    older process whose parent id merely names a reused id is not one (as in
+    src/children_windows.rs)."""
     children = {}
     for pid, parent in pairs:
         if pid != parent:
             children.setdefault(parent, []).append(pid)
     found, queue, seen = [], [root], {root}
     while queue:
-        for child in children.get(queue.pop(), ()):
-            if child not in seen:
-                seen.add(child)
-                found.append(child)
-                queue.append(child)
+        parent = queue.pop()
+        for child in children.get(parent, ()):
+            if child in seen:
+                continue
+            born, parent_born = created(child), created(parent)
+            if born is not None and parent_born is not None and born < parent_born:
+                continue
+            seen.add(child)
+            found.append(child)
+            queue.append(child)
     return sorted(found)
 
 
@@ -389,6 +432,22 @@ class ProcessTree:
         for name in ("Process32FirstW", "Process32NextW"):
             function = getattr(kernel32, name)
             function.restype, function.argtypes = ctypes.c_int, [handle, ctypes.POINTER(ProcessEntry)]
+        time = ctypes.POINTER(ctypes.c_uint64)
+        kernel32.GetProcessTimes.restype = ctypes.c_int
+        kernel32.GetProcessTimes.argtypes = [handle, time, time, time, time]
+
+    def created(self, pid):
+        """A process's creation time (FILETIME as one number), or None."""
+        process = self.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        try:
+            times = [ctypes.c_uint64(0) for _ in range(4)]
+            if not self.kernel32.GetProcessTimes(process, *(ctypes.byref(value) for value in times)):
+                return None
+            return times[0].value
+        finally:
+            self.kernel32.CloseHandle(process)
 
     def pairs(self):
         snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -407,7 +466,14 @@ class ProcessTree:
             self.kernel32.CloseHandle(snapshot)
 
     def process_ids(self):
-        return [self.root] + descendant_pids(self.pairs(), self.root)
+        times = {}
+
+        def created(pid):
+            if pid not in times:
+                times[pid] = self.created(pid)
+            return times[pid]
+
+        return [self.root] + descendant_pids(self.pairs(), self.root, created)
 
 
 def sandbox_evidence(job, browser_pid, deadline):
@@ -419,6 +485,8 @@ def sandbox_evidence(job, browser_pid, deadline):
     handle, dword = ctypes.c_void_p, ctypes.c_uint32
     job.kernel32.GetExitCodeProcess.restype = ctypes.c_int
     job.kernel32.GetExitCodeProcess.argtypes = [handle, ctypes.POINTER(dword)]
+    job.kernel32.WaitForSingleObject.restype = dword
+    job.kernel32.WaitForSingleObject.argtypes = [handle, dword]
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     ntdll = ctypes.WinDLL("ntdll")
     advapi32.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
@@ -446,8 +514,10 @@ def sandbox_evidence(job, browser_pid, deadline):
                                  if fact["arguments"]}),
                 # Processes whose command line could not be read (so their
                 # type is unknown), with the reason.
-                "unread": [{"pid": fact["pid"], "error": fact.get("error"), "exited": fact.get("exited", False)}
-                           for fact in facts if fact.get("arguments") is None]}
+                "unread": settle_unread(
+                    [{"pid": fact["pid"], "error": fact.get("error"), "exited": fact.get("exited", False)}
+                     for fact in facts if fact.get("arguments") is None],
+                    browser_pid, lambda pid: ended_within(job.kernel32, pid, UNREAD_WAIT))}
     evidence["problems"] = sandbox_problems(evidence["browser"], evidence["renderers"], evidence["unread"])
     return evidence
 

@@ -361,22 +361,25 @@ def evidence(session, suffix):
     return json.dumps(digest, separators=(",", ":"))
 
 
-def sandbox_summary(observation, opened, required):
+def sandbox_summary(observation, opened, required, stages=("attach",)):
     """W7: each opened profile's sandbox evidence from the observation
-    (the browser's integrity level, its renderers' and any problem). With
-    `required`, every opened profile must have evidence, all without a
+    (its stage, the browser's integrity level, its renderers' and any
+    problem). With `required`, every opened profile must have evidence from
+    each of `stages` (a real-site run: attach and real-site), all without a
     problem (the observer also requires it)."""
     records = observation.get("sandbox", [])
     found = []
     for process in opened["processes"]:
         mine = [record for record in records if record.get("profile") == process["profile"]]
         if required:
-            require(mine, f"No sandbox evidence for the browser of {process['profile']}")
+            for stage in stages:
+                require(any(record.get("stage", "attach") == stage for record in mine),
+                        f"No {stage} sandbox evidence for the browser of {process['profile']}")
         for record in mine:
             if required:
                 require(not record.get("problems"),
                         f"The browser of {process['profile']} does not show Chromium's sandbox: {record['problems']}")
-            found.append({"profile": process["profile"],
+            found.append({"profile": process["profile"], "stage": record.get("stage", "attach"),
                           "browser": (record.get("browser") or {}).get("integrityName"),
                           "renderers": [renderer.get("integrityName") for renderer in record.get("renderers", [])],
                           "problems": record.get("problems")})
@@ -510,7 +513,9 @@ def run_phase(args, env, files, before, head, suffix):
             require(observation["passed"] is True, "The browser observation must pass")
             opened = read_json(session / (f"app-browser-process{suffix}-open.json" if suffix
                                           else "app-browser-process-open.json"))
-            proof["sandbox"] = sandbox_summary(observation, opened, not args.unsandboxed_candidate)
+            # A real-site run (first launch only) checks again on the real site.
+            stages = ("attach", "real-site") if args.real_site else ("attach",)
+            proof["sandbox"] = sandbox_summary(observation, opened, not args.unsandboxed_candidate, stages)
             execution["browserGuards"] = []
             for process in opened["processes"]:
                 receipt = read_json(Path(process["guardReceipt"]))
