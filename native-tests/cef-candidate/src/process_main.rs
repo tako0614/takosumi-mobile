@@ -688,9 +688,17 @@ fn open(id: u64, payload: OpenRequest) {
             Err(problem) => eprintln!("Reused browser window was not raised: {problem}"),
             // Windows: focus given while the window was still minimized does
             // not reach the page once it is restored and in front (the page
-            // reported `hasFocus()` false in CI); give it again now.
+            // reported `hasFocus()` false in CI, also with a second set_focus
+            // right after the raise in this task). Ask again from a task
+            // posted behind this one, once the activation the raise caused
+            // has been processed; no timer.
             #[cfg(windows)]
-            Ok(()) => host.set_focus(1),
+            Ok(()) => {
+                let mut focus = FocusTask::new(browser.clone());
+                if post_task(ThreadId::UI, Some(&mut focus)) != 1 {
+                    eprintln!("Reused browser window focus could not be requested after the raise");
+                }
+            }
             #[cfg(not(windows))]
             Ok(()) => {}
         }
@@ -812,6 +820,12 @@ fn dispatch(bytes: Option<&[u8]>) {
 wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
     impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
+}
+// Windows: keyboard focus for a reused browser, requested after its raise.
+#[cfg(windows)]
+wrap_task! {
+    struct FocusTask { browser: Browser }
+    impl Task { fn execute(&self) { if let Some(host) = self.browser.host() { host.set_focus(1); } } }
 }
 wrap_request_context_handler! {
     struct ContextHandler;
