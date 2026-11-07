@@ -260,6 +260,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(re.findall(r"'([a-z-]+)'", block.group(1)), cases)
         self.assertEqual(int(count.group(1)), len(cases))
 
+    def test_the_real_site_workflow_requires_exactly_the_runner_cases(self):
+        workflow = (HERE.parents[1] / ".github/workflows/windows-real-sites.yml").read_text()
+        for site in sorted(runner.REAL_SITES):
+            block = re.search(r"\$%sCases = @\(\n(.*?)\n\s*\)" % site, workflow, re.S)
+            count = re.search(r"\$%sCount -ne (\d+)\)" % site, workflow)
+            self.assertIsNotNone(block, f"The real-site workflow lists the {site} cases")
+            self.assertIsNotNone(count, f"The real-site workflow counts the {site} cases")
+            cases = runner.real_site_cases(site)
+            self.assertEqual(re.findall(r"'([a-z/-]+)'", block.group(1)), cases)
+            self.assertEqual(int(count.group(1)), len(cases))
+
+    def test_the_real_site_workflow_checks_out_the_ci_sibling_revisions(self):
+        root = HERE.parents[1] / ".github/workflows"
+        refs = [dict(re.findall(r"^  (MOBILE_KIT_SOURCE_REF|TAKOSUMI_SOURCE_REF): (\S+)$", (root / name).read_text(), re.M))
+                for name in ("ci.yml", "windows-real-sites.yml")]
+        self.assertEqual(len(refs[0]), 2)
+        self.assertEqual(refs[0], refs[1])
+
     def test_real_sites_are_anonymous_https_roots_with_a_readiness_signal(self):
         for site, entry in observer.REAL_SITES.items():
             self.assertTrue(entry["url"].startswith("https://") and entry["url"].endswith("/"), site)
