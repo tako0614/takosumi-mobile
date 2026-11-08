@@ -48,6 +48,19 @@ deletion failures, engine-specific controls and unsigned SDK build limits are
 recorded in [native tests](../../../native-tests/README.md). Real IdP, files,
 notifications and distribution require their own checks.
 
+On iOS 15+, the adapter lets WebKit ask whether the requesting site may access the
+camera or microphone in an attached, visible HTTPS screen. It returns
+[`prompt`](https://developer.apple.com/documentation/webkit/wkpermissiondecision/prompt),
+never `grant`; WebKit's site/iframe policy and the system's camera/microphone
+decisions still apply. Background or detached screens and non-Web origins
+are refused. This delegate policy does not run on earlier iOS versions;
+their WebKit permission behavior is not qualified by these checks.
+Privacy descriptions cover video/audio calls and the existing
+QR scan. Policy tests and SDK builds do not prove the native prompt, OS
+consent or capture on a device. Android's app-screen adapter still refuses
+camera/microphone/location until its site and runtime permission flow exists;
+OS consent is not a shared grant for all websites.
+
 ## Preserved mobile adapter
 
 The remaining sections describe the previous Android/iOS client with
@@ -252,5 +265,6 @@ which skip `shouldOverrideUrlLoading`) are refused before they load.
   reach the shell's deep-link handler, which resolves the URL to a known app.
 - Files picked for `<input type=file>` are passed on only as content URIs from
   other apps' providers, never this app's own files.
-- Camera, microphone and location requests from pages are refused for now
-  (on iOS too).
+- Android still refuses camera, microphone and location requests. iOS 15+ uses
+  the visible-screen media prompt policy described above for both adapters;
+  location remains outside this change.

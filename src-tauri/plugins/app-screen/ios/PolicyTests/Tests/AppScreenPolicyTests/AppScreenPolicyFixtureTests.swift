@@ -6,6 +6,40 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testMediaPromptEligibilityIncludesOtherHttpsFrames() {
+        // Cross-origin frames can ask through WebKit's own Permissions Policy;
+        // no origin is automatically granted by this eligibility decision.
+        for origin in ["https://app.example", "https://call.example:8443", "https://[::1]:8443"] {
+            XCTAssertTrue(AppScreenPolicy.canPromptForMediaCapture(
+                origin: origin, page: "https://app.example/room", visible: true), origin)
+        }
+    }
+
+    func testMediaNativeOriginPreservesIpv6AndNonDefaultPorts() {
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 0), "https://call.example")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 443), "https://call.example")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 8443), "https://call.example:8443")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "::1", port: 8443), "https://[::1]:8443")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "[::1]", port: 8443), "https://[::1]:8443")
+        for item in [("http", "call.example", 443), ("https", "", 443), ("https", "ipc.localhost", 443), ("https", "call.example", -1), ("https", "call.example", 65_536)] {
+            XCTAssertNil(AppScreenPolicy.mediaCaptureOrigin(scheme: item.0, host: item.1, port: item.2))
+        }
+    }
+
+    func testMediaPromptRefusesHiddenMissingAndNonWebDocuments() {
+        let site = "https://call.example"
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: site, visible: false))
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: nil, visible: true))
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: nil, page: site, visible: true))
+        for invalid in ["http://call.example", "about:blank", "file:///private/file", "https://ipc.localhost", "https://tauri.localhost", "https://user:pass@call.example"] {
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: invalid, page: site, visible: true), invalid)
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: invalid, visible: true), invalid)
+        }
+        for notAnOrigin in [site + "/room", site + "?token=secret", site + "#fragment"] {
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: notAnOrigin, page: site, visible: true), notAnOrigin)
+        }
+    }
+
     func testClearRemovesEveryScopeForTheExactKeyWithoutChangingOtherProfiles() {
         let key = "web-home:11111111-1111-4111-8111-111111111111:https://sumi.example"
         let personal = "web-home:22222222-2222-4222-8222-222222222222:https://sumi.example"

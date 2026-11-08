@@ -540,8 +540,8 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             textField: field)
     }
 
-    /// Camera and microphone for app screens come later with an origin-named
-    /// prompt; until then they are refused (as on Android).
+    /// WebKit owns the site prompt; OS camera/microphone consent alone never
+    /// grants every page access. Inactive or detached sessions cannot prompt.
     @available(iOS 15.0, *)
     func webView(
         _ webView: WKWebView,
@@ -550,7 +550,16 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         type: WKMediaCaptureType,
         decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-        decisionHandler(.deny)
+        switch type {
+        case .camera, .microphone, .cameraAndMicrophone: break
+        @unknown default: decisionHandler(.deny); return
+        }
+        let visible = screen?.canPromptForMediaCapture(webView, navigator: self) ?? false
+        let eligible = AppScreenPolicy.canPromptForMediaCapture(
+            origin: AppScreenPolicy.mediaCaptureOrigin(scheme: origin.protocol, host: origin.host, port: origin.port),
+            page: committedURL?.absoluteString,
+            visible: visible)
+        decisionHandler(eligible ? .prompt : .deny)
     }
 }
 
@@ -1144,6 +1153,15 @@ final class AppScreenViewController: UIViewController {
     private func canPresent() -> Bool {
         viewIfLoaded?.window != nil && presentedViewController == nil &&
             !isBeingDismissed && !isBeingPresented && transitionCoordinator == nil
+    }
+
+    func canPromptForMediaCapture(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        guard canPresent(), !webView.isHidden, viewIfLoaded?.isHidden == false,
+              let window = webView.window, window === viewIfLoaded?.window, !window.isHidden,
+              UIApplication.shared.applicationState == .active else { return false }
+        // Pinned Tauri/Tao also supports legacy UIApplicationDelegate windows.
+        if let scene = window.windowScene, scene.activationState != .foregroundActive { return false }
+        return session.webView === webView && session.navigator === navigator
     }
 
     func presentPopup(configuration: WKWebViewConfiguration, origins: AppScreenOrigins?) -> WKWebView? {

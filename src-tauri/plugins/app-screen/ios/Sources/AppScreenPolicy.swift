@@ -270,6 +270,26 @@ enum AppScreenPolicy {
         return decide(rawUrl, mainFrame: true) == .inApp
     }
 
+    /// This permits WebKit's site prompt, never an automatic media grant.
+    /// Cross-origin frames still need WebKit's own document/Permissions Policy.
+    static func canPromptForMediaCapture(origin: String?, page: String?, visible: Bool) -> Bool {
+        guard visible, let page = page, let origin = origin,
+              isLaunchable(page), isLaunchable(origin),
+              self.origin(of: origin) == origin else { return false }
+        return true
+    }
+
+    /// Serialize WebKit's native security origin, including IPv6 and ports.
+    static func mediaCaptureOrigin(scheme: String, host: String, port: Int) -> String? {
+        guard scheme.lowercased() == "https", !host.isEmpty, (0...65_535).contains(port) else { return nil }
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        if port != 0 && port != 443 { components.port = port }
+        guard let raw = components.url?.absoluteString, isLaunchable(raw) else { return nil }
+        return origin(of: raw)
+    }
+
     /// True when a screen with `origins` shows `rawUrl` itself.
     static func isWebProfile(_ profile: String) -> Bool {
         profile == "shared" || profile.range(

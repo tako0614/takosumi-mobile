@@ -84,6 +84,12 @@ with (bundle / "Info.plist").open("rb") as source:
     info = plistlib.load(source)
 assert info["CFBundleIdentifier"] == "com.takosumi.fixture.simulator", info
 assert info["CFBundleSupportedPlatforms"] == ["iPhoneSimulator"], info
+with Path("src-tauri/Info.ios.plist").open("rb") as source:
+    privacy = plistlib.load(source)
+for purpose in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSFaceIDUsageDescription"):
+    expected = privacy.get(purpose)
+    assert isinstance(expected, str) and expected.strip(), f"Missing product purpose: {purpose}"
+    assert info.get(purpose) == expected, f"App bundle lost product purpose: {purpose}"
 binary = bundle / info["CFBundleExecutable"]
 assert binary.is_file() and binary.stat().st_size > 0, binary
 assert not list(Path("src-tauri/gen/apple/build").rglob("*.ipa")), "Unexpected device IPA"
