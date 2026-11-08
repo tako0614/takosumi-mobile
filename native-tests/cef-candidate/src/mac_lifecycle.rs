@@ -79,8 +79,12 @@ pub(crate) fn record(event: &'static str, role: Role, code: Option<i32>) {
     let record = serde_json::json!({"event":event,"pid":pid,"start":start,"parent":parent,"group":group,
         "unixMicros":SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|time| time.as_micros()),
         "role":role.kind,"utility":role.utility,"code":code});
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "takosumi-cef-mac-lifecycle: {record}");
+    // Format before touching the shared inherited descriptor: Display writes
+    // JSON in many pieces, which interleaved across helpers in the native run.
+    // One bounded write avoids splitting our line. A short/failed write stays
+    // diagnostic loss, never a retry or a change to the helper's exit path.
+    let line = format!("takosumi-cef-mac-lifecycle: {record}\n");
+    let _ = std::io::stderr().lock().write(line.as_bytes());
 }
 
 #[cfg(test)]

@@ -1189,8 +1189,12 @@ class RunnerTests(unittest.TestCase):
         # After CefShutdown: the sandboxed browser records and ends with
         # ExitProcess; the unsandboxed candidate records and returns.
         main = (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
-        self.assertIn("    shutdown();\n    let code = i32::from(failed);\n    #[cfg(windows)]\n"
-                      "    children_windows::finish(code, cfg!(feature = \"windows-sandbox\"));\n    code\n}", main)
+        ending = ("    let code = i32::from(failed);\n    #[cfg(windows)]\n"
+                  "    children_windows::finish(code, cfg!(feature = \"windows-sandbox\"));\n    code\n}")
+        self.assertIn(ending, main)
+        # macOS may record CefShutdown's return between these operations.
+        # Windows must still finish only after CefShutdown has returned.
+        self.assertLess(main.index("\n    shutdown();"), main.index(ending))
 
     def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
         class Args:

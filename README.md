@@ -86,6 +86,10 @@ and [Windows sandbox (W7)](native-tests/cef-candidate/README.md#windows-sandbox-
 On macOS the per-profile browser builds as an app bundle with its helper apps
 and runs on its own in CI; see
 [macOS browser process (M1)](native-tests/cef-candidate/README.md#macos-browser-process-m1).
+Its guard/adapter are covered by M2 component tests. The explicit
+[macOS actual App fixture (M3)](native-tests/cef-candidate/README.md#macos-actual-app-fixture-m3)
+adds the shared home/profile flow on macOS 14+; its native qualification is
+pending, and the intermittent ordinary-shutdown failure remains unresolved.
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its

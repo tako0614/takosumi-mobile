@@ -20,14 +20,14 @@ tauri-build = { version = "2", features = [] }
 # native-tests/cef-candidate/README.md, "Linux packaging"). No fixture driver.
 # Windows builds the same adapter with the unsandboxed test candidate, packaged
 # only as an unsigned NSIS test installer (README "Windows packaging (W6)").
-# macOS compiles the adapter (M2, README "macOS guard and adapter (M2)"); it
-# has no App fixture, bundle staging or packaging yet.
+# macOS shares the adapter and the explicit App fixture (M3); App bundle
+# packaging/signing/distribution remain separate.
 desktop-cef = ["tauri-plugin-app-screen/desktop-process-experiment"]
 # Explicit actual-App fixture: the real home drives the per-profile CEF
-# browser (tests/desktop/browser_process.rs) on Linux and Windows; never
+# browser (tests/desktop/browser_process.rs) on Linux, Windows and macOS; never
 # enabled by normal builds or releases. Only Linux takes the GTK/WebKit
-# driver pieces; the Windows driver uses Tauri's own API (WebView2 through
-# eval_with_callback) and no further dependency.
+# driver pieces; Windows/macOS use Tauri's eval_with_callback API for the
+# WebView2/WKWebView home and no further dependency.
 native-browser-process-fixture = ["desktop-cef", "tauri-plugin-app-screen/fixture-overrides", "tauri/custom-protocol", "native-fixture-gtk"]
 # The actual-App fixtures' GTK/WebKit driver pieces. They are Linux-only
 # optional dependencies (see the Linux target section), so nothing is

@@ -1,6 +1,6 @@
 //! Actual bundled WebHome -> existing shell IPC -> owned CEF browser processes.
 //! Only the explicit fixture feature includes this driver. The flow below is
-//! the same on Linux and Windows; it reaches the home through `Shell`, whose
+//! the same on Linux, Windows and macOS; it reaches the home through `Shell`, whose
 //! backend finds the home view and evaluates scripts in it: the GTK WebKit
 //! view on the GTK main loop (`browser_process_linux.rs`) or the main window's
 //! WebView2 from a thread of its own (`browser_process_windows.rs`).
@@ -12,10 +12,15 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "macos")]
+#[path = "browser_process_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::create_home;
 #[cfg(target_os = "linux")]
 #[path = "browser_process_linux.rs"]
 mod shell;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[path = "browser_process_windows.rs"]
 mod shell;
 pub use shell::{run, start};
@@ -27,7 +32,7 @@ type Result<T> = std::result::Result<T, String>;
 /// chooser are inspected on Linux only.
 #[cfg(target_os = "linux")]
 const PHASES: &[&str] = &["restart", "reset", "notify", "files"];
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const PHASES: &[&str] = &["restart", "reset"];
 
 /// The home view the flow drives. `eval` returns the script's value as JSON
@@ -117,7 +122,7 @@ async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
 /// `real_site_first_checkpoint`), so the App waits 450 s; a unit test keeps
 /// the two in step.
 fn inspect_bound() -> Duration {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if shell::real_site() {
         return Duration::from_secs(450);
     }
@@ -204,7 +209,7 @@ async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
 }
 /// An identity of a profile's CEF cache root that a detach-and-recreate
 /// changes: its inode on Linux, its file ID on Windows.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn root_identity(root: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::symlink_metadata(root)
@@ -265,7 +270,7 @@ fn root_identity(root: &Path) -> Result<(u64, [u8; 16])> {
 /// the observer: the `SingletonLock` link target on Linux (it names the
 /// browser's pid); on Windows whether Chromium holds its `lockfile` (an
 /// exclusive open fails with a sharing violation).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn profile_lock(root: &Path) -> Value {
     std::fs::read_link(root.join("SingletonLock"))
         .map(|target| Value::String(target.to_string_lossy().into_owned()))
@@ -286,7 +291,7 @@ fn profile_lock(root: &Path) -> Value {
 /// Whether the refused clear left the running profile's liveness mark: on
 /// Windows Chromium must still hold its `lockfile`. (Linux records the
 /// `SingletonLock` target and the observer checks it.)
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn still_marked_live(_root: &Path) -> bool {
     true
 }
@@ -296,7 +301,7 @@ fn still_marked_live(root: &Path) -> bool {
 }
 /// Windows: the home's clear removed only Work's CEF cache root; Personal's
 /// stays. Both browsers are closed at this point of the relaunch.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn only_work_cleared(app: &AppHandle, connections: &Value) -> Result<()> {
     let data = app
         .path()
@@ -346,7 +351,7 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         tap_in_row(view, "Work", "保存データを消去").await?;
         ready(view,"document.body.innerText.includes('Workのサイトデータを消去しました。') && !document.querySelector('.web-error') && !document.querySelector('.web-clear')").await?;
         println!("reset: Work site data cleared through the home");
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             only_work_cleared(app, &connections)?;
             println!("reset: only Work's CEF profile was removed");
@@ -398,7 +403,7 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         }
         println!("reset: clearing running Personal was refused; its data stayed on disk");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalSingleton":personal_lock});
     #[cfg(windows)]
     let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalLockHeld":personal_lock});
@@ -412,7 +417,11 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
     // The files phase drives native OS dialogs with the standalone driver's
     // own per-step bounds (up to 25 s each). Wait up to the App watchdog (90 s
     // overall), so an observer failing one step reports it, not this wait.
-    let bound = Duration::from_secs(if kind == "files" { 80 } else { 30 });
+    let bound = if cfg!(target_os = "macos") {
+        inspect_bound()
+    } else {
+        Duration::from_secs(if kind == "files" { 80 } else { 30 })
+    };
     checkpoint_within(view, case, &format!("{kind}-inspected"), bound).await?;
     checkpoint_within(view, case, &format!("{kind}-request-exit"), bound).await?;
     if kind == "reset" {
@@ -463,6 +472,16 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     }
     // Progress lines survive an outer timeout that kills the App mid-wait.
     println!("first: shell ready");
+    #[cfg(target_os = "macos")]
+    if eval(
+        view,
+        "localStorage.getItem('takosumi.web-connections.v2') === null",
+    )
+    .await?
+        != Value::Bool(true)
+    {
+        return Err("A new Mac fixture case must have a fresh home store".into());
+    }
     add(view, "Work", 1).await?;
     println!("first: Work added and opened");
     add(view, "Personal", 2).await?;

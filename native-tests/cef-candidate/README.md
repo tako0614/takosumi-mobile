@@ -2156,8 +2156,8 @@ builds nothing); nothing is linked or run here. The second macOS step
 mirrors W2: `takosumi-browser-guard` for macOS, and the plugin's
 `desktop-process-experiment` (and so the App's `desktop-cef`) compiled for
 macOS, where it starts the guard and the bundled browser through the same
-`Process` code as on Linux and Windows. No App UI or fixture on macOS yet
-(M3).
+`Process` code as on Linux and Windows. M2 did not cover the App UI;
+the M3 fixture below adds that candidate scope.
 
 The later `6eacebe` run (42486555333) kept the same macOS implementation but
 failed ordinary adapter shutdown: browser exit 0, complete receipt, no
@@ -2191,6 +2191,10 @@ This adds no work inside the guard's stop-to-kill interval and changes no
 shutdown bound or receipt acceptance. Abnormal closes have a distinct request
 label; the before-exit record is not proof of OS exit, and a missing best-effort
 line does not prove that a helper was absent. The main RED remains unresolved.
+The first diagnostic run (`d32f18a`, 42491760278) passed its macOS component
+job, but concurrent helpers interleaved the JSON formatter's separate writes.
+Records are now formatted fully before one best-effort write. A failed or short
+write still loses evidence; it does not delay or change helper shutdown.
 
 **Guard** (`src/guard_macos.rs`, chosen by `src/guard_entry.rs`; the Linux
 and Windows guards are unchanged). Same command line
@@ -2417,13 +2421,53 @@ Windows run does. The artifact `cef-macos-smoke` adds both test logs and
 each case's `browser.log`, `cef-native.log` and kept guard receipt: text
 only. Still seven jobs (nine runs).
 
-**Remains after M2:** the actual App fixture on macOS (M3: the App's home
-driving this adapter), packaging (the browser bundle and the guard inside
+**Remains after M2:** native qualification of the M3 actual App fixture below,
+packaging (the browser bundle and the guard inside
 the App's `.app`, a `.dmg`), Developer ID signing of every Mach-O file with
 the hardened runtime and the entitlements Chromium's helpers need, and
 notarization (release inputs), the login keychain decision, the shared
 per-user macOS state of the browser bundle (the `HOME` decision above),
 Intel Macs, older macOS versions and real devices.
+
+## macOS actual App fixture (M3)
+
+Candidate source, not a native PASS yet. The explicit
+`native-browser-process-fixture` feature now uses the same App flow on
+Linux, Windows and macOS. The Mac driver uses Tauri's `eval_with_callback`
+against the real WKWebView home, with no new dependency or product UI.
+`native-tests/desktop/macos_browser_process.py` runs anonymous Excalidraw
+and Photopea separately; it does not sign in or supply real account data.
+
+Each case selects a random persistent WK store UUID, refuses macOS below
+14, requires a fresh first home and restores its saved Work/Personal
+connections on two later launches. The pinned tauri-runtime 2.11.3 config
+conversion drops `data_store_identifier`, so the fixture disables automatic
+creation of `main` and explicitly calls the window builder's
+`data_store_identifier` before starting the driver. A configuration marker
+alone is not runtime proof: both distinct cases and their restarts must pass.
+
+The observer requires two separately guarded CEF profiles, separate synthetic
+cookie/localStorage values, same-document reuse through the home, sequential
+quit cancellation and partial quit, restart persistence, clearing only Work,
+refusing a clear while Personal runs, then clearing Personal after its normal
+close. It checks PID/birth, parent and executable identity, the exact loopback
+inspection listener and renderer sandbox. Every profile and the outer App
+guard must exit normally with zero forced cleanup and no remaining tracked
+process. A completed page or closed CDP socket never substitutes for a receipt.
+
+The existing `cef-macos` job builds the actual App after the M1/M2 steps and
+runs both sites once, each in three launches. Its text artifact also retains
+App/observer summaries, home-store requests, guard receipts and bounded tails
+of this case's browser logs. It includes no browser database or binary. The
+three portable rejection tests exercise listener/process ownership and abnormal
+receipts; Linux cross-Clippy with C/library stubs checks Rust only, not linking
+or native behavior.
+
+M3 uses CDP `Page.close` on relaunch. OS window switching, keyboard focus,
+real login/popup return, native files/downloads, site permissions, notifications,
+OS-managed WKWebView services outside the App's guarded tree, macOS packaging,
+signing and updates remain separate. The earlier ordinary-shutdown RED is
+retained; no grace period or receipt acceptance is relaxed for this fixture.
 
 ## Observations and limits
 

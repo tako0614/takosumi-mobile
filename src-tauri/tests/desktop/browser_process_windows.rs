@@ -1,5 +1,5 @@
-//! Windows backend of the browser-process App fixture (`browser_process.rs`):
-//! the home is the main window's WebView2. Scripts go through Tauri's
+//! Tauri callback backend for Windows and macOS of the browser-process App fixture (`browser_process.rs`):
+//! the home is the main window's WebView2 or WKWebView. Scripts go through Tauri's
 //! `eval_with_callback`, which runs WebView2's `ExecuteScript` on the UI
 //! thread and hands back its JSON result; nothing here touches WebView2's COM
 //! objects directly. The flow runs on a thread of its own and waits there, so
@@ -9,7 +9,6 @@ use super::{finish, flow, owned_case, Result, Shell, EXIT};
 use serde_json::Value;
 use std::{
     future::Future,
-    path::Path,
     pin::pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -20,6 +19,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager, WebviewWindow};
 
+#[cfg(windows)]
 const IDENTIFIER: &str = "com.takosumi.fixture.browserprocess";
 /// How long one home script may take to answer.
 const SCRIPT_BOUND: Duration = Duration::from_secs(30);
@@ -40,13 +40,21 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     // profiles under %LOCALAPPDATA%\<identifier> (the known folder, not the
     // environment). Each runner case therefore gets an identifier of its own,
     // and its phases share it.
-    context.config_mut().identifier = match case_identifier() {
-        Ok(identifier) => identifier,
-        Err(error) => {
-            eprintln!("FAIL browser App fixture: {error}");
-            std::process::exit(1);
-        }
-    };
+    #[cfg(windows)]
+    {
+        context.config_mut().identifier = match case_identifier() {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                eprintln!("FAIL browser App fixture: {error}");
+                std::process::exit(1);
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = super::macos::prepare(&mut context) {
+        eprintln!("FAIL browser App fixture: {error}");
+        std::process::exit(1);
+    }
     context.config_mut().build.dev_url = None;
     let app = builder.build(context).expect("Browser process fixture App");
     let handle = app.handle().clone();
@@ -69,7 +77,9 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
 /// runner's case directory: at most 24 lowercase letters, digits and
 /// hyphens, since Chromium's files under the browser profiles in
 /// %LOCALAPPDATA%\<identifier> come close to Windows' 260-character paths.
+#[cfg(windows)]
 fn case_identifier() -> Result<String> {
+    use std::path::Path;
     let case =
         std::env::var_os("TAKOSUMI_BROWSER_PROCESS_CASE").ok_or("Owned fixture case missing")?;
     let name = Path::new(&case)
@@ -109,6 +119,7 @@ fn home(app: &AppHandle) -> Result<Home> {
 }
 
 /// The home's top-level window handle, for the runner's window checks.
+#[cfg(windows)]
 pub(super) fn home_window(app: &AppHandle) -> Result<Value> {
     let window = app
         .get_webview_window("main")
