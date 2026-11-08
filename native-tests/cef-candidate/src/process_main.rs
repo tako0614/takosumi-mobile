@@ -37,6 +37,10 @@ pub(crate) mod children_windows;
 #[path = "mac_front.rs"]
 pub(crate) mod mac_front;
 
+#[cfg(target_os = "macos")]
+#[path = "mac_lifecycle.rs"]
+mod mac_lifecycle;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
     Idle,
@@ -149,6 +153,12 @@ fn admission(shutdown: bool, id: u64, last_id: u64, recorded: bool, quitting: bo
     }
 }
 fn close_all(id: Option<u64>, failed: bool) {
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record(
+        if failed { "abnormal-shutdown-request" } else { "shutdown-request" },
+        mac_lifecycle::BROWSER,
+        None,
+    );
     let browsers = with_state(|state| {
         state.failed |= failed;
         state.shutdown = Some(id.unwrap_or(0));
@@ -1372,7 +1382,11 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         state.failed
     });
     drop(app);
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record("cef-shutdown-begin", mac_lifecycle::BROWSER, None);
     shutdown();
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record("cef-shutdown-return", mac_lifecycle::BROWSER, None);
     let code = i32::from(failed);
     #[cfg(windows)]
     children_windows::finish(code, cfg!(feature = "windows-sandbox"));

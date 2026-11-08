@@ -2170,7 +2170,27 @@ kernel process name and whether it showed stopped). A null snapshot means
 no retained freeze observation, not proof of a late spawn. Names may be
 truncated and are not CEF roles. No arguments or environment are logged.
 The shutdown bounds and `forcedCleanup == 0` qualification are unchanged.
-This diagnostic needs a new macOS run; the previous RED is retained.
+The diagnostic head `574cec4` passed all nine PR jobs (42488149912), including
+14 guard and 6 adapter cases. The same tree merged as `0d480b0`; its automatic
+main run (42489988073) failed ordinary shutdown again. The counted helper
+PID 6082 was born after the initial tree snapshot, and later had parent 1,
+its own process group 6082 and a stopped freeze snapshot. GPU errors named
+PID 6065 instead. The truncated kernel name does not identify helper 6082's
+role, and its start during page activity/reopen versus shutdown is still
+unknown. This is a surviving helper, not evidence that a forced kill should
+be accepted as normal.
+
+The next diagnostic records helper entry (after sandbox initialization),
+the return from CEF, and the point before helper exit, plus the browser's shutdown request and
+CEF shutdown begin/return. Each best-effort stderr line contains its own
+PID/start/parent/group, wall-clock microseconds, exit code when available,
+and only closed enums for recognized process/utility roles. Unknown switch
+values become `other`; no arbitrary argument, path or environment is logged.
+Failure to read its own start time records null, not a fabricated identity.
+This adds no work inside the guard's stop-to-kill interval and changes no
+shutdown bound or receipt acceptance. Abnormal closes have a distinct request
+label; the before-exit record is not proof of OS exit, and a missing best-effort
+line does not prove that a helper was absent. The main RED remains unresolved.
 
 **Guard** (`src/guard_macos.rs`, chosen by `src/guard_entry.rs`; the Linux
 and Windows guards are unchanged). Same command line

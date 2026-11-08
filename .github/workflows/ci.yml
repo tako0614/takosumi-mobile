@@ -1379,6 +1379,15 @@ jobs:
         env:
           CEF_PATH: ${{ runner.temp }}/cef
         run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper --bin takosumi-browser-guard
+      - name: macOS helper diagnostic role tests
+        working-directory: native-tests/cef-candidate
+        env:
+          CEF_PATH: ${{ runner.temp }}/cef
+        run: |
+          log="$RUNNER_TEMP/m2-helper-role-tests.log"
+          cargo test --locked --bin takosumi-cef-browser-helper -- --show-output | tee "$log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Helper role tests failed'; exit 1; }
+          grep -q '^test result: ok\. 2 passed; 0 failed' "$log" || { echo 'Not both role tests ran'; exit 1; }
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
