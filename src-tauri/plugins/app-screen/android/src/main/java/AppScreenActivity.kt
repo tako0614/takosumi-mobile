@@ -71,7 +71,6 @@ class AppScreenActivity : AppCompatActivity() {
     private var lastExternalDeclinedAt = 0L
     private var lastBrowserViewAt = 0L
     private var lastDownloadPromptAt = 0L
-    private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
 
     private lateinit var container: FrameLayout
     private lateinit var hostView: TextView
@@ -120,12 +119,30 @@ class AppScreenActivity : AppCompatActivity() {
         return { dialog.dismiss() }
     }
 
+    private val fileSelection: AppScreenFileSelection by lazy {
+        AppScreenFileSelection(
+            current = ::fileSelectionContext,
+            interactive = { visible && resumed },
+            launch = { fileChooser.launch(it) },
+        )
+    }
     private val fileChooser =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val callback = pendingFileCallback
-            pendingFileCallback = null
-            callback?.onReceiveValue(pickedFiles(result.resultCode, result.data))
+            fileSelection.result(pickedFiles(result.resultCode, result.data))
         }
+
+    private fun fileSelectionContext(): AppScreenFileSelection.Context? {
+        val current = entry ?: return null
+        if (!::request.isInitialized || isFinishing || isDestroyed || evicted) return null
+        if (current.host !== this || !current.webView.isAttachedToWindow) return null
+        val page = current.webView.url ?: return null
+        // Like media consent, require a committed document. A native picker
+        // can stop this Activity, so result validation does not require resume.
+        if (!AppScreenPolicy.isInScreen(page, current.origins) || !current.resumeState.canRequestMedia(page)) return null
+        val generation = AppScreenProfileData.generation(this, current.profile)
+        if (generation < 0 || generation != profileGeneration || AppScreenProfileData.isClearing(current.profile)) return null
+        return AppScreenFileSelection.Context(current.webView, current.profile, generation, current.resumeState.document, page)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,6 +152,7 @@ class AppScreenActivity : AppCompatActivity() {
             return
         }
         request = parsed
+        fileSelection.restoreAwaitingResult(savedInstanceState?.getBoolean(STATE_FILE_PICKER) == true)
         if (refuseWhileClearing()) return
         profileGeneration = AppScreenProfileData.generation(this, parsed.profile)
         val liveProfile = AppScreenRegistry.get(parsed.key)?.profile
@@ -180,6 +198,7 @@ class AppScreenActivity : AppCompatActivity() {
         mediaConsent.cancel()
         setIntent(intent)
         val keep = keepsLivePage(parsed)
+        if (!keep) fileSelection.cancel()
         request = parsed
         show(target = startUrl(), keepLivePage = keep)
         applyTaskDescription()
@@ -217,6 +236,7 @@ class AppScreenActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         if (!::request.isInitialized) return
         outState.putLong(STATE_GENERATION, profileGeneration)
+        outState.putBoolean(STATE_FILE_PICKER, fileSelection.awaitingResult)
         if (!request.webHome || (profileGeneration >= 0L && AppScreenProfileData.generation(this, request.profile) == profileGeneration)) {
             restorable(lastKnownUrl)?.let { outState.putString(STATE_URL, it) }
         }
@@ -225,8 +245,7 @@ class AppScreenActivity : AppCompatActivity() {
     override fun onDestroy() {
         mediaConsent.cancel()
         externalDialog?.dismiss()
-        pendingFileCallback?.onReceiveValue(null)
-        pendingFileCallback = null
+        fileSelection.cancel()
         val current = entry
         if (current != null && current.host === this) {
             unbind(current)
@@ -251,6 +270,7 @@ class AppScreenActivity : AppCompatActivity() {
     internal fun forgetEntry(moved: AppScreenRegistry.Entry) {
         if (entry === moved) {
             mediaConsent.cancel()
+            fileSelection.cancel()
             entry = null
         }
     }
@@ -359,6 +379,7 @@ class AppScreenActivity : AppCompatActivity() {
 
     private fun unbind(current: AppScreenRegistry.Entry) {
         mediaConsent.cancel()
+        fileSelection.cancel()
         val webView = current.webView
         container.removeView(webView)
         webView.webViewClient = current.detachedClient
@@ -387,6 +408,7 @@ class AppScreenActivity : AppCompatActivity() {
 
     private fun closeScreen() {
         mediaConsent.cancel()
+        fileSelection.cancel()
         if (request.popup) finish() else finishAndRemoveTask()
     }
 
@@ -758,6 +780,7 @@ class AppScreenActivity : AppCompatActivity() {
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
             mediaConsent.cancel()
+            fileSelection.cancel()
             bound.resumeState.started(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 // Something reached the main frame without passing the policy.
@@ -792,7 +815,10 @@ class AppScreenActivity : AppCompatActivity() {
             // Subresources and rendered HTTP error responses do not turn a
             // successful main document into a failed navigation.
             if (view === entry?.webView && request.isForMainFrame) {
-                if (request.url.toString() == view.url) mediaConsent.cancel()
+                if (request.url.toString() == view.url) {
+                    mediaConsent.cancel()
+                    fileSelection.cancel()
+                }
                 bound.resumeState.failed(request.url.toString())
             }
         }
@@ -805,6 +831,7 @@ class AppScreenActivity : AppCompatActivity() {
         override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
             if (view !== entry?.webView) return
             mediaConsent.pageChanged(url)
+            fileSelection.pageChanged(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 leavePage(view, url, offerOnly = false)
                 return
@@ -847,6 +874,7 @@ class AppScreenActivity : AppCompatActivity() {
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
             if (view === entry?.webView) {
                 mediaConsent.cancel()
+                fileSelection.cancel()
                 // This callback has no main-frame flag. Conservatively keep
                 // the last successful metadata even if a subframe failed TLS.
                 bound.resumeState.failed(error.url)
@@ -911,15 +939,10 @@ class AppScreenActivity : AppCompatActivity() {
             filePathCallback: ValueCallback<Array<Uri>>,
             fileChooserParams: FileChooserParams,
         ): Boolean {
-            pendingFileCallback?.onReceiveValue(null)
-            pendingFileCallback = filePathCallback
-            return try {
-                fileChooser.launch(fileChooserParams.createIntent())
-                true
-            } catch (_: ActivityNotFoundException) {
-                pendingFileCallback = null
-                false
-            }
+            fileSelection.begin(webView, filePathCallback) { fileChooserParams.createIntent() }
+            // Every branch either completes or retains the callback. Returning
+            // false after answering would also ask WebView to cancel it.
+            return true
         }
 
         override fun onPermissionRequest(request: PermissionRequest) {
@@ -1011,6 +1034,7 @@ class AppScreenActivity : AppCompatActivity() {
     private companion object {
         const val STATE_URL = "com.takosumi.appscreen.state.URL"
         const val STATE_GENERATION = "com.takosumi.appscreen.state.GENERATION"
+        const val STATE_FILE_PICKER = "com.takosumi.appscreen.state.FILE_PICKER"
         const val SHELL_SCHEME = "takosumi"
         const val PROMPT_COOLDOWN_MS = 5_000L
         const val BROWSER_VIEW_COOLDOWN_MS = 3_000L

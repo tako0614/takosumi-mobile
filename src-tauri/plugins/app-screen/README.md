@@ -83,6 +83,16 @@ The manifest marks camera/microphone hardware optional. State-machine tests
 do not qualify actual WebView capture, native permission UI or capture behavior
 after an already-granted screen goes into the background.
 
+Android file selection keeps one native picker outstanding. A second request
+is canceled without replacing the first callback. Returning files requires the
+same view, profile generation, document and page. Navigation, eviction,
+detachment or destruction cancels the callback; the old picker result is still
+consumed before another request may launch. Activity recreation preserves that
+pending-result barrier, not the old callback or selected files. Ordinary
+picker pause/stop does not cancel selection. The existing content-provider URI
+filter remains in force. Controller tests cover this result binding; native
+picker UI, upload completion and device recreation need separate runtime proof.
+
 ## Preserved mobile adapter
 
 The remaining sections describe the previous Android/iOS client with
