@@ -45,9 +45,10 @@ def same_owner(processes, child, parent, browser, guard):
     return (child["parent"] == parent["pid"] and child["start"] >= parent["start"]
             and processes.facts(child["pid"]) == child
             and processes.facts(parent["pid"]) == parent
-            and processes.image(child["pid"]) == browser
-            and processes.image(parent["pid"]) == guard
-            and processes.facts(child["pid"]) == child)
+            and browser.matches(processes.image(child["pid"]))
+            and guard.matches(processes.image(parent["pid"]))
+            and processes.facts(child["pid"]) == child
+            and processes.facts(parent["pid"]) == parent)
 
 
 def sample_owned(processes, child, parent, browser, guard, output):

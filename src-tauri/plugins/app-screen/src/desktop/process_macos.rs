@@ -4,6 +4,10 @@
 //! Linux. libproc (`proc_pidinfo`, `proc_pidpath`) through libc.
 use std::path::{Path, PathBuf};
 
+#[path = "process_image.rs"]
+mod image;
+pub(super) use image::Executable;
+
 /// What the kernel says about one process: its parent and start time
 /// (microseconds since the epoch); `None` when no such process exists.
 pub(super) fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
@@ -48,10 +52,17 @@ pub(super) fn image_of(pid: u32) -> Option<std::path::PathBuf> {
 
 /// The `opened` reply's native process is the guard's own child, started
 /// no earlier than the guard (a reused pid is older than its new parent's
-/// child could be), running exactly `program` (the bundle's
-/// `Contents/MacOS` executable, compared as the canonical path the App
-/// located).
-pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program: &Path) -> bool {
+/// child could be). Its image must name the file held before spawn, including
+/// Chromium's hard-linked code-sign clone. Both process identities and the
+/// image path must remain stable across the file check. proc_pidpath + open
+/// is not an atomic running-vnode query; same-user concurrent file mutation
+/// and bundle authentication remain outside this child-ownership check.
+pub(super) fn native_owned(
+    native_pid: u32,
+    guard: &std::process::Child,
+    program: &Path,
+    executable: &Executable,
+) -> bool {
     let native = parent_and_start(native_pid);
     let parent = parent_and_start(guard.id());
     let parent_matches = native.is_some_and(|(pid, _)| pid == guard.id());
@@ -62,7 +73,14 @@ pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program
     // used for admission. A second diagnostic read could hide a transient.
     let image_checked = parent_matches && birth_order;
     let image = image_checked.then(|| image_of(native_pid)).flatten();
-    let owned = image_checked && image.as_deref() == Some(program);
+    let image_matches = image
+        .as_deref()
+        .is_some_and(|path| executable.matches(path));
+    let identities_unchanged = image_matches
+        && image_of(native_pid) == image
+        && parent_and_start(native_pid) == native
+        && parent_and_start(guard.id()) == parent;
+    let owned = image_checked && image_matches && identities_unchanged;
     if !owned {
         use std::io::Write;
         let _ = writeln!(
@@ -71,7 +89,9 @@ pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program
             serde_json::json!({
                 "nativeIdentityRead":native.is_some(),"guardIdentityRead":parent.is_some(),
                 "parentMatch":parent_matches,"birthOrder":birth_order,"imageChecked":image_checked,
-                "imageRead":image.is_some(),"imageMatch":image.as_deref()==Some(program)
+                "imageRead":image.is_some(),"imageMatch":image_matches,
+                "identitiesUnchanged":identities_unchanged,
+                "exactPathMatch":image.as_deref()==Some(program)
             })
         );
         #[cfg(any(test, feature = "fixture-overrides"))]

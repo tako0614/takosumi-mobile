@@ -1355,7 +1355,7 @@ jobs:
         run: |
           python3 -B native-tests/desktop/test_macos_browser_process.py -v 2>&1 | tee "$RUNNER_TEMP/m3-runner-tests.log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'M3 runner tests failed'; exit 1; }
-          grep -q '^Ran 7 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all M3 runner tests ran'; exit 1; }
+          grep -q '^Ran 9 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all M3 runner tests ran'; exit 1; }
       - name: Locked CEF version
         id: cef
         run: |
@@ -1514,10 +1514,13 @@ jobs:
             desktop::process_adapter::macos_tests::the_identity_checks_read_this_process \
             desktop::process_adapter::macos_tests::a_foreign_hosts_lock_refuses_and_a_killed_holders_lock_is_stale \
             desktop::process_adapter::macos_tests::macos_adapter_opens_reuses_and_shuts_down_a_profile \
-            desktop::process_adapter::macos_tests::macos_adapter_the_apps_death_ends_guard_and_browser; do
+            desktop::process_adapter::macos_tests::macos_adapter_the_apps_death_ends_guard_and_browser \
+            desktop::process_macos::image::macos_tests::hardlinks_match_but_copies_and_names_do_not \
+            desktop::process_macos::image::macos_tests::replacement_does_not_replace_the_held_identity \
+            desktop::process_macos::image::macos_tests::missing_and_non_regular_files_fail_closed; do
             grep -qF "test $name ... ok" "$log" || { echo "$name did not pass"; exit 1; }
           done
-          grep -q '^test result: ok\. 6 passed; 0 failed; 0 ignored' "$log" || { echo 'Not all six macOS adapter tests ran'; exit 1; }
+          grep -q '^test result: ok\. 9 passed; 0 failed; 0 ignored' "$log" || { echo 'Not all nine macOS adapter tests ran'; exit 1; }
       # The adapter's macOS paths outside its tests: the product build
       # (open_externally through /usr/bin/open) and the fixture build (the
       # recording opener). The App with desktop-cef is compiled by the

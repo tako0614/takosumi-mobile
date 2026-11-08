@@ -34,6 +34,7 @@ sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
 from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
 from macos_shutdown_sample import watch_shutdowns  # noqa: E402
+from macos_process_image import PinnedImage  # noqa: E402
 
 
 class BsdInfo(ctypes.Structure):
@@ -117,13 +118,16 @@ class MacObserver(Observer):
         require(guard and child and guard["parent"] == self.app_pid
                 and child["parent"] == guard["pid"] and child["start"] >= guard["start"],
                 "Browser must be its guard's current child")
-        require(self.processes.image(child["pid"]) == self.browser
-                and self.processes.image(guard["pid"]) == self.guard, "Unexpected browser or guard executable")
+        require(self.browser.matches(self.processes.image(child["pid"]))
+                and self.guard.matches(self.processes.image(guard["pid"])), "Unexpected browser or guard executable")
+        require(self.processes.facts(child["pid"]) == child and self.processes.facts(guard["pid"]) == guard,
+                "Browser or guard identity changed during image check")
         self.identities.extend([guard, child])
         inspection = json.loads((Path(process["directory"]) / "inspection.json").read_text())
         require(inspection["pid"] == child["pid"] and listeners(inspection["port"]) == [child["pid"]],
                 "Only the attested native browser may own the inspection listener")
-        require(self.processes.facts(child["pid"]) == child, "Browser identity changed during listener check")
+        require(self.processes.facts(child["pid"]) == child and self.processes.facts(guard["pid"]) == guard,
+                "Browser or guard identity changed during listener check")
         port = inspection["port"]
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         try:
@@ -316,6 +320,13 @@ def preserve_browser_logs(case, phase):
 def run(args):
     processes = Processes()
     binary, browser, guard = (path.resolve(strict=True) for path in (args.binary, args.browser, args.guard))
+    # Keep these open across all launches and sampling threads, before any
+    # owned process starts. A later replacement cannot redefine the identity.
+    with PinnedImage(binary) as app_image, PinnedImage(browser) as browser_image, PinnedImage(guard) as guard_image:
+        return run_pinned(args, processes, binary, browser, guard, app_image, browser_image, guard_image)
+
+
+def run_pinned(args, processes, binary, browser, guard, app_image, browser_image, guard_image):
     case = Path(tempfile.mkdtemp(prefix="sumi-m3-", dir=args.work.resolve(strict=True)))
     (case / ".owned-browser-reference").write_text("macOS actual App fixture\n")
     (case / "home-store.json").write_text(json.dumps(list(uuid.uuid4().bytes)) + "\n")
@@ -342,7 +353,7 @@ def run(args):
             entry = {"name": name}
             proof["phases"].append(entry)
             outer_receipt = case / f"app-guard-{name}.json"
-            observer = MacObserver(case, args.site, phase, processes, browser, guard)
+            observer = MacObserver(case, args.site, phase, processes, browser_image, guard_image)
             with open(case / f"app-{name}.log", "xb") as log:
                 app_guard = subprocess.Popen([str(guard), str(outer_receipt), str(binary)], env=env,
                                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -354,7 +365,10 @@ def run(args):
                     app = processes.facts(store["appPid"])
                     outer = processes.facts(app_guard.pid)
                     require(app and outer and app["parent"] == outer["pid"] and app["start"] >= outer["start"]
-                            and processes.image(app["pid"]) == binary, "App is not the owned outer guard's child")
+                            and app_image.matches(processes.image(app["pid"]))
+                            and guard_image.matches(processes.image(outer["pid"]))
+                            and processes.facts(app["pid"]) == app and processes.facts(outer["pid"]) == outer,
+                            "App is not the owned outer guard's child")
                     observer.app_pid = app["pid"]
                     observer.identities.append(app)
                     entry["homeStore"] = store

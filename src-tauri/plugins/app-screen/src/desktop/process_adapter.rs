@@ -156,6 +156,10 @@ struct Process {
     /// after `Drop` has removed the directory (fields drop after `drop`).
     _runtime_lock: std::fs::File,
     program: PathBuf,
+    /// Pin the executable inode before spawn; Chromium may report its
+    /// hard-linked code-sign clone as the running image on macOS.
+    #[cfg(target_os = "macos")]
+    executable: macos::Executable,
     /// Opening order: an App quit closes the oldest profile first.
     order: u64,
     /// The guard's stop request (Windows): this App created it under a fresh
@@ -783,6 +787,8 @@ impl Process {
         spawner: &mpsc::Sender<SpawnRequest>,
         no_sandbox: bool,
     ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let executable = macos::Executable::open(&program).map_err(failure)?;
         private_directory(&directory)?;
         if directory
             .symlink_metadata()
@@ -1021,6 +1027,8 @@ impl Process {
             runtime: unowned.0.take().expect("Owned runtime directory"),
             _runtime_lock: runtime_lock,
             program,
+            #[cfg(target_os = "macos")]
+            executable,
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
             #[cfg(windows)]
             stop,
@@ -1205,7 +1213,11 @@ impl Process {
                     && browser_id > 0
                     && window_id > 0
                     && native_pid > 0;
+                #[cfg(not(target_os = "macos"))]
                 let owned = fields_match && native_owned(native_pid, &self.child, &self.program);
+                #[cfg(target_os = "macos")]
+                let owned = fields_match
+                    && native_owned(native_pid, &self.child, &self.program, &self.executable);
                 let cache_matches = same_path(
                     &cache_path,
                     &self.directory.join("cef-profiles").join(&self.profile),
@@ -3595,10 +3607,9 @@ mod macos_tests {
             macos::parent_and_start(native_pid).map(|(parent, _)| parent),
             Some(guard)
         );
-        assert_eq!(
-            macos::image_of(native_pid).as_deref(),
-            Some(located.program.as_path())
-        );
+        assert!(process
+            .executable
+            .matches(&macos::image_of(native_pid).unwrap()));
         let tree = descendants(guard);
         println!("guard {guard}, browser {native_pid}, tree while open: {tree:?}");
         assert!(tree.len() >= 2, "no CEF helper below the browser: {tree:?}");

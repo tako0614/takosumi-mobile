@@ -15,6 +15,54 @@ import macos_shutdown_sample as sampler
 
 
 class EvidenceTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory(prefix="m3-images-"))
+        self.root = Path(directory)
+        self.browser, self.guard = self.root / "browser", self.root / "guard"
+        self.browser.write_bytes(b"browser")
+        self.guard.write_bytes(b"guard")
+        self.browser_image = self.enterContext(runner.PinnedImage(self.browser))
+        self.guard_image = self.enterContext(runner.PinnedImage(self.guard))
+
+    def test_image_alias_accepts_hardlink_but_not_copy_replacement_or_missing(self):
+        alias = self.root / "clone" / "browser"
+        alias.parent.mkdir()
+        alias.hardlink_to(self.browser)
+        self.assertTrue(self.browser_image.matches(alias))
+        self.browser.unlink()
+        self.browser.write_bytes(b"browser")
+        self.assertFalse(self.browser_image.matches(self.browser))
+        self.assertTrue(self.browser_image.matches(alias))
+        alias.unlink()
+        alias.write_bytes(b"browser")
+        self.assertFalse(self.browser_image.matches(alias))
+        alias.unlink()
+        self.assertFalse(self.browser_image.matches(alias))
+        self.assertFalse(self.browser_image.matches(self.root))
+        with self.assertRaises(OSError):
+            runner.PinnedImage(alias)
+        with self.assertRaises(OSError):
+            runner.PinnedImage(self.root)
+
+    def test_attach_accepts_hardlink_alias_with_stable_process_before_cdp(self):
+        alias = self.root / "clone-browser"
+        alias.hardlink_to(self.browser)
+        processes = mock.Mock()
+        identities = {11: {"pid": 11, "parent": 10, "group": 11, "start": 100},
+                      12: {"pid": 12, "parent": 11, "group": 11, "start": 101}}
+        processes.facts.side_effect = identities.get
+        processes.image.side_effect = {11: self.guard, 12: alias}.get
+        (self.root / "inspection.json").write_text(json.dumps({"pid": 12, "port": 9222}))
+        observer = runner.MacObserver(self.root, "excalidraw", "", processes, self.browser_image, self.guard_image)
+        observer.app_pid = 10
+        class ReachedCdp(Exception):
+            pass
+        with mock.patch.object(runner, "listeners", return_value=[12]), \
+                mock.patch.object(runner.http.client, "HTTPConnection", side_effect=ReachedCdp) as connection, \
+                self.assertRaises(ReachedCdp):
+            observer.attach({"pid": 11, "opened": {"nativePid": 12}, "directory": str(self.root)})
+        connection.assert_called_once_with("127.0.0.1", 9222, timeout=5)
+
     def test_sampler_thread_failure_still_runs_the_normal_close_body(self):
         with tempfile.TemporaryDirectory(prefix="m3-sample-start-") as directory:
             observer = mock.Mock(identities=[], phase="restart", data=Path(directory), proof={})
@@ -52,7 +100,7 @@ class EvidenceTests(unittest.TestCase):
     def test_stack_sample_refuses_changed_identity_before_or_after_sampling(self):
         child = {"pid": 12, "parent": 11, "start": 101}
         parent = {"pid": 11, "parent": 10, "start": 100}
-        browser, guard = Path("/owned/browser"), Path("/owned/guard")
+        browser, guard = self.browser, self.guard
         with tempfile.TemporaryDirectory(prefix="m3-sample-") as directory:
             for mutation in ("birth", "parent", "guard", "image", "after"):
                 with self.subTest(mutation=mutation):
@@ -73,14 +121,14 @@ class EvidenceTests(unittest.TestCase):
                         return mock.Mock(returncode=0)
                     output = Path(directory) / f"{mutation}.log"
                     with mock.patch.object(sampler.subprocess, "run", side_effect=sample) as command:
-                        result = sampler.sample_owned(processes, child, parent, browser, guard, output)
+                        result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
                     self.assertEqual(result["status"], f"identity-changed-{'after' if mutation == 'after' else 'before'}")
                     self.assertFalse(output.exists())
                     self.assertEqual(command.call_count, int(mutation == "after"))
 
     def test_stack_sample_bounds_output_and_uses_owned_subprocess_timeout(self):
         child, parent = {"pid": 12, "parent": 11, "start": 101}, {"pid": 11, "start": 100}
-        browser, guard = Path("/owned/browser"), Path("/owned/guard")
+        browser, guard = self.browser, self.guard
         processes = mock.Mock()
         processes.facts.side_effect = {11: parent, 12: child}.get
         processes.image.side_effect = {11: guard, 12: browser}.get
@@ -93,10 +141,10 @@ class EvidenceTests(unittest.TestCase):
                 return mock.Mock(returncode=0)
             with mock.patch.object(sampler, "LIMIT", 32), \
                     mock.patch.object(sampler.subprocess, "run", side_effect=sample):
-                result = sampler.sample_owned(processes, child, parent, browser, guard, output)
+                result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
             self.assertEqual((result["status"], result["truncated"], output.stat().st_size), ("captured", True, 32))
             with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 3)):
-                result = sampler.sample_owned(processes, child, parent, browser, guard, Path(directory) / "missing.log")
+                result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
 
     def test_listener_requires_the_exact_loopback_address_and_owner(self):
@@ -121,14 +169,14 @@ class EvidenceTests(unittest.TestCase):
             runner.normal_receipt({"rootExit": 0, "complete": True})
 
     def test_attach_refuses_an_unowned_or_changed_process_before_cdp(self):
-        browser, guard = Path("/owned/browser"), Path("/owned/guard")
+        browser, guard = self.browser, self.guard
         identities = {11: {"pid": 11, "parent": 10, "group": 11, "start": 100},
                       12: {"pid": 12, "parent": 11, "group": 11, "start": 101}}
         with tempfile.TemporaryDirectory(prefix="m3-ownership-") as directory:
             data = Path(directory)
             (data / "inspection.json").write_text(json.dumps({"pid": 12, "port": 9222}))
             process = {"pid": 11, "opened": {"nativePid": 12}, "directory": directory}
-            for mutation in ("guard-parent", "browser-parent", "birth", "image", "listener", "reuse"):
+            for mutation in ("guard-parent", "browser-parent", "birth", "image", "listener", "reuse", "guard-reuse"):
                 with self.subTest(mutation=mutation):
                     facts = copy.deepcopy(identities)
                     if mutation == "guard-parent":
@@ -143,14 +191,14 @@ class EvidenceTests(unittest.TestCase):
                     def read(pid):
                         nonlocal reads
                         reads += 1
-                        if mutation == "reuse" and reads > 2 and pid == 12:
+                        if reads > 2 and ((mutation == "reuse" and pid == 12) or (mutation == "guard-reuse" and pid == 11)):
                             return dict(facts[pid], start=102)
                         return facts[pid]
 
                     processes.facts.side_effect = read
                     processes.image.side_effect = lambda pid: (
                         Path("/foreign/browser") if mutation == "image" else {11: guard, 12: browser}[pid])
-                    observer = runner.MacObserver(data, "excalidraw", "", processes, browser, guard)
+                    observer = runner.MacObserver(data, "excalidraw", "", processes, self.browser_image, self.guard_image)
                     observer.app_pid = 10
                     with mock.patch.object(runner, "listeners", return_value=[99] if mutation == "listener" else [12]), \
                             mock.patch.object(runner.http.client, "HTTPConnection") as connection, \

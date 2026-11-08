@@ -48,6 +48,16 @@ deletion failures, engine-specific controls and unsigned SDK build limits are
 recorded in [native tests](../../../native-tests/README.md). Real IdP, files,
 notifications and distribution require their own checks.
 
+The macOS process adapter holds the selected browser executable open before
+launch. It accepts a reported image only when it names that same device/inode,
+with the guard/native parent and birth identities stable across the check.
+This allows Chromium's hard-linked code-sign clone; a copied or replaced
+executable does not match. It does not authenticate the surrounding bundle,
+verify signatures, or provide an atomic running-vnode check against concurrent
+same-user filesystem mutation. Packaging and staged updates need separate
+qualification. Native fixtures hold their executable identities before launch
+and retain the same process and normal-cleanup requirements.
+
 On iOS 15+, the adapter lets WebKit ask whether the requesting site may access the
 camera or microphone in an attached, visible HTTPS screen. It returns
 [`prompt`](https://developer.apple.com/documentation/webkit/wkpermissiondecision/prompt),
