@@ -717,8 +717,9 @@ The second Windows step (W2) makes the App's per-profile browser backend work
 on Windows at the adapter level: `takosumi-browser-guard` for Windows, and the
 app-screen plugin's `desktop-process-experiment` (and so the App's
 `desktop-cef`) compiled for Windows, where it starts the guard and the browser
-through the same `Process` code as on Linux. macOS and other OSes still refuse
-both with a single compile error. W2 had no App UI or fixture on Windows
+through the same `Process` code as on Linux. macOS and other OSes still refused
+both with a single compile error (macOS builds both since
+[M2](#macos-guard-and-adapter-m2)). W2 had no App UI or fixture on Windows
 (that came with [W3](#windows-actual-app-w3)), and the browser stays the
 unsandboxed candidate.
 
@@ -2121,6 +2122,288 @@ the entitlements Chromium's helpers need, such as JIT for the renderer) and
 notarization (release inputs), the login keychain decision, Intel Macs
 (`x86_64-apple-darwin`; the bundler accepts it, CI does not run it), older
 macOS versions and real devices.
+
+## macOS guard and adapter (M2)
+
+Status: implemented on 2026-11-07. The first macOS runs (CI at `0b281ae`,
+run 42389517653, and `3874b52`, run 42391603085, 9/9) passed all twelve
+guard self-tests then and the adapter tests through the real Process API
+(open, reuse, shutdown with a normal receipt, the App's death); the first
+run's one failure was the unit test's expected reason (tauri's mock App has
+no resource directory on macOS), fixed in `3874b52`. A review then asked for
+the freeze before the kill, `NOTE_FORK`, the startup signal order, a
+stricter group listing, the system's `TMPDIR`, a stricter death case and
+the compile checks below; CI at `5663667` passed 9/9 with them: thirteen
+guard self-tests, the six adapter tests, every freeze line (41) showing
+all its stopped processes stopped, and the death case ending the browser
+with `rootExit` -9 (`SIGKILL`). A last review asked that nothing between
+the first `SIGSTOP` and the kill can panic or leave a process stopped (a
+drop guard, a non-panicking log line), that unreadable stopped processes
+are still killed, the kill goes leaves first, forks reported after the
+freeze are looked at (or make the run incomplete), a reused parent pid
+pulls in no children, base's macOS socket template, and two test
+hardenings. That revision passed in `bc9fd69`'s
+[CI run 42400222011](https://github.com/tako0614/takosumi-mobile/actions/runs/42400222011):
+9/9 jobs, fourteen guard self-tests and six adapter tests. The App-death
+case reported `rootExit: -9`, a complete receipt, no remaining process and
+no cleanup errors. These are runner/component results, not an actual macOS
+App UI or real-device qualification. This Linux host type-checks and lints everything for `aarch64-apple-darwin`
+(`cargo clippy`): the guard and its self-tests, the browser and the helper
+(`cef/dox`), the app-screen plugin with `desktop-process-experiment` (with
+and without `fixture-overrides`) and the App with `desktop-cef`
+(libsodium's build script pointed at an empty `SODIUM_LIB_DIR`, so it
+builds nothing); nothing is linked or run here. The second macOS step
+mirrors W2: `takosumi-browser-guard` for macOS, and the plugin's
+`desktop-process-experiment` (and so the App's `desktop-cef`) compiled for
+macOS, where it starts the guard and the bundled browser through the same
+`Process` code as on Linux and Windows. No App UI or fixture on macOS yet
+(M3).
+
+The later `6eacebe` run (42486555333) kept the same macOS implementation but
+failed ordinary adapter shutdown: browser exit 0, complete receipt, no
+remaining process, `forcedCleanup: 1`. Its freeze saw one stopped process;
+the original log does not identify it. The App correctly retained the
+profile. GPU error lines alone do not identify the forced helper; the cause
+remains unknown. The guard now logs up to 32 counted PID/start identities
+after the kill, with an optional freeze snapshot (parent, group, bounded
+kernel process name and whether it showed stopped). A null snapshot means
+no retained freeze observation, not proof of a late spawn. Names may be
+truncated and are not CEF roles. No arguments or environment are logged.
+The shutdown bounds and `forcedCleanup == 0` qualification are unchanged.
+This diagnostic needs a new macOS run; the previous RED is retained.
+
+**Guard** (`src/guard_macos.rs`, chosen by `src/guard_entry.rs`; the Linux
+and Windows guards are unchanged). Same command line
+(`<absolute new receipt> <program> [args...]`), receipt fields and exit
+codes. macOS has neither Linux's child subreaper and pidfds nor Job
+Objects, and kqueue's `NOTE_TRACK` (following forks) is gone, so the guard
+owns the browser's processes by three means:
+
+- **Its process group.** The App starts the guard as the leader of a new
+  process group (`process_group(0)`); a guard that is not its group's
+  leader refuses to start (exit 2). The browser and everything it starts
+  inherit the group unless they leave it; every member but the guard is
+  the browser's (`proc_listpgrppids`). libproc answers a failed listing
+  with an empty one, so a group listing that does not hold the guard
+  itself is a failure (errno is also checked on an empty answer), and a
+  member whose state cannot be read counts as still there.
+- **Descendants recorded while they run.** The guard lists the group and
+  the children of every process it already tracks (`proc_listchildpids`,
+  only while that pid still has the recorded start time, so a reused pid
+  pulls in no one else's children) on every kqueue event, at least every
+  250 ms, and at once when a tracked process forks (`EVFILT_PROC`
+  `NOTE_FORK` on each one), and keeps each process it has seen by pid and
+  start time, so a descendant that left the group (`setsid`, `setpgid`) is
+  still found under its parent, and one later orphaned to launchd is still
+  tracked.
+- **PID reuse.** The start time comes from `proc_pidinfo`
+  (`PROC_PIDTBSDINFO`). A child that started before the parent it was
+  found under is not that parent's (the pid was reused) and is not
+  recorded; a tracked pid whose start time changed is a different process
+  and is never signalled; a zombie counts as ended.
+
+It refuses (exit 2, nothing started, no receipt) a relative or existing
+receipt path and a guard outside its own group; it reserves the receipt
+(`O_EXCL`, mode 0600, never through a link), marks every descriptor it
+inherited beyond the standard three close-on-exec, and starts the browser
+with the guard's stdin, stdout and stderr (the App's control pipe, reply
+pipe and log). `SIGTERM` and `SIGINT` are blocked from the guard's start
+(the App also starts it with both blocked) until kqueue watches them
+(`EVFILT_SIGNAL` records every one sent from then on, blocked or ignored);
+one already pending then is a stop request before the browser starts.
+Then the guard ignores both and unblocks them; the browser gets them back
+at their defaults with an empty signal mask. It waits on one kqueue,
+without polling or a lifetime cap, for the browser's exit (`NOTE_EXIT`),
+a stop request (either signal, the App's stop as on Linux) or the App's
+death (`NOTE_EXIT` on the guard's parent: macOS has no parent-death
+signal; a parent already gone when the guard starts is a stop before the
+browser starts, and a changed parent at any later look is the App's death
+too, should its exit event be missed).
+
+The drain then always runs, as on Windows: up to 0.5 s for the browser and
+every tracked process to end by themselves. Then the guard **freezes the
+tree before it kills anything**: `SIGSTOP` to the unreaped browser
+(always), to each tracked process still the same (start time) and to
+every other running member of the group, each verified right before its
+signal; it looks again for processes they started before they stopped and
+stops those too, until a look taken after every stopped process showed
+stopped (`SSTOP`) finds nothing new and no stopped process has reported a
+fork since, for at most 0.5 s. A one-shot kill of a listing could leave a
+child forked meanwhile (or the child of a process outside the group,
+orphaned when its parent died first). A stopped process should not fork
+or exit by itself, and its children stay listed under it; a fork or spawn
+a thread was already making may still complete after the stop (as XNU's
+code suggests; not verified), which is why a fork reported after a stop
+means another look. Then `SIGKILL` to every stopped process, **leaves
+first**: each level of the stopped tree gets up to 100 ms to be gone
+before its parents are killed, so no stopped child is orphaned while it
+still runs (a process group orphaned with stopped members gets `SIGHUP`
+and `SIGCONT`). A stopped process keeps its pid, so one whose state
+cannot be read is killed too, its error recorded. For the rest of a 2 s
+window, counted from the freeze, the guard kills whatever it still finds
+the same way every 20 ms; at its end every stopped process still there
+(or unreadable) is killed again and makes the run incomplete, and so does
+a fork that a stopped process reported after the freeze's last look
+(`ForkAfterFreeze` in `cleanupErrors`). From the first `SIGSTOP` to that
+point a drop guard kills every stopped process should the drain return
+or unwind early, and nothing in that section may panic: its arithmetic
+saturates, and the one diagnostic line, written after the kill to
+standard error (the profile's `browser.log`),
+`takosumi-browser-guard: freeze {"stopped":N,"shownStopped":S,"freezeMs":T}`,
+ignores a failed write (`eprintln!` would panic on a full disk or a
+closed log, leaving the tree stopped). The guard's other stderr lines
+ignore failures the same way. `forcedCleanup` counts, for the browser and
+every other process alike, the processes the guard's `SIGKILL` reached
+while they ran (verified, not a zombie): all but certainly ended by that
+kill for a process the freeze saw stopped (it could only have ended
+meanwhile by another's signal); for one it did not see stopped (the
+freeze ran out, or it was found only after the kill), one that ended by
+itself at that moment is counted too, since macOS gives the guard no exit
+status for a process that is not its child: the count errs only on the
+safe side (the App keeps the profile). A failed signal is a
+`cleanupErrors` entry and makes the receipt abnormal. `remaining` lists
+the pids still in the group or tracked; `observed` counts every process
+seen, by pid and start time (the browser included, once).
+
+**What completion means on macOS.** The receipt keeps the fields of the
+Linux and Windows guards, but `kernelNoChildren` and `complete` mean "no
+survivor among the processes the guard observed": after the browser was
+reaped, the group lists only the guard and no tracked process is alive.
+That is not a kernel proof, as the child subreaper's `waitid` answering
+`ECHILD` is on Linux or the job's accounting is on Windows. Outside it: a
+process the browser started through a system service (launchd, XPC), which
+is not its descendant (as on Linux one started by a session manager is
+not), and a double fork faster than an observation: a process that leaves
+the group and whose parent ends before the guard's next look (the
+`NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen. CEF's
+helpers stay in the group (the M1 smoke's group check). The App's checks
+are unchanged (`require_normal_guard` states the same meaning).
+
+**Self-tests** (`src/guard_macos_tests.rs`, `harness = false`, like
+Windows'). The test binary re-executes itself as the guard, as stand-in
+browsers and as a stand-in App, and runs fourteen cases: a normal exit; a
+non-zero exit; the browser keeps the pipes and gets the default stop
+signals with an empty mask; a lingering descendant is killed and counted;
+a descendant that left the group (`setsid`) is still killed; one that ends
+by itself is not forced; a tree forking as the kill begins (a `setsid`
+breeder forking a child every 5 ms for 2 s, which reports on a pipe once
+its first child exists before the browser exits) is frozen, then killed,
+with no child left in the breeder's group, at least two forced and every
+observed process but the browser counted forced once; a guard whose
+standard error cannot be written (a pipe with its reader closed) still
+kills the stopped browser and writes a complete receipt, exiting 1 rather
+than panicking; a stop
+request drains a running browser; the App's death (`SIGKILL` of the
+stand-in App) ends the guard and a browser that never reads its input
+(`rootExit` `SIGKILL`, one forced); refusals create no receipt and start
+no browser (a stand-in that would leave a mark); a browser that cannot
+start leaves an incomplete receipt; the pid-reuse, zombie, stopped and
+group-listing rules; the wait status as `rootExit`. The cases that start
+processes require every one of them gone. Selecting no case fails.
+
+**Adapter** (`src/desktop/process_adapter.rs`, the macOS pieces in
+`process_macos.rs`; the POSIX code is shared with Linux):
+
+- The guard starts from the App's spawner thread in its own process group,
+  with the control pipe, the reply pipe and `browser.log`, and with its
+  stop signals blocked; a fork whose parent is no longer this App refuses
+  to run (`getppid` in `pre_exec`; Linux additionally arms
+  `PR_SET_PDEATHSIG`). The App's death ends the guard through the guard's
+  kqueue on its parent; an ordinary stop is `SIGTERM` to the guard, as on
+  Linux.
+- `confirm_opened` accepts the `opened` reply only when its native process
+  is the guard's child, started no earlier than the guard, running exactly
+  the executable the App located inside the bundle's `Contents/MacOS`
+  (`proc_pidpath`), and when the reported cache path is exactly the
+  requested one.
+- The runtime root is `<app cache>/cef`, as on Windows (no XDG runtime
+  directory), private to the user; the receipts live there. Chromium on
+  macOS takes its temporary directory from `NSTemporaryDirectory()`, which
+  prefers the system's per-user one (`confstr(_CS_DARWIN_USER_TEMP_DIR)`;
+  only `MAC_CHROMIUM_TMPDIR` overrides it), so the `TMPDIR` the browser is
+  given (that same directory, read with `confstr` rather than from the
+  App's environment) is informational. Its singleton socket there,
+  `<dir>/.<base bundle id>.XXXXXX/SingletonSocket` (base's macOS
+  temporary-file template; the check takes the longer of the bundle's
+  `com.takosumi.cef-browser` and Chromium's `org.chromium.Chromium`), must
+  fit 104 bytes, which a path under the App's cache directory would not. A
+  directory too long for it makes the browser unavailable with that reason
+  (checked when the App locates the browser, and at each start).
+- `HOME` stays the person's own. Every Chromium profile file is under the
+  profile's cache path; what profiles share is the browser bundle's own
+  per-user macOS state (its defaults domain, saved window state, system
+  caches). A per-profile `HOME`, as on Linux, would not separate that:
+  Cocoa looks up `~/Library` through the user's account rather than
+  `HOME`, and overriding it is not known to be safe for CEF. Known limit,
+  not implemented; M3 can list what the browser writes under `~/Library`.
+- `clear_profile` refuses while Chromium's `SingletonLock` (a link to
+  `<host>-<pid>`) names a running process on this host; a lock of another
+  host (whatever its pid) or one that cannot be read counts as held, and a
+  lock left by a holder killed with `SIGKILL` is stale.
+- The environment is cleared and only `PATH`, `USER`, `LOGNAME`, `LANG`,
+  `LC_ALL`, `LC_CTYPE` and `HOME` pass, with `TMPDIR` (above) and
+  `MallocNanoZone=0` added (the bundle's `LSEnvironment` applies only to a
+  LaunchServices launch); the browser gets `--use-mock-keychain`, so
+  Chromium never prompts for the login keychain and encrypts cookies with a
+  fixed key (whether the App should use the login keychain is still open).
+- External links open through `/usr/bin/open <url>` in its own process
+  group, reaped by the thread that starts it, within the same budget of
+  eight openers. A `fixture-overrides` build only appends the link to the
+  recording log; the unit tests only record it and never start an opener.
+- The packaged names are
+  `takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process`
+  and `takosumi-browser-guard`; where the App's bundle holds them is M3's
+  packaging.
+
+**Adapter tests** (`macos_tests` in `process_adapter.rs`). Four need
+nothing built: an unresolvable browser leaves the App running with its
+reason (on macOS the mock App's missing resource directory) and without
+the clear capability; a held `SingletonLock` refuses the clear and keeps
+the data, while a foreign or garbled lock counts as held and a stale one
+as free; another host's lock refuses even with a pid free here, and a
+holder killed with `SIGKILL` leaves a stale lock the clear then removes;
+the identity checks read this process (parent, start time,
+`proc_pidpath`) and the system's temporary directory and socket bound.
+Two are ignored unless asked for and need `TAKOSUMI_MACOS_GUARD` (the built
+guard) and `TAKOSUMI_MACOS_BROWSER` (the bundled product browser's
+executable; `TAKOSUMI_MACOS_WORK` places the case directories): one opens a
+profile through `Process::spawn` and the creation reply check (a
+cold-start bound of 120 s), restates the identity checks against the
+kernel, requires a CEF helper below the browser and the profile's
+`SingletonLock` held, reopens the screen and requires the same browser,
+window, pid and cache back, shuts it down through the adapter and requires
+a normal guard receipt and every process of the tree gone; the other
+re-executes the test binary as a stand-in App (the seventh, ignored test,
+which only that case runs) that opens a profile and hands a copy of the
+browser's input to a holder process, so the App's death cannot end the
+browser through its input, then kills that App with `SIGKILL` and requires
+the guard, the browser and the whole tree gone within 10 s, and the receipt
+complete with `kernelNoChildren`, nothing remaining, `rootExit` `SIGKILL`
+and at least one forced process: the guard's watch on the App ended it.
+
+**CI.** `cef-macos`: the product build also builds
+`takosumi-browser-guard`. After the product smoke, `cargo test --locked
+--bin takosumi-browser-guard` must report `14 passed; 0 failed`; the
+plugin's lock is pruned from the App's (its own step, as in the Windows
+job); `cargo test ... --features desktop-process-experiment --lib --
+macos_tests --include-ignored --skip app_stand_in_for_the_death_case
+--test-threads 1` runs with the built guard and `m1-product`'s browser and
+must pass each of the six tests by name and report `6 passed; 0 failed;
+0 ignored`; and `cargo check` compiles the plugin's macOS product build
+(`desktop-process-experiment`: `open_externally` through `/usr/bin/open`)
+and fixture build (`fixture-overrides`: the recording opener). The
+`desktop` job's macOS run compiles the App with `desktop-cef`, as its
+Windows run does. The artifact `cef-macos-smoke` adds both test logs and
+each case's `browser.log`, `cef-native.log` and kept guard receipt: text
+only. Still seven jobs (nine runs).
+
+**Remains after M2:** the actual App fixture on macOS (M3: the App's home
+driving this adapter), packaging (the browser bundle and the guard inside
+the App's `.app`, a `.dmg`), Developer ID signing of every Mach-O file with
+the hardened runtime and the entitlements Chromium's helpers need, and
+notarization (release inputs), the login keychain decision, the shared
+per-user macOS state of the browser bundle (the `HOME` decision above),
+Intel Macs, older macOS versions and real devices.
 
 ## Observations and limits
 

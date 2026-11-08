@@ -1,5 +1,7 @@
-//! Where the Linux per-profile browser, its guard and its short runtime root
-//! are, and whether the browser runs in Chromium's sandbox. A packaged App
+//! Where the Linux (and, the same way, macOS: M2) per-profile browser, its
+//! guard and its short runtime root are, and whether the browser runs in
+//! Chromium's sandbox. macOS has no XDG runtime directory: its root is
+//! `<app cache>/cef`, as on Windows. A packaged App
 //! finds the browser in its own resources (`cef/`) and keeps sockets under
 //! `$XDG_RUNTIME_DIR`; the native fixture names each one explicitly. The
 //! decision is a pure function of its inputs; `locate` then checks the actual
@@ -7,7 +9,7 @@
 //! the same plan are in `process_setup_windows.rs`.
 use super::{failure, private_directory};
 use crate::{Error, Result};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
     ffi::{OsStr, OsString},
@@ -28,12 +30,20 @@ pub(super) const PACKAGED: &str = "cef";
 pub(super) const BROWSER: &str = "takosumi-cef-browser-process";
 #[cfg(target_os = "linux")]
 pub(super) const GUARD: &str = "takosumi-browser-guard";
+/// macOS (M2): the browser is the executable of its app bundle
+/// (scripts/bundle-macos-cef.mjs), with CEF's framework and helper apps
+/// beside it; the guard is a plain executable next to that bundle.
+#[cfg(target_os = "macos")]
+pub(super) const BROWSER: &str =
+    "takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process";
+#[cfg(target_os = "macos")]
+pub(super) const GUARD: &str = "takosumi-browser-guard";
 #[cfg(windows)]
 pub(super) const BROWSER: &str = "takosumi-cef-browser-process.exe";
 #[cfg(windows)]
 pub(super) const GUARD: &str = "takosumi-browser-guard.exe";
 /// This App's entry in `$XDG_RUNTIME_DIR`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RUNTIME: &str = "takosumi-cef";
 /// Its entry in the App's cache directory when no usable runtime directory exists.
 const CACHE_RUNTIME: &str = "cef";
@@ -77,7 +87,7 @@ impl Overrides {
 /// The fixture's sandbox opt-out (`TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX`); a
 /// product build never reads it. Linux only: on Windows the browser decides
 /// its sandbox itself and the App passes no switch.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn sandbox_opt_out(lookup: Lookup) -> Option<OsString> {
     FIXTURE
         .then(|| lookup("TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX"))
@@ -95,7 +105,11 @@ pub(super) fn inspection(lookup: Lookup) -> bool {
 /// and the App's pid, as one JSON object.
 #[cfg(any(
     all(test, target_os = "linux"),
-    all(windows, not(test), feature = "fixture-overrides")
+    all(
+        any(windows, target_os = "macos"),
+        not(test),
+        feature = "fixture-overrides"
+    )
 ))]
 pub(super) fn opener_record(url: &str, pid: u32) -> String {
     serde_json::json!({"argv": [url], "pid": pid}).to_string() + "\n"
@@ -105,7 +119,11 @@ pub(super) fn opener_record(url: &str, pid: u32) -> String {
 /// (`TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG`), only as an absolute path.
 #[cfg(any(
     all(test, target_os = "linux"),
-    all(windows, not(test), feature = "fixture-overrides")
+    all(
+        any(windows, target_os = "macos"),
+        not(test),
+        feature = "fixture-overrides"
+    )
 ))]
 pub(super) fn opener_log(lookup: Lookup) -> Option<PathBuf> {
     lookup("TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG")
@@ -115,7 +133,7 @@ pub(super) fn opener_log(lookup: Lookup) -> Option<PathBuf> {
 
 /// A setuid or setgid App would start browsers with an identity the person
 /// did not choose; the browser path refuses to run that way.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn plain_identity(uid: u32, euid: u32, gid: u32, egid: u32) -> Result<()> {
     if uid != euid || gid != egid {
         return Err(Error::InvalidRequest(
@@ -224,10 +242,14 @@ pub(super) struct Located {
 /// existing files, and the runtime root must be private to `euid`. A fixture's
 /// root must already be so; otherwise the first usable candidate wins. Every
 /// returned path is canonical.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn locate(plan: Plan, euid: u32) -> Result<Located> {
     let program = existing_file(&plan.program, "Browser process executable is unavailable.")?;
     let guard = existing_file(&plan.guard, "Browser guard is unavailable.")?;
+    // macOS: the browser's socket directory is the system's per-user
+    // temporary directory; one too long for the socket is refused here.
+    #[cfg(target_os = "macos")]
+    super::process_macos::browser_temp_dir()?;
     let runtime = match plan.runtime {
         Runtime::Given(path) => private_runtime(&path, euid)?,
         Runtime::Search(candidates) => search(&candidates, euid)?,
@@ -252,24 +274,24 @@ fn existing_file(path: &Path, missing: &'static str) -> Result<PathBuf> {
 
 /// The canonical path in the spelling the browser is given. On Linux that is
 /// `canonicalize`'s own result; Windows drops its verbatim prefix.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn spelled(canonical: PathBuf) -> PathBuf {
     canonical
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn canonical(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map(spelled).map_err(failure)
 }
 
 /// What `lstat` showed about one path.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Seen {
     pub dir: bool,
     pub uid: u32,
     pub mode: u32,
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn seen(path: &Path) -> Result<Option<Seen>> {
     match path.symlink_metadata() {
         Ok(metadata) => Ok(Some(Seen {
@@ -285,7 +307,7 @@ fn seen(path: &Path) -> Result<Option<Seen>> {
 /// The XDG Base Directory rules for `$XDG_RUNTIME_DIR`: a directory owned by
 /// the user with mode 0700. Another user's directory (after `su`) or a shared
 /// `/tmp` (1777) does not qualify.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn xdg_usable(seen: Option<Seen>, euid: u32) -> bool {
     matches!(seen, Some(seen) if seen.dir && seen.uid == euid && seen.mode & 0o777 == 0o700)
 }
@@ -293,12 +315,12 @@ pub(super) fn xdg_usable(seen: Option<Seen>, euid: u32) -> bool {
 /// An existing runtime root this App may use: a plain directory (not a link)
 /// of this user, closed to group and others. Another owner's (one left by
 /// `sudo -E`) or a looser one is skipped, never chmod-ed or chown-ed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn root_usable(seen: Option<Seen>, euid: u32) -> bool {
     matches!(seen, Some(seen) if seen.dir && seen.uid == euid && seen.mode & 0o077 == 0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn search(candidates: &[Candidate], euid: u32) -> Result<PathBuf> {
     let mut reasons = Vec::new();
     for candidate in candidates {
@@ -320,7 +342,7 @@ fn search(candidates: &[Candidate], euid: u32) -> Result<PathBuf> {
     )))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn usable_candidate(candidate: &Candidate, euid: u32) -> Result<PathBuf> {
     let root = match candidate {
         Candidate::Xdg(dir) => {
@@ -350,7 +372,7 @@ fn usable_candidate(candidate: &Candidate, euid: u32) -> Result<PathBuf> {
 /// directory (not a link) owned by `euid`, closed to group and others, and
 /// short enough that Chromium's singleton socket fits `sockaddr_un` for every
 /// runtime name this App instance could plausibly use.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn private_runtime(path: &Path, euid: u32) -> Result<PathBuf> {
     let metadata = path.symlink_metadata().map_err(failure)?;
     if !metadata.file_type().is_dir() {
@@ -379,7 +401,11 @@ fn private_runtime(path: &Path, euid: u32) -> Result<PathBuf> {
 
 /// Chromium's temporary singleton socket under a browser's runtime directory
 /// must fit `sockaddr_un` (108 bytes including the terminator). Linux only:
-/// Chromium on Windows keeps no socket there.
+/// Chromium on Windows keeps no socket there, and on macOS (whose limit is
+/// 104) Chromium puts it in the system's per-user temporary directory
+/// (`NSTemporaryDirectory`), not the runtime directory, so any runtime
+/// directory fits; `locate` checks that directory instead
+/// (`process_macos::browser_temp_dir`).
 #[cfg(target_os = "linux")]
 pub(super) fn socket_path_fits(runtime: &Path) -> bool {
     runtime
@@ -387,6 +413,10 @@ pub(super) fn socket_path_fits(runtime: &Path) -> bool {
         .as_os_str()
         .len()
         < 108
+}
+#[cfg(target_os = "macos")]
+pub(super) fn socket_path_fits(_runtime: &Path) -> bool {
+    true
 }
 
 /// One browser's runtime directory inside the root: `p-<App pid>-<n>`.
@@ -409,7 +439,7 @@ const RUNTIME_LOCK: &str = "lock";
 /// Create and lock a fresh runtime directory's lock file. The returned file
 /// holds the lock until it is closed; it is never inherited by the guard
 /// (close-on-exec).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn lock_runtime(runtime: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -430,7 +460,7 @@ pub(super) fn lock_runtime(runtime: &Path) -> Result<std::fs::File> {
 
 /// A non-blocking exclusive `flock`: false when another open file description
 /// holds it.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     // SAFETY: a live descriptor owned by `file`.
@@ -449,7 +479,7 @@ fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
 /// `None` while another instance holds it, and also when there is no lock
 /// file (a directory being created, or one from an earlier build), which is
 /// never judged stale. The lock file is never followed as a link.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn stale_lock(runtime: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = match std::fs::OpenOptions::new()
@@ -504,7 +534,7 @@ pub(super) fn remove_runtime(path: &Path) -> Result<()> {
 /// `p-<pid>-<n>` with a lock file are considered; a held lock, a missing lock
 /// file, links and other entries stay. Returns the failures; none stops the
 /// App.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn sweep_runtime(root: &Path, euid: u32) -> Vec<String> {
     sweep(root, |metadata| {
         metadata.file_type().is_dir() && metadata.uid() == euid
@@ -553,7 +583,7 @@ fn sweep(root: &Path, is_ours: impl Fn(&std::fs::Metadata) -> bool) -> Vec<Strin
 /// explicit `TAKOSUMI_BROWSER_PROCESS_NO_SANDBOX=1` (fixture builds only, see
 /// `sandbox_opt_out`) opts out. The browser reads the same decision from its
 /// arguments.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn without_sandbox(euid: u32, opt_out: Option<&OsStr>) -> bool {
     euid == 0 || opt_out == Some(OsStr::new("1"))
 }

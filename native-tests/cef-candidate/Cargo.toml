@@ -40,6 +40,8 @@ libc = "0.2"
 # raise of a reused NSWindow (src/mac_front.rs). The versions the lock
 # already holds through cef and tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The guard (src/guard_macos.rs): libproc, kqueue, signals.
+libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
 
@@ -68,8 +70,10 @@ name = "takosumi-cef-browser-helper"
 path = "src/helper_main.rs"
 
 # Product supervisor for one browser process: src/guard_main.rs on Linux
-# (pidfds, signalfd, the child subreaper) and src/guard_windows.rs on Windows
-# (Job Objects), chosen by src/guard_entry.rs; any other OS refuses to
+# (pidfds, signalfd, the child subreaper), src/guard_windows.rs on Windows
+# (Job Objects) and src/guard_macos.rs on macOS (its process group,
+# descendants by pid and start time, kqueue; M2), chosen by
+# src/guard_entry.rs; any other OS refuses to
 # compile, so no inert supervisor can be staged by mistake. Its self-tests run
 # the guard as a separate process, so libtest is not used.
 [[bin]]

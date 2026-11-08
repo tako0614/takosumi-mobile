@@ -354,9 +354,10 @@ jobs:
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
         working-directory: takosumi-mobile
       # The per-profile CEF adapter also compiles on Windows (the cef-windows
-      # job runs it with the sandboxed browser).
+      # job runs it with the sandboxed browser) and on macOS (M2; the
+      # cef-macos job runs it with the bundled browser).
       - name: Compile desktop App with the per-profile CEF adapter
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features desktop-cef
@@ -1311,6 +1312,11 @@ jobs:
   # its process group or among its recorded descendants), with every
   # renderer required in the seatbelt sandbox (--expect-sandbox). The
   # fixture-inspection build then adds the page load and the window reuse.
+  # M2: it also builds takosumi-browser-guard (src/guard_macos.rs), runs its
+  # self-tests, and drives the guard and the bundled browser through the
+  # App's adapter (its Process API, no App UI) in the app-screen plugin's
+  # macOS tests: open, reuse, shutdown with a normal receipt, and the App's
+  # death ending the guard and the browser.
   # Unsigned (the Rust linker's ad-hoc signatures only); only text evidence
   # is uploaded. Independent of the other jobs.
   cef-macos:
@@ -1367,12 +1373,12 @@ jobs:
           rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"
           "$exe" | tee "$RUNNER_TEMP/window-wait-tests.log"
           grep -q '^test result: ok\. 3 passed; 0 failed' "$RUNNER_TEMP/window-wait-tests.log" || { echo 'Not all three window wait tests ran'; exit 1; }
-      - name: Build takosumi-cef-browser-process and takosumi-cef-browser-helper (product)
+      - name: Build takosumi-cef-browser-process, takosumi-cef-browser-helper and takosumi-browser-guard (product)
         id: build
         working-directory: native-tests/cef-candidate
         env:
           CEF_PATH: ${{ runner.temp }}/cef
-        run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper
+        run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper --bin takosumi-browser-guard
       # Keep the SDK and the compiler work even when a smoke run below fails.
       - name: Preserve CEF distribution
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cef-sdk.outputs.cache-hit != 'true' }}
@@ -1407,6 +1413,83 @@ jobs:
         if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
         timeout-minutes: 15
         run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-product/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process" --work "$RUNNER_TEMP" --expect-sandbox
+      # The macOS guard (its process group, descendants by pid and start
+      # time, kqueue, the freeze before the kill) with stand-in browsers:
+      # the self-test binary re-executes itself as the guard, the browser
+      # and the App. A selection that runs fewer than all fourteen cases
+      # fails.
+      - name: Guard self-tests (macOS)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        working-directory: native-tests/cef-candidate
+        env:
+          CEF_PATH: ${{ runner.temp }}/cef
+        run: |
+          log="$RUNNER_TEMP/m2-guard-self-tests.log"
+          cargo test --locked --bin takosumi-browser-guard | tee "$log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Guard self-tests failed'; exit 1; }
+          grep -q '^test result: ok\. 14 passed; 0 failed$' "$log" || { echo 'Not all fourteen guard self-tests ran'; exit 1; }
+      # The app-screen plugin has no lockfile of its own; the App's pins its
+      # versions.
+      - name: Plugin lockfile from the App's
+        id: plugin-lock
+        if: ${{ !cancelled() }}
+        run: |
+          cp src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock
+          # The copied lock also lists crates the plugin's graph does not use,
+          # and --locked refuses to prune them: one unlocked resolve does.
+          cargo metadata --format-version 1 --manifest-path src-tauri/plugins/app-screen/Cargo.toml > /dev/null
+          # It may only prune: every [[package]] name and version left in the
+          # plugin lock must be one the app's lock pins.
+          python3 -I - src-tauri/Cargo.lock src-tauri/plugins/app-screen/Cargo.lock <<'PY'
+          import re, sys
+          def packages(path):
+              text = open(path, encoding="utf-8").read()
+              return set(re.findall(r'^\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', text, re.M))
+          app, plugin = packages(sys.argv[1]), packages(sys.argv[2])
+          added = sorted(plugin - app)
+          if not plugin or added:
+              sys.exit(f"The plugin lock pins versions the app's lock does not: {added}" if added else "The plugin lock lists no packages")
+          print(f"Plugin lock: {len(plugin)} of the app's {len(app)} pinned packages")
+          PY
+      # The App's adapter on macOS with the built guard and the bundled
+      # browser: the plugin's macOS unit tests, then the ignored ones that
+      # start a profile through Process::spawn and the creation reply check,
+      # reopen it, shut it down through the adapter and require a normal
+      # guard receipt, and kill a stand-in App (the test binary itself) while
+      # the browser's input stays open, to require that the guard's watch on
+      # the App ends its guard and every browser process. The stand-in App
+      # itself runs only in that case (skipped here, never counted).
+      - name: App adapter with the built guard and bundled browser (Process API)
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' && steps.plugin-lock.outcome == 'success' }}
+        timeout-minutes: 30
+        env:
+          TAKOSUMI_MACOS_WORK: ${{ runner.temp }}
+        run: |
+          export TAKOSUMI_MACOS_GUARD="$CARGO_TARGET_DIR/debug/takosumi-browser-guard"
+          export TAKOSUMI_MACOS_BROWSER="$RUNNER_TEMP/m1-product/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process"
+          log="$RUNNER_TEMP/m2-adapter-tests.log"
+          cargo test --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-process-experiment --lib -- macos_tests --include-ignored --skip app_stand_in_for_the_death_case --test-threads 1 --show-output | tee "$log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Adapter tests failed'; exit 1; }
+          for name in \
+            desktop::process_adapter::macos_tests::an_unresolvable_browser_leaves_the_app_running_with_its_reason \
+            desktop::process_adapter::macos_tests::a_held_singleton_lock_refuses_the_clear_and_keeps_the_data \
+            desktop::process_adapter::macos_tests::the_identity_checks_read_this_process \
+            desktop::process_adapter::macos_tests::a_foreign_hosts_lock_refuses_and_a_killed_holders_lock_is_stale \
+            desktop::process_adapter::macos_tests::macos_adapter_opens_reuses_and_shuts_down_a_profile \
+            desktop::process_adapter::macos_tests::macos_adapter_the_apps_death_ends_guard_and_browser; do
+            grep -qF "test $name ... ok" "$log" || { echo "$name did not pass"; exit 1; }
+          done
+          grep -q '^test result: ok\. 6 passed; 0 failed; 0 ignored' "$log" || { echo 'Not all six macOS adapter tests ran'; exit 1; }
+      # The adapter's macOS paths outside its tests: the product build
+      # (open_externally through /usr/bin/open) and the fixture build (the
+      # recording opener). The App with desktop-cef is compiled by the
+      # desktop job's macOS run.
+      - name: Compile the adapter's macOS product and fixture builds
+        if: ${{ !cancelled() && steps.plugin-lock.outcome == 'success' }}
+        run: |
+          cargo check --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-process-experiment --lib
+          cargo check --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features fixture-overrides --lib
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the
       # Cocoa raise to report no refusal. Only the browser is rebuilt; the
@@ -1435,5 +1518,9 @@ jobs:
             ${{ runner.temp }}/sumi-cef-smoke-*/*.log
             ${{ runner.temp }}/m1-product/bundle.json
             ${{ runner.temp }}/m1-fixture/bundle.json
+            ${{ runner.temp }}/m2-*-tests.log
+            ${{ runner.temp }}/sumi-m2-*/profiles/*/browser.log
+            ${{ runner.temp }}/sumi-m2-*/profiles/*/cef-native.log
+            ${{ runner.temp }}/sumi-m2-*/rt/*/guard.json
           if-no-files-found: warn
           retention-days: 14

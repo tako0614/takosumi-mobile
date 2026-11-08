@@ -20,14 +20,18 @@ use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuil
 use crate::resume::ResumeStore;
 use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
 #[cfg(target_os = "linux")]
+mod gtk_initial_load;
+#[cfg(target_os = "linux")]
 mod gtk_navigation;
 #[cfg(all(
-    any(target_os = "linux", windows),
+    any(target_os = "linux", windows, target_os = "macos"),
     feature = "desktop-process-experiment"
 ))]
 mod process_adapter;
+#[cfg(all(target_os = "macos", feature = "desktop-process-experiment"))]
+mod process_macos;
 #[cfg(all(
-    any(target_os = "linux", windows),
+    any(target_os = "linux", windows, target_os = "macos"),
     feature = "desktop-process-experiment"
 ))]
 mod process_setup;
@@ -219,7 +223,7 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
         clear_profile
     ]);
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     let builder = builder.setup(|app, _api| {
@@ -229,7 +233,7 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
     builder
         .on_event(|_app, event| {
             #[cfg(all(
-                any(target_os = "linux", windows),
+                any(target_os = "linux", windows, target_os = "macos"),
                 feature = "desktop-process-experiment"
             ))]
             match event {
@@ -255,7 +259,7 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
             }
             if matches!(event, tauri::RunEvent::Exit) {
                 #[cfg(all(
-                    any(target_os = "linux", windows),
+                    any(target_os = "linux", windows, target_os = "macos"),
                     feature = "desktop-process-experiment"
                 ))]
                 process_adapter::terminal(_app);
@@ -284,7 +288,7 @@ fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Capabilitie
     let clear_profile = true;
     // An unavailable browser refuses `clear_profile`, so the home must not offer it.
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     let clear_profile = clear_profile && process_adapter::unavailable(_app).is_none();
@@ -301,7 +305,7 @@ async fn clear_profile(
 ) -> Result<crate::ClearProfileResponse> {
     payload.validate()?;
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     if app.try_state::<process_adapter::Backend>().is_some() {
@@ -309,7 +313,7 @@ async fn clear_profile(
     }
     // An unavailable browser never falls back to the Wry profiles.
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     if let Some(reason) = process_adapter::unavailable(&app) {
@@ -344,7 +348,7 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
         ));
     }
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     if app.try_state::<process_adapter::Backend>().is_some() {
@@ -352,7 +356,7 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
     }
     // The home keeps running and shows why; never the Wry adapter instead.
     #[cfg(all(
-        any(target_os = "linux", windows),
+        any(target_os = "linux", windows, target_os = "macos"),
         feature = "desktop-process-experiment"
     ))]
     if let Some(reason) = process_adapter::unavailable(&app) {
@@ -384,7 +388,7 @@ async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
 }
 
 #[cfg(all(
-    any(target_os = "linux", windows),
+    any(target_os = "linux", windows, target_os = "macos"),
     feature = "desktop-process-experiment"
 ))]
 pub fn shutdown_browser_process_experiment(app: &AppHandle) -> Result<()> {
@@ -392,7 +396,7 @@ pub fn shutdown_browser_process_experiment(app: &AppHandle) -> Result<()> {
 }
 
 #[cfg(all(
-    any(target_os = "linux", windows),
+    any(target_os = "linux", windows, target_os = "macos"),
     feature = "desktop-process-experiment"
 ))]
 pub fn browser_process_experiment_status(app: &AppHandle) -> Result<serde_json::Value> {
@@ -621,6 +625,13 @@ fn create_screen(
         if !is_popup {
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
             note_fixture_target(&label, &start);
+            // A first navigation WebKitGTK starts and then drops (no commit,
+            // no failure) is issued once more.
+            #[cfg(target_os = "linux")]
+            {
+                use wry::WebViewExtUnix;
+                gtk_initial_load::watch(&view.webview(), &label, &start);
+            }
             let loaded = view.load_url(&start);
             #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
             note_fixture_view(
