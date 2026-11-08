@@ -92,6 +92,62 @@ fn standin(args: &[String]) -> ExitCode {
             say(format!("linger {}", child.id()));
             ExitCode::SUCCESS
         }
+        // Model Chromium's shutdown-launched clone cleanup: a child in its
+        // own group polls for its browser parent's exit at one-second ticks.
+        Some("clone-browser") => {
+            #[allow(clippy::zombie_processes)]
+            let mut child = helper(&["clone-cleanup", &args[1], &args[2]])
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut reader = BufReader::new(child.stdout.take().unwrap());
+            let mut ready = String::new();
+            reader.read_line(&mut ready).unwrap();
+            assert_eq!(ready, "ready\n");
+            say(format!("cleanup {}", child.id()));
+            // Keep both identities alive for the test and the real guard.
+            let mut release = String::new();
+            io::stdin().lock().read_line(&mut release).unwrap();
+            assert_eq!(release, "release\n");
+            child.stdin.take().unwrap().write_all(b"poll\n").unwrap();
+            let mut polled = String::new();
+            reader.read_line(&mut polled).unwrap();
+            assert_eq!(polled, format!("polled {}\n", std::process::id()));
+            ExitCode::SUCCESS
+        }
+        Some("clone-cleanup") => {
+            let parent = unsafe { libc::getppid() };
+            assert!(parent > 1);
+            say("ready".to_string());
+            let mut release = String::new();
+            io::stdin().lock().read_line(&mut release).unwrap();
+            assert_eq!(release, "poll\n");
+            // Evaluate the loop's first condition while the parent is
+            // definitely alive, then acknowledge it before its first sleep.
+            // The browser cannot exit before receiving this acknowledgement.
+            assert_eq!(unsafe { libc::getppid() }, parent);
+            say(format!("polled {parent}"));
+            let limit = Instant::now() + Duration::from_secs(5);
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if unsafe { libc::getppid() } == 1 {
+                    break;
+                }
+                assert!(Instant::now() < limit, "fixture parent did not exit");
+            }
+            std::fs::remove_dir_all(&args[1]).unwrap();
+            std::fs::write(
+                &args[2],
+                format!(
+                    "{}:{parent}:clone-removed-after-parent-exit",
+                    std::process::id()
+                ),
+            )
+            .unwrap();
+            ExitCode::SUCCESS
+        }
         // A descendant that leaves the group (its own session), which the
         // guard can only know as a child it recorded while the browser ran.
         Some("escape") => {
@@ -152,7 +208,7 @@ fn standin(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         // Forks a child every 5 ms (at most 400, over 2 s, beyond the
-        // guard's 0.5 s natural phase), each only waiting for a signal.
+        // guard's 1.5 s clean-exit natural phase), each only waiting for a signal.
         Some("breeder") => {
             for n in 0..400 {
                 // SAFETY: this stand-in is single-threaded; the child only
@@ -221,6 +277,7 @@ const TESTS: &[Test] = tests![
     a_lingering_descendant_is_killed_and_counted,
     a_descendant_that_left_the_group_is_still_killed,
     a_descendant_that_ends_by_itself_is_not_forced,
+    a_parent_polling_cleanup_finishes_and_removes_its_clone_without_force,
     a_tree_forking_as_the_kill_begins_is_frozen_then_killed,
     an_unwritable_log_still_kills_the_frozen_tree,
     a_stop_request_drains_a_running_browser,
@@ -552,6 +609,51 @@ fn a_descendant_that_ends_by_itself_is_not_forced() {
     assert!(clean(&proof), "{proof}");
     assert_eq!(proof["forcedCleanup"], 0, "{proof}");
     assert_nothing_left(guard.id() as i32, &[helper]);
+}
+
+fn a_parent_polling_cleanup_finishes_and_removes_its_clone_without_force() {
+    let case = Case::new("clone-cleanup");
+    let clone = case.receipt.with_file_name("owned-clone");
+    let done = case.receipt.with_file_name("cleanup-complete");
+    std::fs::create_dir_all(clone.join("Contents/MacOS")).unwrap();
+    std::fs::write(clone.join("Contents/MacOS/fixture"), b"owned clone fixture").unwrap();
+    let mut guard = case
+        .guard(&[
+            "clone-browser",
+            clone.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let helper = pid_in(&first_line(&mut guard));
+    let identity = facts(helper).unwrap().expect("live cleanup helper");
+    assert_eq!(identity.pgid, helper);
+    let parent = facts(identity.ppid).unwrap().expect("live browser parent");
+    assert_eq!(parent.ppid, guard.id() as i32);
+    assert_eq!(
+        std::fs::read(clone.join("Contents/MacOS/fixture")).unwrap(),
+        b"owned clone fixture"
+    );
+    assert!(!done.exists());
+    guard.stdin.take().unwrap().write_all(b"release\n").unwrap();
+    let status = finish(&mut guard, Duration::from_secs(10));
+    let proof = case.receipt();
+    assert_eq!(status.code(), Some(0), "{proof}");
+    assert!(clean(&proof), "{proof}");
+    assert_eq!(proof["rootExit"], 0, "{proof}");
+    assert_eq!(proof["complete"], true, "{proof}");
+    assert_eq!(proof["forcedCleanup"], 0, "{proof}");
+    assert!(proof["observed"].as_u64().unwrap() >= 2, "{proof}");
+    assert!(
+        !clone.exists(),
+        "cleanup was killed before removing its clone"
+    );
+    assert_eq!(
+        std::fs::read_to_string(done).unwrap(),
+        format!("{helper}:{}:clone-removed-after-parent-exit", identity.ppid),
+    );
+    assert_nothing_left(guard.id() as i32, &[helper, identity.ppid]);
 }
 
 fn a_tree_forking_as_the_kill_begins_is_frozen_then_killed() {

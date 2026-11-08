@@ -2244,8 +2244,16 @@ signal; a parent already gone when the guard starts is a stop before the
 browser starts, and a changed parent at any later look is the App's death
 too, should its exit event be missed).
 
-The drain then always runs, as on Windows: up to 0.5 s for the browser and
-every tracked process to end by themselves. Then the guard **freezes the
+The drain then always runs: up to 0.5 s for the browser and
+every tracked process to end by themselves. After observing a clean root
+exit with no supervision failure, the natural window is 1.5 s instead.
+Chromium's code-sign-clone cleanup polls for its parent's exit once a second
+before deleting the temporary clone; the longer normal-exit window allows
+one poll plus 0.5 s scheduling/deletion margin. Stops/App death observed before
+drain, recorded observation failures and abnormal exits retain 0.5 s. The phase
+is fixed at drain entry; later events never restart or extend it.
+No role or process is exempt, and the role diagnostic
+does not select this deadline. Then the guard **freezes the
 tree before it kills anything**: `SIGSTOP` to the unreaped browser
 (always), to each tracked process still the same (start time) and to
 every other running member of the group, each verified right before its
@@ -2300,16 +2308,24 @@ is not its descendant (as on Linux one started by a session manager is
 not), and a double fork faster than an observation: a process that leaves
 the group and whose parent ends before the guard's next look (the
 `NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen. CEF's
-helpers stay in the group (the M1 smoke's group check). The App's checks
+renderers stay in the group in the M1 smoke. Its code-sign-clone cleanup
+instead starts its own group, and the guard tracks its observed browser
+parent and birth identity. The App's checks
 are unchanged (`require_normal_guard` states the same meaning).
 
 **Self-tests** (`src/guard_macos_tests.rs`, `harness = false`, like
 Windows'). The test binary re-executes itself as the guard, as stand-in
-browsers and as a stand-in App, and runs fourteen cases: a normal exit; a
+browsers and as a stand-in App, and runs fifteen cases: a normal exit; a
 non-zero exit; the browser keeps the pipes and gets the default stop
 signals with an empty mask; a lingering descendant is killed and counted;
 a descendant that left the group (`setsid`) is still killed; one that ends
-by itself is not forced; a tree forking as the kill begins (a `setsid`
+by itself is not forced; a self-grouped cleanup child that acknowledges a
+live browser parent, polls again after one second and deletes its owned clone
+fixture must finish with zero forced cleanup and an exact completion marker;
+the handshake models the upstream poll, but an unusually descheduled browser
+can shift its exit relative to that tick, so this case alone is not a
+deterministic reproduction of every old 0.5 s failure;
+a tree forking as the kill begins (a `setsid`
 breeder forking a child every 5 ms for 2 s, which reports on a pipe once
 its first child exists before the browser exits) is frozen, then killed,
 with no child left in the breeder's group, at least two forced and every
@@ -2407,7 +2423,7 @@ and at least one forced process: the guard's watch on the App ended it.
 
 **CI.** `cef-macos`: the product build also builds
 `takosumi-browser-guard`. After the product smoke, `cargo test --locked
---bin takosumi-browser-guard` must report `14 passed; 0 failed`; the
+--bin takosumi-browser-guard` must report `15 passed; 0 failed`; the
 plugin's lock is pruned from the App's (its own step, as in the Windows
 job); `cargo test ... --features desktop-process-experiment --lib --
 macos_tests --include-ignored --skip app_stand_in_for_the_death_case
@@ -2591,13 +2607,23 @@ so that helper's role was not observed. The forwarding repair passes only
 literal `1`, only in an inspecting fixture build; normal product builds never
 read or forward it. It changes no cleanup/acceptance rule.
 
-The existing cleanup deadline starts before this optional read; the natural
-and forced windows are unchanged. A sysctl has no hard latency bound and
+The forced cleanup deadline starts before this optional read; the read itself
+never extends the selected natural or forced window. A sysctl has no hard latency bound and
 may return stale data across same-PID exec, so the result is observational.
 Opt-in runs are timing-perturbed evidence, not unsampled shutdown qualification.
 The pinned [XNU layout](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_exec.c#L5467-L5481)
 and [sysctl behavior](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_sysctl.c#L1335-L1592)
 explain the strict padding, size checks and exec-race limitation.
+
+Run 42506394284 at `06c3b94` then observed the late Excalidraw restart helper's
+actual `code-sign-clone-cleanup` role with stable PID/birth and the recorded
+browser parent. It was forced after the old 0.5 s natural window. Photopea
+completed all three launches. The [pinned Chromium cleanup loop](https://chromium.googlesource.com/chromium/src/+/154.0.8037.98/chrome/browser/mac/code_sign_clone_manager.mm#753)
+sleeps for one second after seeing its parent alive, then removes the clone
+only after reparenting. The normal-root-exit window above now accommodates
+that behavior; its native regression also requires the owned clone fixture
+to be removed. This repair still needs native execution and does not resolve
+the separate historical `CefShutdown` watchdog failure by itself.
 
 ## Observations and limits
 

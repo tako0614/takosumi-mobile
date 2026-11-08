@@ -39,8 +39,12 @@
 //! ignored in the guard, which kqueue still records, and restored to their
 //! defaults in the browser.
 //!
-//! The drain then always runs, as on Windows: up to 0.5 s for the browser
-//! and every tracked process to end by themselves. Then the guard freezes
+//! The drain then always runs: up to 0.5 s for the browser
+//! and every tracked process to end by themselves. After an observed clean
+//! browser exit, allow 1.5 s instead: Chromium's clone-cleanup helper polls
+//! for its parent's exit once a second before deleting its temporary clone.
+//! This grants no process an exception or ownership based on its role.
+//! Then the guard freezes
 //! the tree before it kills anything: `SIGSTOP` to the unreaped browser, to
 //! each tracked process still the same (start time) and to every other
 //! running member of the group, each verified right before its signal; it
@@ -180,6 +184,13 @@ const DRAIN_TICK: Duration = Duration::from_millis(20);
 /// Natural end, then the freeze and the kill, and this long (from the
 /// freeze) for everything to be gone.
 const NATURAL: Duration = Duration::from_millis(500);
+/// Chromium 154's ChromeCodeSignCloneCleanupMain polls getppid() once per
+/// second before deleting the code-sign clone. After a clean root exit,
+/// allow that poll plus the existing 500 ms scheduling/deletion margin.
+/// Stops/App death already observed before drain, nonzero exits and recorded
+/// observation failures keep NATURAL. The phase is fixed at drain entry;
+/// later events never restart/extend it. No role diagnostic selects a deadline.
+const CLEAN_EXIT_NATURAL: Duration = Duration::from_millis(1500);
 const FORCED: Duration = Duration::from_secs(2);
 /// The longest the freeze waits for its stopped processes to show stopped,
 /// within the forced window.
@@ -694,6 +705,9 @@ struct Run {
     parent: i32,
     child: Option<i32>,
     root_exit: Option<i32>,
+    /// A stop signal or changed App parent seen while supervising. A zero
+    /// browser exit in that same event batch is still a stop, not normal quit.
+    stop_observed: bool,
     /// Processes of the browser's still running, with their start times.
     tracked: BTreeMap<i32, u64>,
     /// Every process seen, by pid and start time (the browser included),
@@ -949,7 +963,8 @@ impl Run {
                     // its exit event be missed.
                     // SAFETY: getppid has no preconditions.
                     let orphaned = unsafe { libc::getppid() } != self.parent;
-                    if woke.stop || orphaned || woke.browser_exited || self.root_exit.is_some() {
+                    self.stop_observed |= woke.stop || orphaned;
+                    if self.stop_observed || woke.browser_exited || self.root_exit.is_some() {
                         return Ok(());
                     }
                 }
@@ -1170,8 +1185,8 @@ impl Run {
 
     /// The bounded drain every run takes. Returns whether it found no
     /// survivor among the observed processes.
-    fn drain(&mut self) -> bool {
-        if self.settle_until(Instant::now() + NATURAL) {
+    fn drain(&mut self, natural: Duration) -> bool {
+        if self.settle_until(Instant::now() + natural) {
             return true;
         }
         let freezing = Instant::now();
@@ -1358,6 +1373,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         parent,
         child: None,
         root_exit: None,
+        stop_observed: stopping,
         tracked: BTreeMap::new(),
         observed: BTreeMap::new(),
         forced: 0,
@@ -1397,7 +1413,17 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
             Err(error) => failure = Some(fault(&error)),
         }
     }
-    let empty = run.drain();
+    let natural = if run.root_exit == Some(0)
+        && !run.stop_observed
+        && failure.is_none()
+        && run.non_fatal.is_empty()
+        && run.cleanup_errors.is_empty()
+    {
+        CLEAN_EXIT_NATURAL
+    } else {
+        NATURAL
+    };
+    let empty = run.drain(natural);
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     // The browser counts once, also when no look ever read its start time.
     let mut observed = run.observed.len();
