@@ -256,9 +256,10 @@ jobs:
               ('com.takosumi.appscreen.ProfileIsolationTest', 'clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles'),
               ('com.takosumi.appscreen.ProfileResetActivityTest', 'completedResetDropsAnEvictedActivityUrlAndPreResetSavedState'),
               ('com.takosumi.appscreen.MediaPermissionActivityTest', 'webViewMediaConsentRequiresSiteAndAndroidAndStopsCapture'),
+              ('com.takosumi.appscreen.FileSelectionActivityTest', 'actualPickerReturnsOnlyTheSelectedFixtureFileToTheSameDocument'),
           }
           assert required <= actual_cases, f'Missing actual profile/media controls: {required - actual_cases}'
-          assert tests >= 5 and failures == 0 and skipped == 0
+          assert tests >= 6 and failures == 0 and skipped == 0
           PY
 
       - name: Keep Android native test results

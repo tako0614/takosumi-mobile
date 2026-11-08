@@ -6,3 +6,12 @@ buildscript {
     }
 }
 allprojects { repositories { google(); mavenCentral() } }
+
+// Match src-tauri/gen/android/app/build.gradle.kts. The library otherwise
+// gives its instrumentation APK minSdk (28) as targetSdk, hiding modern OS
+// permission/storage behavior. This setting affects only the test harness.
+project(':app-screen') {
+    plugins.withId('com.android.library') {
+        android.defaultConfig.targetSdk = 36
+    }
+}

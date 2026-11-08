@@ -369,6 +369,22 @@ capture, cross-origin iframe permission or other Android/OEM versions.
 
 The profile-reset instrumentation requires both `MULTI_PROFILE` and
 `DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
+
+The instrumentation APK targets SDK 36, matching the generated product App's
+`src-tauri/gen/android/app/build.gradle.kts`. Earlier native results used the
+library's implicit target SDK 28 even on the API 36 emulator; retain that
+limitation when interpreting their OS permission and storage behavior.
+The media and file-selection cases assert the actual runtime target SDK.
+
+`FileSelectionActivityTest` creates one uniquely named small text file in the
+disposable emulator's MediaStore Downloads collection, opens a real WebView
+file input with a pointer gesture, and selects that exact file in DocumentsUI.
+It requires the original document to receive the exact name, byte length,
+MIME type and `File.text()` contents, then resume the same profile. It deletes
+only the URI it created. No broad storage grant, provider substitution,
+WebChromeClient replacement or simulated picker result is used. The DocumentsUI
+selectors cover the default English CI AVD; other picker apps, OEMs, locales,
+multiple-file selection and recreation while a picker is open remain separate.
 The initial API35 emulator used WebView124 and passed profile isolation but
 failed the two deletion preconditions. The next CI candidate selects the
 official API36 Google APIs x86_64 image and logs its revision and actual WebView

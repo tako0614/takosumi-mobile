@@ -176,6 +176,7 @@ class MediaPermissionActivityTest {
 
     @Test
     fun webViewMediaConsentRequiresSiteAndAndroidAndStopsCapture() {
+        assertEquals("Native tests must match the product target SDK", 36, context.applicationInfo.targetSdkVersion)
         assertEquals("This fixture must start without an OS microphone grant", PackageManager.PERMISSION_DENIED,
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
         val profile = UUID.randomUUID().toString()
