@@ -172,6 +172,8 @@ struct Facts {
     start: u64,
     zombie: bool,
     stopped: bool,
+    /// Kernel's bounded process name, never its arguments or environment.
+    name: [u8; 32],
 }
 
 /// `proc_pidinfo(PROC_PIDTBSDINFO)`; `None` when no such process exists.
@@ -200,6 +202,7 @@ fn facts(pid: i32) -> io::Result<Option<Facts>> {
                 .saturating_add(info.pbi_start_tvusec),
             zombie: info.pbi_status == libc::SZOMB,
             stopped: info.pbi_status == libc::SSTOP,
+            name: info.pbi_name.map(|byte| byte as u8),
         }));
     }
     let error = io::Error::last_os_error();
@@ -642,6 +645,8 @@ struct Frozen {
     start: u64,
     ppid: i32,
     stopped: bool,
+    pgid: i32,
+    name: [u8; 32],
 }
 
 impl Run {
@@ -960,6 +965,8 @@ impl Run {
                             start: now.start,
                             ppid: now.ppid,
                             stopped: false,
+                            pgid: now.pgid,
+                            name: now.name,
                         },
                     );
                     found = true;
@@ -1136,6 +1143,41 @@ impl Run {
                 .count(),
             freeze_ms
         ));
+        // Diagnose only after every stopped process has been killed and
+        // the drop guard disarmed. Neither IO nor serialization can delay
+        // the stop-to-kill section. Bound the log, and never collect argv.
+        for &(pid, start) in killed.iter().take(32) {
+            let frozen = freezer
+                .frozen
+                .get(&pid)
+                .filter(|entry| entry.start == start);
+            let snapshot = frozen.map(|entry| {
+                let end = entry
+                    .name
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(entry.name.len());
+                serde_json::json!({
+                    "parent": entry.ppid,
+                    "group": entry.pgid,
+                    "name": String::from_utf8_lossy(&entry.name[..end]),
+                    "shownStopped": entry.stopped,
+                })
+            });
+            note(format_args!(
+                "forced {}",
+                serde_json::json!({
+                    "pid": pid,
+                    "start": start,
+                    // null means this identity was not retained by the freeze:
+                    // it was found later or ended during the stop observation.
+                    "freezeSnapshot": snapshot,
+                })
+            ));
+        }
+        if killed.len() > 32 {
+            note(format_args!("forced omitted={}", killed.len() - 32));
+        }
         empty
     }
 }

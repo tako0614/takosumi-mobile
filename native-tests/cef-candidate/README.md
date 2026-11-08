@@ -2159,6 +2159,19 @@ macOS, where it starts the guard and the bundled browser through the same
 `Process` code as on Linux and Windows. No App UI or fixture on macOS yet
 (M3).
 
+The later `6eacebe` run (42486555333) kept the same macOS implementation but
+failed ordinary adapter shutdown: browser exit 0, complete receipt, no
+remaining process, `forcedCleanup: 1`. Its freeze saw one stopped process;
+the original log does not identify it. The App correctly retained the
+profile. GPU error lines alone do not identify the forced helper; the cause
+remains unknown. The guard now logs up to 32 counted PID/start identities
+after the kill, with an optional freeze snapshot (parent, group, bounded
+kernel process name and whether it showed stopped). A null snapshot means
+no retained freeze observation, not proof of a late spawn. Names may be
+truncated and are not CEF roles. No arguments or environment are logged.
+The shutdown bounds and `forcedCleanup == 0` qualification are unchanged.
+This diagnostic needs a new macOS run; the previous RED is retained.
+
 **Guard** (`src/guard_macos.rs`, chosen by `src/guard_entry.rs`; the Linux
 and Windows guards are unchanged). Same command line
 (`<absolute new receipt> <program> [args...]`), receipt fields and exit

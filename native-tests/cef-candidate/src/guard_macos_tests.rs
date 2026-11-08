@@ -439,8 +439,14 @@ fn the_browser_keeps_the_pipes_and_default_stop_signals() {
 
 fn a_lingering_descendant_is_killed_and_counted() {
     let case = Case::new("linger");
-    let mut guard = case.guard(&["linger"]).spawn().unwrap();
+    let log = case.receipt.with_extension("log");
+    let mut guard = case
+        .guard(&["linger"])
+        .stderr(File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
     let helper = pid_in(&first_line(&mut guard));
+    let helper_start = facts(helper).unwrap().expect("live lingering helper").start;
     let status = finish(&mut guard, Duration::from_secs(10));
     let proof = case.receipt();
     assert_eq!(status.code(), Some(0), "{proof}");
@@ -450,6 +456,22 @@ fn a_lingering_descendant_is_killed_and_counted() {
     assert_eq!(proof["forcedCleanup"], 1, "{proof}");
     assert!(proof["observed"].as_u64().unwrap() >= 2, "{proof}");
     assert_nothing_left(guard.id() as i32, &[helper]);
+    let log = std::fs::read_to_string(log).unwrap();
+    print!("{log}");
+    let forced: Vec<Value> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("takosumi-browser-guard: forced "))
+        .map(|line| serde_json::from_str(line).expect("structured forced identity"))
+        .collect();
+    assert_eq!(forced.len(), 1, "{log}");
+    assert_eq!(forced[0]["pid"], helper);
+    assert_eq!(forced[0]["start"], helper_start);
+    assert_eq!(forced[0]["freezeSnapshot"]["group"], guard.id());
+    assert_eq!(forced[0]["freezeSnapshot"]["shownStopped"], true);
+    assert!(!forced[0]["freezeSnapshot"]["name"]
+        .as_str()
+        .unwrap()
+        .is_empty());
 }
 
 fn a_descendant_that_left_the_group_is_still_killed() {
@@ -671,6 +693,7 @@ fn pid_reuse_zombie_and_listing_rules() {
         start,
         zombie,
         stopped: false,
+        name: [0; 32],
     };
     // The same process: same start time and not a zombie.
     assert!(still_running(5, Some(facts(5, false))));
