@@ -381,6 +381,14 @@ inspecting samples.
 It does not qualify physical microphone quality, camera capture, background
 capture, cross-origin iframe permission or other Android/OEM versions.
 
+The plugin manifest also declares `MODIFY_AUDIO_SETTINGS`, Android's normal
+audio-routing permission. The matching WebView 133 code refuses low-latency
+input-device selection without it, even when `RECORD_AUDIO` is granted. The
+native probe checks the installed permission before audio initialization and
+still requires the real site/OS consent and stream lifecycle. The fresh test
+install/process matters because Chromium caches the normal permission. This
+fix does not by itself qualify the audio backend or physical capture.
+
 The profile-reset instrumentation requires both `MULTI_PROFILE` and
 `DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
 

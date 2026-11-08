@@ -177,6 +177,10 @@ class MediaPermissionActivityTest {
     @Test
     fun webViewMediaConsentRequiresSiteAndAndroidAndStopsCapture() {
         assertEquals("Native tests must match the product target SDK", 36, context.applicationInfo.targetSdkVersion)
+        // Chromium caches this normal manifest permission when its audio
+        // manager initializes. RECORD_AUDIO alone cannot select an input.
+        assertEquals("The installed App must declare WebView audio routing permission",
+            PackageManager.PERMISSION_GRANTED, context.checkSelfPermission(Manifest.permission.MODIFY_AUDIO_SETTINGS))
         assertEquals("This fixture must start without an OS microphone grant", PackageManager.PERMISSION_DENIED,
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
         val profile = UUID.randomUUID().toString()
