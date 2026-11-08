@@ -948,6 +948,7 @@ impl Process {
         // known to be safe for CEF; that sharing is a known limit.
         #[cfg(target_os = "macos")]
         {
+            setup::guard_role_diagnostics(&mut command, &setup::environment);
             for key in MACOS_ENVIRONMENT {
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);

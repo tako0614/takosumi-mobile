@@ -100,6 +100,16 @@ pub(super) fn inspection(lookup: Lookup) -> bool {
     FIXTURE && lookup("TAKOSUMI_BROWSER_PROCESS_INSPECT").as_deref() == Some(OsStr::new("1"))
 }
 
+/// The App clears a child guard's environment. Forward this opt-in only for
+/// an inspecting fixture; a product build never reads or forwards it.
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+pub(super) fn guard_role_diagnostics(command: &mut std::process::Command, lookup: Lookup) {
+    const KEY: &str = "TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS";
+    if inspection(lookup) && lookup(KEY).as_deref() == Some(OsStr::new("1")) {
+        command.env(KEY, "1");
+    }
+}
+
 /// One line of a fixture build's recording opener log (Windows; see
 /// `process_windows::shell_open`): the link as the opener's only argument
 /// and the App's pid, as one JSON object.
@@ -1020,6 +1030,36 @@ mod tests {
         assert!(!inspection(&nothing));
         let other = |_: &str| Some(OsString::from("0"));
         assert!(!inspection(&other));
+    }
+
+    #[test]
+    fn cleanup_role_diagnostics_reach_only_an_opted_in_fixture_guard() {
+        const KEY: &str = "TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS";
+        for inspect in [None, Some("0"), Some("1")] {
+            for enabled in [
+                None,
+                Some(""),
+                Some("0"),
+                Some("true"),
+                Some(" 1"),
+                Some("1"),
+            ] {
+                let lookup = |key: &str| match key {
+                    "TAKOSUMI_BROWSER_PROCESS_INSPECT" => inspect.map(OsString::from),
+                    KEY => enabled.map(OsString::from),
+                    _ => panic!("Unexpected environment read: {key}"),
+                };
+                let mut command = std::process::Command::new("unused-fixture-guard");
+                command.env_clear();
+                guard_role_diagnostics(&mut command, &lookup);
+                let env: Vec<_> = command.get_envs().collect();
+                if FIXTURE && inspect == Some("1") && enabled == Some("1") {
+                    assert_eq!(env, vec![(OsStr::new(KEY), Some(OsStr::new("1")))]);
+                } else {
+                    assert!(env.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

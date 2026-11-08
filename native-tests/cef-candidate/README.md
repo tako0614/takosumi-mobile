@@ -2581,6 +2581,16 @@ stability and elapsed time, after kill/disarm. No path, argv or environment
 value is logged. This does not grant any role an exception: the native
 escaped-helper test claims the cleanup type and must still be killed/count 1.
 
+Run 42504487318 at `ae375e4` passed the four native parser and fourteen guard
+tests, including the escaped helper's actual kernel role. Excalidraw passed all
+three App launches without stack sampling. Photopea's Work browser exited 0 but
+its guard forced one late own-group helper; the App retained the profile and
+did not advance to Personal's beforeunload. This is still a failed ordinary
+shutdown. The App cleared the diagnostic flag when launching profile guards,
+so that helper's role was not observed. The forwarding repair passes only
+literal `1`, only in an inspecting fixture build; normal product builds never
+read or forward it. It changes no cleanup/acceptance rule.
+
 The existing cleanup deadline starts before this optional read; the natural
 and forced windows are unchanged. A sysctl has no hard latency bound and
 may return stale data across same-PID exec, so the result is observational.
