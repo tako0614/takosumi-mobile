@@ -229,9 +229,10 @@ class MacObserver(Observer):
         self.remove_beforeunload(work)
         self.case("quit-cancel-stops", {"cancelledBy": cancelled_by})
         mark = self.beforeunload(personal)
-        self.checkpoint("request-partial-exit")
-        dialog = self.dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30)
-        receipt = self.normal_receipt(work.process["guardReceipt"], "Work did not close normally before Personal")
+        with watch_shutdowns(self, [work]):
+            self.checkpoint("request-partial-exit")
+            dialog = self.dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30)
+            receipt = self.normal_receipt(work.process["guardReceipt"], "Work did not close normally before Personal")
         cancelled_by = self.cancel_dialog(personal, mark, "Personal cancel was not observed", dialog)
         self.checkpoint("partial-inspected")
         partial = self.marker("app-browser-process-partial.json")

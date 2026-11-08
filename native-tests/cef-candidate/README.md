@@ -2522,6 +2522,26 @@ qualification. No heap, environment, page contents or binary crash dump is
 requested. Existing first-launch/restart/reset and zero-forced-cleanup
 requirements remain unchanged.
 
+At `6a1f7ff` (run 42497100922), Photopea completed all three launches with
+normal receipts and no stack sampling. Excalidraw instead stopped at the
+partial quit: Work exited 0 but its guard forced one leftover process, so
+the App correctly kept Personal open. The leftover was born 10.3 ms before
+Work's `CefShutdown` returned; by the freeze it had parent 1 and its own
+process group, with no helper-entry record identifying its role. This is
+not evidence of a missing Personal beforeunload. The full run was 8/9,
+with only the Mac job failing; the earlier creation refusal did not recur.
+
+The guard now retains the first parent/group already observed for each
+PID/birth and includes it in forced-process diagnostics after kill/disarm.
+There are no new OS queries, argument captures, startup hooks or waits.
+`trackedParentStart` is the parent's stored observation, not a fresh
+simultaneous identity proof; a missing value stays unknown. The escaped
+descendant test checks that its first parent survives later orphaning,
+allowing the first group to be either side of `setsid()`. The fixture's
+existing stack watcher also covers Work's partial close and keeps both
+partial/final records. These changes do not resolve the residual process,
+the earlier Photopea watchdog or the creation refusal by themselves.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,

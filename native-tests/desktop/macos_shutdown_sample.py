@@ -131,6 +131,7 @@ def watch_shutdowns(observer, pages):
             worker.join()
         observer.proof.setdefault("shutdownSamples", []).extend(records)
         try:
-            (observer.data / f"shutdown-samples-{phase}.json").write_text(json.dumps(records, indent=2) + "\n")
+            (observer.data / f"shutdown-samples-{phase}.json").write_text(
+                json.dumps(observer.proof["shutdownSamples"], indent=2) + "\n")
         except OSError as error:
             observer.proof["shutdownSampleWriteError"] = type(error).__name__

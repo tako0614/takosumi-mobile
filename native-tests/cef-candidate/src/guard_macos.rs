@@ -632,11 +632,19 @@ struct Run {
     root_exit: Option<i32>,
     /// Processes of the browser's still running, with their start times.
     tracked: BTreeMap<i32, u64>,
-    /// Every process seen, by pid and start time (the browser included).
-    observed: BTreeSet<(i32, u64)>,
+    /// Every process seen, by pid and start time (the browser included),
+    /// retaining its first parent edge before a later orphan becomes PPID 1.
+    observed: BTreeMap<(i32, u64), FirstObserved>,
     forced: u32,
     cleanup_errors: BTreeSet<String>,
     non_fatal: BTreeSet<String>,
+}
+
+struct FirstObserved {
+    parent: i32,
+    /// The parent's already-tracked birth, if available; no extra OS read.
+    tracked_parent_start: Option<u64>,
+    group: i32,
 }
 
 /// A process the freeze stopped: its start time, its parent (for the kill
@@ -650,6 +658,21 @@ struct Frozen {
 }
 
 impl Run {
+    fn remember(&mut self, pid: i32, facts: Facts) {
+        let tracked_parent_start = self
+            .tracked
+            .get(&facts.ppid)
+            .copied()
+            .filter(|start| *start <= facts.start);
+        self.observed
+            .entry((pid, facts.start))
+            .or_insert(FirstObserved {
+                parent: facts.ppid,
+                tracked_parent_start,
+                group: facts.pgid,
+            });
+    }
+
     /// Record the browser's exit status once it has exited.
     fn reap(&mut self) {
         let Some(child) = self.child else {
@@ -677,7 +700,7 @@ impl Run {
         if pid == self.me || facts.zombie {
             return;
         }
-        self.observed.insert((pid, facts.start));
+        self.remember(pid, facts);
         if self.tracked.contains_key(&pid) {
             return;
         }
@@ -958,7 +981,7 @@ impl Run {
                     continue;
                 };
                 if self.signal(pid, libc::SIGSTOP) {
-                    self.observed.insert((pid, now.start));
+                    self.remember(pid, now);
                     freezer.frozen.insert(
                         pid,
                         Frozen {
@@ -1087,7 +1110,7 @@ impl Run {
                     continue;
                 }
                 if self.signal(pid, libc::SIGKILL) {
-                    self.observed.insert((pid, found.start));
+                    self.remember(pid, found);
                     killed.insert((pid, found.start));
                 }
             }
@@ -1172,6 +1195,11 @@ impl Run {
                     // null means this identity was not retained by the freeze:
                     // it was found later or ended during the stop observation.
                     "freezeSnapshot": snapshot,
+                    "firstObserved": self.observed.get(&(pid, start)).map(|first| serde_json::json!({
+                        "parent": first.parent,
+                        "trackedParentStart": first.tracked_parent_start,
+                        "group": first.group,
+                    })),
                 })
             ));
         }
@@ -1226,7 +1254,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         child: None,
         root_exit: None,
         tracked: BTreeMap::new(),
-        observed: BTreeSet::new(),
+        observed: BTreeMap::new(),
         forced: 0,
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
@@ -1246,7 +1274,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
                 // the browser, and the receipt counts it once in any case.
                 if let Ok(Some(facts)) = facts(pid) {
                     run.tracked.insert(pid, facts.start);
-                    run.observed.insert((pid, facts.start));
+                    run.remember(pid, facts);
                 }
                 match run.queue.watch_browser(pid) {
                     Ok(()) => {}
@@ -1268,7 +1296,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
     // The browser counts once, also when no look ever read its start time.
     let mut observed = run.observed.len();
     if let Some(child) = run.child {
-        if !run.observed.iter().any(|(pid, _)| *pid == child) {
+        if !run.observed.keys().any(|(pid, _)| *pid == child) {
             observed += 1;
         }
     }

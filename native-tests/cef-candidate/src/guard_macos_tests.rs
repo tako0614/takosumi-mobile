@@ -108,6 +108,10 @@ fn standin(args: &[String]) -> ExitCode {
             #[allow(clippy::zombie_processes)]
             let child = command.spawn().unwrap();
             say(format!("linger {}", child.id()));
+            // Keep the browser alive until the test has read both births.
+            // Closing the pipe on test failure also releases this stand-in.
+            let mut release = String::new();
+            io::stdin().lock().read_line(&mut release).unwrap();
             // Long enough for several of the guard's observations.
             std::thread::sleep(Duration::from_millis(1500));
             ExitCode::SUCCESS
@@ -476,8 +480,20 @@ fn a_lingering_descendant_is_killed_and_counted() {
 
 fn a_descendant_that_left_the_group_is_still_killed() {
     let case = Case::new("escape");
-    let mut guard = case.guard(&["escape"]).spawn().unwrap();
+    let log = case.receipt.with_extension("log");
+    let mut guard = case
+        .guard(&["escape"])
+        .stdin(Stdio::piped())
+        .stderr(File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
     let helper = pid_in(&first_line(&mut guard));
+    let identity = facts(helper).unwrap().expect("live escaped helper");
+    let parent_start = facts(identity.ppid)
+        .unwrap()
+        .expect("live browser parent")
+        .start;
+    guard.stdin.take().unwrap().write_all(b"release\n").unwrap();
     let status = finish(&mut guard, Duration::from_secs(15));
     let proof = case.receipt();
     let still = running(helper);
@@ -489,6 +505,27 @@ fn a_descendant_that_left_the_group_is_still_killed() {
     assert_eq!(status.code(), Some(0), "{proof}");
     assert!(clean(&proof), "{proof}");
     assert_eq!(proof["forcedCleanup"], 1, "{proof}");
+    let log = std::fs::read_to_string(log).unwrap();
+    let forced: Vec<Value> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("takosumi-browser-guard: forced "))
+        .map(|line| serde_json::from_str(line).expect("structured forced identity"))
+        .collect();
+    assert_eq!(forced.len(), 1, "{log}");
+    assert_eq!(forced[0]["pid"], helper);
+    assert_eq!(forced[0]["start"], identity.start);
+    assert_eq!(forced[0]["firstObserved"]["parent"], identity.ppid);
+    assert_eq!(
+        forced[0]["firstObserved"]["trackedParentStart"],
+        parent_start
+    );
+    // The first observation may precede the child's pre_exec setsid().
+    let first_group = forced[0]["firstObserved"]["group"].as_i64().unwrap();
+    assert!(
+        first_group == i64::from(helper) || first_group == i64::from(guard.id()),
+        "{log}"
+    );
+    assert_eq!(forced[0]["freezeSnapshot"]["parent"], 1);
 }
 
 fn a_descendant_that_ends_by_itself_is_not_forced() {

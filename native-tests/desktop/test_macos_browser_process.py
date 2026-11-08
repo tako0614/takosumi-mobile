@@ -23,9 +23,16 @@ class EvidenceTests(unittest.TestCase):
                 entered = False
                 with sampler.watch_shutdowns(observer, []):
                     entered = True
+                # Partial and final quit share a phase: the second watcher
+                # must preserve the first watcher's diagnostics on disk.
+                with sampler.watch_shutdowns(observer, []):
+                    pass
                 self.assertTrue(entered)
                 thread.return_value.join.assert_not_called()
             self.assertEqual(observer.proof["shutdownSamples"][0]["status"], "thread-start-error")
+            saved = json.loads((Path(directory) / "shutdown-samples-restart.json").read_text())
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(saved, observer.proof["shutdownSamples"])
 
     def test_shutdown_watch_ignores_old_birth_and_completed_shutdown(self):
         identity = {"pid": 12, "start": 101}
