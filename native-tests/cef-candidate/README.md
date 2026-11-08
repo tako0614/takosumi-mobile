@@ -2486,9 +2486,41 @@ recorded and no prior crash was established. Its outer forced cleanup was
 the runner's response to failure, not an ordinary exit. The Mac observer now
 keeps dialog events, target/receipt state, setup activation/visibility and
 checkpoint times before that cleanup. The original wait bounds and required
-open/cancel events remain unchanged. Restart, reset and normal exit still
-require the next native result; these first-run partial successes do not
-qualify them or resolve the earlier M2 helper-lifetime failure.
+open/cancel events remain unchanged.
+
+The next native run (42495346362 at `0c4013c`; synthetic merge `1ce6eab`
+has the same tree) passed all three Excalidraw launches: cancel/reuse,
+sequential quit, restart with persistent separated state and one-profile
+clear. All nine App/profile receipts had exit 0 and zero forced cleanup.
+Photopea passed its first launch, including both cancellations and normal
+exit, and verified the separated state after restart. Closing Personal on
+that restart entered `CefShutdown`, then printed `Teardown watchdog expired`
+and exited 2; the guard had to end the network-service helper. Reset was
+not reached. The watchdog's cause remains unknown; a surviving helper is
+not by itself proof of what blocked shutdown. This differs from both the
+earlier missing dialog and the old M2 exit-0/forced-1 failure.
+
+The same run's M2 adapter failed during its first creation confirmation,
+before reuse or shutdown. Its native window existed, but the exact failed
+reply predicate was not logged. These failures keep Mac native acceptance
+open despite the completed Excalidraw flow.
+
+The next diagnostic records only admission predicate booleans on a rejected
+Mac creation reply, including the exact libproc reads used for admission.
+It neither retries nor relaxes identity/path checks. In the Mac fixture,
+an owned browser still inside `CefShutdown` after two seconds is sampled
+once for one second at 100 ms intervals, before Chromium's ten-second
+[teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
+PID/birth, guard ancestry and both executable paths are checked before and
+after; changed identity discards the output. The sample subprocess has a
+three-second limit, its retained text is capped at 4 MiB and is joined before
+fixture cleanup. Filesystem/libproc reads have no hard IO deadline. A failed
+watcher-thread start still runs the close body; missing samples never change
+the receipt verdict. Sampling
+can perturb scheduling: a sampled pass is diagnostic, not an unsampled
+qualification. No heap, environment, page contents or binary crash dump is
+requested. Existing first-launch/restart/reset and zero-forced-cleanup
+requirements remain unchanged.
 
 ## Observations and limits
 

@@ -1199,17 +1199,33 @@ impl Process {
                 window_id,
                 native_pid,
                 ..
-            } if actual == key
-                && profile == self.profile
-                && browser_id > 0
-                && window_id > 0
-                && native_pid > 0
-                && native_owned(native_pid, &self.child, &self.program)
-                && same_path(
+            } => {
+                let fields_match = actual == key
+                    && profile == self.profile
+                    && browser_id > 0
+                    && window_id > 0
+                    && native_pid > 0;
+                let owned = fields_match && native_owned(native_pid, &self.child, &self.program);
+                let cache_matches = same_path(
                     &cache_path,
                     &self.directory.join("cef-profiles").join(&self.profile),
-                ) =>
-            {
+                );
+                if !owned || !cache_matches {
+                    #[cfg(target_os = "macos")]
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "takosumi-mac-open-rejected: {}",
+                        serde_json::json!({
+                            "keyMatch":actual==key,"profileMatch":profile==self.profile,
+                            "browserIdPositive":browser_id>0,"windowIdPositive":window_id>0,
+                            "nativePidPositive":native_pid>0,"identityCheckAttempted":fields_match,
+                            "nativeOwned":owned,"cachePathMatch":cache_matches
+                        })
+                    );
+                    return Err(Error::InvalidRequest(
+                        "Browser profile creation was not confirmed.",
+                    ));
+                }
                 self.opened = serde_json::json!({"key":actual,"profile":profile,"browserId":browser_id,"nativeCache":cache_path,"windowId":window_id,"nativePid":native_pid});
                 self.opening = None;
                 Ok(())

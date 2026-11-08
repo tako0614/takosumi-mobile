@@ -52,14 +52,30 @@ pub(super) fn image_of(pid: u32) -> Option<std::path::PathBuf> {
 /// `Contents/MacOS` executable, compared as the canonical path the App
 /// located).
 pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program: &Path) -> bool {
-    let (Some((parent, started)), Some((_, guard_started))) =
-        (parent_and_start(native_pid), parent_and_start(guard.id()))
-    else {
-        return false;
-    };
-    parent == guard.id()
-        && started >= guard_started
-        && image_of(native_pid).as_deref() == Some(program)
+    let native = parent_and_start(native_pid);
+    let parent = parent_and_start(guard.id());
+    let parent_matches = native.is_some_and(|(pid, _)| pid == guard.id());
+    let birth_order = native
+        .zip(parent)
+        .is_some_and(|((_, started), (_, guard_started))| started >= guard_started);
+    // Preserve the original short circuit, and report the very same reads
+    // used for admission. A second diagnostic read could hide a transient.
+    let image_checked = parent_matches && birth_order;
+    let image = image_checked.then(|| image_of(native_pid)).flatten();
+    let owned = image_checked && image.as_deref() == Some(program);
+    if !owned {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "takosumi-mac-native-rejected: {}",
+            serde_json::json!({
+                "nativeIdentityRead":native.is_some(),"guardIdentityRead":parent.is_some(),
+                "parentMatch":parent_matches,"birthOrder":birth_order,"imageChecked":image_checked,
+                "imageRead":image.is_some(),"imageMatch":image.as_deref()==Some(program)
+            })
+        );
+    }
+    owned
 }
 
 /// The cache path CEF reported is exactly the requested one (the browser

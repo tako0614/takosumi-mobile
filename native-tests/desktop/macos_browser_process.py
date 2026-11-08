@@ -33,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
 from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
+from macos_shutdown_sample import watch_shutdowns  # noqa: E402
 
 
 class BsdInfo(ctypes.Structure):
@@ -238,8 +239,9 @@ class MacObserver(Observer):
                 and self.sample(personal) == expected[1], "Partial quit did not retain the same Personal document")
         self.remove_beforeunload(personal)
         self.case("quit-partial-order", {"workReceipt": receipt, "cancelledBy": cancelled_by})
-        self.checkpoint("request-final-exit")
-        self.finish_final_quit([personal])
+        with watch_shutdowns(self, [personal]):
+            self.checkpoint("request-final-exit")
+            self.finish_final_quit([personal])
         self.proof["passed"] = True
 
     def relaunch(self, kind):
@@ -257,17 +259,18 @@ class MacObserver(Observer):
                     and lock.endswith(f"-{personal.native['nativePid']}"), "Running Personal was not kept locked")
         self.case("clear-only-one-profile" if kind == "reset" else "restart-keeps-separation", samples)
         self.checkpoint(f"{kind}-inspected")
-        try:
-            pages[1].send("Page.close")
-        except Failure as error:
-            # A close may end CDP before replying; only a normal guard receipt
-            # below can establish that it closed, never the socket error alone.
-            self.proof["pageCloseReplyError"] = str(error)
+        with watch_shutdowns(self, pages):
+            try:
+                pages[1].send("Page.close")
+            except Failure as error:
+                # A close may end CDP before replying; only a normal guard receipt
+                # below can establish that it closed, never the socket error alone.
+                self.proof["pageCloseReplyError"] = str(error)
 
-        self.finish_final_quit([pages[1]])
-        self.normal_receipt(pages[1].process["guardReceipt"], "Personal did not close normally")
-        self.checkpoint(f"{kind}-request-exit")
-        self.finish_final_quit([pages[0]])
+            self.finish_final_quit([pages[1]])
+            self.normal_receipt(pages[1].process["guardReceipt"], "Personal did not close normally")
+            self.checkpoint(f"{kind}-request-exit")
+            self.finish_final_quit([pages[0]])
         self.proof["passed"] = True
 
     def failure_capture(self):
