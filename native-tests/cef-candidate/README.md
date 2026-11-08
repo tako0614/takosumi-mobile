@@ -2542,6 +2542,25 @@ existing stack watcher also covers Work's partial close and keeps both
 partial/final records. These changes do not resolve the residual process,
 the earlier Photopea watchdog or the creation refusal by themselves.
 
+At `48de24f` (run 42498855602), Excalidraw completed all three launches
+without sampling, and Photopea completed its first and restart launches
+with normal receipts. Photopea's reset removed only Work's profile, then
+failed to reopen it. The M2 App-death test also failed during creation.
+Both rejections had matching parent/birth, key, profile, cache and positive
+native IDs; the executable path read by `proc_pidpath` did not exactly
+match the expected canonical path. The earlier watchdog and late helper
+did not recur; the reset's outer forced cleanup is failure cleanup, not a
+normal-shutdown result.
+
+On rejection, test/fixture builds now also record the two compared
+executable paths, whether canonicalization or device/inode identifies the
+same file, and whether the process identities remain unchanged after those
+diagnostic reads. No arguments, environment or file contents are recorded.
+Product builds retain only predicate booleans. Neither later filesystem
+reads nor a matching basename/file identity can admit the rejected browser;
+the exact admission predicate remains unchanged until the mismatch is
+explained by native evidence.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,

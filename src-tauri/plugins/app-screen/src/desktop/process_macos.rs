@@ -74,8 +74,57 @@ pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program
                 "imageRead":image.is_some(),"imageMatch":image.as_deref()==Some(program)
             })
         );
+        #[cfg(any(test, feature = "fixture-overrides"))]
+        describe_rejected_image(
+            native_pid,
+            guard.id(),
+            native,
+            parent,
+            image.as_deref(),
+            program,
+        );
     }
     owned
+}
+
+/// Anonymous native fixtures only: keep the exact paths from the failed
+/// comparison so a spelling difference can be distinguished from a different
+/// executable (non-UTF-8 paths are null, never a serialization panic).
+/// These later filesystem/process reads are diagnostic, never a
+/// fallback admission check. Product builds retain only the booleans above.
+#[cfg(any(test, feature = "fixture-overrides"))]
+fn describe_rejected_image(
+    native_pid: u32,
+    guard_pid: u32,
+    native: Option<(u32, u64)>,
+    parent: Option<(u32, u64)>,
+    image: Option<&Path>,
+    program: &Path,
+) {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let canonical = image.and_then(|path| path.canonicalize().ok());
+    let same_file = image
+        .and_then(|path| path.metadata().ok())
+        .zip(program.metadata().ok())
+        .map(|(actual, expected)| {
+            actual.is_file()
+                && expected.is_file()
+                && actual.dev() == expected.dev()
+                && actual.ino() == expected.ino()
+        });
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "takosumi-mac-fixture-image-rejected: {}",
+        serde_json::json!({
+            "nativePid":native_pid,"guardPid":guard_pid,
+            "expectedPathUtf8":program.to_str(),"observedPathUtf8":image.and_then(Path::to_str),
+            "canonicalMatch":canonical.as_deref().map(|path| path==program),
+            "sameFile":same_file,
+            "identitiesUnchanged":native.is_some() && parent.is_some()
+                && parent_and_start(native_pid)==native && parent_and_start(guard_pid)==parent
+        })
+    );
 }
 
 /// The cache path CEF reported is exactly the requested one (the browser
