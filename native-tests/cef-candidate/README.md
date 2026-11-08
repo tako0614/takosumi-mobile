@@ -2552,14 +2552,42 @@ match the expected canonical path. The earlier watchdog and late helper
 did not recur; the reset's outer forced cleanup is failure cleanup, not a
 normal-shutdown result.
 
-On rejection, test/fixture builds now also record the two compared
-executable paths, whether canonicalization or device/inode identifies the
-same file, and whether the process identities remain unchanged after those
-diagnostic reads. No arguments, environment or file contents are recorded.
-Product builds retain only predicate booleans. Neither later filesystem
-reads nor a matching basename/file identity can admit the rejected browser;
-the exact admission predicate remains unchanged until the mismatch is
-explained by native evidence.
+The rejection diagnostic at `a35a531` identified Chromium's code-sign clone:
+its main executable was a hard link of the selected browser (`sameFile=true`,
+stable PID/birth, different canonical path). The adapter now holds that
+executable open before spawn and compares regular-file device/inode, with
+process identity and image-path rechecks. Copies and replaced files fail;
+the observer and shutdown sampler also hold their expected executable files.
+This is not bundle/signature validation or an atomic running-vnode check
+against concurrent same-user filesystem mutation.
+
+At `fe1b913` (run 42502662408), all nine Mac adapter/image tests passed, and
+both anonymous sites completed all three App launches with nine normal
+receipts each. Photopea had no stack sampling. Excalidraw's first launch
+attempted one sample, then discarded it after the process identity changed;
+its timing may have been perturbed. The two Windows fixture jobs instead
+failed a stale CI-contract test that counted only the six adapter tests,
+excluding the three new image tests; that test now checks both exact sets.
+The earlier intermittent late helper and teardown watchdog remain unresolved.
+
+`TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS=1` opts native diagnostics into one
+closed-role read for a tracked orphan in its own process group after natural
+drain expires, before any SIGSTOP. Default runs do not query arguments.
+The guard reads at most 64 KiB using KERN_PROCARGS2, checks the required size
+before/after, parses exactly the counted arguments (including exact 64-bit
+path padding and empty-argv boundaries), and discards raw bytes. It records
+only `none`, `other`, `code-sign-clone-cleanup` or null plus PID/birth, identity
+stability and elapsed time, after kill/disarm. No path, argv or environment
+value is logged. This does not grant any role an exception: the native
+escaped-helper test claims the cleanup type and must still be killed/count 1.
+
+The existing cleanup deadline starts before this optional read; the natural
+and forced windows are unchanged. A sysctl has no hard latency bound and
+may return stale data across same-PID exec, so the result is observational.
+Opt-in runs are timing-perturbed evidence, not unsampled shutdown qualification.
+The pinned [XNU layout](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_exec.c#L5467-L5481)
+and [sysctl behavior](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_sysctl.c#L1335-L1592)
+explain the strict padding, size checks and exec-race limitation.
 
 ## Observations and limits
 

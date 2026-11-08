@@ -84,7 +84,8 @@
 //! manager is not), and a double fork faster than an observation: a process
 //! that leaves the group and whose parent ends before the guard's next look
 //! (the `NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen.
-//! CEF's helpers stay in the group (the M1 smoke's group check).
+//! M1 observed ordinary CEF helpers in the group. Chromium's code-sign-clone
+//! cleanup helper can leave it and relies on the descendant tracking above.
 //!
 //! Receipt, written once after the drain, with the other guards' fields:
 //! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
@@ -107,6 +108,69 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
+
+#[path = "mac_cleanup_role.rs"]
+mod cleanup_role;
+
+/// Opt-in for native diagnostic fixtures only. Default runs never read argv.
+const ROLE_DIAGNOSTICS: &str = "TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS";
+
+/// Best-effort closed role from a bounded, complete KERN_PROCARGS2 response.
+/// XNU can return a suffix on a short successful read: query size before and
+/// after, require it below the cap, and account for the query's 4-byte round-up.
+/// Even then XNU permits stale data across same-PID execve. Never authority.
+fn read_cleanup_role(pid: i32) -> Option<&'static str> {
+    const CAP: usize = 64 * 1024;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let size = |mib: &mut [i32; 3]| -> Option<usize> {
+        let mut count = 0;
+        // SAFETY: three valid integer selectors, no output or new value.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (result == 0).then_some(count)
+    };
+    let expected = size(&mut mib)?;
+    if !(5..CAP).contains(&expected) {
+        return None;
+    }
+    let mut bytes = vec![0u8; CAP];
+    let mut count = bytes.len();
+    // SAFETY: the writable output allocation has `count` bytes; no new value.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut count,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0
+        || count >= CAP
+        || count.next_multiple_of(4) != expected
+        || size(&mut mib) != Some(expected)
+    {
+        return None;
+    }
+    cleanup_role::parse(&bytes[..count])
+}
+
+struct RoleObservation {
+    pid: i32,
+    start: u64,
+    role: Option<&'static str>,
+    identities_unchanged: bool,
+    elapsed_micros: u128,
+}
 
 /// While the browser runs, observe its processes on every event and at
 /// least this often.
@@ -638,6 +702,7 @@ struct Run {
     forced: u32,
     cleanup_errors: BTreeSet<String>,
     non_fatal: BTreeSet<String>,
+    role_diagnostics: bool,
 }
 
 struct FirstObserved {
@@ -658,6 +723,35 @@ struct Frozen {
 }
 
 impl Run {
+    /// One owned, orphaned process in its own group, before any SIGSTOP.
+    /// No raw arguments survive the read. This observation cannot affect
+    /// ownership, signals, forced count or receipt acceptance. A syscall has
+    /// no hard latency bound: opt-in runs are timing-perturbed diagnostics.
+    fn diagnose_cleanup_role(&self) -> Option<RoleObservation> {
+        if !self.role_diagnostics {
+            return None;
+        }
+        for (&pid, &start) in self.tracked.iter().take(32) {
+            let Some(before) = facts(pid).ok().flatten() else {
+                continue;
+            };
+            if before.start != start || before.zombie || before.ppid != 1 || before.pgid != pid {
+                continue;
+            }
+            let reading = Instant::now();
+            let role = read_cleanup_role(pid);
+            let unchanged = facts(pid).ok().flatten() == Some(before);
+            return Some(RoleObservation {
+                pid,
+                start,
+                role: role.filter(|_| unchanged),
+                identities_unchanged: unchanged,
+                elapsed_micros: reading.elapsed().as_micros(),
+            });
+        }
+        None
+    }
+
     fn remember(&mut self, pid: i32, facts: Facts) {
         let tracked_parent_start = self
             .tracked
@@ -1082,6 +1176,9 @@ impl Run {
         }
         let freezing = Instant::now();
         let deadline = freezing + FORCED;
+        // Opt-in diagnostic IO is before SIGSTOP and charged to the existing
+        // deadline. It never extends the natural or forced cleanup windows.
+        let role_observation = self.diagnose_cleanup_role();
         // From the first SIGSTOP until the kill, nothing may leave the
         // stopped processes behind: the freezer kills them if this section
         // returns early or unwinds.
@@ -1166,9 +1263,17 @@ impl Run {
                 .count(),
             freeze_ms
         ));
+        if let Some(observed) = role_observation {
+            note(format_args!(
+                "cleanup-role {}",
+                serde_json::json!({"pid":observed.pid,"start":observed.start,
+                    "role":observed.role,"identitiesUnchanged":observed.identities_unchanged,
+                    "elapsedMicros":observed.elapsed_micros,"diagnosticOnly":true})
+            ));
+        }
         // Diagnose only after every stopped process has been killed and
         // the drop guard disarmed. Neither IO nor serialization can delay
-        // the stop-to-kill section. Bound the log, and never collect argv.
+        // the stop-to-kill section. Bound the log, and never emit argv.
         for &(pid, start) in killed.iter().take(32) {
             let frozen = freezer
                 .frozen
@@ -1258,6 +1363,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         forced: 0,
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
+        role_diagnostics: std::env::var(ROLE_DIAGNOSTICS).as_deref() == Ok("1"),
     };
     let mut failure = None;
     if stopping {

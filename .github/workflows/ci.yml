@@ -1328,6 +1328,9 @@ jobs:
         shell: bash
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-cef
+      # One closed-role read for an owned orphan before forced cleanup.
+      # Opt-in diagnostic timing; this run does not qualify unsampled exit.
+      TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1401,6 +1404,14 @@ jobs:
           rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"
           "$exe" | tee "$RUNNER_TEMP/window-wait-tests.log"
           grep -q '^test result: ok\. 3 passed; 0 failed' "$RUNNER_TEMP/window-wait-tests.log" || { echo 'Not all three window wait tests ran'; exit 1; }
+      - name: macOS cleanup-role argument boundary tests
+        run: |
+          exe="$RUNNER_TEMP/cleanup-role-tests"
+          log="$RUNNER_TEMP/cleanup-role-tests.log"
+          rustc --edition 2021 --test native-tests/cef-candidate/src/mac_cleanup_role.rs -o "$exe"
+          "$exe" | tee "$log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Cleanup role tests failed'; exit 1; }
+          grep -q '^test result: ok\. 4 passed; 0 failed' "$log" || { echo 'Not all four role boundary tests ran'; exit 1; }
       - name: Build takosumi-cef-browser-process, takosumi-cef-browser-helper and takosumi-browser-guard (product)
         id: build
         working-directory: takosumi-mobile/native-tests/cef-candidate

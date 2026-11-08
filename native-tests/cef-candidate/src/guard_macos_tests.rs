@@ -96,6 +96,9 @@ fn standin(args: &[String]) -> ExitCode {
         // guard can only know as a child it recorded while the browser ran.
         Some("escape") => {
             let mut command = helper(&["sleep"]);
+            // A claimed Chromium cleanup role is diagnostic, never immunity
+            // from this guard's forced cleanup of a lingering descendant.
+            command.arg("--type=code-sign-clone-cleanup");
             // SAFETY: setsid in the forked child before exec.
             unsafe {
                 command.pre_exec(|| {
@@ -483,6 +486,7 @@ fn a_descendant_that_left_the_group_is_still_killed() {
     let log = case.receipt.with_extension("log");
     let mut guard = case
         .guard(&["escape"])
+        .env(ROLE_DIAGNOSTICS, "1")
         .stdin(Stdio::piped())
         .stderr(File::create(&log).unwrap())
         .spawn()
@@ -526,6 +530,16 @@ fn a_descendant_that_left_the_group_is_still_killed() {
         "{log}"
     );
     assert_eq!(forced[0]["freezeSnapshot"]["parent"], 1);
+    let observation: Value = log
+        .lines()
+        .find_map(|line| line.strip_prefix("takosumi-browser-guard: cleanup-role "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .expect("owned orphan role diagnostic");
+    assert_eq!(observation["pid"], helper);
+    assert_eq!(observation["start"], identity.start);
+    assert_eq!(observation["role"], "code-sign-clone-cleanup");
+    assert_eq!(observation["identitiesUnchanged"], true);
+    assert_eq!(observation["diagnosticOnly"], true);
 }
 
 fn a_descendant_that_ends_by_itself_is_not_forced() {
