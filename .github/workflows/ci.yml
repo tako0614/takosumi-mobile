@@ -1462,7 +1462,7 @@ jobs:
         run: |
           python3 -B native-tests/desktop/test_macos_browser_process.py -v 2>&1 | tee "$RUNNER_TEMP/m3-runner-tests.log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'M3 runner tests failed'; exit 1; }
-          grep -q '^Ran 9 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all M3 runner tests ran'; exit 1; }
+          grep -q '^Ran 10 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all M3 runner tests ran'; exit 1; }
       - name: Locked CEF version
         id: cef
         run: |
