@@ -1058,8 +1058,20 @@ class RunnerTests(unittest.TestCase):
         required = re.findall(r"^\s+desktop::process_adapter::macos_tests::([a-z_]+)(?: \\|;)", adapter, re.M)
         self.assertEqual(sorted(required), sorted(tests))
         self.assertEqual(len(required), len(set(required)))
+        # The same macos_tests filter also includes the executable identity
+        # module. Require every one of those tests, not just a larger total.
+        image = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_image.rs").read_text(
+            encoding="utf-8")
+        image_tests = re.findall(r"^    #\[test\]\n    fn ([a-z_]+)\(\)", image, re.M)
+        self.assertTrue(image_tests)
+        self.assertEqual(len(image_tests), image.count("#[test]"))
+        image_required = re.findall(r"^\s+desktop::process_macos::image::macos_tests::([a-z_]+)(?: \\|;)",
+                                    adapter, re.M)
+        self.assertEqual(sorted(image_required), sorted(image_tests))
+        self.assertEqual(len(image_required), len(set(image_required)))
         self.assertIn('grep -qF "test $name ... ok" "$log"', adapter)
-        self.assertIn(f"grep -q '^test result: ok\\. {len(tests)} passed; 0 failed; 0 ignored' \"$log\"", adapter)
+        self.assertIn(f"grep -q '^test result: ok\\. {len(tests) + len(image_tests)} passed; 0 failed; 0 ignored' \"$log\"",
+                      adapter)
         # The socket check uses the browser bundle's identifier, as the
         # bundler writes it.
         bundler = (HERE.parents[1] / "scripts/bundle-macos-cef.mjs").read_text(encoding="utf-8")
