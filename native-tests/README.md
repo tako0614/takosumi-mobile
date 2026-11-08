@@ -338,6 +338,18 @@ an App acceptance result.
 
 ## Android
 
+`AppScreenMediaConsentTest` checks the camera/microphone consent state machine,
+including OS denial, stale results and document/profile changes. The actual
+`MediaPermissionActivityTest` uses an intercepted HTTPS fixture in the production
+WebView and Activity, without substituting the WebChromeClient. It requires the
+origin-named site prompt, observes a still-pending `getUserMedia` request before
+site denial, then opens a new document and accepts the site prompt. The real
+Android permission UI must appear while the request is still pending; OS denial
+must reject it and return to the same resumed screen. Missing dialogs, skipped
+tests or an early rejection cannot qualify this path. This control does not
+grant OS permission or qualify recording, camera capture, background capture,
+cross-origin iframe permission or other Android/OEM versions.
+
 The profile-reset instrumentation requires both `MULTI_PROFILE` and
 `DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
 The initial API35 emulator used WebView124 and passed profile isolation but

@@ -67,9 +67,21 @@ are refused. This delegate policy does not run on earlier iOS versions;
 their WebKit permission behavior is not qualified by these checks.
 Privacy descriptions cover video/audio calls and the existing
 QR scan. Policy tests and SDK builds do not prove the native prompt, OS
-consent or capture on a device. Android's app-screen adapter still refuses
-camera/microphone/location until its site and runtime permission flow exists;
-OS consent is not a shared grant for all websites.
+consent or capture on a device.
+
+On Android, an attached, resumed Web-home screen asks for explicit site consent
+for each camera/microphone request, then requests any missing Android runtime
+permissions. The prompt names the requesting origin and, for an iframe, the
+top-level origin. OS consent is not a shared grant for all websites: completion
+requires the same view, profile generation, document and page, with the OS
+permissions still granted. Navigation, detachment, stopping the Activity and
+WebView cancellation invalidate the pending request. The system permission
+dialog may pause the Activity; its result waits for the same screen to resume.
+No site grant is persisted. Unknown protected resources and geolocation remain
+refused, as do camera/microphone requests in the preserved mobile adapter.
+The manifest marks camera/microphone hardware optional. State-machine tests
+do not qualify actual WebView capture, native permission UI or capture behavior
+after an already-granted screen goes into the background.
 
 ## Preserved mobile adapter
 
@@ -275,6 +287,6 @@ which skip `shouldOverrideUrlLoading`) are refused before they load.
   reach the shell's deep-link handler, which resolves the URL to a known app.
 - Files picked for `<input type=file>` are passed on only as content URIs from
   other apps' providers, never this app's own files.
-- Android still refuses camera, microphone and location requests. iOS 15+ uses
+- This preserved Android adapter refuses camera, microphone and location requests. iOS 15+ uses
   the visible-screen media prompt policy described above for both adapters;
   location remains outside this change.

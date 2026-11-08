@@ -231,9 +231,10 @@ jobs:
           required = {
               ('com.takosumi.appscreen.ProfileIsolationTest', 'clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles'),
               ('com.takosumi.appscreen.ProfileResetActivityTest', 'completedResetDropsAnEvictedActivityUrlAndPreResetSavedState'),
+              ('com.takosumi.appscreen.MediaPermissionActivityTest', 'webViewSiteConsentAndAndroidDenialReturnToTheSameScreen'),
           }
-          assert required <= actual_cases, f'Missing actual profile reset controls: {required - actual_cases}'
-          assert tests >= 4 and failures == 0 and skipped == 0
+          assert required <= actual_cases, f'Missing actual profile/media controls: {required - actual_cases}'
+          assert tests >= 5 and failures == 0 and skipped == 0
           PY
 
   desktop:

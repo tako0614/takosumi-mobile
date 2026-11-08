@@ -64,6 +64,7 @@ class AppScreenActivity : AppCompatActivity() {
     private var entry: AppScreenRegistry.Entry? = null
     private var lastKnownUrl: String = ""
     private var visible = false
+    private var resumed = false
     private var evicted = false
     private var profileGeneration = 0L
     private var externalDialog: AlertDialog? = null
@@ -76,6 +77,48 @@ class AppScreenActivity : AppCompatActivity() {
     private lateinit var hostView: TextView
     private lateinit var backButton: TextView
     private lateinit var progress: ProgressBar
+
+    private val mediaConsent: AppScreenMediaConsent by lazy {
+        AppScreenMediaConsent(
+            current = ::mediaContext,
+            prompt = ::promptMedia,
+            hasPermission = { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED },
+            askAndroid = { mediaPermissions.launch(it) },
+        )
+    }
+    private val mediaPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+            mediaConsent.androidResult(granted)
+        }
+
+    private fun mediaContext(): AppScreenMediaConsent.Context? {
+        val current = entry ?: return null
+        if (!::request.isInitialized || !visible || !resumed || isFinishing || isDestroyed || evicted) return null
+        // A Web-home popup inherits its opener's null origin restriction.
+        // Legacy installed-app screens keep their existing denial policy.
+        if (current.origins != null || current.host !== this || !current.webView.isAttachedToWindow || !current.webView.isShown) return null
+        val page = current.webView.url ?: return null
+        if (!AppScreenPolicy.isLaunchable(page) || !current.resumeState.canRequestMedia(page)) return null
+        val generation = AppScreenProfileData.generation(this, current.profile)
+        if (generation < 0 || generation != profileGeneration || AppScreenProfileData.isClearing(current.profile)) return null
+        return AppScreenMediaConsent.Context(current.webView, current.profile, generation, current.resumeState.document, page)
+    }
+
+    private fun promptMedia(access: AppScreenMediaConsent.Access, allow: () -> Unit, deny: () -> Unit): () -> Unit {
+        val resources = access.resources.map {
+            if (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE) "カメラ" else "マイク"
+        }.joinToString("と")
+        val parent = if (access.origin == access.topOrigin) "" else "\n表示中のサイト: ${access.topOrigin}"
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("${resources}の使用を許可")
+            .setMessage("${access.origin} が${resources}へのアクセスを求めています。$parent\nこの要求に許可しますか？")
+            .setPositiveButton("許可") { _, _ -> allow() }
+            .setNegativeButton("許可しない") { _, _ -> deny() }
+            .setOnCancelListener { deny() }
+            .create()
+        dialog.show()
+        return { dialog.dismiss() }
+    }
 
     private val fileChooser =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -134,6 +177,7 @@ class AppScreenActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         val parsed = AppScreenLaunch.parse(this, intent) ?: return
         if (parsed.key != request.key || parsed.popup || parsed.profile != request.profile) return
+        mediaConsent.cancel()
         setIntent(intent)
         val keep = keepsLivePage(parsed)
         request = parsed
@@ -151,8 +195,21 @@ class AppScreenActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        mediaConsent.resumed()
+    }
+
+    override fun onPause() {
+        resumed = false
+        mediaConsent.paused()
+        super.onPause()
+    }
+
     override fun onStop() {
         visible = false
+        mediaConsent.cancel()
         super.onStop()
     }
 
@@ -166,6 +223,7 @@ class AppScreenActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mediaConsent.cancel()
         externalDialog?.dismiss()
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -191,7 +249,10 @@ class AppScreenActivity : AppCompatActivity() {
 
     /** Another activity took over this webview (same app relaunched). */
     internal fun forgetEntry(moved: AppScreenRegistry.Entry) {
-        if (entry === moved) entry = null
+        if (entry === moved) {
+            mediaConsent.cancel()
+            entry = null
+        }
     }
 
     /** Started (visible, even when not focused in split screen). */
@@ -277,7 +338,7 @@ class AppScreenActivity : AppCompatActivity() {
         current.context.baseContext = this
         current.host = this
         webView.webViewClient = ScreenClient(current)
-        webView.webChromeClient = ScreenChromeClient()
+        webView.webChromeClient = ScreenChromeClient(current)
         webView.setDownloadListener { url, _, _, _, _ ->
             // A page cannot keep raising download prompts.
             val now = SystemClock.elapsedRealtime()
@@ -297,6 +358,7 @@ class AppScreenActivity : AppCompatActivity() {
     }
 
     private fun unbind(current: AppScreenRegistry.Entry) {
+        mediaConsent.cancel()
         val webView = current.webView
         container.removeView(webView)
         webView.webViewClient = current.detachedClient
@@ -324,6 +386,7 @@ class AppScreenActivity : AppCompatActivity() {
     }
 
     private fun closeScreen() {
+        mediaConsent.cancel()
         if (request.popup) finish() else finishAndRemoveTask()
     }
 
@@ -694,6 +757,7 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
+            mediaConsent.cancel()
             bound.resumeState.started(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 // Something reached the main frame without passing the policy.
@@ -728,6 +792,7 @@ class AppScreenActivity : AppCompatActivity() {
             // Subresources and rendered HTTP error responses do not turn a
             // successful main document into a failed navigation.
             if (view === entry?.webView && request.isForMainFrame) {
+                if (request.url.toString() == view.url) mediaConsent.cancel()
                 bound.resumeState.failed(request.url.toString())
             }
         }
@@ -739,6 +804,7 @@ class AppScreenActivity : AppCompatActivity() {
          */
         override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
             if (view !== entry?.webView) return
+            mediaConsent.pageChanged(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 leavePage(view, url, offerOnly = false)
                 return
@@ -780,6 +846,7 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
             if (view === entry?.webView) {
+                mediaConsent.cancel()
                 // This callback has no main-frame flag. Conservatively keep
                 // the last successful metadata even if a subframe failed TLS.
                 bound.resumeState.failed(error.url)
@@ -810,7 +877,7 @@ class AppScreenActivity : AppCompatActivity() {
         }
     }
 
-    private inner class ScreenChromeClient : WebChromeClient() {
+    private inner class ScreenChromeClient(private val bound: AppScreenRegistry.Entry) : WebChromeClient() {
         override fun onCreateWindow(
             view: WebView,
             isDialog: Boolean,
@@ -855,10 +922,12 @@ class AppScreenActivity : AppCompatActivity() {
             }
         }
 
-        // Camera, microphone and location for app screens come later with an
-        // origin-named prompt; until then they are refused.
         override fun onPermissionRequest(request: PermissionRequest) {
-            request.deny()
+            mediaConsent.begin(request, bound.webView)
+        }
+
+        override fun onPermissionRequestCanceled(request: PermissionRequest) {
+            mediaConsent.canceledByWebView(request)
         }
 
         override fun onGeolocationPermissionsShowPrompt(

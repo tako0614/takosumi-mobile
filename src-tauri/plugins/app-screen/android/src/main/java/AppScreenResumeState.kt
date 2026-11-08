@@ -39,6 +39,8 @@ internal class AppScreenResumeState {
 
     fun canRemember(url: String): Boolean = !pending && successful && url != blocked
 
+    fun canRequestMedia(url: String): Boolean = (if (pending) committed else successful) && url != blocked
+
     fun isPending(): Boolean = pending
 
     fun invalidate() {
@@ -52,6 +54,7 @@ internal class AppScreenResumeState {
 internal class AppScreenResumeTracker {
     private val state = AppScreenResumeState()
     private val generations = LinkedHashMap<String, Long>()
+    val document: Long get() = state.current
 
     private fun bind(url: String?, id: Long) {
         if (url == null) return
@@ -89,4 +92,6 @@ internal class AppScreenResumeTracker {
     }
 
     fun canRemember(url: String): Boolean = state.canRemember(url)
+
+    fun canRequestMedia(url: String): Boolean = state.canRequestMedia(url)
 }
