@@ -362,8 +362,22 @@ Host microphone input is never opted in, and the
 must acknowledge `OK` before testing. That acknowledgment is not an independent
 host-mic state readback. Failures retain bounded audio logcat, the DOM exception
 message and input-device types (no device identifiers or labels). The native
-result remains required: no backend fallback or synthetic WebView grant is
-used. The probe checks stream lifecycle without recording or inspecting samples.
+result remains required: no synthetic WebView grant is used. The default
+backend run still returned `NotReadableError` and logged a failed `pa` driver
+initialization. The next CI fixture starts its own PulseAudio server on a
+private UNIX socket with only a null sink and its monitor source. It loads no
+hardware discovery modules and reads back the exact sink/source/module list
+before starting the emulator. Host input remains disabled. Cleanup targets only
+the owned server and emulator; no shared audio service is changed. Cleanup
+captures each child PID and kernel birth, binds signals with a Linux pidfd,
+and bounds TERM/KILL waits to three/two seconds. Four real-child controls cover
+normal exit, forced exit, wrong identity refusal and an already-exited child.
+Unverified identity or failed cleanup makes the job fail; it never falls back
+to signaling a raw PID. The EXIT trap explicitly preserves the original failure
+or reports a cleanup failure. The PA artifact is capped at 64 KiB. This is
+a targeted backend experiment, not proof that PA initialization caused the
+browser failure. The probe checks stream lifecycle without recording or
+inspecting samples.
 It does not qualify physical microphone quality, camera capture, background
 capture, cross-origin iframe permission or other Android/OEM versions.
 
