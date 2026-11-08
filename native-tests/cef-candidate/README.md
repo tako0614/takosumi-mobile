@@ -2431,7 +2431,7 @@ Intel Macs, older macOS versions and real devices.
 
 ## macOS actual App fixture (M3)
 
-Candidate source, not a native PASS yet. The explicit
+Candidate source, not a complete native PASS. The explicit
 `native-browser-process-fixture` feature now uses the same App flow on
 Linux, Windows and macOS. The Mac driver uses Tauri's `eval_with_callback`
 against the real WKWebView home, with no new dependency or product UI.
@@ -2468,6 +2468,27 @@ real login/popup return, native files/downloads, site permissions, notifications
 OS-managed WKWebView services outside the App's guarded tree, macOS packaging,
 signing and updates remain separate. The earlier ordinary-shutdown RED is
 retained; no grace period or receipt acceptance is relaxed for this fixture.
+
+The first M3 native run (42493648973 at `3ad4ca6`; CI's synthetic merge
+`b159ded` has the same tree) built and ran the actual Mac App. Both sites
+passed separate-profile synthetic cookie/storage and same-document reuse.
+Excalidraw's beforeunload opened and closed with `result:false`, then the
+browser threw `NSInvalidArgumentException`: `TakosumiCefApplication` lacked
+`cancelTerminate:`. Its guard recorded signal 5, zero forced cleanup. The
+application now implements that selector and forwards to the delegate's
+`stopTryingToTerminateApplication` when present, matching
+[the pinned Chromium 154.0.8037.98 cancel route](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/chrome_browser_application_mac.mm)
+without invoking AppKit termination. The real cancel/reuse/subsequent
+normal-close flow remains the regression gate, not just selector presence.
+
+Photopea instead timed out waiting for beforeunload opening; no dialog was
+recorded and no prior crash was established. Its outer forced cleanup was
+the runner's response to failure, not an ordinary exit. The Mac observer now
+keeps dialog events, target/receipt state, setup activation/visibility and
+checkpoint times before that cleanup. The original wait bounds and required
+open/cancel events remain unchanged. Restart, reset and normal exit still
+require the next native result; these first-run partial successes do not
+qualify them or resolve the earlier M2 helper-lifetime failure.
 
 ## Observations and limits
 

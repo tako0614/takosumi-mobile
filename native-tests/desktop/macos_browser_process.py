@@ -32,7 +32,7 @@ import uuid
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
-from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, WebSocket  # noqa: E402
+from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
 
 
 class BsdInfo(ctypes.Structure):
@@ -160,10 +160,31 @@ class MacObserver(Observer):
                              f"cookie:{self.cookie_of()},origin:location.origin}})")
 
     def beforeunload(self, page):
+        self.step("beforeunload setup", page)
         mark = page.cdp.mark()
-        page.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
-                      "addEventListener('beforeunload',window.__sumiBeforeUnload);return true})()", True)
+        state = page.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
+                              "addEventListener('beforeunload',window.__sumiBeforeUnload);"
+                              "return {stickyActivation:navigator.userActivation.hasBeenActive,"
+                              "active:navigator.userActivation.isActive,visibility:document.visibilityState,"
+                              "focus:document.hasFocus(),origin:location.origin}})()", True)
+        self.proof.setdefault("beforeUnloadSetup", []).append({"profile": page.process["profile"],
+                                                               "unixMicros": time.time_ns() // 1000,
+                                                               "state": state})
         return mark
+
+    def checkpoint(self, name):
+        self.proof.setdefault("checkpointTimes", []).append({"name": name, "unixMicros": time.time_ns() // 1000})
+        super().checkpoint(name)
+
+    def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
+        self.step(f"{kind} observation", page)
+        try:
+            return super().dialog(page, mark, kind, what, bound)
+        except Failure as error:
+            # Keep events/target/receipt before the owned failure cleanup.
+            # This never answers a dialog or changes its acceptance/bound.
+            self.dialog_failure(what, [(page, mark)], error)
+            raise
 
     @staticmethod
     def remove_beforeunload(page):
