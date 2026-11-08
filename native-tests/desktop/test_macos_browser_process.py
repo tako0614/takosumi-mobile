@@ -124,6 +124,7 @@ class EvidenceTests(unittest.TestCase):
                         result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
                     self.assertEqual(result["status"], f"identity-changed-{'after' if mutation == 'after' else 'before'}")
                     self.assertFalse(output.exists())
+                    self.assertFalse(output.with_suffix(".stderr.log").exists())
                     self.assertEqual(command.call_count, int(mutation == "after"))
 
     def test_stack_sample_bounds_output_and_uses_owned_subprocess_timeout(self):
@@ -146,6 +147,38 @@ class EvidenceTests(unittest.TestCase):
             with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 3)):
                 result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
+
+    def test_sampler_timeout_keeps_bounded_diagnostics_without_becoming_a_pass(self):
+        child, parent = {"pid": 12, "parent": 11, "start": 101}, {"pid": 11, "start": 100}
+        processes = mock.Mock()
+        processes.facts.side_effect = {11: parent, 12: child}.get
+        processes.image.side_effect = {11: self.guard, 12: self.browser}.get
+        with tempfile.TemporaryDirectory(prefix="m3-sample-timeout-") as directory:
+            for changed in (False, True):
+                with self.subTest(changed_identity=changed):
+                    output = Path(directory) / f"sample-{changed}.log"
+                    def sample(args, **options):
+                        self.assertEqual(options["timeout"], 3)
+                        Path(args[-1]).write_bytes(b"s" * 33)
+                        options["stderr"].write(b"e" * 17)
+                        if changed:
+                            processes.facts.side_effect = {11: parent, 12: dict(child, start=102)}.get
+                        raise sampler.subprocess.TimeoutExpired("sample", 3)
+                    with mock.patch.object(sampler, "LIMIT", 32), \
+                            mock.patch.object(sampler, "STDERR_LIMIT", 16), \
+                            mock.patch.object(sampler.subprocess, "run", side_effect=sample):
+                        result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
+                    if changed:
+                        self.assertEqual(result["status"], "identity-changed-after")
+                        self.assertFalse(output.exists())
+                        self.assertFalse(output.with_suffix(".stderr.log").exists())
+                    else:
+                        self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
+                        self.assertTrue(result["diagnosticOnly"])
+                        self.assertEqual(result["partialStack"], {"bytes": 32, "truncated": True})
+                        self.assertEqual(result["stderr"], {"bytes": 16, "truncated": True})
+                        self.assertEqual(output.read_bytes(), b"s" * 32)
+                        self.assertEqual(output.with_suffix(".stderr.log").read_bytes(), b"e" * 16)
 
     def test_listener_requires_the_exact_loopback_address_and_owner(self):
         self.assertEqual(runner.parse_listeners("p12\nn127.0.0.1:9222\n", 9222), [12])

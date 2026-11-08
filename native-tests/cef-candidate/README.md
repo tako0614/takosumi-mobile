@@ -2529,8 +2529,11 @@ once for one second at 100 ms intervals, before Chromium's ten-second
 [teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
 PID/birth, guard ancestry and both executable paths are checked before and
 after; changed identity discards the output. The sample subprocess has a
-three-second limit, its retained text is capped at 4 MiB and is joined before
-fixture cleanup. Filesystem/libproc reads have no hard IO deadline. A failed
+three-second limit. Its retained stack text is capped at 4 MiB and stderr at
+8 KiB. A timeout retains any partial stack and stderr only after the same
+identity readback, and remains a failed diagnostic, never a native pass.
+The subprocess is reaped and the watcher joined before fixture cleanup.
+Filesystem/libproc reads have no hard IO deadline. A failed
 watcher-thread start still runs the close body; missing samples never change
 the receipt verdict. Sampling
 can perturb scheduling: a sampled pass is diagnostic, not an unsampled

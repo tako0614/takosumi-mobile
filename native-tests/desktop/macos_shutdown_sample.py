@@ -13,6 +13,7 @@ import threading
 import time
 
 LIMIT = 4 * 1024 * 1024
+STDERR_LIMIT = 8192
 PREFIX = "takosumi-cef-mac-lifecycle: "
 
 
@@ -51,6 +52,16 @@ def same_owner(processes, child, parent, browser, guard):
             and processes.facts(parent["pid"]) == parent)
 
 
+def retain_bounded(source, output, limit):
+    if not source.is_file() or source.is_symlink():
+        return None
+    with source.open("rb") as stream:
+        data = stream.read(limit + 1)
+    with output.open("xb") as stream:
+        stream.write(data[:limit])
+    return {"bytes": min(len(data), limit), "truncated": len(data) > limit}
+
+
 def sample_owned(processes, child, parent, browser, guard, output):
     """One one-second sample; discard output if process identity changed meanwhile."""
     result = {"pid": child["pid"], "start": child["start"], "diagnosticOnly": True}
@@ -62,19 +73,28 @@ def sample_owned(processes, child, parent, browser, guard, output):
         # that subprocess through subprocess.run, never the sampled browser.
         with tempfile.TemporaryDirectory(prefix="sample-", dir=output.parent) as scratch:
             raw = Path(scratch) / "stack.log"
-            completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100", "-file", str(raw)],
-                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL, timeout=3, check=False)
-            result["sampleExit"] = completed.returncode
+            diagnostic = Path(scratch) / "stderr.log"
+            timed_out = False
+            with diagnostic.open("wb") as stderr:
+                try:
+                    completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100", "-file", str(raw)],
+                                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                               stderr=stderr, timeout=3, check=False)
+                    result["sampleExit"] = completed.returncode
+                except subprocess.TimeoutExpired:
+                    timed_out = True
             if not same_owner(processes, child, parent, browser, guard):
                 return dict(result, status="identity-changed-after")
-            if completed.returncode != 0 or not raw.is_file() or raw.is_symlink():
+            result["stderr"] = retain_bounded(diagnostic, output.with_suffix(".stderr.log"), STDERR_LIMIT)
+            stack = retain_bounded(raw, output, LIMIT)
+            if timed_out:
+                # Keep a partial diagnostic only after identity readback. It
+                # remains a timeout, never a successful sample or native pass.
+                return dict(result, status="sample-error", errorType="TimeoutExpired", partialStack=stack)
+            if result["sampleExit"] != 0 or stack is None:
+                result["partialStack"] = stack
                 return dict(result, status="sample-unavailable")
-            with raw.open("rb") as stream:
-                data = stream.read(LIMIT + 1)
-            with output.open("xb") as stream:
-                stream.write(data[:LIMIT])
-            return dict(result, status="captured", bytes=min(len(data), LIMIT), truncated=len(data) > LIMIT)
+            return dict(result, status="captured", **stack)
     except Exception as error:
         # Diagnostics are best effort, including a missing sample executable.
         # Do not retain subprocess arguments or arbitrary exception messages.
