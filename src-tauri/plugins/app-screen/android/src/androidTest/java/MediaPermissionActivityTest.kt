@@ -14,6 +14,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -22,7 +23,8 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-/** Actual WebView and both permission UIs. No camera, recording or real site. */
+/** Actual WebView and both permission UIs, with the CI emulator's audio input.
+ * No host microphone, recording, uploaded data, camera or real site. */
 @RunWith(AndroidJUnit4::class)
 class MediaPermissionActivityTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -61,10 +63,14 @@ class MediaPermissionActivityTest {
                             window.askForMicrophone = () => {
                               window.mediaResult = 'pending';
                               navigator.mediaDevices.getUserMedia({audio:true}).then(stream => {
-                                stream.getTracks().forEach(track => track.stop());
-                                window.mediaResult = 'unexpected-grant';
+                                window.mediaStream = stream;
+                                window.mediaResult = 'granted';
                               }, error => { window.mediaResult = error.name; });
                             };
+                            window.stopMedia = () => {
+                              window.mediaStream?.getTracks().forEach(track => track.stop());
+                            };
+                            addEventListener('pagehide', window.stopMedia);
                         </script>""".trimIndent()
                         return WebResourceResponse("text/html", "utf-8", 200, "OK", emptyMap(),
                             ByteArrayInputStream(html.toByteArray(Charsets.UTF_8)))
@@ -123,19 +129,20 @@ class MediaPermissionActivityTest {
         fail("Origin-named site permission button did not appear: $text")
     }
 
-    private fun denyAndroidPermission(view: WebView) {
+    private fun answerAndroidPermission(view: WebView, allow: Boolean) {
+        val resource = if (allow) "permission_allow_foreground_only_button" else "permission_deny_button"
         val deadline = SystemClock.elapsedRealtime() + 15_000L
         while (SystemClock.elapsedRealtime() < deadline) {
             val tree = instrumentation.uiAutomation.rootInActiveWindow
             val owner = tree?.packageName?.toString()
             if (tree != null && (owner == "com.google.android.permissioncontroller" || owner == "com.android.permissioncontroller")) {
                 val button = listOf("com.android.permissioncontroller", "com.google.android.permissioncontroller")
-                    .flatMap { tree.findAccessibilityNodeInfosByViewId("$it:id/permission_deny_button") }
+                    .flatMap { tree.findAccessibilityNodeInfosByViewId("$it:id/$resource") }
                     .firstOrNull { it.isClickable && it.isEnabled }
                 if (button != null) {
                     assertEquals("Site consent must wait for Android's answer before settling getUserMedia",
                         "\"pending\"", evaluate(view, "window.mediaResult"))
-                    assertTrue("Android denial button did not accept click", button.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+                    assertTrue("Android permission button did not accept click: $resource", button.performAction(AccessibilityNodeInfo.ACTION_CLICK))
                     return
                 }
             }
@@ -144,26 +151,29 @@ class MediaPermissionActivityTest {
         fail("The real Android permission dialog did not appear after site consent")
     }
 
-    private fun awaitDenial(view: WebView) {
+    private fun awaitMediaResult(view: WebView, expected: String) {
         val deadline = SystemClock.elapsedRealtime() + 15_000L
         while (SystemClock.elapsedRealtime() < deadline) {
             val result = evaluate(view, "window.mediaResult")
             if (result != "\"pending\"") {
-                assertEquals("Actual getUserMedia must reject after denial", "\"NotAllowedError\"", result)
+                assertEquals("Actual getUserMedia must reflect the native permission answer", "\"$expected\"", result)
                 return
             }
             SystemClock.sleep(100)
         }
-        fail("getUserMedia did not settle after native denial")
+        fail("getUserMedia did not settle after the native answer: $expected")
     }
 
     @Test
-    fun webViewSiteConsentAndAndroidDenialReturnToTheSameScreen() {
+    fun webViewMediaConsentRequiresSiteAndAndroidAndStopsCapture() {
         assertEquals("This fixture must start without an OS microphone grant", PackageManager.PERMISSION_DENIED,
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
         val profile = UUID.randomUUID().toString()
         val key = ScreenRequest.webHomeKey(root, profile)
         val request = ScreenRequest(key, root, "Media fixture", webHome = true, profile = profile, scope = key)
+        val otherProfile = UUID.randomUUID().toString()
+        val otherKey = ScreenRequest.webHomeKey(root, otherProfile)
+        val otherRequest = ScreenRequest(otherKey, root, "Other media fixture", webHome = true, profile = otherProfile, scope = otherKey)
         val automation = instrumentation.uiAutomation
         val originalFlags = automation.serviceInfo.flags
         automation.serviceInfo = automation.serviceInfo.apply { flags = flags or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS }
@@ -173,7 +183,7 @@ class MediaPermissionActivityTest {
                 document(entry)
                 evaluate(entry.webView, "window.askForMicrophone()")
                 clickSiteButton(entry.webView, "許可しない")
-                awaitDenial(entry.webView)
+                awaitMediaResult(entry.webView, "NotAllowedError")
                 assertEquals(PackageManager.PERMISSION_DENIED, context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
 
                 // A fresh native document does not reuse any WebView-cached
@@ -181,8 +191,8 @@ class MediaPermissionActivityTest {
                 document(entry)
                 evaluate(entry.webView, "window.askForMicrophone()")
                 clickSiteButton(entry.webView, "許可")
-                denyAndroidPermission(entry.webView)
-                awaitDenial(entry.webView)
+                answerAndroidPermission(entry.webView, allow = false)
+                awaitMediaResult(entry.webView, "NotAllowedError")
                 instrumentation.waitForIdleSync()
                 assertEquals(Lifecycle.State.RESUMED, scenario.state)
                 main {
@@ -191,10 +201,54 @@ class MediaPermissionActivityTest {
                     assertEquals(profile, entry.profile)
                 }
                 assertEquals(PackageManager.PERMISSION_DENIED, context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
+
+                document(entry)
+                evaluate(entry.webView, "window.askForMicrophone()")
+                clickSiteButton(entry.webView, "許可")
+                answerAndroidPermission(entry.webView, allow = true)
+                awaitMediaResult(entry.webView, "granted")
+                assertEquals(PackageManager.PERMISSION_GRANTED, context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
+                instrumentation.waitForIdleSync()
+                assertEquals(Lifecycle.State.RESUMED, scenario.state)
+                try {
+                    val live = JSONObject(requireNotNull(evaluate(entry.webView, """(() => {
+                        const stream = window.mediaStream;
+                        const tracks = stream.getTracks();
+                        return {active:stream.active, audio:stream.getAudioTracks().length,
+                          video:stream.getVideoTracks().length,
+                          live:tracks.every(track => track.readyState === 'live' && track.enabled)};
+                    })()""")))
+                    assertTrue("The native stream must be active", live.getBoolean("active"))
+                    assertEquals(1, live.getInt("audio"))
+                    assertEquals(0, live.getInt("video"))
+                    assertTrue("The native audio track must be live and enabled", live.getBoolean("live"))
+                } finally {
+                    evaluate(entry.webView, "window.stopMedia()")
+                }
+                val stopped = JSONObject(requireNotNull(evaluate(entry.webView, """(() => {
+                    const stream = window.mediaStream;
+                    return {active:stream.active, ended:stream.getTracks().every(track => track.readyState === 'ended')};
+                })()""")))
+                assertFalse(stopped.getBoolean("active"))
+                assertTrue("Stopping the stream must end its actual native tracks", stopped.getBoolean("ended"))
+            }
+
+            // OS consent belongs to the App, but it must not become a site
+            // grant in a different profile, even at the exact same origin.
+            ActivityScenario.launch<AppScreenActivity>(AppScreenLaunch.documentIntent(context, otherRequest)).use { scenario ->
+                val entry = main { requireNotNull(AppScreenRegistry.get(otherKey)) }
+                assertEquals(PackageManager.PERMISSION_GRANTED, context.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
+                document(entry)
+                evaluate(entry.webView, "window.askForMicrophone()")
+                clickSiteButton(entry.webView, "許可しない")
+                awaitMediaResult(entry.webView, "NotAllowedError")
+                instrumentation.waitForIdleSync()
+                assertEquals(Lifecycle.State.RESUMED, scenario.state)
+                main { assertEquals(otherProfile, entry.profile) }
             }
         } finally {
             automation.serviceInfo = automation.serviceInfo.apply { flags = originalFlags }
-            main { AppScreenRegistry.remove(key) }
+            main { AppScreenRegistry.remove(key); AppScreenRegistry.remove(otherKey) }
         }
     }
 }

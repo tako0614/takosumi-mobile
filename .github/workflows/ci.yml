@@ -189,6 +189,22 @@ jobs:
           export ANDROID_AVD_HOME="$RUNNER_TEMP/sumi-avd"
           mkdir -p "$ANDROID_AVD_HOME"
           echo no | avdmanager create avd --name sumi-profiles --package "system-images;android-36;google_apis;x86_64" --force
+          # Guest audio input is emulated by the no-audio backend. Keep host
+          # capture disabled; the media test checks stream lifetime, not sound.
+          python3 - <<'PY'
+          import os, pathlib
+          config = pathlib.Path(os.environ['ANDROID_AVD_HOME']) / 'sumi-profiles.avd/config.ini'
+          lines = config.read_text().splitlines()
+          audio = [i for i, line in enumerate(lines) if line.split('=', 1)[0].strip() == 'hw.audioInput']
+          assert len(audio) <= 1, 'Ambiguous owned AVD audio input setting'
+          if audio:
+              lines[audio[0]] = 'hw.audioInput=yes'
+          else:
+              lines.append('hw.audioInput=yes')
+          config.write_text('\n'.join(lines) + '\n')
+          assert config.read_text().splitlines().count('hw.audioInput=yes') == 1
+          print('Owned AVD guest audio input: yes; host audio remains disabled')
+          PY
           "$ANDROID_HOME/emulator/emulator" -version
           "$ANDROID_HOME/emulator/emulator" -list-avds
           df -h "$ANDROID_HOME" "$RUNNER_TEMP"
@@ -214,6 +230,10 @@ jobs:
           adb shell input keyevent 82
           adb shell getprop ro.build.version.sdk
           adb shell dumpsys webviewupdate
+          # This is a setter acknowledgement, not a host-mic state readback.
+          # Never opt in with -allow-host-audio or avd hostmicon.
+          emulator_audio_ack="$(adb emu avd hostmicoff | tr -d '\r')"
+          test "$emulator_audio_ack" = OK || { printf '%s\n' "$emulator_audio_ack"; exit 1; }
           gradle --project-dir native-tests/android :app-screen:connectedDebugAndroidTest
           python3 - <<'PY'
           import pathlib, xml.etree.ElementTree as E
@@ -231,7 +251,7 @@ jobs:
           required = {
               ('com.takosumi.appscreen.ProfileIsolationTest', 'clearingAnIdleProfileWaitsForCompletionAndPreservesOtherProfiles'),
               ('com.takosumi.appscreen.ProfileResetActivityTest', 'completedResetDropsAnEvictedActivityUrlAndPreResetSavedState'),
-              ('com.takosumi.appscreen.MediaPermissionActivityTest', 'webViewSiteConsentAndAndroidDenialReturnToTheSameScreen'),
+              ('com.takosumi.appscreen.MediaPermissionActivityTest', 'webViewMediaConsentRequiresSiteAndAndroidAndStopsCapture'),
           }
           assert required <= actual_cases, f'Missing actual profile/media controls: {required - actual_cases}'
           assert tests >= 5 and failures == 0 and skipped == 0

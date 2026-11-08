@@ -345,10 +345,22 @@ WebView and Activity, without substituting the WebChromeClient. It requires the
 origin-named site prompt, observes a still-pending `getUserMedia` request before
 site denial, then opens a new document and accepts the site prompt. The real
 Android permission UI must appear while the request is still pending; OS denial
-must reject it and return to the same resumed screen. Missing dialogs, skipped
-tests or an early rejection cannot qualify this path. This control does not
-grant OS permission or qualify recording, camera capture, background capture,
-cross-origin iframe permission or other Android/OEM versions.
+must reject it and return to the same resumed screen. The same scenario then
+explicitly allows the OS prompt and requires one live, enabled native audio
+track, no video track, and an inactive stream with ended tracks after stopping.
+A fresh profile at the same origin must still show the site prompt despite the
+app-wide OS grant, and its denial must reject the request. Missing dialogs,
+skipped tests, early rejection or early grant cannot qualify these paths.
+
+The disposable CI AVD explicitly enables guest audio input and retains
+`-no-audio`. The [upstream noaudio input backend](https://android.googlesource.com/platform/external/qemu/+/emu-master-dev/audio/noaudio.c#87)
+supplies silence; the runner's actual stream result is still required. Host
+audio is never enabled, and the [documented `adb emu avd hostmicoff` command](https://developer.android.com/studio/releases/emulator)
+must acknowledge `OK` before testing.
+That acknowledgment is not an independent host-mic state readback. The probe
+checks the emulated stream's lifecycle, without recording or inspecting samples.
+It does not qualify physical microphone quality, camera capture, background
+capture, cross-origin iframe permission or other Android/OEM versions.
 
 The profile-reset instrumentation requires both `MULTI_PROFILE` and
 `DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
