@@ -2142,7 +2142,12 @@ drop guard, a non-panicking log line), that unreadable stopped processes
 are still killed, the kill goes leaves first, forks reported after the
 freeze are looked at (or make the run incomplete), a reused parent pid
 pulls in no children, base's macOS socket template, and two test
-hardenings; that revision has not run on macOS yet. This Linux host type-checks and lints everything for `aarch64-apple-darwin`
+hardenings. That revision passed in `bc9fd69`'s
+[CI run 42400222011](https://github.com/tako0614/takosumi-mobile/actions/runs/42400222011):
+9/9 jobs, fourteen guard self-tests and six adapter tests. The App-death
+case reported `rootExit: -9`, a complete receipt, no remaining process and
+no cleanup errors. These are runner/component results, not an actual macOS
+App UI or real-device qualification. This Linux host type-checks and lints everything for `aarch64-apple-darwin`
 (`cargo clippy`): the guard and its self-tests, the browser and the helper
 (`cef/dox`), the app-screen plugin with `desktop-process-experiment` (with
 and without `fixture-overrides`) and the App with `desktop-cef`

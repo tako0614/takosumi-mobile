@@ -1,146 +1,234 @@
-//! A connection view's first navigation on Linux (WebKitGTK).
+//! Recover only a new connection view's vanished first navigation on GTK.
 //!
-//! WebKitGTK has been seen (in about a third of the GTK fixture's CI runs)
-//! to start a new view's initial navigation (`load-changed` Started) and
-//! then drop it: no Committed, no load failure, no web-process termination,
-//! the view no longer loading and its URI empty, so the connection's screen
-//! would stay blank. Such a vanished initial navigation is issued again,
-//! exactly once per view. A real load failure keeps WebKit's error page and
-//! is never retried, and once the initial navigation has committed, failed,
-//! been retried or its web process ended, nothing here acts again: later
-//! navigations are never touched.
+//! Some GTK fixture runs report Started, then an empty, idle view without
+//! Committed, Finished, failure or process termination. Retry that case once.
+//! Loading/URI notifications also occur during real failures: never call
+//! load_uri from those notifications. Sample only on the main-loop timer,
+//! require two consecutive empty samples, and retire on any resolution,
+//! redirect, other navigation, destruction or the one-minute deadline.
 
-use gtk::glib::{self, prelude::ObjectExt};
-use std::{cell::Cell, rc::Rc, time::Duration};
+use gtk::{
+    glib::{self, prelude::ObjectExt, SignalHandlerId, SourceId},
+    prelude::WidgetExt,
+};
+use std::{cell::RefCell, rc::Rc, time::Duration, time::Instant};
 use webkit2gtk::{LoadEvent, WebViewExt};
 
-/// How often the view is looked at until its initial navigation resolves,
-/// besides every change of its loading state.
 const TICK: Duration = Duration::from_millis(250);
-/// The most looks (one minute): a view still loading after that is left
-/// alone.
-const MAX_TICKS: u32 = 240;
+const MAX_AGE: Duration = Duration::from_secs(60);
 
-/// What the view's initial navigation has done so far.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
+enum Event<'a> {
+    Started(Option<&'a str>),
+    Resolved,
+    Tick { loading: bool, uri: Option<&'a str> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Watch,
+    Stop,
+    Retry,
+}
+
+#[derive(Debug, Default)]
 struct InitialLoad {
     started: bool,
-    committed: bool,
-    failed: bool,
-    terminated: bool,
-    retried: bool,
+    empty_ticks: u8,
+    stopped: bool,
 }
 
 impl InitialLoad {
-    /// Committed, failed, retried or its web process ended: nothing more to
-    /// watch.
-    fn resolved(self) -> bool {
-        self.committed || self.failed || self.terminated || self.retried
+    fn step(&mut self, event: Event<'_>, elapsed: Duration, target: &str) -> Action {
+        if self.stopped || elapsed >= MAX_AGE {
+            return self.stop(Action::Stop);
+        }
+        match event {
+            Event::Resolved => self.stop(Action::Stop),
+            // WebKit sets the URI before emitting Started. An absent or
+            // different URI cannot be bound to our first load; leave it alone.
+            Event::Started(uri) => {
+                if self.started || !uri.is_some_and(|uri| same_page(uri, target)) {
+                    return self.stop(Action::Stop);
+                }
+                self.started = true;
+                Action::Watch
+            }
+            Event::Tick { loading, uri } => {
+                // Never restore the original URL over a redirect or another
+                // navigation (including about:blank and unparseable URLs).
+                if uri.is_some_and(|uri| !uri.is_empty() && !same_page(uri, target)) {
+                    return self.stop(Action::Stop);
+                }
+                if self.started && !loading && uri.is_none_or(str::is_empty) {
+                    self.empty_ticks += 1;
+                    if self.empty_ticks == 2 {
+                        // Retire before load_uri: nested signals cannot
+                        // initiate another retry or reconnect the watcher.
+                        return self.stop(Action::Retry);
+                    }
+                } else {
+                    self.empty_ticks = 0;
+                }
+                Action::Watch
+            }
+        }
+    }
+
+    fn stop(&mut self, action: Action) -> Action {
+        self.stopped = true;
+        action
     }
 }
 
-/// Whether the initial navigation vanished: it started, then nothing
-/// followed (no commit, no failure, no web-process termination), and the
-/// view is no longer loading with its URI empty or not the target. Never
-/// after a retry.
-fn vanished(state: InitialLoad, loading: bool, uri: Option<&str>, target: &str) -> bool {
-    state.started
-        && !state.resolved()
-        && !loading
-        && uri.is_none_or(|uri| uri.is_empty() || !same_page(uri, target))
-}
-
-/// The same URL, compared as parsed URLs (WebKit reports a normalized one).
 fn same_page(uri: &str, target: &str) -> bool {
     match (tauri::Url::parse(uri), tauri::Url::parse(target)) {
         (Ok(uri), Ok(target)) => uri == target,
-        _ => uri == target,
+        _ => false,
     }
 }
 
-/// Watch a new connection view's initial navigation to `target`. Call it
-/// before that load is issued, so its Started is seen.
-pub(super) fn watch(view: &webkit2gtk::WebView, label: &str, target: &str) {
-    let state = Rc::new(Cell::new(InitialLoad::default()));
-    let update = |state: &Rc<Cell<InitialLoad>>, change: fn(&mut InitialLoad)| {
-        let mut now = state.get();
-        change(&mut now);
-        state.set(now);
-    };
-    {
-        let state = state.clone();
-        view.connect_load_changed(move |_, event| match event {
-            LoadEvent::Started => update(&state, |now| now.started = true),
-            LoadEvent::Committed => update(&state, |now| now.committed = true),
-            _ => {}
-        });
-    }
-    {
-        let state = state.clone();
-        // WebKit's own handling (its error page) still runs.
-        view.connect_load_failed(move |_, _, _, _| {
-            update(&state, |now| now.failed = true);
-            false
-        });
-    }
-    {
-        let state = state.clone();
-        view.connect_load_failed_with_tls_errors(move |_, _, _, _| {
-            update(&state, |now| now.failed = true);
-            false
-        });
-    }
-    {
-        let state = state.clone();
-        view.connect_web_process_terminated(move |_, _| {
-            update(&state, |now| now.terminated = true);
-        });
-    }
-    {
-        let (state, label, target) = (state.clone(), label.to_owned(), target.to_owned());
-        view.connect_is_loading_notify(move |view| look(view, &state, &label, &target));
-    }
-    let weak = view.downgrade();
-    let (label, target) = (label.to_owned(), target.to_owned());
-    let mut ticks = 0;
-    glib::timeout_add_local(TICK, move || {
-        ticks += 1;
-        let Some(view) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        look(&view, &state, &label, &target);
-        if state.get().resolved() || ticks >= MAX_TICKS {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
+struct Watch {
+    state: InitialLoad,
+    began: Instant,
+    target: String,
+    label: String,
+    handlers: Vec<SignalHandlerId>,
+    source: Option<SourceId>,
+}
+
+/// All callbacks share this path. Disconnect before any potentially reentrant
+/// call, with no RefCell borrow held. The active timer returns Break instead of
+/// removing itself; a signal removes the pending timer immediately.
+fn observe(
+    view: &webkit2gtk::WebView,
+    watch: &RefCell<Watch>,
+    event: Event<'_>,
+) -> glib::ControlFlow {
+    let from_tick = matches!(event, Event::Tick { .. });
+    let (action, handlers, source, target, label) = {
+        let mut watch = watch.borrow_mut();
+        let Watch {
+            state,
+            began,
+            target,
+            ..
+        } = &mut *watch;
+        let action = state.step(event, began.elapsed(), target);
+        if action == Action::Watch {
+            return glib::ControlFlow::Continue;
         }
-    });
+        (
+            action,
+            std::mem::take(&mut watch.handlers),
+            watch.source.take(),
+            watch.target.clone(),
+            watch.label.clone(),
+        )
+    };
+    for handler in handlers {
+        view.disconnect(handler);
+    }
+    if let Some(source) = source {
+        if !from_tick {
+            source.remove();
+        }
+    }
+    if action == Action::Retry {
+        #[cfg(feature = "desktop-fixture")]
+        super::note_fixture_view(
+            &label,
+            format!(
+                "event=initial-load-retried vanished_uri={:?} loading=false target={target}",
+                view.uri()
+            ),
+        );
+        #[cfg(not(feature = "desktop-fixture"))]
+        {
+            let _ = label;
+            eprintln!(
+                "Takosumi: a connection's first navigation stayed empty without a completion event; retrying once."
+            );
+        }
+        view.load_uri(&target);
+    }
+    glib::ControlFlow::Break
 }
 
-/// Issue the initial load once more if it vanished.
-fn look(view: &webkit2gtk::WebView, state: &Cell<InitialLoad>, label: &str, target: &str) {
-    let now = state.get();
-    let uri = view.uri();
-    if !vanished(now, view.is_loading(), uri.as_deref(), target) {
-        return;
-    }
-    state.set(InitialLoad {
-        retried: true,
-        ..now
-    });
-    #[cfg(feature = "desktop-fixture")]
-    super::note_fixture_view(
-        label,
-        format!("event=initial-load-retried vanished_uri={uri:?} loading=false target={target}"),
-    );
-    #[cfg(not(feature = "desktop-fixture"))]
+/// Install immediately before issuing a new connection view's first load.
+/// No handler owns the view. Resolution/expiry disconnects every handler and
+/// removes the timer; widget destruction retires it even before final unref.
+pub(super) fn watch(view: &webkit2gtk::WebView, label: &str, target: &str) {
+    let watch = Rc::new(RefCell::new(Watch {
+        state: InitialLoad::default(),
+        began: Instant::now(),
+        target: target.to_owned(),
+        label: label.to_owned(),
+        handlers: Vec::new(),
+        source: None,
+    }));
+    let mut handlers = Vec::new();
     {
-        let _ = label;
-        eprintln!(
-            "Takosumi: a connection's first page load ended without loading or failing; loading it once more."
+        let watch = watch.clone();
+        handlers.push(view.connect_load_changed(move |view, event| {
+            let uri = view.uri();
+            let event = match event {
+                LoadEvent::Started => Event::Started(uri.as_deref()),
+                LoadEvent::Redirected | LoadEvent::Committed | LoadEvent::Finished => {
+                    Event::Resolved
+                }
+                _ => return,
+            };
+            observe(view, &watch, event);
+        }));
+    }
+    {
+        let watch = watch.clone();
+        handlers.push(view.connect_load_failed(move |view, _, _, _| {
+            observe(view, &watch, Event::Resolved);
+            false // Keep WebKit's own error handling.
+        }));
+    }
+    {
+        let watch = watch.clone();
+        handlers.push(
+            view.connect_load_failed_with_tls_errors(move |view, _, _, _| {
+                observe(view, &watch, Event::Resolved);
+                false
+            }),
         );
     }
-    view.load_uri(target);
+    {
+        let watch = watch.clone();
+        handlers.push(view.connect_web_process_terminated(move |view, _| {
+            observe(view, &watch, Event::Resolved);
+        }));
+    }
+    {
+        let watch = watch.clone();
+        handlers.push(view.connect_destroy(move |view| {
+            observe(view, &watch, Event::Resolved);
+        }));
+    }
+    watch.borrow_mut().handlers = handlers;
+    let weak = view.downgrade();
+    let timed_watch = watch.clone();
+    let source = glib::timeout_add_local(TICK, move || {
+        let Some(view) = weak.upgrade() else {
+            timed_watch.borrow_mut().source.take();
+            return glib::ControlFlow::Break;
+        };
+        let uri = view.uri();
+        observe(
+            &view,
+            &timed_watch,
+            Event::Tick {
+                loading: view.is_loading(),
+                uri: uri.as_deref(),
+            },
+        )
+    });
+    watch.borrow_mut().source = Some(source);
 }
 
 #[cfg(test)]
@@ -148,65 +236,157 @@ mod tests {
     use super::*;
 
     const TARGET: &str = "https://example.com/";
+    const EMPTY: Event<'_> = Event::Tick {
+        loading: false,
+        uri: Some(""),
+    };
+
+    fn step(state: &mut InitialLoad, event: Event<'_>) -> Action {
+        state.step(event, TICK, TARGET)
+    }
 
     fn started() -> InitialLoad {
-        InitialLoad {
-            started: true,
-            ..InitialLoad::default()
+        let mut state = InitialLoad::default();
+        assert_eq!(
+            step(&mut state, Event::Started(Some(TARGET))),
+            Action::Watch
+        );
+        state
+    }
+
+    #[test]
+    fn a_single_idle_observation_does_not_retry_before_failure_signals() {
+        let mut state = started();
+        // notify::is-loading does not drive the reducer at all. Even if one
+        // tick intervenes, load-failed/TLS/Finished retires before retry.
+        assert_eq!(step(&mut state, EMPTY), Action::Watch);
+        assert_eq!(step(&mut state, Event::Resolved), Action::Stop);
+        assert_eq!(step(&mut state, Event::Resolved), Action::Stop); // Finished
+        assert_eq!(step(&mut state, EMPTY), Action::Stop);
+    }
+
+    #[test]
+    fn a_started_navigation_that_vanished_is_retried_once() {
+        let mut state = started();
+        assert_eq!(step(&mut state, EMPTY), Action::Watch);
+        assert_eq!(step(&mut state, EMPTY), Action::Retry);
+        // Includes nested Started and later timer callbacks after load_uri.
+        assert_eq!(step(&mut state, Event::Started(Some(TARGET))), Action::Stop);
+        assert_eq!(step(&mut state, EMPTY), Action::Stop);
+        assert_eq!(step(&mut state, EMPTY), Action::Stop);
+    }
+
+    #[test]
+    fn another_navigation_must_not_be_replaced_with_the_initial_target() {
+        for uri in [
+            "https://other.example/",
+            "https://example.com/other",
+            "about:blank",
+            "invalid URI",
+        ] {
+            let mut state = started();
+            assert_eq!(step(&mut state, EMPTY), Action::Watch);
+            assert_eq!(
+                step(
+                    &mut state,
+                    Event::Tick {
+                        loading: false,
+                        uri: Some(uri)
+                    }
+                ),
+                Action::Stop
+            );
+            assert_eq!(step(&mut state, EMPTY), Action::Stop);
         }
     }
 
     #[test]
-    fn a_started_navigation_that_vanished_is_retried() {
-        assert!(vanished(started(), false, Some(""), TARGET));
-        assert!(vanished(started(), false, None, TARGET));
-        assert!(vanished(started(), false, Some("about:blank"), TARGET));
+    fn failure_finished_commit_redirect_and_termination_are_terminal() {
+        // Each corresponding signal maps to Resolved, even without Started.
+        for mut state in [InitialLoad::default(), started()] {
+            assert_eq!(step(&mut state, Event::Resolved), Action::Stop);
+            assert_eq!(step(&mut state, Event::Started(Some(TARGET))), Action::Stop);
+            assert_eq!(step(&mut state, EMPTY), Action::Stop);
+            assert_eq!(step(&mut state, EMPTY), Action::Stop);
+        }
     }
 
     #[test]
-    fn a_committed_navigation_is_not_retried() {
-        let committed = InitialLoad {
-            committed: true,
-            ..started()
-        };
-        assert!(!vanished(committed, false, Some(""), TARGET));
+    fn expiry_is_terminal_for_ticks_and_signals() {
+        for event in [EMPTY, Event::Started(Some(TARGET))] {
+            let mut state = started();
+            assert_eq!(step(&mut state, EMPTY), Action::Watch);
+            assert_eq!(state.step(event, MAX_AGE, TARGET), Action::Stop);
+            assert_eq!(step(&mut state, Event::Started(Some(TARGET))), Action::Stop);
+            assert_eq!(step(&mut state, EMPTY), Action::Stop);
+        }
     }
 
     #[test]
-    fn a_failed_navigation_keeps_its_error_page() {
-        let failed = InitialLoad {
-            failed: true,
-            ..started()
-        };
-        assert!(!vanished(failed, false, Some(""), TARGET));
+    fn only_consecutive_empty_idle_ticks_count() {
+        for event in [
+            Event::Tick {
+                loading: true,
+                uri: None,
+            },
+            Event::Tick {
+                loading: false,
+                uri: Some(TARGET),
+            },
+        ] {
+            let mut state = started();
+            assert_eq!(step(&mut state, EMPTY), Action::Watch);
+            assert_eq!(step(&mut state, event), Action::Watch);
+            assert_eq!(step(&mut state, EMPTY), Action::Watch);
+            assert_eq!(
+                step(
+                    &mut state,
+                    Event::Tick {
+                        loading: false,
+                        uri: None
+                    }
+                ),
+                Action::Retry
+            );
+        }
     }
 
     #[test]
-    fn a_navigation_is_retried_at_most_once() {
-        let retried = InitialLoad {
-            retried: true,
-            ..started()
-        };
-        assert!(!vanished(retried, false, Some(""), TARGET));
+    fn no_started_event_means_no_retry() {
+        let mut state = InitialLoad::default();
+        for _ in 0..3 {
+            assert_eq!(step(&mut state, EMPTY), Action::Watch);
+        }
+        assert_eq!(state.step(EMPTY, MAX_AGE, TARGET), Action::Stop);
     }
 
     #[test]
-    fn a_loading_unstarted_ended_or_arrived_view_is_left_alone() {
-        // Still loading, never started, its web process ended, or already
-        // showing the target (WebKit's normalized spelling included).
-        assert!(!vanished(started(), true, Some(""), TARGET));
-        assert!(!vanished(InitialLoad::default(), false, Some(""), TARGET));
-        let terminated = InitialLoad {
-            terminated: true,
-            ..started()
-        };
-        assert!(!vanished(terminated, false, Some(""), TARGET));
-        assert!(!vanished(started(), false, Some(TARGET), TARGET));
-        assert!(!vanished(
-            started(),
-            false,
-            Some("https://example.com/"),
-            "https://example.com"
-        ));
+    fn only_the_first_target_navigation_can_be_watched() {
+        for uri in [
+            None,
+            Some(""),
+            Some("https://other.example/"),
+            Some("not a URL"),
+        ] {
+            let mut state = InitialLoad::default();
+            assert_eq!(step(&mut state, Event::Started(uri)), Action::Stop);
+            assert_eq!(step(&mut state, Event::Started(Some(TARGET))), Action::Stop);
+        }
+        let mut state = started();
+        assert_eq!(step(&mut state, EMPTY), Action::Watch);
+        assert_eq!(step(&mut state, Event::Started(Some(TARGET))), Action::Stop);
+        assert_eq!(step(&mut state, EMPTY), Action::Stop);
+    }
+
+    #[test]
+    fn url_normalization_is_allowed_but_parse_failure_is_not_equality() {
+        assert!(same_page("https://example.com", TARGET));
+        assert!(!same_page("not a URL", "not a URL"));
+        assert!(!same_page(TARGET, "not a URL"));
+        let mut state = InitialLoad::default();
+        assert_eq!(
+            state.step(Event::Started(Some("not a URL")), TICK, "not a URL"),
+            Action::Stop
+        );
     }
 }

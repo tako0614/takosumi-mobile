@@ -24,6 +24,16 @@ default Downloads destination and download lifecycle. Direct Blob launch and
 Blob popup creation remain refused. Other platforms' download behavior needs
 separate runtime evidence; this does not select a product engine.
 
+For a new GTK connection view, the first navigation is retried once only if
+it started at the requested URL and two consecutive 250 ms timer samples find
+an idle view with no URI and no completion event. Loading-state notifications
+never issue requests: WebKit can deliver them before a real failure signal.
+Commit, Finished, load/TLS failure, process termination, redirect, another
+navigation or a different nonempty URI ends the watcher. All its signal
+handlers and timer are retired on resolution, destruction or the one-minute
+deadline. This bounded recovery does not establish the cause of the historical
+intermittent blank-screen failures or qualify other engines/platforms.
+
 `capabilities` returns `pinShortcut` and `clearProfile`. The bundled shell
 offers explicit data deletion only when `clearProfile` is true. Its separate
 `clear_profile` command takes `{ profile, key }`; shared profiles, mismatched
