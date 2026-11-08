@@ -4,6 +4,7 @@ import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.AudioManager
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.WebResourceRequest
@@ -65,7 +66,10 @@ class MediaPermissionActivityTest {
                               navigator.mediaDevices.getUserMedia({audio:true}).then(stream => {
                                 window.mediaStream = stream;
                                 window.mediaResult = 'granted';
-                              }, error => { window.mediaResult = error.name; });
+                              }, error => {
+                                window.mediaErrorDetail = String(error.message).slice(0, 256);
+                                window.mediaResult = error.name;
+                              });
                             };
                             window.stopMedia = () => {
                               window.mediaStream?.getTracks().forEach(track => track.stop());
@@ -156,7 +160,13 @@ class MediaPermissionActivityTest {
         while (SystemClock.elapsedRealtime() < deadline) {
             val result = evaluate(view, "window.mediaResult")
             if (result != "\"pending\"") {
-                assertEquals("Actual getUserMedia must reflect the native permission answer", "\"$expected\"", result)
+                if (result != "\"$expected\"") {
+                    val inputs = context.getSystemService(AudioManager::class.java)
+                        .getDevices(AudioManager.GET_DEVICES_INPUTS).map { it.type }.distinct()
+                    val osPermission = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    val detail = evaluate(view, "window.mediaErrorDetail")
+                    fail("Actual getUserMedia expected=$expected result=$result detail=$detail osMicrophone=$osPermission inputTypes=$inputs")
+                }
                 return
             }
             SystemClock.sleep(100)

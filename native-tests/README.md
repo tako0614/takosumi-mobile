@@ -352,13 +352,18 @@ A fresh profile at the same origin must still show the site prompt despite the
 app-wide OS grant, and its denial must reject the request. Missing dialogs,
 skipped tests, early rejection or early grant cannot qualify these paths.
 
-The disposable CI AVD explicitly enables guest audio input and retains
-`-no-audio`. The [upstream noaudio input backend](https://android.googlesource.com/platform/external/qemu/+/emu-master-dev/audio/noaudio.c#87)
-supplies silence; the runner's actual stream result is still required. Host
-audio is never enabled, and the [documented `adb emu avd hostmicoff` command](https://developer.android.com/studio/releases/emulator)
-must acknowledge `OK` before testing.
-That acknowledgment is not an independent host-mic state readback. The probe
-checks the emulated stream's lifecycle, without recording or inspecting samples.
+The disposable CI AVD explicitly enables guest audio input. The first
+`-no-audio` run reached OS allow but rejected capture with `NotReadableError`;
+its cause is not established. The next fixture uses the default audio backend
+without that flag. [QEMU2 forwards `-no-audio` to its disabled driver](https://android.googlesource.com/platform/external/qemu/+/emu-master-dev/android-qemu2-glue/main.cpp#1950);
+zero-filled input in another backend path does not prove WebView can start.
+Host microphone input is never opted in, and the
+[documented `adb emu avd hostmicoff` command](https://developer.android.com/studio/releases/emulator)
+must acknowledge `OK` before testing. That acknowledgment is not an independent
+host-mic state readback. Failures retain bounded audio logcat, the DOM exception
+message and input-device types (no device identifiers or labels). The native
+result remains required: no backend fallback or synthetic WebView grant is
+used. The probe checks stream lifecycle without recording or inspecting samples.
 It does not qualify physical microphone quality, camera capture, background
 capture, cross-origin iframe permission or other Android/OEM versions.
 
