@@ -279,8 +279,29 @@ public final class WebAppOperationTest {
             return false;
         }, 15);
         assertEquals(0, activity.fileSelections);
-        tap(bounds(inputName, false, false));
-        await("Original file prompt did not receive the OS answer", () -> activity.fileSelections == 1, 15);
+        // A row can be visible before it accepts input while the picker is
+        // still settling after a view-mode switch: a lone tap inside that
+        // window is lost without any picker-side error. Allow bounded
+        // spaced re-taps only while the picker still shows the owned
+        // filename unselected, tracing each attempt for the run's
+        // evidence. The preview icon is a different node and never the
+        // tap target.
+        int[] inputTaps = {0};
+        long[] lastInputTap = {0};
+        await("Original file prompt did not receive the OS answer", () -> {
+            if (activity.fileSelections == 1) return true;
+            if (!picker()) return false;
+            Rect file = bounds(inputName, false, false);
+            if (file == null) return false;
+            long now = SystemClock.elapsedRealtime();
+            if (inputTaps[0] < 3 && now - lastInputTap[0] >= 2000) {
+                inputTaps[0]++;
+                lastInputTap[0] = now;
+                activity.trace("input tap attempt=" + inputTaps[0] + " " + file.toShortString());
+                tap(file);
+            }
+            return false;
+        }, 30);
         assertEquals(activity.work, activity.inputContext);
     }
 
