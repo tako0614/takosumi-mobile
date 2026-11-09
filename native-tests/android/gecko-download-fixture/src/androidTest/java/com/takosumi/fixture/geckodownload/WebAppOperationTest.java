@@ -92,6 +92,54 @@ public final class WebAppOperationTest {
         try { return find(root, text, contains, description, visibleOnly, 0); } finally { root.recycle(); }
     }
 
+    // Text-match-only lookup with the interactive enabled/visible gates
+    // bypassed: distinguishes a rendered-but-flagged node from one that is
+    // genuinely absent from the a11y snapshot.
+    private AccessibilityNodeInfo findAny(AccessibilityNodeInfo node, String text, int depth) {
+        if (depth > 24) return null;
+        CharSequence raw = node.getText();
+        if (raw != null && raw.toString().contains(text)) {
+            Rect b = new Rect(); node.getBoundsInScreen(b);
+            if (!b.isEmpty()) return node;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child == null) continue;
+            AccessibilityNodeInfo found;
+            try {
+                found = findAny(child, text, depth + 1);
+            } catch (RuntimeException | Error failure) {
+                child.recycle();
+                throw failure;
+            }
+            if (found == null) { child.recycle(); continue; }
+            // A match returns the matching object itself; when that is the
+            // child, recycling it here would hand the caller a dead node.
+            if (found != child) child.recycle();
+            return found;
+        }
+        return null;
+    }
+
+    // One a11y snapshot answering three hypotheses for a named node: which
+    // package owns the active window (a dead picker's stale root blocks every
+    // bounds read), whether the node exists at all, and if present whether
+    // the interactive enabled/visibleToUser gates would see it.
+    private String nodeState(String text) {
+        AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+        if (root == null) return "no-root";
+        try {
+            String pkg = String.valueOf(root.getPackageName());
+            AccessibilityNodeInfo hit = findAny(root, text, 0);
+            if (hit == null) return pkg + " absent";
+            try {
+                Rect b = new Rect(); hit.getBoundsInScreen(b);
+                return pkg + " " + (hit.isEnabled() ? "enabled" : "disabled") +
+                    "/" + (hit.isVisibleToUser() ? "visible" : "invisible") + " " + b.toShortString();
+            } finally { if (hit != root) hit.recycle(); }
+        } finally { root.recycle(); }
+    }
+
     private void tap(Rect bounds) {
         tap(bounds, null);
     }
@@ -335,7 +383,9 @@ public final class WebAppOperationTest {
         return new Rect(x, y, x + 2, y + 2);
     }
 
-    private void chooseInput() {
+    // Returns the elapsedRealtime at which the OS answer was observed, so the
+    // post-open await can measure tab appearance from the file confirm itself.
+    private long chooseInput() {
         openDownloads();
         boolean[] listViewRequested = {false};
         await("OS picker did not show exact owned image", () -> {
@@ -365,8 +415,9 @@ public final class WebAppOperationTest {
         // tap target.
         int[] inputTaps = {0};
         long[] lastInputTap = {0};
+        long[] confirmedAt = {0};
         await("Original file prompt did not receive the OS answer", () -> {
-            if (activity.fileSelections == 1) return true;
+            if (activity.fileSelections == 1) { confirmedAt[0] = SystemClock.elapsedRealtime(); return true; }
             if (!picker()) return false;
             Rect file = itemBounds();
             if (file == null) return false;
@@ -380,6 +431,7 @@ public final class WebAppOperationTest {
             return false;
         }, 30);
         assertEquals(activity.work, activity.inputContext);
+        return confirmedAt[0];
     }
 
     private void saveOutput() {
@@ -510,8 +562,22 @@ public final class WebAppOperationTest {
                     () -> stable("open-retry", bounds(openAction, false, false)), 15), openAction);
             }
         }
-        chooseInput();
-        await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
+        long fileConfirmedAt = chooseInput();
+        String[] lastNodeState = {null};
+        await("The actual editor did not open the selected image", () -> {
+            // Classify the tab node each poll, tracing only transitions: a
+            // persistent dead-picker package invalidates every bounds read,
+            // an invisible/disabled node is a flag miss, and absence until
+            // the deadline is honest lateness — kept distinguishable without
+            // weakening the visible+enabled oracle. Times are elapsed since
+            // the OS file confirm, matching the parent's discrimination ask.
+            String state = nodeState(tabName);
+            if (!state.equals(lastNodeState[0])) {
+                lastNodeState[0] = state;
+                activity.trace("open-await t=+" + (SystemClock.elapsedRealtime() - fileConfirmedAt) + "ms " + state);
+            }
+            return !picker() && bounds(tabName, true, false) != null;
+        }, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);
         assertNotNull(work);
         int document = work.generation;
@@ -594,6 +660,7 @@ public final class WebAppOperationTest {
         if (node.isSelected()) out.append(",selected");
         if (node.isFocused()) out.append(",focused");
         if (!node.isEnabled()) out.append(",disabled");
+        if (!node.isVisibleToUser()) out.append(",invisible");
         return out.length() == 0 ? "" : " flags=" + out.substring(1);
     }
 
