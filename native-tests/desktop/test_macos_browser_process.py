@@ -165,7 +165,7 @@ class EvidenceTests(unittest.TestCase):
             def sample(args, **options):
                 self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
                 self.assertEqual(args[4:6], ["-mayDie", "-file"])
-                self.assertEqual(options["timeout"], 5)
+                self.assertEqual(options["timeout"], 7)
                 Path(args[-1]).write_bytes(b"x" * 33)
                 return mock.Mock(returncode=0)
             with mock.patch.object(sampler, "LIMIT", 32), \
@@ -186,7 +186,7 @@ class EvidenceTests(unittest.TestCase):
                 with self.subTest(changed_identity=changed):
                     output = Path(directory) / f"sample-{changed}.log"
                     def sample(args, **options):
-                        self.assertEqual(options["timeout"], 5)
+                        self.assertEqual(options["timeout"], 7)
                         Path(args[-1]).write_bytes(b"s" * 33)
                         options["stderr"].write(b"e" * 17)
                         if changed:

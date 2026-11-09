@@ -82,11 +82,13 @@ def sample_owned(processes, child, parent, browser, guard, output):
                     # under that watchdog's window (pending detection plus this
                     # limit ends before the kill) but lets symbol grab, the one
                     # second sample and the report write finish on a CEF-sized
-                    # binary, which three seconds did not.
+                    # binary. Three and five seconds both expired before the
+                    # report; seven keeps detection (~+2 s) plus this limit
+                    # inside the watchdog's ~ten seconds.
                     completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100",
                                                 "-mayDie", "-file", str(raw)],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                               stderr=stderr, timeout=5, check=False)
+                                               stderr=stderr, timeout=7, check=False)
                     result["sampleExit"] = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
