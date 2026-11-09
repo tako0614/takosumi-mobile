@@ -191,6 +191,16 @@ Its small host compiles the product coordinator, navigator, policy and download
 owner directly; only the unused Tauri shell signal is replaced with a refusal.
 The existing desktop macOS CI job runs it after the whole App SDK build.
 
+The disposable host supplies an explicit `Info.plist` with Boolean file-sharing
+and opening-in-place keys, merged with Xcode's generated bundle fields. XCTest
+records and requires the installed bundle's two flags, `Download Fixture`
+display name, and owned `Documents/keep.txt` before opening the first Web page.
+This addresses an unverified configuration boundary from 791d830, where the
+real Files picker opened but showed `On My iPhone is Empty`; the old built
+bundle's flags were not retained. It changes only the fixture, not the product's
+document-sharing policy. The actual folder, final Save tap and exported bytes
+remain required; the configuration readback alone cannot qualify an export.
+
 The actual XCTest uses visible links, a fixture session cookie, the native Save
 prompt and the OS Save to Files UI. It reads the cookie/Blob exports from the
 fixture App's Documents and requires their exact bytes. A second UUID profile

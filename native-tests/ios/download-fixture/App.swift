@@ -79,7 +79,15 @@ final class FixtureHome: UIViewController {
         }
         receipt.numberOfLines = 0
         receipt.accessibilityIdentifier = "fixture-receipt"
-        receipt.text = "not inspected"
+        // Read the built bundle, not the project settings: Files must see this
+        // disposable app's actual Documents-sharing flags and seeded folder.
+        let configuration: [String: Any] = [
+            "fileSharing": Bundle.main.object(forInfoDictionaryKey: "UIFileSharingEnabled") as? Bool ?? false,
+            "documentsInPlace": Bundle.main.object(forInfoDictionaryKey: "LSSupportsOpeningDocumentsInPlace") as? Bool ?? false,
+            "displayName": Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "",
+            "seedPresent": (try? Data(contentsOf: documents.appendingPathComponent("keep.txt"))) == sentinelBytes,
+        ]
+        receipt.text = String(data: try! JSONSerialization.data(withJSONObject: configuration, options: .sortedKeys), encoding: .utf8)
         stack.addArrangedSubview(receipt)
         view.addSubview(stack)
         NSLayoutConstraint.activate([

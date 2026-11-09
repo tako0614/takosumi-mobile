@@ -11,6 +11,17 @@ final class DownloadUITests: XCTestCase {
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launch()
         XCTAssertTrue(app.buttons["Work"].waitForExistence(timeout: 15))
+        let configuration = app.staticTexts["fixture-receipt"].label
+        let attachment = XCTAttachment(string: configuration)
+        attachment.name = "Actual fixture bundle and Documents configuration"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let data = try XCTUnwrap(configuration.data(using: .utf8))
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(value["fileSharing"] as? Bool, true, "The installed fixture must expose its own Documents")
+        XCTAssertEqual(value["documentsInPlace"] as? Bool, true)
+        XCTAssertEqual(value["displayName"] as? String, "Download Fixture")
+        XCTAssertEqual(value["seedPresent"] as? Bool, true)
     }
 
     override func tearDownWithError() throws {

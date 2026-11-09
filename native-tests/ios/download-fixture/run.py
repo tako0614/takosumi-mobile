@@ -25,7 +25,7 @@ PRODUCT = ROOT / "src-tauri/plugins/app-screen/ios/Sources"
 SOURCES = [PRODUCT / name for name in (
     "AppScreenViewController.swift", "AppScreenPolicy.swift", "AppScreenDownload.swift")]
 FROZEN_SOURCES = SOURCES + [HERE / name for name in (
-    "App.swift", "DownloadUITests.swift", "project.yml", "run.py", "server.py", "test_run.py")]
+    "App.swift", "DownloadUITests.swift", "Info.plist", "project.yml", "run.py", "server.py", "test_run.py")]
 BUNDLE = "com.takosumi.fixture.download"
 SIGNING = ("IOS_CERTIFICATE", "IOS_CERTIFICATE_PASSWORD", "IOS_MOBILE_PROVISION",
            "APPLE_DEVELOPMENT_TEAM", "APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH")
