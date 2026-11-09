@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Actual product WKDownload UI test on one fresh, owned iOS Simulator."""
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -204,6 +205,58 @@ def owned_device(inventory, udid, name, runtime):
     return found[0][1]
 
 
+def preserve_device_logs(device, udid, output, log_root):
+    """Bounded text from this freshly created Simulator only; no shared service logs."""
+    result = {"diagnosticOnly": True, "files": []}
+    try:
+        expected = log_root / udid
+        raw_path = device.get("logPath")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("No owned Simulator log path")
+        selected = Path(raw_path)
+        if (not selected.is_absolute() or selected != expected or
+                str(uuid.UUID(udid)).upper() != udid.upper()):
+            raise ValueError("Unexpected owned Simulator log path")
+        # Refuse directory aliases and final-file links, including any alias
+        # introduced after the creation inventory was captured.
+        if selected.resolve(strict=True) != expected or not selected.is_dir():
+            raise ValueError("Owned Simulator log directory changed")
+        with ExitStack() as stack:
+            directory_fd = os.open(selected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, directory_fd)
+            with os.scandir(directory_fd) as scan:
+                entries = list(itertools.islice(scan, 129))
+            result["entriesTruncated"] = len(entries) > 128
+            names = sorted(e.name for e in entries[:128] if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}\.log", e.name))
+            result["filesTruncated"] = len(names) > 4
+            output.mkdir(mode=0o700)
+            for name in names[:4]:
+                entry = {"name": name}
+                result["files"].append(entry)
+                try:
+                    before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                        raise ValueError("Not a single owned regular log")
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                    with os.fdopen(fd, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
+                            raise ValueError("Log changed before read")
+                        stream.seek(max(0, info.st_size - 65536))
+                        data = stream.read(65536)
+                    with (output / name).open("xb") as target:
+                        target.write(data)
+                    entry.update(sourceBytes=info.st_size, keptBytes=len(data), truncated=info.st_size > len(data),
+                                 sha256=hashlib.sha256(data).hexdigest())
+                except (OSError, ValueError) as error:
+                    entry["errorType"] = type(error).__name__
+    except Exception as error:
+        # Diagnostic absence must never replace the original boot/test error,
+        # including unsupported platform fd operations or malformed metadata.
+        result["errorType"] = type(error).__name__
+    return result
+
+
 def require_test_pass(log):
     # Require the actual method and aggregate, never only xcodebuild exit zero.
     method = "testOriginalResponsesExportAndRetireWithinTheirProfile"
@@ -263,6 +316,7 @@ def main():
     result = {"passed": False, "simulator": None, "cleanup": False,
               "source": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in FROZEN_SOURCES}}
     udid = None
+    created_device = None
     server = None
     failure = None
     with owned_scratch(scratch_parent) as (scratch, scratch_state):
@@ -279,7 +333,7 @@ def main():
                 raise RuntimeError("Invalid created Simulator identity")
             result["simulator"] = {"udid": udid, "name": name, "runtime": runtime, "deviceType": device_type}
             devices = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"], out / "created.log"))
-            owned_device(devices, udid, name, runtime)
+            created_device = owned_device(devices, udid, name, runtime)
             save(out / "result.json", result)
             ca, cert, key = certificate(scratch)
             command(["xcrun", "simctl", "boot", udid], out / "boot.log")
@@ -316,6 +370,11 @@ def main():
             result["error"] = str(error)
             result["errorType"] = type(error).__name__
             result["errorNotes"] = getattr(error, "__notes__", [])
+            if created_device is not None:
+                # Capture before cleanup: simctl itself may be stuck, so use
+                # only the exact logPath returned by our creation readback.
+                result["deviceLogs"] = preserve_device_logs(
+                    created_device, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
         finally:
             try:
                 if server is not None:

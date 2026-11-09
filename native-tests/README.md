@@ -146,6 +146,12 @@ native terminal `Finished` record, and saves that paired readback. There is no
 additional wait, reboot or retry. A live/nonzero CLI or a nonterminal/error log
 still preserves the timeout. The original 2fd run did not reach XCTest; its
 later cleanup inventory timeout remains a separate unresolved observation.
+On failure after creation readback, the runner retains bounded `.log` tails
+from that exact new device's recorded log directory before cleanup. It refuses
+foreign paths, directory aliases, symlinks and multiply linked files; at most
+four 64 KiB tails are copied through a held directory descriptor. Shared
+CoreSimulator service logs and binary dumps are not collected. Missing logs
+remain diagnostic absence and do not change boot deadlines or native verdicts.
 
 The WKDownload candidate has policy cases for active Web-home/frame origins,
 the explicit same-origin Blob exception, attachment disposition and safe

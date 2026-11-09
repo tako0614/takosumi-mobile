@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 import run as fixture_runner
 
-from run import (certificate, owned_device, require_interrupted_transfers,
+from run import (certificate, owned_device, preserve_device_logs, require_interrupted_transfers,
                  require_test_pass, select_runtime, verify_exports)
 from server import BLOB_BYTES, COOKIE_BYTES, SENTINEL_BYTES, FixtureServer
 
@@ -195,6 +195,54 @@ class HarnessTests(unittest.TestCase):
                     success.replace("0 failures", "1 failures"), success + "\n** TEST FAILED **"):
             with self.assertRaises(RuntimeError):
                 require_test_pass(bad)
+
+    def test_only_owned_device_text_logs_are_kept_with_strict_bounds(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            root = Path(raw)
+            udid = "22F3E5C2-C70D-4096-B876-C4F3B9EBAD14"
+            logs = root / udid
+            logs.mkdir()
+            for index in range(5):
+                (logs / f"system{index}.log").write_bytes(b"x" * 70000 + bytes([index]))
+            (logs / "crash.dmp").write_bytes(b"not text evidence")
+            result = preserve_device_logs({"logPath": str(logs)}, udid, root / "evidence", root)
+            self.assertEqual(len(result["files"]), 4)
+            self.assertTrue(result["filesTruncated"])
+            self.assertFalse(result["entriesTruncated"])
+            self.assertTrue(result["diagnosticOnly"])
+            for index, entry in enumerate(result["files"]):
+                self.assertEqual((entry["sourceBytes"], entry["keptBytes"], entry["truncated"]), (70001, 65536, True))
+                self.assertEqual((root / "evidence" / entry["name"]).read_bytes(), b"x" * 65535 + bytes([index]))
+            self.assertFalse((root / "evidence/crash.dmp").exists())
+
+    def test_device_logs_refuse_foreign_paths_and_links(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            root = Path(raw)
+            udid = "22F3E5C2-C70D-4096-B876-C4F3B9EBAD14"
+            foreign = root / "foreign"
+            foreign.mkdir()
+            (foreign / "system.log").write_text("foreign private log")
+            for value in (None, "", [], False):
+                result = preserve_device_logs({"logPath": value}, udid, root / "invalid", root)
+                self.assertEqual(result["errorType"], "ValueError")
+                self.assertFalse((root / "invalid").exists())
+            for index, path in enumerate((foreign, Path(udid), root / ".." / udid)):
+                result = preserve_device_logs({"logPath": str(path)}, udid, root / f"out-{index}", root)
+                self.assertEqual(result["errorType"], "ValueError")
+                self.assertFalse((root / f"out-{index}").exists())
+            selected = root / udid
+            selected.symlink_to(foreign, target_is_directory=True)
+            result = preserve_device_logs({"logPath": str(selected)}, udid, root / "alias", root)
+            self.assertEqual(result["errorType"], "ValueError")
+            self.assertFalse((root / "alias").exists())
+            selected.unlink()
+            selected.mkdir()
+            (selected / "symlink.log").symlink_to(foreign / "system.log")
+            os.link(foreign / "system.log", selected / "hardlink.log")
+            result = preserve_device_logs({"logPath": str(selected)}, udid, root / "links", root)
+            self.assertEqual(len(result["files"]), 2)
+            self.assertTrue(all(entry["errorType"] == "ValueError" for entry in result["files"]))
+            self.assertEqual(list((root / "links").iterdir()), [])
 
     def test_export_requires_real_files_and_complete_observation(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
