@@ -349,11 +349,24 @@ public final class WebAppOperationTest {
         // Ctrl+O did not open DocumentsUI; do not send both and risk two prompts.
         String openAction = "\u2000Open From Computer";
         await("Missing native text " + openAction, () -> bounds(openAction, false, false) != null, 30);
-        // The accessibility node exists before first paint: the pre-input
-        // screenshot was blank and the tap produced no prompt. A real user's
-        // tap waits for visible content, so require pixels inside the action's
-        // own bounds; then one capture, fresh bounds and a single tap as before.
-        await("Open action did not paint", () -> painted(bounds(openAction, false, false)), 20);
+        // The accessibility node exists while the screen still shows the
+        // site's own Loading overlay: a tap then lands on the overlay and
+        // produces no prompt. Any non-white pixel is not enough either, since
+        // the dimmed background already paints. Require real rendered content
+        // inside the action's own bounds (a button's fill/border/text spans
+        // more than one luminance band); then one capture, fresh bounds and a
+        // single tap as before.
+        try {
+            await("Open action did not paint", () -> painted(bounds(openAction, false, false)), 60);
+        } catch (AssertionError unpainted) {
+            // Keep the screen that failed the paint gate: whether the site
+            // still shows its Loading overlay decides the next diagnostic.
+            try { captureUi("photopea-unpainted-open"); }
+            catch (IOException | RuntimeException observation) {
+                activity.trace("unpainted-open capture unavailable " + observation.getClass().getSimpleName());
+            }
+            throw unpainted;
+        }
         try { captureUi("photopea-before-open"); }
         catch (IOException | RuntimeException observation) {
             activity.trace("before-open capture unavailable " + observation.getClass().getSimpleName());
@@ -450,19 +463,27 @@ public final class WebAppOperationTest {
         if (screen == null) return false;
         try {
             // Screenshot and accessibility bounds share full-screen
-            // coordinates. The unpainted page is uniformly light, so any
-            // clearly darker pixel inside the current target proves paint;
-            // it asserts nothing about the site's own colors.
+            // coordinates. A rendered button spans at least two luminance
+            // bands (fill, border, text); a blank page or a dimmed Loading
+            // backdrop concentrates in one. Band colors are not asserted,
+            // only that real content occupies the rect.
             Rect inside = new Rect(target);
             if (!inside.intersect(0, 0, screen.getWidth(), screen.getHeight())) return false;
+            int[] bands = new int[8];
+            int total = 0;
             for (int y = inside.top; y < inside.bottom; y += 2) {
                 for (int x = inside.left; x < inside.right; x += 2) {
                     int pixel = screen.getPixel(x, y);
-                    if ((pixel & 0xFF) < 0xF0 || ((pixel >> 8) & 0xFF) < 0xF0 || ((pixel >> 16) & 0xFF) < 0xF0)
-                        return true;
+                    int luminance = (((pixel >> 16) & 0xFF) + ((pixel >> 8) & 0xFF) + (pixel & 0xFF)) / 3;
+                    bands[luminance >> 5]++;
+                    total++;
                 }
             }
-            return false;
+            int occupied = 0;
+            for (int band = 0; band < bands.length; band++) {
+                if (bands[band] * 100 >= total) occupied++;
+            }
+            return occupied >= 2;
         } finally { screen.recycle(); }
     }
 
