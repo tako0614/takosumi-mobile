@@ -475,6 +475,41 @@ public final class WebAppOperationTest {
         // half a second, the same gate the picker rows already use.
         tap(awaitRect("Open action did not settle",
             () -> stable("open", bounds(openAction, false, false)), 15), openAction);
+        // A settled rect is still not proof of a hit: the home panel's reveal
+        // once left the reported Open bounds ~50px above the painted cards
+        // (sent == current through both touch phases, filePrompts stayed 0
+        // and the failure tree showed the New Project dialog). That is a
+        // human-shaped miss, not a pass: when the tap produced no prompt
+        // and the recognizable New Project dialog (its Create button)
+        // appeared, dismiss it like a user — Escape, never BACK into page
+        // history — re-read the now-settled action and tap once more. Any
+        // other silent miss keeps the original failure evidence; the real
+        // OS-picker oracle is unchanged.
+        boolean[] missDismissed = {false};
+        try {
+            await("Open tap produced no real file prompt", () -> {
+                if (activity.filePrompts > 0) return true;
+                if (bounds("Create", false, false) != null) {
+                    missDismissed[0] = true;
+                    activity.trace("open tap opened the New Project dialog; dismissing once and retrying");
+                    key(KeyEvent.KEYCODE_ESCAPE, 0);
+                    return true;
+                }
+                return false;
+            }, 12);
+        } catch (AssertionError noPrompt) {
+            // A prompt that lands just after the bound is still the prompt;
+            // only a real zero keeps the failure alive.
+            if (activity.filePrompts == 0) throw noPrompt;
+        }
+        if (missDismissed[0] && activity.filePrompts == 0) {
+            await("Missed-tap New Project dialog did not dismiss",
+                () -> activity.filePrompts > 0 || bounds("Create", false, false) == null, 10);
+            if (activity.filePrompts == 0) {
+                tap(awaitRect("Retried open action did not settle",
+                    () -> stable("open-retry", bounds(openAction, false, false)), 15), openAction);
+            }
+        }
         chooseInput();
         await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);
