@@ -92,6 +92,10 @@ public final class WebAppOperationTest {
     }
 
     private void tap(Rect bounds) {
+        tap(bounds, null);
+    }
+
+    private void tap(Rect bounds, String observedAction) {
         assertNotNull(bounds);
         AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
         assertNotNull("Native tap needs the active window", root);
@@ -119,6 +123,16 @@ public final class WebAppOperationTest {
                     current.getBoundsInScreen(window);
                     assertTrue("Native tap moved outside its window", window.contains(bounds));
                 } finally { current.recycle(); }
+                if (observedAction != null) {
+                    try {
+                        Rect currentAction = bounds(observedAction, false, false);
+                        activity.trace("open touch phase=" + action + " sent=" + bounds.toShortString() +
+                            " current=" + (currentAction == null ? "missing" : currentAction.toShortString()) +
+                            " window=" + window.toShortString() + " filePrompts=" + activity.filePrompts);
+                    } catch (RuntimeException observation) {
+                        activity.trace("open touch observation unavailable " + observation.getClass().getSimpleName());
+                    }
+                }
                 MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
                     bounds.exactCenterX(), bounds.exactCenterY(), 0);
                 event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
@@ -333,7 +347,16 @@ public final class WebAppOperationTest {
         // Use the mobile editor's visible Open action. The original native
         // hierarchy includes this leading EN QUAD after its computer icon.
         // Ctrl+O did not open DocumentsUI; do not send both and risk two prompts.
-        tap("\u2000Open From Computer");
+        String openAction = "\u2000Open From Computer";
+        await("Missing native text " + openAction, () -> bounds(openAction, false, false) != null, 30);
+        // The prior failure ended in Photopea's New Project dialog. Preserve
+        // the actual pre-input UI, then read fresh target bounds after capture.
+        // No extra tap, page action, longer picker wait or fallback is added.
+        try { captureUi("photopea-before-open"); }
+        catch (IOException | RuntimeException observation) {
+            activity.trace("before-open capture unavailable " + observation.getClass().getSimpleName());
+        }
+        tap(bounds(openAction, false, false), openAction);
         chooseInput();
         await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);
@@ -419,18 +442,22 @@ public final class WebAppOperationTest {
         return PlatformTestStorageRegistry.getInstance().openOutputFile(name);
     }
 
+    private void captureUi(String prefix) throws IOException {
+        try (OutputStream out = evidence(prefix + "-hierarchy.txt")) {
+            out.write(tree().getBytes(StandardCharsets.UTF_8));
+        }
+        Bitmap screen = instrumentation.getUiAutomation().takeScreenshot();
+        if (screen != null) {
+            try (OutputStream out = evidence(prefix + "-screen.png")) { screen.compress(Bitmap.CompressFormat.PNG, 100, out); }
+            finally { screen.recycle(); }
+        }
+    }
+
     @After public void retireOnlyOwnedFilesAfterWriterCompletion() throws Exception {
         // Retain native UI evidence before either owned Activity/picker closes.
         try {
             // Encoding replaces a truncated surrogate; at most64k UTF-8 bytes.
-            try (OutputStream out = evidence("photopea-hierarchy.txt")) {
-                out.write(tree().getBytes(StandardCharsets.UTF_8));
-            }
-            Bitmap screen = instrumentation.getUiAutomation().takeScreenshot();
-            if (screen != null) {
-                try (OutputStream out = evidence("photopea-screen.png")) { screen.compress(Bitmap.CompressFormat.PNG, 100, out); }
-                finally { screen.recycle(); }
-            }
+            captureUi("photopea");
         } finally {
             if (scenario != null) scenario.close();
             if (activity != null) {

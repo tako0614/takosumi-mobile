@@ -110,6 +110,12 @@ public final class WebAppProbeActivity extends Activity {
             });
             session.setPromptDelegate(new GeckoSession.PromptDelegate() {
                 @Override public GeckoResult<PromptResponse> onFilePrompt(GeckoSession owner, FilePrompt prompt) {
+                    // Bounded anonymous-fixture metadata only. Distinguish a
+                    // page tap that never requests a file from a native refusal.
+                    trace("file prompt selected=" + (selected == Page.this) + " destroyed=" + destroyed +
+                        " site=" + site(uri) + " pendingFile=" + (pendingFile != null) +
+                        " pendingExport=" + (pendingExport != null) + " type=" + prompt.type +
+                        " capture=" + prompt.capture + " generation=" + generation);
                     if (selected != Page.this || destroyed || !site(uri) || pendingFile != null || pendingExport != null ||
                             prompt.type == FilePrompt.Type.FOLDER || prompt.capture != FilePrompt.Capture.NONE) {
                         return GeckoResult.fromValue(prompt.dismiss());
@@ -125,7 +131,10 @@ public final class WebAppProbeActivity extends Activity {
                     Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("image/png");
                     // This single-image experiment does not implement folder,
                     // camera or multi-file selection. The page gets one OS URI.
-                    try { startActivityForResult(pick, pending.code); }
+                    try {
+                        startActivityForResult(pick, pending.code);
+                        trace("file picker requested generation=" + pending.generation);
+                    }
                     catch (RuntimeException e) { failure = "OS Open picker unavailable"; dismissFile(); }
                     return pending.result;
                 }
@@ -188,6 +197,7 @@ public final class WebAppProbeActivity extends Activity {
         PendingFile pending = pendingFile;
         pendingFile = null;
         if (pending == null) return;
+        trace("file prompt dismissed generation=" + pending.generation);
         finishActivity(pending.code);
         if (!pending.prompt.isComplete()) pending.result.complete(pending.prompt.dismiss());
     }
@@ -212,6 +222,8 @@ public final class WebAppProbeActivity extends Activity {
             pendingFile = null;
             boolean current = !destroyed && selected == pending.page && pending.generation == pending.page.generation &&
                 !pending.prompt.isComplete() && site(pending.page.uri);
+            trace("file picker returned ok=" + (resultCode == RESULT_OK) + " current=" + current +
+                " contentUri=" + (uri != null && "content".equals(uri.getScheme())));
             if (current && uri != null && "content".equals(uri.getScheme())) {
                 selectedInput = uri;
                 inputContext = pending.page.context;

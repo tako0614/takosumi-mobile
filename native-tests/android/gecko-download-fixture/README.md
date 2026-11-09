@@ -57,6 +57,17 @@ Photopea's file prompt. Its exact accessibility label includes the observed
 leading EN QUAD after the computer icon; visibility, enabled state and bounds
 remain required. The preceding Ctrl+O attempt never showed DocumentsUI, so the
 fixture uses the ordinary mobile action without a second shortcut/fallback.
+The 791d830 failure screenshot instead showed Photopea's New Project dialog.
+To distinguish page layout/overlay timing from a native file-prompt refusal,
+the fixture captures the UI once before Open, then reads fresh action bounds.
+Its bounded trace records the sent and currently observed Open bounds at
+down/up, prompt type/capture and ownership booleans, picker request/dismissal
+and result. The screenshot/hierarchy contain the visible anonymous page UI;
+the event trace contains no raw response body, file URI, cookies or credentials.
+If this extra capture or target observation fails, a bounded error class is
+recorded and the same Open tap continues; existing teardown checks are retained. These
+observations retain the single tap and existing picker deadline; they are not
+a fix or a native success claim, and capture may affect page timing.
 Taps revalidate the active package, window ID and containing bounds for both
 down/up events. The fixture's own window keeps the app-targeted instrumentation
 input route. Only the two explicitly allowed DocumentsUI packages use Android
