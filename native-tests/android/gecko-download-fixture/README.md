@@ -57,6 +57,16 @@ Photopea's file prompt. Its exact accessibility label includes the observed
 leading EN QUAD after the computer icon; visibility, enabled state and bounds
 remain required. The preceding Ctrl+O attempt never showed DocumentsUI, so the
 fixture uses the ordinary mobile action without a second shortcut/fallback.
+Taps revalidate the active package, window ID and containing bounds for both
+down/up events. The fixture's own window keeps the app-targeted instrumentation
+input route. Only the two explicitly allowed DocumentsUI packages use Android
+UiAutomation's cross-app input route, with touchscreen source and successful
+injection required: `sendPointerSync` is restricted to the instrumented app UID
+and cannot operate the real system picker. No permission adoption, shell input
+or direct picker callback replaces the OS touch/selection.
+If a target recheck or UP fails after an accepted DOWN, the test attempts to cancel that
+same touch stream and retains the original failure (including cancellation
+failure if present). There is no repeat tap or recovery that hides the error.
 The engine prompt uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes
 Photopea's Save for web and receives the original HTTPS Blob response. Native

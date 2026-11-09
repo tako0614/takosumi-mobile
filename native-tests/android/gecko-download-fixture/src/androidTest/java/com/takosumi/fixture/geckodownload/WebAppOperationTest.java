@@ -96,13 +96,59 @@ public final class WebAppOperationTest {
         AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
         assertNotNull("Native tap needs the active window", root);
         Rect window = new Rect();
-        try { root.getBoundsInScreen(window); } finally { root.recycle(); }
+        String targetPackage;
+        int targetWindow;
+        try {
+            root.getBoundsInScreen(window);
+            targetPackage = String.valueOf(root.getPackageName());
+            targetWindow = root.getWindowId();
+        } finally { root.recycle(); }
+        boolean systemPicker = pickers.contains(targetPackage);
+        assertTrue("Native tap must target this fixture or the actual DocumentsUI: " + targetPackage,
+            systemPicker || instrumentation.getTargetContext().getPackageName().equals(targetPackage));
         assertTrue("Native tap must stay inside the active window: " + bounds, window.contains(bounds));
         long down = SystemClock.uptimeMillis();
-        for (int action : new int[] {MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
-            MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
-                bounds.exactCenterX(), bounds.exactCenterY(), 0);
-            try { instrumentation.sendPointerSync(event); } finally { event.recycle(); }
+        boolean gestureStarted = false;
+        try {
+            for (int action : new int[] {MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
+                AccessibilityNodeInfo current = instrumentation.getUiAutomation().getRootInActiveWindow();
+                assertNotNull("Native tap target disappeared", current);
+                try {
+                    assertEquals("Native tap target package changed", targetPackage, String.valueOf(current.getPackageName()));
+                    assertEquals("Native tap target window changed", targetWindow, current.getWindowId());
+                    current.getBoundsInScreen(window);
+                    assertTrue("Native tap moved outside its window", window.contains(bounds));
+                } finally { current.recycle(); }
+                MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
+                    bounds.exactCenterX(), bounds.exactCenterY(), 0);
+                event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                try {
+                    // sendPointerSync is restricted to the instrumented app UID.
+                    // The real OS picker belongs to its own UID; UiAutomation is
+                    // Android's cross-app test input route. No permission adoption,
+                    // shell input or direct file-prompt callback substitutes for it.
+                    if (systemPicker) assertTrue("DocumentsUI rejected native touch",
+                        instrumentation.getUiAutomation().injectInputEvent(event, true));
+                    else instrumentation.sendPointerSync(event);
+                    gestureStarted = action == MotionEvent.ACTION_DOWN;
+                } finally { event.recycle(); }
+            }
+        } catch (RuntimeException | Error failure) {
+            if (gestureStarted) {
+                // A changed target or rejected UP must not leave our accepted
+                // DOWN held. Attempt CANCEL through the same input route, not
+                // an UP on a replacement window. Preserve the original error.
+                MotionEvent cancel = MotionEvent.obtain(down, SystemClock.uptimeMillis(),
+                    MotionEvent.ACTION_CANCEL, bounds.exactCenterX(), bounds.exactCenterY(), 0);
+                cancel.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                try {
+                    if (systemPicker) assertTrue("Owned picker touch stream could not be cancelled",
+                        instrumentation.getUiAutomation().injectInputEvent(cancel, true));
+                    else instrumentation.sendPointerSync(cancel);
+                } catch (RuntimeException | Error cancellation) { failure.addSuppressed(cancellation); }
+                finally { cancel.recycle(); }
+            }
+            throw failure;
         }
     }
 
