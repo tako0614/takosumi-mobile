@@ -27,7 +27,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   # The same sibling revisions as ci.yml (a unit test keeps them equal).
-  MOBILE_KIT_SOURCE_REF: 2e1aeff1f88c4370889acb68b99081c32f5a6740
+  MOBILE_KIT_SOURCE_REF: c6862bb0ae23f62957287f49d4bd79ceadca6a94
   TAKOSUMI_SOURCE_REF: d6347b169dc04f5036218cfb59a7e91b7d489176
 
 jobs:
