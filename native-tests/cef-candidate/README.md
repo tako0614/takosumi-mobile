@@ -2671,6 +2671,34 @@ that behavior; its native regression also requires the owned clone fixture
 to be removed. This repair still needs native execution and does not resolve
 the separate historical `CefShutdown` watchdog failure by itself.
 
+Run 42607719040 at `cc4f836` reproduced the historical watchdog under
+Photopea: after Personal's `system-quit-request`, the serialized quit sent
+Shutdown to Work, Work closed its windows and logged `cef-shutdown-begin`,
+then hung inside `CefShutdown` until Chromium's ten-second teardown
+watchdog killed it (rootExit=2). Personal therefore never received
+`shutdown-request` and its beforeunload never opened - a failed ordinary
+shutdown, not evidence of a missing handler. The hanging profile's
+`cef-native.log` recorded `Failed to post task from
+FlushAndNotifyInBackground to client_task_runner_` (a sqlite cookie-store
+flush post failing during teardown); Photopea writes cookies continuously,
+so a shutdown-ordering race is plausible but unproven and still needs a
+sampled stack. The run added the `-mayDie` sample flag so symbol locations
+are grabbed before the watchdog can kill the sampled browser.
+
+Run 42613143371 at `02ef39f` hung at the same CefShutdown stage on the
+second of three Photopea launches; the `-mayDie` symbol grab still exceeded
+the then-three-second subprocess bound, so `1a035be` raised it to five
+seconds, keeping detect (~+2 s) plus sample inside the ten-second kill
+window. The iOS job flaked on simulator boot, and native-plugins recovered
+its picker test, marking that failure intermittent.
+
+Run 42621435741 at `ceed2fe` then passed all nine Mac adapter/image tests
+and all three Photopea launches through all six phases with no stack
+sampling, so the five-second bound remains unexercised and the hang's root
+cause unresolved. The same run's Android job still failed at the Open tap
+stage (filePrompts=0); its retained screenshot proved the first paint gate
+accepted the site's own uniform Loading backdrop, corrected by 03b33c3.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,
