@@ -16,6 +16,12 @@ only after stream/output closure. The server must observe both incomplete
 responses disconnected before server teardown. Personal's unsigned state and
 an unrelated sentinel must remain intact.
 
+Native controls retain their exact visible label casing, including in Android's
+accessibility tree. The test first requires every control to be visible and
+enabled; it still injects actual pointer input. A failed wait includes a bounded
+accessibility snapshot captured before Activity cleanup, without relaxing text
+matching or invoking button handlers directly.
+
 The server binds only `127.0.0.1` on an ephemeral port. Its synthetic HTTP cookie
 is not a real credential. This first transport experiment does **not** qualify
 HTTPS/Secure cookies, external IdP login, OS Save to Files, background recovery,

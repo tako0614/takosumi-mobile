@@ -60,6 +60,9 @@ public final class ResponseProbeActivity extends Activity {
     private void addButton(LinearLayout row, String label, Runnable action) {
         Button button = new Button(this);
         button.setText(label);
+        // Material's default uppercase transform also changes accessibility text.
+        // Keep the visible label equal to the exact text the native input test taps.
+        button.setAllCaps(false);
         button.setOnClickListener(v -> action.run());
         row.addView(button, new LinearLayout.LayoutParams(0, -2, 1));
     }

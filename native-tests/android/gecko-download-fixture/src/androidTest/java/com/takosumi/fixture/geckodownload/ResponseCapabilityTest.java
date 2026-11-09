@@ -31,7 +31,33 @@ public final class ResponseCapabilityTest {
             if (ready.getAsBoolean()) return;
             SystemClock.sleep(100);
         }
-        fail(message);
+        fail(message + "\n" + visibleTree());
+    }
+
+    /** A bounded snapshot before @After closes the owned fixture, not a substitute selector. */
+    private String visibleTree() {
+        AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+        if (root == null) return "No active accessibility root";
+        StringBuilder result = new StringBuilder();
+        try { describe(root, result, 0, new int[] {200}); } finally { root.recycle(); }
+        return result.toString();
+    }
+
+    private void describe(AccessibilityNodeInfo node, StringBuilder result, int depth, int[] remaining) {
+        if (depth > 16 || remaining[0]-- <= 0) return;
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        String text = String.valueOf(node.getText());
+        result.append(depth).append(' ').append(node.getClassName())
+            .append(" visible=").append(node.isVisibleToUser()).append(" enabled=").append(node.isEnabled())
+            .append(' ').append(bounds.toShortString()).append(" text=")
+            .append(text, 0, Math.min(text.length(), 200)).append('\n');
+        if (depth == 16) return;
+        for (int index = 0; index < node.getChildCount() && remaining[0] > 0; index++) {
+            AccessibilityNodeInfo child = node.getChild(index);
+            if (child == null) continue;
+            try { describe(child, result, depth + 1, remaining); } finally { child.recycle(); }
+        }
     }
 
     private Rect textBounds(String text) {
@@ -106,6 +132,8 @@ public final class ResponseCapabilityTest {
     @Test public void originalCookieBlobAndCancellationStayWithinTheirContext() throws Exception {
         scenario = ActivityScenario.launch(ResponseProbeActivity.class);
         scenario.onActivity(value -> activity = value);
+        // Exercise the native control labels before any engine result can obscure them.
+        for (String button : new String[] {"Work", "Personal", "Reopen Work", "Cancel transfer", "Close Work"}) visible(button);
         visible("Fixture signed out");
         tap("Fixture sign in");
         visible("Fixture signed in");
