@@ -224,7 +224,9 @@ class MacObserver(Observer):
                 entry["nativeAlive"] = True
             except OSError:
                 entry["nativeAlive"] = False
-            log = Path(native["directory"]) / "cef-native.log"
+            # page.native is the flattened opened record (pid/window/cache);
+            # the profile directory that owns cef-native.log is the parent's.
+            log = Path(page.process["directory"]) / "cef-native.log"
             if log.is_file():
                 size = log.stat().st_size
                 with log.open("rb") as stream:
