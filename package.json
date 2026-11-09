@@ -32,7 +32,7 @@
     "tauri:android:init": "bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform android --apple-environment development",
     "tauri:android-manifest:apply": "bun ../mobile-kit/scripts/apply-tauri-mobile-android-manifest.mjs --product takosumi",
     "tauri:android-manifest:verify": "bun ../mobile-kit/scripts/apply-tauri-mobile-android-manifest.mjs --product takosumi --dry-run --strict",
-    "tauri:android:dev": "bunx tauri android dev --open --host",
+    "tauri:android:dev": "bunx tauri android dev",
     "tauri:android:build": "bunx tauri android build",
     "tauri:ios:init": "bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform ios --apple-environment development",
     "tauri:ios:dev": "bunx tauri ios dev",

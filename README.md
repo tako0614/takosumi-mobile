@@ -239,6 +239,24 @@ bun run mobile:check
 bun run tauri:dev
 ```
 
+For Android, initialize the native project with `bun run tauri:android:init`,
+then use `bun run tauri:android:dev` to select and run on a device or emulator.
+The default command does not open Android Studio or force a network host.
+Arguments are forwarded to the installed Tauri CLI:
+
+```bash
+bun run tauri:android:dev --help
+bun run tauri:android:dev "device name" --host 192.0.2.10
+bun run tauri:android:dev --open --host 192.0.2.10
+```
+
+Replace the example device name and address with your actual device and a
+reachable development-machine address. `--open` selects Android Studio instead
+of directly running on the device. `--host` is optional; when supplied, the
+shared Vite configuration uses Tauri's `TAURI_DEV_HOST` for the server and HMR.
+Do not use `0.0.0.0` as the address a device connects to. CLI argument checks and
+`bun run doctor` do not establish device launch or LAN connectivity.
+
 Every Takosumi instance includes the built-in public OIDC client
 `takosumi-mobile` (redirect exactly `takosumi://oauth/callback`, PKCE S256) and
 publishes it as `oidcClientId` in `/.well-known/takosumi`; no per-instance
