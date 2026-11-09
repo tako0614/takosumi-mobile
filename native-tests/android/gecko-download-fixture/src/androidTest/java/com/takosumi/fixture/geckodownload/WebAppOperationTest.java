@@ -349,9 +349,11 @@ public final class WebAppOperationTest {
         // Ctrl+O did not open DocumentsUI; do not send both and risk two prompts.
         String openAction = "\u2000Open From Computer";
         await("Missing native text " + openAction, () -> bounds(openAction, false, false) != null, 30);
-        // The prior failure ended in Photopea's New Project dialog. Preserve
-        // the actual pre-input UI, then read fresh target bounds after capture.
-        // No extra tap, page action, longer picker wait or fallback is added.
+        // The accessibility node exists before first paint: the pre-input
+        // screenshot was blank and the tap produced no prompt. A real user's
+        // tap waits for visible content, so require pixels inside the action's
+        // own bounds; then one capture, fresh bounds and a single tap as before.
+        await("Open action did not paint", () -> painted(bounds(openAction, false, false)), 20);
         try { captureUi("photopea-before-open"); }
         catch (IOException | RuntimeException observation) {
             activity.trace("before-open capture unavailable " + observation.getClass().getSimpleName());
@@ -440,6 +442,28 @@ public final class WebAppOperationTest {
         // The connected-test runner collects these before retiring its APKs.
         // App-specific external files can disappear before a later adb pull.
         return PlatformTestStorageRegistry.getInstance().openOutputFile(name);
+    }
+
+    private boolean painted(Rect target) {
+        if (target == null) return false;
+        Bitmap screen = instrumentation.getUiAutomation().takeScreenshot();
+        if (screen == null) return false;
+        try {
+            // Screenshot and accessibility bounds share full-screen
+            // coordinates. The unpainted page is uniformly light, so any
+            // clearly darker pixel inside the current target proves paint;
+            // it asserts nothing about the site's own colors.
+            Rect inside = new Rect(target);
+            if (!inside.intersect(0, 0, screen.getWidth(), screen.getHeight())) return false;
+            for (int y = inside.top; y < inside.bottom; y += 2) {
+                for (int x = inside.left; x < inside.right; x += 2) {
+                    int pixel = screen.getPixel(x, y);
+                    if ((pixel & 0xFF) < 0xF0 || ((pixel >> 8) & 0xFF) < 0xF0 || ((pixel >> 16) & 0xFF) < 0xF0)
+                        return true;
+                }
+            }
+            return false;
+        } finally { screen.recycle(); }
     }
 
     private void captureUi(String prefix) throws IOException {
