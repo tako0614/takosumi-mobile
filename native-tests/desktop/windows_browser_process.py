@@ -27,8 +27,12 @@ pages through the browsers' PID-attested loopback inspection ports and the
 windows through Win32. The connections are this runner's local HTTPS fixture
 site (https://127.0.0.1:<port>: a synthetic sign-in stand-in, an app home and
 an app page); its certificate comes from windows_fixture_tls.ps1, whose CA
-the machine must trust. Real sites, notifications, the native file chooser,
-popups and the open-outside choice are inspected by the Linux runner only.
+the machine must trust. The fixture run also covers a sign-in style popup
+(same-origin window.open into Work's own browser process, storage/cookie
+sharing, the postMessage result back to its opener, self-close and a
+Personal popup inside the final quit's close chain). Real sites,
+notifications, the native file chooser, external links and the
+open-outside choice are inspected by the Linux runner only.
 External links are never opened: the fixture build records them to the
 session's external-open.log instead of calling ShellExecuteW (the record's
 shape is unit-tested in the plugin). No case chooses to open a link outside,
@@ -100,9 +104,12 @@ CASE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,23}")
 IDENTIFIER = "com.takosumi.fixture.browserprocess"
 # Cases each launch's observer verifies, in order; the runner then requires
 # the App's normal exit, every guard's normal receipt and an empty job.
+# The first launch's fixture-site popup case: real-site (W4) runs skip it,
+# so their expected lists exclude it too.
+POPUP_CASE = "work-same-origin-popup"
 OBSERVED_CASES = {
-    "": ("separate-profiles", "home-by-window-switch", "reuse-raises-window", "quit-cancel-stops",
-         "quit-partial-order"),
+    "": ("separate-profiles", "home-by-window-switch", "reuse-raises-window", POPUP_CASE,
+         "quit-cancel-stops", "quit-partial-order"),
     "restart": ("restart-keeps-separation",),
     "reset": ("clear-only-one-profile",),
 }
@@ -682,7 +689,9 @@ def dialog_lines(args, observation):
 def real_site_cases(site):
     """The cases a W4 run of `site` prints, in order (the first launch's,
     its final quit and the run's invariants)."""
-    return [f"{site}/{name}" for name in list(OBSERVED_CASES[""]) + [QUIT_CASE] + list(FINAL_CASES)]
+    return [f"{site}/{name}" for name
+            in [name for name in OBSERVED_CASES[""] if name != POPUP_CASE]
+            + [QUIT_CASE] + list(FINAL_CASES)]
 
 
 # The executables a packaged App resolves itself (`cef\` in its install).
@@ -767,7 +776,8 @@ def run(args, summary):
                                       "shutdown": shutdown})
             print(f"shutdown{suffix or '-first'} {json.dumps(shutdown, separators=(',', ':'))}", flush=True)
             require(proof["passed"] is True, f"The {proof['phase']} App launch did not pass")
-            expected = list(OBSERVED_CASES[suffix[1:]])
+            expected = [name for name in OBSERVED_CASES[suffix[1:]]
+                        if name != POPUP_CASE or not args.real_site]
             require(proof["cases"] == expected,
                     f"The {proof['phase']} launch verified {proof['cases']}, not {expected}")
             # The first launch's final quit: the App exited 0 after closing

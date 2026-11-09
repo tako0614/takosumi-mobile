@@ -1178,8 +1178,8 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File native-tests/desktop/windows_fixture_tls.ps1 -Out "$env:RUNNER_TEMP\w3-tls"
           if ($LASTEXITCODE -ne 0) { throw "The fixture TLS setup failed (exit $LASTEXITCODE)" }
       # One case, three launches of the App on its data (first, restart,
-      # reset). Every required case must pass and exactly these ten run.
-      - name: Actual App cases (home, per-profile CEF, reuse, quit, restart, clear)
+      # reset). Every required case must pass and exactly these eleven run.
+      - name: Actual App cases (home, per-profile CEF, reuse, popup, quit, restart, clear)
         id: w3-run
         if: ${{ !cancelled() && steps.w3-tls.outcome == 'success' }}
         timeout-minutes: 20
@@ -1201,6 +1201,7 @@ jobs:
             'separate-profiles',
             'home-by-window-switch',
             'reuse-raises-window',
+            'work-same-origin-popup',
             'quit-cancel-stops',
             'quit-partial-order',
             'quit-completes',
@@ -1213,7 +1214,7 @@ jobs:
             if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "W3 case $case_name did not pass" }
           }
           $w3Count = @(Select-String -Path $log -Pattern '^PASS case ').Count
-          if ($w3Count -ne 10) { throw "Expected exactly ten W3 cases, saw $w3Count" }
+          if ($w3Count -ne 11) { throw "Expected exactly eleven W3 cases, saw $w3Count" }
           $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
           if ($summary.passed -ne $true) { throw 'The W3 summary did not pass' }
       - name: Remove the fixture CA
@@ -1421,8 +1422,8 @@ jobs:
           "W6_FIXTURE_APP=$(Join-Path $dir $installed.app)" >> $env:GITHUB_ENV
       # The W3 case against the installed App: it resolves its bundled browser,
       # guard and runtime root itself (no fixture override). Every required
-      # case must pass and exactly these ten run.
-      - name: Packaged actual App cases (home, per-profile CEF, reuse, quit, restart, clear)
+      # case must pass and exactly these eleven run.
+      - name: Packaged actual App cases (home, per-profile CEF, reuse, popup, quit, restart, clear)
         id: w6-run
         if: ${{ !cancelled() && steps.fixture-install.outcome == 'success' }}
         timeout-minutes: 20
@@ -1440,6 +1441,7 @@ jobs:
             'separate-profiles',
             'home-by-window-switch',
             'reuse-raises-window',
+            'work-same-origin-popup',
             'quit-cancel-stops',
             'quit-partial-order',
             'quit-completes',
@@ -1452,7 +1454,7 @@ jobs:
             if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "Packaged case $case_name did not pass" }
           }
           $w6Count = @(Select-String -Path $log -Pattern '^PASS case ').Count
-          if ($w6Count -ne 10) { throw "Expected exactly ten packaged cases, saw $w6Count" }
+          if ($w6Count -ne 11) { throw "Expected exactly eleven packaged cases, saw $w6Count" }
           $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
           if ($summary.passed -ne $true -or $summary.packaged -ne $true) { throw 'The packaged summary did not pass' }
       - name: Uninstall the fixture App (silent)

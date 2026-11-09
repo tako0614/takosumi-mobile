@@ -1205,6 +1205,163 @@ class Observer:
             except Exception as failure:  # diagnostics only: keep the original failure
                 entry["evidenceError"] = repr(failure)[:300]
 
+    def popup_loaded(self, evaluate, url):
+        """Same load bound as the cef-candidate and Linux popup probes: the
+        requested fixture page itself, not the new window's initial
+        about:blank. The navigation entry keeps the URL actually loaded."""
+        deadline = time.monotonic() + LOAD_WAIT
+        loaded = False
+        while time.monotonic() < deadline and not loaded:
+            try:
+                loaded = bool(evaluate(
+                    f"performance.getEntriesByType('navigation')[0]?.name==={json.dumps(url)}"
+                    "&&document.readyState==='complete'"
+                    "&&Boolean(document.querySelector('main[data-page]'))"))
+            except Failure:
+                # A page between documents counts as not yet.
+                loaded = False
+            if not loaded:
+                time.sleep(0.1)
+        require(loaded, "Popup document must load the requested fixture page")
+
+    def work_popup_probe(self, work, personal, expected):
+        """A sign-in style popup on the local fixture: window.open from Work
+        opens a native popup inside Work's own browser process (same
+        profile). It shares Work's storage and cookie, reports Work as its
+        opener, and hands a result back by postMessage before closing
+        itself; Personal sees neither. Synthetic state, not provider login.
+        Mirrors the Linux runner's popupProbe."""
+        state = {"method": "Standard window.open/postMessage/window.close on the local fixture site; "
+                           "synthetic state, not provider login"}
+        ref = f"sumi_popup_{self.nonce.replace('-', '')}"
+        url = f"{self.site}/?{ref}"
+        result = f"popup:{self.nonce}"
+        key = json.dumps(self.key)
+
+        def page_targets(page):
+            return [target for target in page.cdp.command("Target.getTargets")["targetInfos"]
+                    if target["type"] == "page"]
+
+        require([target["targetId"] for target in page_targets(work)] == [work.target["targetId"]],
+                "Work must have one document before its popup")
+        state["accepted"] = work.evaluate(
+            "(()=>{window.__sumiMessages=[];window.__sumiOnMessage=e=>{"
+            f"if(e.data?.sumi==={json.dumps(self.nonce)})window.__sumiMessages.push("
+            f"{{origin:e.origin,fromPopup:e.source===globalThis[{json.dumps(ref)}],data:e.data}})"
+            "};addEventListener('message',window.__sumiOnMessage);"
+            f"globalThis[{json.dumps(ref)}]=window.open({json.dumps(url)},{json.dumps(ref)},"
+            "'popup,width=600,height=500');"
+            f"return Boolean(globalThis[{json.dumps(ref)}])}})()",
+            True)
+        require(state["accepted"] is True, "Popup request must be accepted")
+        target = {}
+
+        def appeared():
+            found = [item for item in page_targets(work) if item["targetId"] != work.target["targetId"]]
+            require(len(found) <= 1, "Unexpected popup family")
+            target.update(next((item for item in found
+                                if item.get("openerId") == work.target["targetId"]), {}))
+            return bool(target)
+        self.settled(appeared, "Popup did not appear in Work's own browser process")
+        state["target"] = {"targetId": target["targetId"], "openerId": target.get("openerId"),
+                           "url": target.get("url")}
+        require([item["targetId"] for item in page_targets(personal)] == [personal.target["targetId"]],
+                "The popup must not appear in Personal")
+        session = work.cdp.command("Target.attachToTarget",
+                                   {"targetId": target["targetId"], "flatten": True})["sessionId"]
+
+        def evaluate(expression, gesture=False):
+            value = work.cdp.command("Runtime.evaluate",
+                                     {"expression": expression, "returnByValue": True,
+                                      "awaitPromise": True, "userGesture": gesture}, session)
+            require(not value.get("exceptionDetails"), json.dumps(value.get("exceptionDetails"))[:1000])
+            return value["result"].get("value")
+
+        self.popup_loaded(evaluate, url)
+        state["context"] = evaluate(
+            "({href:location.href,origin:location.origin,secure:isSecureContext,"
+            "opener:window.opener!==null,openerOrigin:window.opener?.location.origin,"
+            "tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,"
+            "wry:typeof window.webkit?.messageHandlers?.ipc,webview2:typeof window.chrome?.webview})")
+        require(state["context"]["origin"] == self.site, "The popup must load the fixture origin")
+        require(state["context"]["secure"] is True, "The popup document must be a secure context")
+        require(state["context"]["opener"] is True and state["context"]["openerOrigin"] == self.site,
+                "The popup must keep Work as its opener")
+        for field in ("tauri", "ipc", "wry", "webview2"):
+            require(state["context"][field] == "undefined",
+                    f"A CEF popup must not see the App's {field} bridge")
+        state["sharedBefore"] = evaluate(
+            f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()}}})")
+        require(state["sharedBefore"] == {"storage": expected[0]["storage"], "cookie": expected[0]["cookie"]},
+                "The popup must share Work's storage and cookie")
+        evaluate(
+            f"(()=>{{localStorage.setItem({key},{json.dumps(result)});"
+            f"document.cookie={json.dumps(self.key + '=' + result + '; Max-Age=86400; Path=/; Secure; SameSite=Lax')};"
+            f"window.opener.postMessage({{sumi:{json.dumps(self.nonce)},result:{json.dumps(result)}}},"
+            f"{json.dumps(self.site)});setTimeout(()=>window.close(),0);return true}})()",
+            True)
+
+        def closed_back():
+            return (work.evaluate(f"globalThis[{json.dumps(ref)}].closed") is True
+                    and not any(item["targetId"] == target["targetId"] for item in page_targets(work)))
+        self.settled(closed_back, "Popup did not close back to Work")
+        state["messages"] = work.evaluate("window.__sumiMessages")
+        require(state["messages"] == [{"origin": self.site, "fromPopup": True,
+                                       "data": {"sumi": self.nonce, "result": result}}],
+                "Work must receive exactly its popup's result")
+        state["workAfter"] = work.evaluate(
+            f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()}}})")
+        require(state["workAfter"] == {"storage": result, "cookie": result},
+                "Work must see the state its popup wrote")
+        require(self.sample(personal) == expected[1],
+                "Personal must see neither the popup nor its state")
+        # Restore Work's first-launch state, which the later phases check.
+        work.evaluate(
+            f"(()=>{{localStorage.setItem({key},{json.dumps(expected[0]['storage'])});"
+            f"document.cookie={json.dumps(self.key + '=' + expected[0]['cookie'] + '; Max-Age=86400; Path=/; Secure; SameSite=Lax')};"
+            "removeEventListener('message',window.__sumiOnMessage);delete window.__sumiOnMessage;"
+            f"delete window.__sumiMessages;delete globalThis[{json.dumps(ref)}];return true}})()")
+        require(self.sample(work) == expected[0], "Work must keep its document after the popup")
+        state["passed"] = True
+        return state
+
+    def open_popup_for_quit(self, page):
+        """A popup left open when the App quits closes with its profile: the
+        native close chain covers it, and the runner then requires a normal
+        guard and App exit. Quit only after the popup's own document
+        loaded, so its native browser exists in the profile's close
+        chain. Mirrors the Linux runner's openPopupForQuit."""
+        ref = f"sumi_quit_popup_{self.nonce.replace('-', '')}"
+        url = f"{self.site}/?{ref}"
+        accepted = page.evaluate(
+            f"(()=>{{globalThis[{json.dumps(ref)}]=window.open({json.dumps(url)},{json.dumps(ref)},"
+            "'popup,width=500,height=400');"
+            f"return Boolean(globalThis[{json.dumps(ref)}])}})()",
+            True)
+        require(accepted is True, "Popup request must be accepted")
+        target = {}
+
+        def appeared():
+            found = [item for item in page.cdp.command("Target.getTargets")["targetInfos"]
+                     if item["type"] == "page" and item.get("openerId") == page.target["targetId"]]
+            target.update(found[0] if found else {})
+            return bool(target)
+        self.settled(appeared, "Popup did not appear before the final quit")
+        session = page.cdp.command("Target.attachToTarget",
+                                   {"targetId": target["targetId"], "flatten": True})["sessionId"]
+
+        def evaluate(expression):
+            value = page.cdp.command("Runtime.evaluate", {"expression": expression, "returnByValue": True},
+                                     session)
+            require(not value.get("exceptionDetails"), json.dumps(value.get("exceptionDetails"))[:1000])
+            return value["result"].get("value")
+
+        self.popup_loaded(evaluate, url)
+        observed = evaluate("({navigation:performance.getEntriesByType('navigation')[0]?.name??null,"
+                            "href:location.href,ready:document.readyState})")
+        return {"targetId": target["targetId"], "openerId": target.get("openerId"),
+                "profile": page.process["profile"], "requested": url, "observed": observed}
+
     def first_launch(self):
         win = self.win
         opened = self.proof["opened"] = self.marker("app-browser-process-open.json")
@@ -1369,6 +1526,15 @@ class Observer:
                 f"Work's GUI thread focus record could not be captured: {json.dumps(evidence['threadFocus'])}")
         self.case("reuse-raises-window", evidence)
 
+        if not self.real:
+            # A sign-in style popup on the local fixture site only: the real
+            # sites are anonymous and use their own content. The case name
+            # sits between reuse and the quit cases in OBSERVED_CASES, from
+            # which real-site runs exclude it too.
+            self.step("Work same-origin popup", work)
+            self.proof["popup"] = self.work_popup_probe(work, personal, expected)
+            self.case("work-same-origin-popup", self.proof["popup"])
+
         # Chrome's real beforeunload path needs sticky user activation. CDP's
         # userGesture is synthetic and is reported as such, not a real click.
         self.step("Work beforeunload setup", work)
@@ -1442,6 +1608,11 @@ class Observer:
         self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
                                          "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
         self.step("Personal final exit", personal)
+        if not self.real:
+            # Personal's own popup stays open for the final quit: its native
+            # browser is inside the profile's close chain, and the run's
+            # normal receipts cover it (mirrors the Linux runner).
+            self.proof["finalPopup"] = self.open_popup_for_quit(personal)
         self.checkpoint("request-final-exit")
         if self.real:
             self.finish_final_quit([personal])
