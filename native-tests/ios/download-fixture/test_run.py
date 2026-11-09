@@ -5,9 +5,14 @@ import json
 import os
 from pathlib import Path
 import ssl
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
+
+import run as fixture_runner
 
 from run import (certificate, owned_device, require_interrupted_transfers,
                  require_test_pass, select_runtime, verify_exports)
@@ -15,6 +20,110 @@ from server import BLOB_BYTES, COOKIE_BYTES, SENTINEL_BYTES, FixtureServer
 
 
 class HarnessTests(unittest.TestCase):
+    def setUp(self):
+        for name in ("UNREAPED_COMMANDS", "INTERRUPTED_COMMANDS"):
+            reset = patch.object(fixture_runner, name, [])
+            reset.start()
+            self.addCleanup(reset.stop)
+
+    def test_timeout_reaps_only_owned_cli_and_keeps_original_failure(self):
+        original = subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "owned-id", "-b"], 180)
+        process = Mock(pid=424242)
+        process.wait.side_effect = [original, subprocess.TimeoutExpired(original.cmd, 5), -9]
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "bootstatus.log"
+            # The first real run's SIGKILL to the group failed with EPERM.
+            # A CLI timeout must neither signal platform helpers nor hide it.
+            with patch.object(fixture_runner.subprocess, "Popen", return_value=process), \
+                 patch.object(fixture_runner.os, "killpg", side_effect=[None, PermissionError(1, "not permitted")]) as group:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    fixture_runner.command(original.cmd, path, timeout=180)
+                self.assertIs(caught.exception, original)
+                group.assert_not_called()
+                process.terminate.assert_called_once_with()
+                process.kill.assert_called_once_with()
+                result = json.loads(path.with_suffix(".process.json").read_text())
+                self.assertTrue(result["reaped"])
+                self.assertEqual(result["originalErrorType"], "TimeoutExpired")
+
+    def test_real_timed_out_child_is_reaped(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            with fixture_runner.owned_scratch(Path(raw)) as (scratch, state):
+                path = scratch / "owned-child.log"
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    fixture_runner.command([sys.executable, "-c", "import time; time.sleep(30)"], path, timeout=0.05)
+                result = json.loads(path.with_suffix(".process.json").read_text())
+                self.assertTrue(result["reaped"])
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(result["pid"], os.WNOHANG)
+            # A direct child being gone is not a general descendant proof.
+            self.assertTrue(state["retain"])
+            self.assertTrue(scratch.is_dir())
+            # This test's Python child spawned none and was reaped above, so
+            # the test's outer TemporaryDirectory may retire its own fixture.
+
+    def test_unreaped_cli_is_recorded_without_masking_timeout(self):
+        original = subprocess.TimeoutExpired(["xcrun", "simctl", "shutdown", "owned-id"], 60)
+        process = Mock(pid=424242)
+        process.wait.side_effect = [original, subprocess.TimeoutExpired(original.cmd, 5),
+                                    subprocess.TimeoutExpired(original.cmd, 5)]
+        process.poll.return_value = None
+        process.terminate.side_effect = PermissionError(1, "not permitted")
+        process.kill.side_effect = PermissionError(1, "not permitted")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "shutdown.log"
+            with patch.object(fixture_runner.subprocess, "Popen", return_value=process), \
+                 patch.object(fixture_runner, "UNREAPED_COMMANDS", []) as live:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    fixture_runner.command(original.cmd, path)
+                self.assertIs(caught.exception, original)
+                self.assertEqual(live, [{"process": process, "log": str(path)}])
+                result = json.loads(path.with_suffix(".process.json").read_text())
+                self.assertFalse(result["reaped"])
+                self.assertEqual([s["errorType"] for s in result["signals"]], ["PermissionError"] * 2)
+
+    def test_cold_boot_needs_recent_distinct_migration_not_just_elapsed_time(self):
+        def entry(seconds, plugin):
+            return (f"Status=2, isTerminal=NO, Elapsed={seconds // 60:02}:{seconds % 60:02}.\n"
+                    f"Reason:Running plugin {plugin} (fixture.migrator)\n")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "bootstatus.log"
+            for log, allowed in ((entry(5, "launch") + entry(175, "launch"), False),
+                                 (entry(5, "launch") + entry(20, "keys") + entry(175, "keys"), False),
+                                 (entry(5, "launch") + entry(165, "safari") + entry(175, "safari"), True),
+                                 ("Status=4, isTerminal=NO, Elapsed=02:55.\n", False), ("", False)):
+                path.write_text(log)
+                self.assertEqual(fixture_runner.migration_progress(path)["recentMigrationProgress"], allowed)
+
+    def test_cold_boot_continues_same_process_once_and_requires_exit_zero(self):
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        log = (b"Status=2, isTerminal=NO, Elapsed=00:05.\nReason:Running plugin launch (a.migrator)\n"
+               b"Status=2, isTerminal=NO, Elapsed=02:45.\nReason:Running plugin safari (b.migrator)\n"
+               b"Status=2, isTerminal=NO, Elapsed=02:55.\nReason:Running plugin safari (b.migrator)\n")
+        for final in (0, 1, subprocess.TimeoutExpired(argv, 120)):
+            process = Mock(pid=424242)
+            original = subprocess.TimeoutExpired(argv, 180)
+            process.wait.side_effect = [original, final, -15]
+            process.poll.return_value = None
+
+            def spawn(*_, **kwargs):
+                kwargs["stdout"].write(log)
+                kwargs["stdout"].flush()
+                return process
+
+            with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+                path = Path(raw) / "bootstatus.log"
+                with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn) as launch:
+                    if final == 0:
+                        self.assertEqual(fixture_runner.command(argv, path, timeout=180, boot_status=True), log.decode())
+                    else:
+                        with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                            fixture_runner.command(argv, path, timeout=180, boot_status=True)
+                    launch.assert_called_once()
+                    self.assertEqual([c.kwargs["timeout"] for c in process.wait.call_args_list[:2]], [180, 120])
+                    self.assertEqual(json.loads(path.with_suffix(".progress.json").read_text())["extensionSeconds"], 120)
+
     def test_runtime_requires_installed_compatible_phone(self):
         runtime = {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-0", "version": "26.0",
                    "isAvailable": True, "supportedDeviceTypes": [{"name": "iPhone 16", "identifier": "phone-16"}]}

@@ -140,6 +140,15 @@ It needs existing Xcode, XcodeGen, OpenSSL and an available iOS 17+ iPhone runti
 on macOS. It creates one disposable Simulator, trusts a new loopback HTTPS CA
 only inside that device, and deletes that exact device after an identity readback.
 It does not install SDKs/runtimes, alter host trust or use signing credentials.
+The first cold boot has a 180-second readiness budget. Only distinct native
+migration-plugin transitions near that deadline permit the same readiness
+process to continue once for 120 seconds; elapsed counters alone do not.
+Terminal `bootstatus` success is still required before trust or tests. A timeout
+retires only the directly owned CLI, preserving the original failure separately
+from termination errors. Interrupted commands retain scratch even if their
+direct child reaps, because that alone cannot prove spawned build/test children
+are gone. Unreaped commands also force failure; neither case authorizes group
+signals or deleting a potentially live build directory.
 Its small host compiles the product coordinator, navigator, policy and download
 owner directly; only the unused Tauri shell signal is replaced with a refusal.
 The existing desktop macOS CI job runs it after the whole App SDK build.

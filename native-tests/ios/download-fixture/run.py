@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual product WKDownload UI test on one fresh, owned iOS Simulator."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -8,7 +9,6 @@ from pathlib import Path
 import platform
 import re
 import shutil
-import signal
 import stat
 import subprocess
 import tempfile
@@ -27,27 +27,122 @@ FROZEN_SOURCES = SOURCES + [HERE / name for name in (
 BUNDLE = "com.takosumi.fixture.download"
 SIGNING = ("IOS_CERTIFICATE", "IOS_CERTIFICATE_PASSWORD", "IOS_MOBILE_PROVISION",
            "APPLE_DEVELOPMENT_TEAM", "APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH")
+UNREAPED_COMMANDS = []
+INTERRUPTED_COMMANDS = []
 
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def command(argv, path, timeout=60, env=None):
-    """Only signal the group created by this still-owned, unreaped Popen."""
+def migration_progress(path):
+    """Only distinct native migration plugins justify one cold-start continuation."""
+    with path.open("rb") as source:
+        source.seek(0, 2)
+        source.seek(max(0, source.tell() - 262144))
+        text = source.read().decode("utf-8", errors="replace")
+    transitions, elapsed, status, terminal = [], 0, None, None
+    for line in text.splitlines():
+        header = re.search(r"Status=(\d+), isTerminal=(YES|NO), Elapsed=(\d+):(\d+)\.", line)
+        if header:
+            status, terminal = int(header[1]), header[2]
+            elapsed = int(header[3]) * 60 + int(header[4])
+        plugin = re.search(r"Reason:Running plugin ([\w.-]+) \(", line)
+        if plugin and status == 2 and terminal == "NO":
+            if not transitions or transitions[-1]["plugin"] != plugin[1]:
+                transitions.append({"plugin": plugin[1], "elapsed": elapsed})
+    recent = (len(transitions) >= 2 and status == 2 and terminal == "NO" and
+              elapsed >= 150 and 0 <= elapsed - transitions[-1]["elapsed"] <= 60)
+    return {"transitions": transitions, "lastElapsed": elapsed, "recentMigrationProgress": recent,
+            "extensionSeconds": 120 if recent else 0, "maximumBootSeconds": 300}
+
+
+def retire_cli(process, path, original):
+    # A simctl process group can contain platform-owned helpers. Own only the
+    # direct, unreaped Popen child; Simulator teardown uses its exact UDID.
+    outcome = {"pid": process.pid, "log": str(path), "originalErrorType": type(original).__name__,
+               "reaped": False, "signals": []}
+    INTERRUPTED_COMMANDS.append(outcome)
+    code = process.poll()
+    if code is not None:
+        outcome.update(reaped=True, exit=code)
+    else:
+        for label, stop in (("terminate", process.terminate), ("kill", process.kill)):
+            event = {"operation": label}
+            try:
+                stop()
+            except OSError as error:
+                event["errorType"] = type(error).__name__
+            outcome["signals"].append(event)
+            try:
+                outcome.update(reaped=True, exit=process.wait(timeout=5))
+                break
+            except subprocess.TimeoutExpired:
+                event["waitTimedOut"] = True
+    if not outcome["reaped"]:
+        UNREAPED_COMMANDS.append({"process": process, "log": str(path)})
+    try:
+        save(path.with_suffix(".process.json"), outcome)
+    except OSError as error:
+        original.add_note(f"Command retirement receipt failed: {type(error).__name__}")
+
+
+@contextmanager
+def owned_scratch(parent):
+    path = Path(tempfile.mkdtemp(prefix="sumi-ios-download-", dir=parent))
+    state = {"retain": False, "removed": False}
+    try:
+        yield path, state
+    finally:
+        # Reaping xcodebuild (or another CLI) does not prove its descendants
+        # stopped using the build directory. Preserve all interrupted scratch.
+        if INTERRUPTED_COMMANDS:
+            state["retain"] = True
+            state["reason"] = "CLI interrupted; descendant scratch use is not disproved"
+        if not state["retain"]:
+            try:
+                shutil.rmtree(path)
+                state["removed"] = True
+            except OSError as error:
+                state["cleanupError"] = type(error).__name__
+
+
+def command(argv, path, timeout=60, env=None, boot_status=False):
+    """Preserve the original failure even if retiring our own CLI also fails."""
+    if boot_status and (len(argv) != 5 or argv[:3] != ["xcrun", "simctl", "bootstatus"] or
+                        argv[4] != "-b" or timeout != 180):
+        raise ValueError("Cold-boot continuation is only for exact Simulator readiness")
     with path.open("xb") as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT,
                                    env=env, start_new_session=True)
         try:
-            code = process.wait(timeout=timeout)
-        except BaseException:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as original:
+                if not boot_status:
+                    raise
                 try:
-                    process.wait(timeout=5)
+                    progress = migration_progress(path)
+                    progress["udid"] = argv[3]
+                    save(path.with_suffix(".progress.json"), progress)
+                except OSError as error:
+                    original.add_note(f"No recorded migration progress: {type(error).__name__}")
+                    raise original
+                if not progress["recentMigrationProgress"]:
+                    raise
+                # Continue this same readiness process once, without reboot,
+                # only after actual plugin transitions near the first deadline.
+                try:
+                    code = process.wait(timeout=120)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
+                    original.add_note("Fresh-boot migration continued for 120 seconds, but readiness still timed out")
+                    raise original
+        except BaseException as original:
+            try:
+                retire_cli(process, path, original)
+            except Exception as error:
+                original.add_note(f"Owned CLI retirement failed: {type(error).__name__}")
+                UNREAPED_COMMANDS.append({"process": process, "log": str(path)})
             raise
     if code:
         raise RuntimeError(f"{argv[0]} exit {code}; see {path.name}")
@@ -158,8 +253,7 @@ def main():
     udid = None
     server = None
     failure = None
-    with tempfile.TemporaryDirectory(prefix="sumi-ios-download-", dir=scratch_parent) as raw:
-        scratch = Path(raw)
+    with owned_scratch(scratch_parent) as (scratch, scratch_state):
         try:
             checkout = command(["git", "-C", str(ROOT), "rev-parse", "HEAD", "HEAD^{tree}"], out / "checkout.log").splitlines()
             if len(checkout) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in checkout):
@@ -177,7 +271,7 @@ def main():
             save(out / "result.json", result)
             ca, cert, key = certificate(scratch)
             command(["xcrun", "simctl", "boot", udid], out / "boot.log")
-            command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180)
+            command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
             # Trust only on this exact disposable Simulator, never host trust.
             command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log")
             server = FixtureServer(cert, key)
@@ -208,6 +302,8 @@ def main():
         except Exception as error:
             failure = error
             result["error"] = str(error)
+            result["errorType"] = type(error).__name__
+            result["errorNotes"] = getattr(error, "__notes__", [])
         finally:
             try:
                 if server is not None:
@@ -230,8 +326,23 @@ def main():
                 except Exception as error:
                     failure = failure or error
                     result["cleanupError"] = str(error)
+            live = [{"pid": item["process"].pid, "log": item["log"]} for item in UNREAPED_COMMANDS
+                    if item["process"].poll() is None]
+            if live:
+                scratch_state["retain"] = True
+                result["scratchRetained"] = str(scratch)
+                result["activeOwnedCommands"] = live
+                failure = failure or RuntimeError("An owned CLI is still live; preserve its scratch")
             result["passed"] = result["passed"] and failure is None and result["cleanup"]
             save(out / "result.json", result)
+    result["scratchCleanup"] = scratch_state
+    result["interruptedCommands"] = INTERRUPTED_COMMANDS
+    if scratch_state["retain"]:
+        result["scratchRetained"] = str(scratch)
+    if scratch_state.get("cleanupError"):
+        failure = failure or RuntimeError("Owned scratch cleanup failed")
+        result["passed"] = False
+    save(out / "result.json", result)
     if failure or not result["passed"]:
         raise RuntimeError(f"iOS download fixture failed; inspect {out / 'result.json'}") from failure
     print("PASS: actual product WKDownload cookie/Blob export, profile isolation and partial-file cancellation")
