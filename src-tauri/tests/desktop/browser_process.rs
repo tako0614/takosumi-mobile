@@ -108,10 +108,31 @@ fn local_site() -> Result<String> {
     Ok(format!("https://127.0.0.1:{port}"))
 }
 async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
+    let started = Instant::now();
     let label = serde_json::to_string(label).unwrap();
     let origin = serde_json::to_string(&app_origin()?).unwrap();
+    eprintln!("add {label}: submitting through home");
     eval(view,&format!("(()=>{{const url=document.querySelector('#connection-url'),name=document.querySelector('#connection-name');url.value={origin};url.dispatchEvent(new Event('input',{{bubbles:true}}));name.value={label};name.dispatchEvent(new Event('input',{{bubbles:true}}));document.querySelector('form').requestSubmit();return true}})()")).await?;
-    ready(view,&format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')")).await
+    eprintln!("add {label}: submit callback after {:?}", started.elapsed());
+    let condition = format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')");
+    // Report the home's actual open error immediately. The generic readiness
+    // helper is also used by cases that deliberately expect a visible error.
+    ready(
+        view,
+        &format!("({condition}) || document.querySelector('.web-error')"),
+    )
+    .await?;
+    if eval(view, &format!("Boolean({condition})")).await? != Value::Bool(true) {
+        return Err(format!(
+            "Home could not open {label} after {:?}: {}",
+            started.elapsed(),
+            eval(view, "document.querySelector('.web-error')?.textContent")
+                .await
+                .unwrap_or(Value::Null)
+        ));
+    }
+    eprintln!("add {label}: open ready after {:?}", started.elapsed());
+    Ok(())
 }
 /// How long the first launch waits for the observer's first checkpoint: 30 s,
 /// as on Linux. In the Windows real-site run (W4,
