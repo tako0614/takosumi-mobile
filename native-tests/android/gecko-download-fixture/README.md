@@ -105,6 +105,8 @@ documents and the test's input row. A closure failure retains those files.
 Evidence uses AndroidX `PlatformTestStorage` and the connected runner's
 additional-test-output collection. CI requires the exported PNG there on a
 successful run, and uploads the bounded hierarchy/screenshot when available.
+The host-side Gradle Android test report and the owned emulator log are kept
+in the same artifact so an offline device does not erase the failure boundary.
 It does not depend on app external files surviving Gradle's APK retirement.
 The EXIT trap records the captured emulator PID/birth, original step status,
 owned-stop result and same-shell child wait. That receipt concerns the direct

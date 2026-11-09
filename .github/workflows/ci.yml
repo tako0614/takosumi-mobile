@@ -519,6 +519,8 @@ jobs:
           name: android-gecko-response-candidate
           path: |
             native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected/**/TEST-*.xml
+            native-tests/android/gecko-download-fixture/build/reports/androidTests/connected/debug/**
+            ${{ runner.temp }}/sumi-gecko-emulator.log
             ${{ runner.temp }}/sumi-gecko-failure.log
             native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output/**/photopea-*
             ${{ runner.temp }}/sumi-gecko-process.json
