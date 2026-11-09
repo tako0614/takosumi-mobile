@@ -134,9 +134,11 @@ cached compiler files are not accepted App artifacts or runtime evidence.
 
 The standalone [Gecko download fixture](android/gecko-download-fixture/README.md)
 compares original cookie/Blob response streams, UUID context isolation/reopen and
-cancel/close cleanup. Its Java-only toolchain and pinned engine are separate from
-the product. It is a loopback HTTP capability experiment, not engine adoption,
-product adapter completion, OS export, HTTPS or real IdP qualification.
+cancel/close cleanup on loopback HTTP. The separate anonymous Photopea operation
+case requires real HTTPS file Open, document retention across profile switches
+and original-response OS export with exact PNG pixels. Its Java-only toolchain
+and pinned engine remain separate from product adoption; source/API compilation
+does not qualify those native operations, profile-clear completion or real IdP.
 
 ### iOS download runtime qualification
 
@@ -154,6 +156,16 @@ foreign paths, directory aliases, symlinks and multiply linked files; at most
 four 64 KiB tails are copied through a held directory descriptor. Shared
 CoreSimulator service logs and binary dumps are not collected. Missing logs
 remain diagnostic absence and do not change boot deadlines or native verdicts.
+The one CA-import command retains its original 60-second wait. A failure records
+fixed-size libproc identity/image reads of its still-unreaped direct child before
+retirement, checking parent and birth around the image read. Only a closed image
+class (`xcrun`, `simctl`, other/unavailable), PID/birth/state and stage timing are
+saved; no arguments, environment, certificate contents or service census.
+These libproc calls have no hard I/O deadline. They start only after failure and
+cannot establish a keychain-service cause. No additional simctl, sampling, import
+retry or TLS exception is added. Missing diagnostic data cannot replace the
+original exception or skip direct-child retirement. The stage receipt is written
+after retirement on failure; successful import records its actual exit instead.
 
 The WKDownload candidate has policy cases for active Web-home/frame origins,
 the explicit same-origin Blob exception, attachment disposition and safe

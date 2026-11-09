@@ -63,6 +63,110 @@ class HarnessTests(unittest.TestCase):
             # This test's Python child spawned none and was reaped above, so
             # the test's outer TemporaryDirectory may retire its own fixture.
 
+    def test_trust_timeout_snapshot_precedes_retirement_and_cannot_mask_failure(self):
+        argv = ["xcrun", "simctl", "keychain", "owned-id", "add-root-cert", "owned-ca.pem"]
+        for snapshot_failure, write_failure in ((False, False), (True, False), (False, True)):
+            with self.subTest(snapshot_failure=snapshot_failure, write_failure=write_failure), \
+                 tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+                original = subprocess.TimeoutExpired(argv, 60)
+                process = Mock(pid=424242)
+                process.wait.side_effect = [original, -15]
+                process.poll.return_value = None
+                path = Path(raw) / "trust.log"
+                order = []
+
+                def snapshot(pid):
+                    self.assertEqual(pid, process.pid)
+                    process.poll.assert_not_called()
+                    process.terminate.assert_not_called()
+                    order.append("snapshot")
+                    if snapshot_failure:
+                        raise RuntimeError("diagnostic unavailable")
+                    return {"pid": pid, "birthMicros": 123, "imageClass": "simctl"}
+
+                original_save = fixture_runner.save
+
+                def save(path, data):
+                    if path.name == "trust.stage.json":
+                        process.terminate.assert_called_once_with()
+                        order.append("save")
+                        if write_failure:
+                            raise OSError("diagnostic write unavailable")
+                    original_save(path, data)
+
+                with patch.object(fixture_runner.subprocess, "Popen", return_value=process), \
+                     patch.object(fixture_runner, "owned_cli_snapshot", side_effect=snapshot), \
+                     patch.object(fixture_runner, "save", side_effect=save):
+                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        fixture_runner.command(argv, path, trust_trace=True)
+                self.assertIs(caught.exception, original)
+                self.assertEqual(order, ["snapshot", "save"])
+                self.assertEqual([call.kwargs for call in process.wait.call_args_list],
+                                 [{"timeout": 60}, {"timeout": 5}])
+                self.assertTrue(json.loads(path.with_suffix(".process.json").read_text())["reaped"])
+                if not write_failure:
+                    stage = json.loads(path.with_suffix(".stage.json").read_text())
+                    self.assertEqual(stage["errorType"], "TimeoutExpired")
+                    self.assertNotIn("exit", stage)
+                    self.assertEqual("snapshotErrorType" in stage, snapshot_failure)
+
+    def test_trust_success_has_exit_receipt_without_failure_snapshot(self):
+        argv = ["xcrun", "simctl", "keychain", "owned-id", "add-root-cert", "owned-ca.pem"]
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "trust.log"
+            process = Mock(pid=424242)
+            process.wait.return_value = 0
+            with patch.object(fixture_runner.subprocess, "Popen", return_value=process), \
+                 patch.object(fixture_runner, "owned_cli_snapshot") as snapshot:
+                fixture_runner.command(argv, path, trust_trace=True)
+            snapshot.assert_not_called()
+            process.terminate.assert_not_called()
+            stage = json.loads(path.with_suffix(".stage.json").read_text())
+            self.assertEqual(stage["exit"], 0)
+            self.assertEqual(stage["configuredWaitSeconds"], 60)
+            self.assertTrue(stage["diagnosticOnly"])
+            self.assertGreaterEqual(stage["stageElapsedSeconds"], 0)
+
+    def test_owned_snapshot_rejects_changed_birth_or_foreign_parent(self):
+        ctypes = fixture_runner.ctypes
+        for mode in ("simctl", "other", "birth-changed", "foreign-parent"):
+            with self.subTest(mode=mode):
+                lib = Mock()
+                reads = []
+
+                def facts(pid, flavor, arg, target, size):
+                    info = fixture_runner.OwnedBsdInfo()
+                    info.pid, info.parent, info.status = pid, os.getpid(), 2
+                    info.seconds, info.micros = 100, 3
+                    if mode == "foreign-parent":
+                        info.parent += 1
+                    if mode == "birth-changed" and reads:
+                        info.micros += 1
+                    reads.append(pid)
+                    self.assertEqual((flavor, arg, size), (3, 0, 136))
+                    ctypes.memmove(target, ctypes.byref(info), size)
+                    return size
+
+                def image(pid, target, size):
+                    value = b"/private/fixture/simctl" if mode != "other" else b"/private/hidden-name"
+                    self.assertEqual(size, 4096)
+                    ctypes.memmove(target, value + b"\0", len(value) + 1)
+                    return len(value)
+
+                lib.proc_pidinfo.side_effect, lib.proc_pidpath.side_effect = facts, image
+                with patch.object(fixture_runner.platform, "system", return_value="Darwin"), \
+                     patch.object(ctypes, "CDLL", return_value=lib):
+                    if mode in ("birth-changed", "foreign-parent"):
+                        with self.assertRaises(RuntimeError):
+                            fixture_runner.owned_cli_snapshot(424242)
+                    else:
+                        result = fixture_runner.owned_cli_snapshot(424242)
+                        self.assertEqual(result["birthMicros"], 100000003)
+                        self.assertEqual(result["imageClass"], mode)
+                        self.assertNotIn("private", json.dumps(result))
+                if mode == "foreign-parent":
+                    lib.proc_pidpath.assert_not_called()
+
     def test_unreaped_cli_is_recorded_without_masking_timeout(self):
         original = subprocess.TimeoutExpired(["xcrun", "simctl", "shutdown", "owned-id"], 60)
         process = Mock(pid=424242)

@@ -2,6 +2,7 @@
 """Actual product WKDownload UI test on one fresh, owned iOS Simulator."""
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
 import hashlib
 import itertools
 import json
@@ -30,6 +31,46 @@ SIGNING = ("IOS_CERTIFICATE", "IOS_CERTIFICATE_PASSWORD", "IOS_MOBILE_PROVISION"
            "APPLE_DEVELOPMENT_TEAM", "APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH")
 UNREAPED_COMMANDS = []
 INTERRUPTED_COMMANDS = []
+
+
+class OwnedBsdInfo(ctypes.Structure):
+    # Darwin proc_bsdinfo, matching the existing desktop process observer.
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "flags", "status", "xstatus", "pid", "parent", "uid", "gid", "ruid",
+        "rgid", "svuid", "svgid", "reserved")]
+    _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+    _fields_ += [(name, ctypes.c_uint32) for name in ("files", "group", "jobc", "tdev", "tpgid")]
+    _fields_ += [("nice", ctypes.c_int32), ("seconds", ctypes.c_uint64), ("micros", ctypes.c_uint64)]
+
+
+def owned_cli_snapshot(pid):
+    """Fixed-size reads of our still-unreaped Popen child, never its services."""
+    if platform.system() != "Darwin" or ctypes.sizeof(OwnedBsdInfo) != 136:
+        raise RuntimeError("Darwin process identity unavailable")
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    lib.proc_pidinfo.restype = ctypes.c_int
+    lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    lib.proc_pidpath.restype = ctypes.c_int
+
+    def facts():
+        info = OwnedBsdInfo()
+        size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if size != ctypes.sizeof(info) or info.pid != pid or info.parent != os.getpid():
+            raise RuntimeError("Direct child identity unavailable")
+        return {"pid": info.pid, "parent": info.parent,
+                "birthMicros": info.seconds * 1_000_000 + info.micros, "state": info.status}
+
+    before = facts()
+    buffer = ctypes.create_string_buffer(4096)
+    size = lib.proc_pidpath(pid, buffer, len(buffer))
+    after = facts()
+    if any(before[key] != after[key] for key in ("pid", "parent", "birthMicros")):
+        raise RuntimeError("Direct child changed during snapshot")
+    # No command line, environment, full path, certificate or service inventory.
+    image = buffer.value.rsplit(b"/", 1)[-1] if 0 < size < len(buffer) else b""
+    return {**after, "imageClass": image.decode("ascii") if image in (b"xcrun", b"simctl")
+            else "other" if image else "unavailable", "diagnosticOnly": True}
 
 
 def save(path, value):
@@ -112,15 +153,24 @@ def owned_scratch(parent):
                 state["cleanupError"] = type(error).__name__
 
 
-def command(argv, path, timeout=60, env=None, boot_status=False):
+def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=False):
     """Preserve the original failure even if retiring our own CLI also fails."""
     if boot_status and (len(argv) != 5 or argv[:3] != ["xcrun", "simctl", "bootstatus"] or
                         argv[4] != "-b" or timeout != 180):
         raise ValueError("Cold-boot continuation is only for exact Simulator readiness")
+    if trust_trace and (len(argv) != 6 or argv[:3] != ["xcrun", "simctl", "keychain"] or
+                        argv[4] != "add-root-cert" or timeout != 60 or boot_status):
+        raise ValueError("Trust trace is only for the single Simulator CA import")
     boot_started = time.monotonic() if boot_status else None
+    trust = {"diagnosticOnly": True, "configuredWaitSeconds": timeout,
+             "startedUnixSeconds": time.time()} if trust_trace else None
+    trust_started = time.monotonic() if trust_trace else None
     with path.open("xb") as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT,
                                    env=env, start_new_session=True)
+        if trust is not None:
+            trust["pid"] = process.pid
+        failure = None
         try:
             try:
                 code = process.wait(timeout=timeout)
@@ -187,12 +237,34 @@ def command(argv, path, timeout=60, env=None, boot_status=False):
                         original.add_note("Continued bootstatus did not prove exit0 within the total 300-second budget")
                         raise original
         except BaseException as original:
+            failure = original
+            if trust is not None:
+                trust.update(errorType=type(original).__name__,
+                             stageElapsedSeconds=time.monotonic() - trust_started)
+                try:
+                    # Do not poll/reap before the snapshot. Our unreaped child
+                    # cannot have its PID reused, even if it has just exited.
+                    # libproc has fixed read sizes but no hard I/O deadline.
+                    trust["child"] = owned_cli_snapshot(process.pid)
+                except Exception as error:
+                    trust["snapshotErrorType"] = type(error).__name__
             try:
                 retire_cli(process, path, original)
             except Exception as error:
                 original.add_note(f"Owned CLI retirement failed: {type(error).__name__}")
                 UNREAPED_COMMANDS.append({"process": process, "log": str(path)})
             raise
+        finally:
+            if trust is not None:
+                if failure is None:
+                    trust.update(exit=code, stageElapsedSeconds=time.monotonic() - trust_started)
+                try:
+                    save(path.with_suffix(".stage.json"), trust)
+                except Exception as error:
+                    # This optional receipt cannot replace failure or turn a
+                    # failed native operation into success. Retirement ran first.
+                    if failure is not None:
+                        failure.add_note(f"Trust stage evidence unavailable: {type(error).__name__}")
     if code:
         raise RuntimeError(f"{argv[0]} exit {code}; see {path.name}")
     return path.read_text(errors="replace")
@@ -376,7 +448,8 @@ def main():
             command(["xcrun", "simctl", "boot", udid], out / "boot.log")
             command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
             # Trust only on this exact disposable Simulator, never host trust.
-            command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log")
+            command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
+                    out / "trust.log", trust_trace=True)
             server = FixtureServer(cert, key)
             server.start()
             env = dict(os.environ, SUMI_DOWNLOAD_URL=server.url, SUMI_DOWNLOAD_SOURCE=str(HERE),
