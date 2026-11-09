@@ -44,6 +44,14 @@ fresh contexts. A new owned Downloads PNG contains a 128x96 red/blue image.
 Each fresh profile enters through the visible `Start using Photopea` button if
 the ordinary landing page is shown. There is at most one real tap per profile,
 and the same 60-second wait still requires the editor's File menu before Open.
+When the first entry button is below the actual GeckoView viewport, one native
+upward swipe reveals it. Offscreen accessibility bounds authorize that scroll
+only: the tap still requires a visible action wholly inside the viewport.
+The retained event trace records scroll/tap bounds; no script click or page
+replacement is used. All native taps must fit inside the active window.
+The main-thread viewport read waits at most one second within the remaining
+entry deadline. A stalled read fails and cancels its queued callback; a late
+read cannot inject input.
 Actual native keyboard input opens Photopea's file prompt; the engine prompt
 uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes

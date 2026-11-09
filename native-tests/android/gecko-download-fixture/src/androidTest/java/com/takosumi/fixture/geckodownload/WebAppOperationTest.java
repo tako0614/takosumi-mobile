@@ -7,6 +7,8 @@ import android.graphics.BitmapFactory;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.provider.DocumentsContract;
@@ -23,6 +25,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.FutureTask;
 import java.util.function.BooleanSupplier;
 import org.junit.After;
 import org.junit.Test;
@@ -58,10 +61,11 @@ public final class WebAppOperationTest {
         finally { root.recycle(); }
     }
 
-    private Rect find(AccessibilityNodeInfo node, String text, boolean contains, boolean description, int depth) {
+    private Rect find(AccessibilityNodeInfo node, String text, boolean contains, boolean description,
+            boolean visibleOnly, int depth) {
         if (depth > 24) return null;
         CharSequence raw = description ? node.getContentDescription() : node.getText();
-        if (node.isVisibleToUser() && node.isEnabled() && raw != null &&
+        if ((!visibleOnly || node.isVisibleToUser()) && node.isEnabled() && raw != null &&
                 (contains ? raw.toString().contains(text) : raw.toString().equalsIgnoreCase(text))) {
             Rect bounds = new Rect(); node.getBoundsInScreen(bounds);
             if (!bounds.isEmpty()) return bounds;
@@ -70,7 +74,7 @@ public final class WebAppOperationTest {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child == null) continue;
             try {
-                Rect found = find(child, text, contains, description, depth + 1);
+                Rect found = find(child, text, contains, description, visibleOnly, depth + 1);
                 if (found != null) return found;
             } finally { child.recycle(); }
         }
@@ -78,13 +82,22 @@ public final class WebAppOperationTest {
     }
 
     private Rect bounds(String text, boolean contains, boolean description) {
+        return bounds(text, contains, description, true);
+    }
+
+    private Rect bounds(String text, boolean contains, boolean description, boolean visibleOnly) {
         AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
         if (root == null) return null;
-        try { return find(root, text, contains, description, 0); } finally { root.recycle(); }
+        try { return find(root, text, contains, description, visibleOnly, 0); } finally { root.recycle(); }
     }
 
     private void tap(Rect bounds) {
         assertNotNull(bounds);
+        AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+        assertNotNull("Native tap needs the active window", root);
+        Rect window = new Rect();
+        try { root.getBoundsInScreen(window); } finally { root.recycle(); }
+        assertTrue("Native tap must stay inside the active window: " + bounds, window.contains(bounds));
         long down = SystemClock.uptimeMillis();
         for (int action : new int[] {MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
             MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
@@ -100,18 +113,67 @@ public final class WebAppOperationTest {
 
     private void enterEditor(String profile) {
         boolean[] entryTapped = {false};
+        boolean[] entryScrolled = {false};
+        long deadline = SystemClock.elapsedRealtime() + 60000;
         await("Actual anonymous Photopea File menu did not load for " + profile, () -> {
             if (bounds("File", false, false) != null) return true;
             if (!entryTapped[0]) {
+                Rect viewport = visibleWebViewport(deadline);
                 Rect start = bounds("Start using Photopea", false, false);
-                if (start != null) {
+                if (start != null && viewport.contains(start)) {
                     entryTapped[0] = true;
-                    System.out.println("Native Photopea landing entry tap for " + profile);
+                    activity.trace("landing tap " + profile + " viewport=" + viewport.toShortString() + " action=" + start.toShortString());
                     tap(start);
+                } else if (!entryScrolled[0]) {
+                    // The original 320x640 capture places the first CTA below
+                    // the WebView. Its offscreen bounds authorize only a native
+                    // scroll, never a tap or a synthesized page action.
+                    Rect below = bounds("Start using Photopea", false, false, false);
+                    if (below != null && below.top >= viewport.top && below.bottom > viewport.bottom) {
+                        entryScrolled[0] = true;
+                        activity.trace("landing scroll " + profile + " viewport=" + viewport.toShortString() + " action=" + below.toShortString());
+                        swipeUp(viewport);
+                    }
                 }
             }
             return false;
         }, 60);
+    }
+
+    private Rect visibleWebViewport(long deadline) {
+        Handler main = new Handler(Looper.getMainLooper());
+        FutureTask<Rect> read = new FutureTask<>(() -> {
+            Rect viewport = new Rect();
+            if (!activity.view.getGlobalVisibleRect(viewport)) throw new IllegalStateException("GeckoView is not visible");
+            return viewport;
+        });
+        try {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            assertTrue("Photopea entry deadline expired", remaining > 0);
+            assertTrue("Main thread rejected viewport read", main.post(read));
+            return read.get(Math.min(1000, remaining), TimeUnit.MILLISECONDS);
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new AssertionError("Visible GeckoView bounds unavailable before the entry deadline", error);
+        } finally {
+            // A queued or late callback only reads geometry. It must never
+            // perform delayed native input after this test has failed.
+            main.removeCallbacks(read);
+            read.cancel(false);
+        }
+    }
+
+    private void swipeUp(Rect viewport) {
+        assertTrue(viewport.width() > 0 && viewport.height() > 0);
+        long down = SystemClock.uptimeMillis();
+        for (int step = 0; step <= 12; step++) {
+            int action = step == 0 ? MotionEvent.ACTION_DOWN : step == 12 ? MotionEvent.ACTION_UP : MotionEvent.ACTION_MOVE;
+            float y = viewport.top + viewport.height() * (0.75f - 0.5f * step / 12);
+            MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
+                viewport.exactCenterX(), y, 0);
+            try { instrumentation.sendPointerSync(event); } finally { event.recycle(); }
+            if (step < 12) SystemClock.sleep(25);
+        }
     }
 
     private void key(int code, int modifiers) {
