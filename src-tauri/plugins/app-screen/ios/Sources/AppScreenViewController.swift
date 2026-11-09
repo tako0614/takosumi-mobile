@@ -246,6 +246,8 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Where to go when a page the screen does not show was reached in place.
     var fallbackURL: URL?
     private var lastDownloadPromptAt: Date?
+    private var currentDownload: AppScreenDownloadActivity?
+    private var lastNativeDownloadPromptAt: Date?
     /// Last committed URL. The host label shows only this, never the URL of
     /// a navigation that has not committed yet (no spoofing by slow loads).
     private(set) var committedURL: URL?
@@ -275,10 +277,59 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func invalidate(_ webView: WKWebView) {
+        cancelDownloads()
         observations.removeAll()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         screen = nil
+    }
+
+    func cancelDownloads() {
+        let current = currentDownload
+        currentDownload = nil
+        current?.cancel()
+    }
+
+    func resumeDownloadPresentation() { currentDownload?.resumePresentation() }
+
+    private func downloadOrigin(_ frame: WKFrameInfo) -> String? {
+        AppScreenPolicy.mediaCaptureOrigin(scheme: frame.securityOrigin.protocol,
+                                          host: frame.securityOrigin.host, port: frame.securityOrigin.port)
+    }
+
+    private func canDownload(_ webView: WKWebView, target: URL?, sourceOrigin: String?, explicit: Bool) -> Bool {
+        if let last = lastNativeDownloadPromptAt, Date().timeIntervalSince(last) < 3 { return false }
+        return currentDownload == nil && AppScreenPolicy.canDownload(
+            target?.absoluteString ?? "", sourceOrigin: sourceOrigin, page: committedURL?.absoluteString,
+            explicitDownload: explicit, webHome: screen?.isWebHomeDownloadScreen(webView, navigator: self) ?? false,
+            visible: screen?.canPromptForMediaCapture(webView, navigator: self) ?? false)
+    }
+
+    @available(iOS 14.5, *)
+    private func adoptDownload(_ download: WKDownload, webView: WKWebView, sourceOrigin: String) {
+        guard currentDownload == nil, download.webView === webView else { download.cancel(nil); return }
+        lastNativeDownloadPromptAt = Date()
+        let id = UUID()
+        let activity = AppScreenDownload(id: id, download: download, sourceOrigin: sourceOrigin,
+            context: { [weak self, weak webView] in
+                guard let self = self, let webView = webView, self.currentDownload?.id == id,
+                      let screen = self.screen,
+                      screen.isWebHomeDownloadScreen(webView, navigator: self),
+                      screen.isCurrentVisibleWebView(webView, navigator: self) else { return nil }
+                return screen
+            }, declined: { [weak self] in
+                if self?.currentDownload?.id == id { self?.lastNativeDownloadPromptAt = Date() }
+            }, ended: { [weak self] in
+                if self?.currentDownload?.id == id { self?.currentDownload = nil }
+            })
+        currentDownload = activity
+        activity.start()
+    }
+
+    private func isDownloadResponse(_ response: WKNavigationResponse) -> Bool {
+        response.isForMainFrame && AppScreenPolicy.shouldDownloadResponse(
+            canShowMIMEType: response.canShowMIMEType,
+            contentDisposition: (response.response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition"))
     }
 
     func reloadIfNeeded(_ webView: WKWebView) {
@@ -355,6 +406,12 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let url = navigationAction.request.url
         // A nil target frame is a new window; it is judged as a main frame.
         let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        if #available(iOS 14.5, *), navigationAction.shouldPerformDownload,
+           screen?.isWebHomeDownloadScreen(webView, navigator: self) == true {
+            decisionHandler(canDownload(webView, target: url, sourceOrigin: downloadOrigin(navigationAction.sourceFrame),
+                                        explicit: true) ? .download : .cancel)
+            return
+        }
         switch AppScreenPolicy.decide(
             url?.absoluteString ?? "", mainFrame: mainFrame, origins: origins)
         {
@@ -388,6 +445,14 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
+        if #available(iOS 14.5, *), isDownloadResponse(navigationResponse),
+           screen?.isWebHomeDownloadScreen(webView, navigator: self) == true {
+            let url = navigationResponse.response.url
+            decisionHandler(canDownload(webView, target: url,
+                                        sourceOrigin: url.flatMap { AppScreenPolicy.origin(of: $0.absoluteString) },
+                                        explicit: false) ? .download : .cancel)
+            return
+        }
         if !navigationResponse.canShowMIMEType,
            navigationResponse.isForMainFrame,
            let url = navigationResponse.response.url,
@@ -402,6 +467,26 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decisionHandler(.allow)
     }
 
+    @available(iOS 14.5, *)
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        guard navigationAction.shouldPerformDownload, let origin = downloadOrigin(navigationAction.sourceFrame),
+              canDownload(webView, target: navigationAction.request.url, sourceOrigin: origin, explicit: true) else {
+            download.cancel(nil); return
+        }
+        adoptDownload(download, webView: webView, sourceOrigin: origin)
+    }
+
+    @available(iOS 14.5, *)
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        let url = navigationResponse.response.url
+        guard isDownloadResponse(navigationResponse),
+              let origin = url.flatMap({ AppScreenPolicy.origin(of: $0.absoluteString) }),
+              canDownload(webView, target: url, sourceOrigin: origin, explicit: false) else {
+            download.cancel(nil); return
+        }
+        adoptDownload(download, webView: webView, sourceOrigin: origin)
+    }
+
     private func navigationID(_ navigation: WKNavigation) -> Int {
         Int(bitPattern: Unmanaged.passUnretained(navigation).toOpaque())
     }
@@ -411,6 +496,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        currentDownload?.cancelUnconfirmed()
         if let navigation = navigation { resumeState.commit(navigationID(navigation)) }
         if let url = webView.url, !keepsCommitted(webView, url) { return }
         committedURL = webView.url
@@ -443,6 +529,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        cancelDownloads()
         if screen != nil {
             webView.reload()
         } else {
@@ -830,17 +917,26 @@ final class AppScreenViewController: UIViewController {
         coordinator.setVisible(session.key, true)
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        session.navigator.resumeDownloadPresentation()
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         // Covered by its own popup it stays on the stack and stays alive.
-        if isBeingDismissed || presentingViewController == nil {
+        if isBeingDismissed || (presentingViewController == nil && presentedViewController == nil) {
             pendingDialog?.cancel()
             // The app may already be reopened in a new controller.
-            if ownsSession() { coordinator.setVisible(session.key, false) }
+            if ownsSession() {
+                session.navigator.cancelDownloads()
+                coordinator.setVisible(session.key, false)
+            }
         }
     }
 
     func show(_ next: AppScreenSession) {
+        session.navigator.cancelDownloads()
         coordinator.setVisible(session.key, false)
         session = next
         coordinator.setVisible(next.key, true)
@@ -861,6 +957,7 @@ final class AppScreenViewController: UIViewController {
     private func attach(_ next: AppScreenSession) {
         if attachedSession === next { return }
         if let previous = attachedSession {
+            previous.navigator.cancelDownloads()
             if previous.navigator.screen === self { previous.navigator.screen = nil }
             previous.webView.removeFromSuperview()
         }
@@ -1156,7 +1253,15 @@ final class AppScreenViewController: UIViewController {
     }
 
     func canPromptForMediaCapture(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
-        guard canPresent(), !webView.isHidden, viewIfLoaded?.isHidden == false,
+        canPresent() && isCurrentVisibleWebView(webView, navigator: navigator)
+    }
+
+    func isWebHomeDownloadScreen(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        session.webHome && session.webView === webView && session.navigator === navigator
+    }
+
+    func isCurrentVisibleWebView(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        guard !isBeingDismissed, !webView.isHidden, viewIfLoaded?.isHidden == false,
               let window = webView.window, window === viewIfLoaded?.window, !window.isHidden,
               UIApplication.shared.applicationState == .active else { return false }
         // Pinned Tauri/Tao also supports legacy UIApplicationDelegate windows.
@@ -1169,6 +1274,7 @@ final class AppScreenViewController: UIViewController {
         configuration.websiteDataStore = session.webView.configuration.websiteDataStore
         configuration.processPool = session.webView.configuration.processPool
         let popup = coordinator.makePopupSession(configuration: configuration, origins: origins, profile: session.profile)
+        popup.webHome = session.webHome
         popup.title = session.title
         let controller = AppScreenViewController(coordinator: coordinator, session: popup)
         controller.modalPresentationStyle = .fullScreen

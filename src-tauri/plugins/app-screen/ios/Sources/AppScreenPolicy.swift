@@ -279,6 +279,45 @@ enum AppScreenPolicy {
         return true
     }
 
+    /// A download-only exception. This does not change ordinary navigation or
+    /// make a Blob/file/data URL launchable. WebKit supplies the frame origin.
+    static func canDownload(_ target: String, sourceOrigin: String?, page: String?,
+                            explicitDownload: Bool, webHome: Bool, visible: Bool) -> Bool {
+        guard webHome, canPromptForMediaCapture(origin: sourceOrigin, page: page, visible: visible),
+              let sourceOrigin = sourceOrigin else { return false }
+        if isLaunchable(target) { return true }
+        return explicitDownload && isDownloadTarget(target, sourceOrigin: sourceOrigin)
+    }
+
+    static func isDownloadTarget(_ target: String, sourceOrigin: String) -> Bool {
+        guard isLaunchable(sourceOrigin), origin(of: sourceOrigin) == sourceOrigin else { return false }
+        if isLaunchable(target) { return true }
+        guard target.lowercased().hasPrefix("blob:") else { return false }
+        let inner = String(target.dropFirst(5))
+        return isLaunchable(inner) && origin(of: inner) == sourceOrigin
+    }
+
+    static func shouldDownloadResponse(canShowMIMEType: Bool, contentDisposition: String?) -> Bool {
+        !canShowMIMEType || contentDisposition?.split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "attachment"
+    }
+
+    /// A display/export basename, never a filesystem path from web content.
+    static func downloadFilename(_ suggested: String) -> String {
+        let leaf = (suggested.replacingOccurrences(of: "\\", with: "/") as NSString).lastPathComponent
+        let scalars = leaf.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .format &&
+                $0 != ":" && $0 != "/" && $0 != "\\"
+        }
+        var name = String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        if name.isEmpty { name = "download" }
+        let ext = (name as NSString).pathExtension
+        let suffix = !ext.isEmpty && ext.utf8.count <= 24 ? "." + ext : ""
+        var stem = suffix.isEmpty ? name : String(name.dropLast(suffix.count))
+        while stem.utf8.count + suffix.utf8.count > 180 { stem.removeLast() }
+        return (stem.isEmpty ? "download" : stem) + suffix
+    }
+
     /// Serialize WebKit's native security origin, including IPv6 and ports.
     static func mediaCaptureOrigin(scheme: String, host: String, port: Int) -> String? {
         guard scheme.lowercased() == "https", !host.isEmpty, (0...65_535).contains(port) else { return nil }

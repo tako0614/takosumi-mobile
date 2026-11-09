@@ -130,6 +130,26 @@ Compiler caches are saved after non-cancelled SDK failures as well as success,
 so a source repair can reuse completed compilation. Failed checks stay failed;
 cached compiler files are not accepted App artifacts or runtime evidence.
 
+### iOS download runtime qualification
+
+The WKDownload candidate has policy cases for active Web-home/frame origins,
+the explicit same-origin Blob exception, attachment disposition and safe
+filename handling. The whole App SDK lane compiles its UIKit/WebKit wiring.
+There is no download runtime fixture yet, and these checks must not be reported
+as a successful authenticated file transfer or OS export.
+
+The next native case must use the actual AppScreen WebView with a disposable
+HTTPS fixture: establish its own session cookie, select an attachment and a
+Blob from visible controls, accept the native prompt, export through the OS,
+and verify exact bytes/name. A separate profile must not inherit that cookie.
+Exercise decline, transfer cancellation, navigation before consent, session
+close and an adapted export presentation; verify only the owned temporary
+directory is removed after writing/export actually stops. Include a tiny file
+that finishes during modal transitions and return from an inactive application.
+Use neither a replacement URLSession fetch nor a synthetic WKDownload delegate
+result as the success oracle. Real IdP, device, HTTP-auth and distribution
+qualification remain separate.
+
 ## Desktop GTK runtime fixture
 
 On Linux with the Tauri GTK/WebKit SDK, Xvfb, xdotool, Python and OpenSSL, build

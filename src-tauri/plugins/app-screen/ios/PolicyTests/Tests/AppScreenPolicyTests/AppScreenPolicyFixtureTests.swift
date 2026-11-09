@@ -6,6 +6,56 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testDownloadsRequireVisibleWebHomeAndNativeFrameOrigin() {
+        let origin = "https://app.example"
+        let blob = "blob:https://app.example/1234"
+        func allowed(_ url: String, source: String? = "https://app.example", page: String? = "https://app.example/editor",
+                     explicit: Bool = true, webHome: Bool = true, visible: Bool = true) -> Bool {
+            AppScreenPolicy.canDownload(url, sourceOrigin: source, page: page,
+                                        explicitDownload: explicit, webHome: webHome, visible: visible)
+        }
+        XCTAssertTrue(allowed("https://files.example/export?format=pdf", explicit: false))
+        XCTAssertTrue(allowed(blob))
+        XCTAssertFalse(allowed(blob, explicit: false))
+        XCTAssertFalse(allowed(blob, source: "https://other.example"))
+        XCTAssertFalse(allowed(blob, source: origin + "/editor"))
+        XCTAssertFalse(allowed(blob, source: nil))
+        XCTAssertFalse(allowed(blob, page: nil))
+        XCTAssertFalse(allowed(blob, visible: false))
+        XCTAssertFalse(allowed(blob, webHome: false))
+        for url in ["blob:null/id", "blob:https://ipc.localhost/id", "file:///private/data", "data:text/plain,body",
+                    "http://app.example/file", "https://user:pass@app.example/file", "https://ipc.localhost/file"] {
+            XCTAssertFalse(allowed(url), url)
+        }
+        XCTAssertFalse(allowed(blob, page: "https://ipc.localhost/"))
+        XCTAssertEqual(AppScreenPolicy.decide(blob, mainFrame: true, origins: nil), .block)
+        XCTAssertFalse(AppScreenPolicy.isLaunchable(blob))
+    }
+
+    func testSuggestedDownloadFilenameCannotChoosePathOrHideExtension() {
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("../../secrets/export.txt"), "export.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("C:\\private\\export.txt"), "export.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("\u{0}bad\nfile\u{202E}.txt"), "badfile.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename(".."), "download")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename(" .hidden.txt "), "hidden.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("report:final.pdf"), "reportfinal.pdf")
+    }
+
+    func testAttachmentDownloadsEvenWhenWebKitCanRenderItsMimeType() {
+        XCTAssertTrue(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: false, contentDisposition: nil))
+        XCTAssertTrue(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: "Attachment; filename=report.pdf"))
+        XCTAssertFalse(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: "inline; filename=attachment"))
+        XCTAssertFalse(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: nil))
+    }
+
+    func testLongUnicodeDownloadNameKeepsItsExtensionWithinByteLimit() {
+        let name = AppScreenPolicy.downloadFilename(String(repeating: "資料🦀", count: 100) + ".pdf")
+        XCTAssertLessThanOrEqual(name.utf8.count, 180)
+        XCTAssertTrue(name.hasSuffix(".pdf"))
+        XCTAssertFalse(name.contains("/"))
+        XCTAssertFalse(name.isEmpty)
+    }
+
     func testMediaPromptEligibilityIncludesOtherHttpsFrames() {
         // Cross-origin frames can ask through WebKit's own Permissions Policy;
         // no origin is automatically granted by this eligibility decision.

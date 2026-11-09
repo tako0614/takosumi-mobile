@@ -96,6 +96,14 @@ native download service while keeping them out of page navigation. Its
 Excalidraw/Photopea file checks and remaining platform limits are described in
 [native tests](native-tests/README.md).
 
+The iOS Web-home adapter now hands download actions and attachment responses
+to the original WKDownload, with native confirmation, transfer cancellation
+and OS export. It keeps the originating profile and does not reopen the URL
+in Safari or copy cookies. This candidate still needs actual Simulator download
+and export qualification; the SDK build alone cannot establish cookie/Blob
+transfer or temporary-file cleanup. See the
+[download contract](src-tauri/plugins/app-screen/README.md#ios-web-home-downloads).
+
 Web homes remember an eligible last page separately for each connection and
 profile, including another app's https origin. Native document outcomes gate
 this metadata: provisional loads and transport failures do not replace a working

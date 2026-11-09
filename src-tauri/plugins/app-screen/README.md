@@ -93,6 +93,32 @@ picker pause/stop does not cancel selection. The existing content-provider URI
 filter remains in force. Controller tests cover this result binding; native
 picker UI, upload completion and device recreation need separate runtime proof.
 
+### iOS Web-home downloads
+
+Web homes use the original WKDownload for explicit download actions and
+main-frame attachment/non-renderable responses. The existing isolated Web-home
+profile still requires iOS 17+. Blob handling is an explicit-download-only
+exception tied to WebKit's HTTPS frame origin; ordinary Blob navigation and
+local/shell/data URLs remain blocked. Legacy app screens keep their old path.
+The navigator retains one activity, bound to the exact WebView/session, through
+native confirmation, byte progress with Cancel, and OS export/Save to Files.
+An untrusted suggested name becomes a bounded basename inside a fresh private
+temporary directory. The page receives no filesystem bridge or cookie export.
+Redirects must stay on eligible HTTPS URLs and TLS uses system validation.
+Non-TLS HTTP authentication challenges are refused; cookie continuity still
+needs actual native proof.
+
+Page commits cancel an unconfirmed request. Session removal/switching,
+WebContent termination and backgrounding stop an unfinished transfer; partial
+files are removed after WebKit confirms cancellation. OS export retains its
+file until completion/cancellation, including a file-provider handoff. Prompts
+keep a three-second cooldown, restarted by the person's cancellation. Cleanup
+only targets that activity's directory; failures are logged without URLs or
+paths. Process-crash cleanup and background/resumable downloads are not qualified.
+The policy tests and SDK build do not prove cookie/Blob bytes, native modal
+ordering, export completion or cleanup. Those require the
+[iOS runtime fixture](../../../native-tests/README.md#ios-download-runtime-qualification) described separately.
+
 ## Preserved mobile adapter
 
 The remaining sections describe the previous Android/iOS client with
