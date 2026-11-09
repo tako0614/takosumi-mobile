@@ -197,7 +197,10 @@ public final class WebAppOperationTest {
 
     private void tap(String text) {
         await("Missing native text " + text, () -> bounds(text, false, false) != null, 30);
-        tap(bounds(text, false, false));
+        // Every text tap faces the same re-layout race the open action hit:
+        // a still-moving rect is refuse-to-tap, not best-effort.
+        tap(awaitRect("Native text " + text + " did not settle",
+            () -> stable("text " + text, bounds(text, false, false)), 15));
     }
 
     private void enterEditor(String profile) {
