@@ -75,6 +75,12 @@ UiAutomation's cross-app input route, with touchscreen source and successful
 injection required: `sendPointerSync` is restricted to the instrumented app UID
 and cannot operate the real system picker. No permission adoption, shell input
 or direct picker callback replaces the OS touch/selection.
+Every synthesized touch reports a real finger's tool type. A plain
+MotionEvent.obtain overload leaves TOOL_TYPE_UNKNOWN; selection-driven
+picker rows can ignore unknown-tool input while ordinary buttons still click,
+so faithful tool types keep the tap inside the picker's own input handling.
+Each tap records its down-to-up delivery gap in the bounded event trace so a
+gesture that arrives too slowly to click is visible rather than silent.
 If a target recheck or UP fails after an accepted DOWN, the test attempts to cancel that
 same touch stream and retains the original failure (including cancellation
 failure if present). There is no repeat tap or recovery that hides the error.
@@ -83,6 +89,11 @@ description, with a Preview overlay covering the thumbnail center. In that
 layout the test taps the actual `List view` control at most once, within the
 same 15-second image wait. Selection still requires the exact visible filename
 text and the original OS prompt result; it never taps a substring or preview.
+A visible row can ignore a lone tap while the picker still settles after a
+view-mode switch. Only while DocumentsUI still shows the exact owned filename
+unselected may the test re-tap that same filename text, at most three times
+total and two seconds apart, each attempt traced. The original OS prompt
+result remains the only success signal; a repeat never counts as selection.
 The engine prompt uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes
 Photopea's Save for web and receives the original HTTPS Blob response. Native

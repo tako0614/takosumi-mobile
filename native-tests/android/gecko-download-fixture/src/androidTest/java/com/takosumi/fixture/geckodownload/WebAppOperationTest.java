@@ -113,6 +113,7 @@ public final class WebAppOperationTest {
         assertTrue("Native tap must stay inside the active window: " + bounds, window.contains(bounds));
         long down = SystemClock.uptimeMillis();
         boolean gestureStarted = false;
+        long downDelivered = -1;
         try {
             for (int action : new int[] {MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
                 AccessibilityNodeInfo current = instrumentation.getUiAutomation().getRootInActiveWindow();
@@ -133,9 +134,13 @@ public final class WebAppOperationTest {
                         activity.trace("open touch observation unavailable " + observation.getClass().getSimpleName());
                     }
                 }
-                MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
-                    bounds.exactCenterX(), bounds.exactCenterY(), 0);
-                event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                // A real finger reports TOOL_TYPE_FINGER; obtain()'s plain overload
+                // leaves TOOL_TYPE_UNKNOWN. Selection-driven lists gate their item
+                // activation on finger/stylus tool types, so an unknown-tool tap
+                // on a DocumentsUI row can be ignored while ordinary buttons
+                // still click. Keep the synthesized touch faithful instead of
+                // routing around the picker's own input handling.
+                MotionEvent event = touch(down, action, bounds);
                 try {
                     // sendPointerSync is restricted to the instrumented app UID.
                     // The real OS picker belongs to its own UID; UiAutomation is
@@ -145,6 +150,10 @@ public final class WebAppOperationTest {
                         instrumentation.getUiAutomation().injectInputEvent(event, true));
                     else instrumentation.sendPointerSync(event);
                     gestureStarted = action == MotionEvent.ACTION_DOWN;
+                    if (action == MotionEvent.ACTION_DOWN) downDelivered = SystemClock.uptimeMillis();
+                    else if (activity != null)
+                        activity.trace("tap delivery gap=" + (SystemClock.uptimeMillis() - downDelivered) +
+                            "ms " + bounds.toShortString());
                 } finally { event.recycle(); }
             }
         } catch (RuntimeException | Error failure) {
@@ -152,9 +161,7 @@ public final class WebAppOperationTest {
                 // A changed target or rejected UP must not leave our accepted
                 // DOWN held. Attempt CANCEL through the same input route, not
                 // an UP on a replacement window. Preserve the original error.
-                MotionEvent cancel = MotionEvent.obtain(down, SystemClock.uptimeMillis(),
-                    MotionEvent.ACTION_CANCEL, bounds.exactCenterX(), bounds.exactCenterY(), 0);
-                cancel.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                MotionEvent cancel = touch(down, MotionEvent.ACTION_CANCEL, bounds);
                 try {
                     if (systemPicker) assertTrue("Owned picker touch stream could not be cancelled",
                         instrumentation.getUiAutomation().injectInputEvent(cancel, true));
@@ -164,6 +171,21 @@ public final class WebAppOperationTest {
             }
             throw failure;
         }
+    }
+
+    private MotionEvent touch(long down, int action, Rect bounds) {
+        MotionEvent.PointerProperties[] properties = new MotionEvent.PointerProperties[1];
+        properties[0] = new MotionEvent.PointerProperties();
+        properties[0].id = 0;
+        properties[0].toolType = MotionEvent.TOOL_TYPE_FINGER;
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+        coords[0] = new MotionEvent.PointerCoords();
+        coords[0].x = bounds.exactCenterX();
+        coords[0].y = bounds.exactCenterY();
+        coords[0].pressure = 1;
+        coords[0].size = 1;
+        return MotionEvent.obtain(down, SystemClock.uptimeMillis(), action,
+            1, properties, coords, 0, 0, 1, 1, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
     }
 
     private void tap(String text) {
@@ -459,12 +481,25 @@ public final class WebAppOperationTest {
         Rect bounds = new Rect(); node.getBoundsInScreen(bounds);
         out.append(depth).append(' ').append(bounded(node.getClassName())).append(' ').append(bounds.toShortString())
             .append(" text=").append(bounded(node.getText()))
-            .append(" description=").append(bounded(node.getContentDescription())).append('\n');
+            .append(" description=").append(bounded(node.getContentDescription()))
+            .append(flags(node)).append('\n');
         if (out.length() > 16000) out.setLength(16000);
         for (int i = 0; i < node.getChildCount() && left[0] > 0 && out.length() < 16000; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) try { describe(child, out, depth + 1, left); } finally { child.recycle(); }
         }
+    }
+
+    private String flags(AccessibilityNodeInfo node) {
+        StringBuilder out = new StringBuilder();
+        if (node.isClickable()) out.append(",clickable");
+        if (node.isLongClickable()) out.append(",long-clickable");
+        if (node.isCheckable()) out.append(",checkable");
+        if (node.isChecked()) out.append(",checked");
+        if (node.isSelected()) out.append(",selected");
+        if (node.isFocused()) out.append(",focused");
+        if (!node.isEnabled()) out.append(",disabled");
+        return out.length() == 0 ? "" : " flags=" + out.substring(1);
     }
 
     private String bounded(CharSequence raw) {
