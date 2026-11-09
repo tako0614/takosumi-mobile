@@ -503,6 +503,42 @@ pub struct CapabilitiesResponse {
     pub pin_shortcut: bool,
     #[serde(default)]
     pub clear_profile: bool,
+    #[serde(default)]
+    pub recover_profile: bool,
+}
+
+/// A separate user-confirmed restart of one ended browser generation. The
+/// normal open command never grants this consent or erases saved site data.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverProfileRequest {
+    pub open: OpenRequest,
+    pub generation: String,
+}
+
+impl RecoverProfileRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.open.web_home || !is_isolated_profile(&self.open.profile) {
+            return Err(crate::Error::InvalidRequest(
+                "Browser recovery requires an isolated Web home.",
+            ));
+        }
+        self.open.validate()?;
+        if !self.generation.parse::<u64>().is_ok_and(|generation| {
+            generation > 0 && generation.to_string() == self.generation
+        }) {
+            return Err(crate::Error::InvalidRequest(
+                "Browser recovery generation is invalid.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverProfileResponse {
+    pub reopened: bool,
 }
 
 /// Explicitly clear one isolated Web connection, never the legacy shared jar.
@@ -551,6 +587,34 @@ pub struct PinShortcutResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_requires_an_isolated_web_home_origin_and_exact_generation() {
+        let profile = "10448f17-8fb9-40b9-a690-4d3aaafc4e31";
+        let mut recovery = RecoverProfileRequest {
+            open: request("https://sumi.example/", profile),
+            generation: "1".into(),
+        };
+        recovery.open.key = format!("web-home:{profile}:https://sumi.example");
+        assert!(recovery.validate().is_err());
+        recovery.open.web_home = true;
+        recovery.validate().unwrap();
+        recovery.open.url = "https://different.example/".into();
+        assert!(recovery.validate().is_err());
+        recovery.open.url = "https://sumi.example/".into();
+        for generation in ["", "0", "01", "+1", "-1", "18446744073709551616"] {
+            recovery.generation = generation.into();
+            assert!(recovery.validate().is_err(), "{generation}");
+        }
+        recovery.generation = "1".into();
+        recovery.open.profile = SHARED_PROFILE.into();
+        recovery.open.key = "web-home:https://sumi.example".into();
+        assert!(recovery.validate().is_err());
+        recovery.open.web_home = false;
+        recovery.open.key = "app:cap:web".into();
+        recovery.open.validate().unwrap(); // valid legacy request, never recovery
+        assert!(recovery.validate().is_err());
+    }
 
     #[test]
     fn clear_profile_targets_never_include_shared_or_another_connection() {

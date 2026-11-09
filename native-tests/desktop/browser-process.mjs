@@ -10,7 +10,7 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify','files','recover'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 // The app's own document has rendered (not the initial about:blank of a new window).
@@ -102,8 +102,15 @@ async function failureSnapshot(client) {
   if(!binding||client.snapshotAttempted)return;
   client.snapshotAttempted=true;
   try {
+    const args=[];
+    if(phase==='recover') {
+      const selected=[['open',proof.reopened],['before',proof.before],['initial',proof.opened]]
+        .find(([,state])=>state?.processes.some(p=>p.pid===binding.process.pid&&p.opened.nativePid===binding.process.opened.nativePid));
+      assert(selected,'Recovery snapshot needs the exact recorded generation');
+      args.push('--binding',`app-browser-process-recover-${selected[0]}.json`);
+    }
     proof.processSnapshot=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('./browser_snapshot.py',import.meta.url)),
-      '--data',data,'--profile',binding.process.profile,'--native-start',binding.nativeStart,'--guard-start',binding.guardStart]));
+      '--data',data,'--profile',binding.process.profile,'--native-start',binding.nativeStart,'--guard-start',binding.guardStart,...args]));
   }catch(error){proof.snapshotError=String(error);}
   try {
     const owner=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(binding.process.opened.windowId)]));
@@ -657,6 +664,86 @@ async function openExternalProbe(work,personal,expected,sample) {
   assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
   state.passed=true;return state;
 }
+async function recoverFlow() {
+  const initial=await marker('app-browser-process-recover-initial.json');proof.opened=initial;
+  const named=(state,name)=>{
+    const connection=state.connections.find(c=>c.name===name);assert(connection);
+    const record=state.processes.find(p=>p.profile===connection.profile);assert(record);return record;
+  };
+  const work=await attach(named(initial,'Work')),personal=await attach(named(initial,'Personal'));
+  const key=`sumi_recovery_${nonce}`,quoted=JSON.stringify(key);
+  const sample=page=>page.evaluate(`({document:globalThis[${quoted}]??null,storage:localStorage.getItem(${quoted}),cookie:${cookieOf(key)}})`);
+  for(const [index,page] of [work,personal].entries()) {
+    assert.deepEqual(await sample(page),{document:null,storage:null,cookie:null});
+    await page.evaluate(`(()=>{globalThis[${quoted}]=${JSON.stringify(`${index}:${nonce}`)};localStorage.setItem(${quoted},globalThis[${quoted}]);document.cookie=${JSON.stringify(`${key}=${index}:${nonce}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};return true})()`);
+  }
+  const expected=await Promise.all([work,personal].map(sample));proof.initial=expected;
+  assert.deepEqual(expected.map(p=>p.cookie),[`0:${nonce}`,`1:${nonce}`]);
+  step('save Work normally before inducing a crash',work);
+  desktop('xdotool',['windowraise',String(work.native.windowId)]);
+  desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
+  desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
+  proof.seedClosed=await normalReceipt(work.process.guardReceipt,'Work must save normally before the crash generation');
+  await writeFile(path.join(data,'recover-seeded'),'ready',{flag:'wx'});
+  const before=await marker('app-browser-process-recover-before.json');proof.before=before;
+  const crashed=await attach(named(before,'Work'));
+  const saved={...expected[0],document:null};
+  assert.deepEqual(await sample(crashed),saved,'Crash input must already be durable across normal reopen');
+  assert.deepEqual(await sample(personal),expected[1],'Personal must keep its exact live document');
+  const binding=crashed.c.binding;
+  const cacheRoot=path.join(crashed.process.directory,'cef-profiles');
+  const cacheIdentity=async()=>{
+    const root=await lstat(cacheRoot,{bigint:true}),cache=await lstat(path.join(cacheRoot,crashed.process.profile),{bigint:true});
+    assert(root.isDirectory()&&cache.isDirectory());
+    return {root:{device:String(root.dev),inode:String(root.ino)},cache:{device:String(cache.dev),inode:String(cache.ino)}};
+  };
+  proof.cacheBefore=await cacheIdentity();
+  step('terminate only the attested fixture-owned native browser',crashed);
+  // pidfd binds the signal to this generation. Check its start and direct
+  // guard parent after opening the handle; never signal the guard or scan.
+  proof.crashSignal=JSON.parse(desktop('python3',['-B','-c',
+    "import json,os,pathlib,signal,sys\npid,start,guard,gstart=sys.argv[1:]\nfd=os.pidfd_open(int(pid))\ntry:\n p=pathlib.Path('/proc/'+pid+'/stat').read_text().rsplit(') ',1)[1].split()\n g=pathlib.Path('/proc/'+guard+'/stat').read_text().rsplit(') ',1)[1].split()\n assert p[19]==start and p[1]==guard and p[0] not in ('Z','X')\n assert g[19]==gstart and g[0] not in ('Z','X')\n signal.pidfd_send_signal(fd,signal.SIGKILL)\n print(json.dumps({'nativePid':int(pid),'nativeStart':start,'guardPid':int(guard),'guardStart':gstart,'signal':'SIGKILL','pidfd':True}))\nfinally:\n os.close(fd)",
+    String(crashed.native.nativePid),binding.nativeStart,String(crashed.process.pid),binding.guardStart]));
+  await settled(()=>guardEnded(crashed.process.guardReceipt),'Crash guard must finish its exact descendants');
+  const receipt=JSON.parse(await readFile(crashed.process.guardReceipt,'utf8'));proof.crashReceipt=receipt;
+  assert.equal(receipt.rootExit,-9);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
+  assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.deepEqual(receipt.nonFatalErrors,[]);assert.equal(receipt.error,null);
+  assert(Number.isSafeInteger(receipt.forcedCleanup)&&receipt.forcedCleanup>=0);
+  await settled(async()=>{const state=await guardState(crashed.process.pid);return !state||(state.start===binding.guardStart&&state.state==='Z');},'Original guard must be terminal before recovery');
+  await writeFile(path.join(data,'recover-crashed'),'ready',{flag:'wx'});
+  const offered=await marker('app-browser-process-recover-offered.json');
+  assert.deepEqual(offered,before.processes,'The first home open must not automatically recover');
+  assert.deepEqual(await sample(personal),expected[1]);
+  proof.explicitConsentRequired=true;
+  await writeFile(path.join(data,'recover-consent'),'ready',{flag:'wx'});
+  const reopened=await marker('app-browser-process-recover-open.json');proof.reopened=reopened;
+  assert.equal(reopened.explicitRecovery,true);
+  assert.deepEqual(reopened.connections,before.connections);
+  const fresh=named(reopened,'Work'),other=named(reopened,'Personal');
+  assert.deepEqual(other,named(before,'Personal'),'Personal native ownership must not change');
+  assert.equal(fresh.profile,crashed.process.profile);assert.equal(fresh.directory,crashed.process.directory);
+  assert.notEqual(fresh.pid,crashed.process.pid);assert.notEqual(fresh.opened.nativePid,crashed.native.nativePid);
+  const recovered=await attach(fresh);
+  assert.deepEqual(await sample(recovered),saved,'Explicit recovery must retain the already saved cookie/storage');
+  proof.cacheAfter=await cacheIdentity();
+  assert.deepEqual(proof.cacheAfter,proof.cacheBefore,'Recovery must reuse the same cache directories');
+  assert.deepEqual(await sample(personal),expected[1],'Other profile must keep its exact document and data');
+  assert.equal(await startTime(personal.native.nativePid),personal.c.binding.nativeStart);
+  assert.equal(await startTime(personal.process.pid),personal.c.binding.guardStart);
+  const incidents=path.join(fresh.directory,'recoveries'),entries=await readdir(incidents);
+  assert.equal(entries.length,1,'One durable recovery incident for this generation');
+  const incidentFile=path.join(incidents,entries[0]),info=await lstat(incidentFile);
+  assert(info.isFile()&&!info.isSymbolicLink());assert.equal(info.mode&0o777,0o600);
+  const incident=JSON.parse(await readFile(incidentFile,'utf8'));proof.incident=incident;
+  assert.equal(incident.schema,1);assert.equal(incident.profile,fresh.profile);
+  assert.equal(incident.guardPid,crashed.process.pid);assert.equal(incident.nativePid,crashed.native.nativePid);
+  assert.deepEqual(incident.receipt,receipt,'Original abnormal receipt must remain abnormal and unchanged');
+  proof.persisted=await Promise.all([recovered,personal].map(sample));
+  proof.bindings=[crashed,recovered,personal].map(page=>page.c.binding);
+  await writeFile(path.join(data,'recover-inspected'),'ready',{flag:'wx'});
+  proof.passed=true;
+}
+
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -805,7 +892,8 @@ async function firstLaunch() {
 const clients=[];
 const attachments=[];
 try {
-  if(phase)await relaunchFlow(phase);
+  if(phase==='recover')await recoverFlow();
+  else if(phase)await relaunchFlow(phase);
   else await firstLaunch();
 }catch(error){
   proof.error=String(error);

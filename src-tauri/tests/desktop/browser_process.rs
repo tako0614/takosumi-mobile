@@ -31,7 +31,7 @@ type Result<T> = std::result::Result<T, String>;
 /// Later launches on the same App data. Notifications and the native file
 /// chooser are inspected on Linux only.
 #[cfg(target_os = "linux")]
-const PHASES: &[&str] = &["restart", "reset", "notify", "files"];
+const PHASES: &[&str] = &["restart", "reset", "notify", "files", "recover"];
 #[cfg(any(windows, target_os = "macos"))]
 const PHASES: &[&str] = &["restart", "reset"];
 
@@ -561,6 +561,77 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
     println!("PASS {kind} App reopened both saved profiles");
     Ok(())
 }
+/// Actual home controls: normal open must offer recovery without reopening;
+/// only a subsequent explicit action may create a new native generation.
+#[cfg(target_os = "linux")]
+async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
+    add(view, "Work", 1).await?;
+    add(view, "Personal", 2).await?;
+    let connections = eval(
+        view,
+        "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+    )
+    .await?;
+    let record = |name: &str, value: &Value| -> Result<()> {
+        std::fs::write(case.join(name), serde_json::to_vec_pretty(value).unwrap())
+            .map_err(|error| error.to_string())
+    };
+    record(
+        "app-browser-process-recover-initial.json",
+        &serde_json::json!({
+            "connections":connections,"processes":browser_status(app)?
+        }),
+    )?;
+    // The observer first saves and normally closes Work. Reopening it proves
+    // this case's data was durable before inducing the crash.
+    checkpoint(view, case, "recover-seeded").await?;
+    open_saved(view, app, "Work", 2).await?;
+    let before = browser_status(app)?;
+    record(
+        "app-browser-process-recover-before.json",
+        &serde_json::json!({
+            "connections":connections,"processes":before
+        }),
+    )?;
+    checkpoint(view, case, "recover-crashed").await?;
+    // Match the existing saved connection button by its own name, independent
+    // of whether this home still displays the resume hint.
+    eval(view,"(()=>{const buttons=[...document.querySelectorAll('.web-connection')].filter(b=>b.querySelector('strong').textContent==='Work');if(buttons.length!==1||buttons[0].disabled)throw Error('Unique enabled Work required');buttons[0].click();return true})()").await?;
+    ready(view,"document.querySelector('.web-error') && document.querySelector('section[aria-label=\"ブラウザの復帰\"]') && !document.querySelector('.web-connection:disabled')").await?;
+    if eval(view, "document.querySelector('section[aria-label=\"ブラウザの復帰\"] p').textContent.startsWith('Workを開き直します。')").await? != Value::Bool(true) {
+        return Err("Recovery confirmation must identify Work".into());
+    }
+    let offered = browser_status(app)?;
+    if offered != before {
+        return Err("Offering crash recovery must not change browser ownership".into());
+    }
+    record("app-browser-process-recover-offered.json", &offered)?;
+    checkpoint(view, case, "recover-consent").await?;
+    eval(view,"(()=>{const buttons=[...document.querySelectorAll('section[aria-label=\"ブラウザの復帰\"] button')].filter(b=>b.textContent.trim()==='保存データを保持して開き直す'&&!b.disabled);if(buttons.length!==1)throw Error('Unique explicit recovery action required');buttons[0].click();return true})()").await?;
+    ready(view,"!document.querySelector('.web-error') && !document.querySelector('section[aria-label=\"ブラウザの復帰\"]') && !document.querySelector('.web-connection:disabled')").await?;
+    let after_connections = eval(
+        view,
+        "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+    )
+    .await?;
+    if connections != after_connections {
+        return Err("Crash recovery changed the saved connections".into());
+    }
+    record(
+        "app-browser-process-recover-open.json",
+        &serde_json::json!({
+            "connections":connections,"processes":browser_status(app)?,"explicitRecovery":true
+        }),
+    )?;
+    checkpoint(view, case, "recover-inspected").await?;
+    record(
+        "app-browser-process-recover-complete.json",
+        &serde_json::json!({"passed":true}),
+    )?;
+    println!("PASS same-App explicit crash recovery; both saved profiles retained");
+    Ok(())
+}
+
 async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     ready(
         view,
@@ -573,6 +644,10 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
         println!("{kind}: shell ready");
+        #[cfg(target_os = "linux")]
+        if kind == "recover" {
+            return recovery_flow(app, case, view).await;
+        }
         return relaunch_flow(app, view, case, &kind).await;
     }
     // Progress lines survive an outer timeout that kills the App mid-wait.

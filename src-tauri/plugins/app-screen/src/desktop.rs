@@ -220,7 +220,8 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
     let builder = Builder::new("app-screen").invoke_handler(tauri::generate_handler![
         capabilities,
         open,
-        clear_profile
+        clear_profile,
+        recover_profile
     ]);
     #[cfg(all(
         any(target_os = "linux", windows, target_os = "macos"),
@@ -295,7 +296,41 @@ fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Capabilitie
     CapabilitiesResponse {
         pin_shortcut: false,
         clear_profile,
+        recover_profile: {
+            #[cfg(all(
+                any(target_os = "linux", windows),
+                feature = "desktop-process-experiment"
+            ))]
+            {
+                _app.try_state::<process_adapter::Backend>().is_some()
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", windows),
+                feature = "desktop-process-experiment"
+            )))]
+            {
+                false
+            }
+        },
     }
+}
+
+#[tauri::command]
+async fn recover_profile(
+    app: AppHandle,
+    payload: crate::RecoverProfileRequest,
+) -> Result<crate::RecoverProfileResponse> {
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
+    if app.try_state::<process_adapter::Backend>().is_some() {
+        return process_adapter::recover_profile(app, payload).await;
+    }
+    let _ = (app, payload);
+    Err(Error::InvalidRequest(
+        "Browser recovery is unavailable on this backend.",
+    ))
 }
 
 #[tauri::command]

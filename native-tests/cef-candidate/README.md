@@ -278,6 +278,22 @@ CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build
 CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
 ```
 
+`browser_process.py --recover` is a separate same-App crash-recovery case; do
+not combine it with restart/reset/files/notification scenarios. Pass the
+product Rust guard explicitly with `--guard /absolute/owned/target/debug/takosumi-browser-guard`
+(or use `--packaged` with that guard). The Python fixture guard lacks the complete
+incident schema required for recovery. With either `--app excalidraw` or
+`--app photopea`, the case saves distinct cookies/storage in Work and Personal,
+normally closes and reopens Work to prove its data was saved, then terminates
+only that exact native Work generation through a pidfd. It requires the guard's
+abnormal receipt with kernel-confirmed exhaustion, the home's explicit recovery
+action, unchanged UUID/cache-directory inodes and saved values, an immutable
+incident copy, and Personal's original process/document/data. Final live browser
+guards must still exit normally; the induced crash is never relabelled normal.
+The existing finite watchdogs, document-readiness predicate and source-hash
+checks remain unchanged. This Linux fixture is not Windows/macOS, power-loss,
+real login or unsaved-write qualification.
+
 The runner needs the existing Python pidfd/subreaper guard, Node, Xvfb, D-Bus,
 XRes, xdotool and ImageMagick; it installs nothing. It supplies fresh HOME/XDG
 directories and explicitly enables PID-attested loopback inspection ports.

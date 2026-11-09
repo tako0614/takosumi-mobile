@@ -91,6 +91,18 @@ Its guard/adapter are covered by M2 component tests. The explicit
 adds the shared home/profile flow on macOS 14+; its native qualification is
 pending, and the intermittent ordinary-shutdown failure remains unresolved.
 
+On Linux/Windows with `desktop-cef`, opening a saved connection after its browser
+crashes can offer **保存データを保持して開き直す** on the home. This explicit action
+keeps that connection's UUID and site-data directory and starts a new browser;
+it does not clear the profile. It is available only after the original guard
+proves that all its processes ended, with no unresolved ownership errors or
+live Chromium lock. The original abnormal receipt is retained privately under
+the profile's `recoveries/` directory. Unsaved changes and writes interrupted by
+the crash may be lost. Ordinary open, clear and quit keep their stricter normal
+exit checks. This recovery applies to a browser tracked by the still-running
+App; it does not qualify recovery after an App/OS crash. macOS and mobile do not
+advertise this command. Windows native recovery is not yet qualified.
+
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
 Excalidraw/Photopea file checks and remaining platform limits are described in

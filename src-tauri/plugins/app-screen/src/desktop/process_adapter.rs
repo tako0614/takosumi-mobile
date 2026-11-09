@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -154,6 +154,8 @@ struct Process {
     input: Option<Input>,
     replies: mpsc::Receiver<std::result::Result<Reply, String>>,
     profile: String,
+    key: String,
+    reader_finished: Arc<AtomicBool>,
     directory: PathBuf,
     next: u64,
     uncertain: bool,
@@ -183,6 +185,12 @@ struct Process {
     /// (`None` before any reopen); reported by `status`.
     #[cfg(windows)]
     foreground_grant: Option<bool>,
+}
+struct ReaderFinished(Arc<AtomicBool>);
+impl Drop for ReaderFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 /// How long a browser that agreed to stop (it answered Stopped, or its pipe
@@ -418,57 +426,173 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             .transpose()
             .map_err(failure)?
             .flatten();
-        if exited.is_some_and(|status| !status.success()) {
-            return Err(Error::InvalidRequest(
-                "Previous browser process ended abnormally; profile data is retained.",
-            ));
-        }
-        if exited.is_some() {
+        if let Some(status) = exited {
             // A guard may exit zero after forced descendant cleanup. Reuse
             // requires its complete normal receipt, not its status alone.
-            state.processes.get(&profile).unwrap().normal_guard()?;
+            let process = state.processes.get_mut(&profile).unwrap();
+            let normal = if status.success() {
+                process.normal_guard()
+            } else {
+                Err(Error::InvalidRequest(
+                    "Previous browser process ended abnormally; profile data is retained.",
+                ))
+            };
+            if let Err(error) = normal {
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    // Child exit can beat EOF processing on the reply thread.
+                    // Only wait after this exact guard is reaped; a late or
+                    // uncertain reader still cannot authorize recovery.
+                    reader_finished_within(&process.reader_finished, Duration::from_millis(250));
+                    if process.recovery_proof(&payload.key).is_ok() {
+                        return Err(Error::BrowserRecoveryRequired {
+                            profile: profile.clone(),
+                            key: payload.key.clone(),
+                            generation: process.order.to_string(),
+                        });
+                    }
+                }
+                return Err(error);
+            }
             state.processes.remove(&profile);
         } else if let Some(process) = state.processes.get_mut(&profile) {
             if process.recover()? {
                 state.processes.remove(&profile);
             }
         }
-        if let Some(process) = state.processes.get_mut(&profile) {
-            process.open(payload)
-        } else {
-            if state.processes.len() >= 32 {
-                return Err(Error::InvalidRequest("Browser profile limit reached."));
-            }
-            let key = payload.key.clone();
-            // Windows: the bundled executables are checked again now, not
-            // only when the App started.
-            #[cfg(windows)]
-            setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
-            let runtime = free_runtime(&state.runtime_root)?;
-            let mut process = Process::spawn(
-                state.program.clone(),
-                state.guard.clone(),
-                state.directory.join(&profile),
-                runtime,
-                payload,
-                &state.spawner,
-                SpawnOptions {
-                    no_sandbox: state.no_sandbox,
-                    on_quit: Some(Box::new(move || {
-                        // The reader never takes the backend lock. request_exit
-                        // latches now and drains on a separate blocking worker.
-                        request_exit(&app, 0);
-                    })),
-                },
-            )?;
-            // Retain ownership before waiting for the native creation reply.
-            let result = process.expect_open(1, &key);
-            state.processes.insert(profile, process);
-            result
-        }
+        open_in_state(&app, &mut state, payload)
     })
     .await
     .map_err(failure)?
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn reader_finished_within(finished: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !finished.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5).min(deadline - now));
+    }
+    true
+}
+
+fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Result<()> {
+    let profile = payload.profile.clone();
+    if let Some(process) = state.processes.get_mut(&profile) {
+        process.open(payload)
+    } else {
+        if state.processes.len() >= 32 {
+            return Err(Error::InvalidRequest("Browser profile limit reached."));
+        }
+        let key = payload.key.clone();
+        let app = app.clone();
+        // Windows: the bundled executables are checked again now, not
+        // only when the App started.
+        #[cfg(windows)]
+        setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
+        let runtime = free_runtime(&state.runtime_root)?;
+        let mut process = Process::spawn(
+            state.program.clone(),
+            state.guard.clone(),
+            state.directory.join(&profile),
+            runtime,
+            payload,
+            &state.spawner,
+            SpawnOptions {
+                no_sandbox: state.no_sandbox,
+                on_quit: Some(Box::new(move || {
+                    // The reader never takes the backend lock. request_exit
+                    // latches now and drains on a separate blocking worker.
+                    request_exit(&app, 0);
+                })),
+            },
+        )?;
+        // Retain ownership before waiting for the native creation reply.
+        let result = process.expect_open(1, &key);
+        state.processes.insert(profile, process);
+        result
+    }
+}
+
+/// Explicit consent never substitutes for evidence that the old browser and
+/// all its descendants ended. macOS does not yet have this kernel proof.
+#[cfg(any(target_os = "linux", windows))]
+pub(super) async fn recover_profile(
+    app: AppHandle,
+    payload: crate::RecoverProfileRequest,
+) -> Result<crate::RecoverProfileResponse> {
+    payload.validate()?;
+    let backend = app.state::<Backend>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = backend.0.lock().map_err(failure)?;
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let profile = payload.open.profile.clone();
+        let request = Request::Open {
+            id: 1,
+            payload: payload.open,
+        };
+        request.validate(&profile)?;
+        let Request::Open { payload: open, .. } = request else {
+            unreachable!()
+        };
+        retire_for_recovery(
+            &mut state,
+            &profile,
+            &open.key,
+            &payload.generation,
+            &backend.1,
+        )?;
+        // This uses the original UUID/cache and fresh runtime/guard. Its normal
+        // Opened reply must still prove native process and cache identity.
+        open_in_state(&app, &mut state, open)?;
+        Ok(crate::RecoverProfileResponse { reopened: true })
+    })
+    .await
+    .map_err(failure)?
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn retire_for_recovery(
+    state: &mut State,
+    profile: &str,
+    key: &str,
+    generation: &str,
+    phase: &ExitPhase,
+) -> Result<()> {
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    let process = state
+        .processes
+        .get_mut(profile)
+        .ok_or(Error::InvalidRequest(
+            "The browser generation has changed; open this connection again.",
+        ))?;
+    if generation != process.order.to_string() {
+        return Err(Error::InvalidRequest(
+            "The browser recovery confirmation is stale.",
+        ));
+    }
+    let proof = process.recovery_proof(key)?;
+    // The reply reader has finished, including any old App quit request.
+    // Recheck the latch after observing that completion, before retiring it.
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    process.preserve_recovery(&proof)?;
+    if process.recovery_proof(key)? != proof {
+        return Err(Error::InvalidRequest("Browser recovery evidence changed."));
+    }
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    state.processes.remove(profile);
+    Ok(())
 }
 
 /// The next free runtime directory for a new browser. Names are unique within
@@ -830,6 +954,7 @@ impl Process {
             eprintln!("Detached browser data was not removed: {problem}");
         }
         let profile = payload.profile.clone();
+        let key = payload.key.clone();
         #[cfg(target_os = "linux")]
         if !setup::socket_path_fits(&runtime) {
             return Err(Error::InvalidRequest(
@@ -1034,6 +1159,7 @@ impl Process {
         let input = child.stdin.take().expect("Owned child stdin");
         let stdout = child.stdout.take().expect("Owned child stdout");
         let (send, replies) = mpsc::channel();
+        let reader_finished = Arc::new(AtomicBool::new(false));
         let process = Self {
             child,
             #[cfg(unix)]
@@ -1043,6 +1169,8 @@ impl Process {
             input: None,
             replies,
             profile,
+            key,
+            reader_finished: reader_finished.clone(),
             directory,
             next: 1,
             uncertain: false,
@@ -1073,6 +1201,7 @@ impl Process {
         std::thread::Builder::new()
             .name("browser-process-replies".into())
             .spawn(move || {
+                let _finished = ReaderFinished(reader_finished);
                 let mut reader = BufReader::new(stdout);
                 loop {
                     let reply = match read_packet(&mut reader) {
@@ -1289,6 +1418,7 @@ impl Process {
             ));
         }
         let key = payload.key.clone();
+        self.key = key.clone();
         self.next = self
             .next
             .checked_add(1)
@@ -1484,11 +1614,168 @@ impl Process {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    #[cfg(any(target_os = "linux", windows))]
+    fn recovery_proof(&mut self, key: &str) -> Result<serde_json::Value> {
+        use std::io::Read;
+        let refused = || {
+            Error::InvalidRequest(
+            "The ended browser's process ownership is not fully confirmed; saved data is retained.",
+        )
+        };
+        let status = self
+            .child
+            .try_wait()
+            .map_err(failure)?
+            .ok_or_else(refused)?;
+        if self.key != key
+            || self.uncertain
+            || self.opening.is_some()
+            || !self.reader_finished.load(Ordering::Acquire)
+            || self.guard_receipt != self.runtime.join("guard.json")
+        {
+            return Err(refused());
+        }
+        require_recovery_directory(&self.runtime)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let file = options.open(&self.guard_receipt).map_err(failure)?;
+        let metadata = file.metadata().map_err(failure)?;
+        if !metadata.is_file() || metadata.len() > 65536 {
+            return Err(refused());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(refused());
+            }
+        }
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes).map_err(failure)?;
+        if bytes.len() > 65536 {
+            return Err(refused());
+        }
+        let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(failure)?;
+        require_recovery_guard(&proof, status.code())?;
+        // Never remove a Chromium lock. A second App/browser, foreign host,
+        // unreadable lock or reused live PID leaves recovery unavailable.
+        for path in [
+            &self.directory,
+            &self.directory.join("cef-profiles"),
+            &self.directory.join("cef-profiles").join(&self.profile),
+        ] {
+            require_recovery_directory(path)?;
+        }
+        if singleton_live(&self.directory.join("cef-profiles")) {
+            return Err(refused());
+        }
+        Ok(proof)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn preserve_recovery(&self, proof: &serde_json::Value) -> Result<()> {
+        let directory = self.directory.join("recoveries");
+        private_directory(&directory)?;
+        require_recovery_directory(&directory)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(failure)?
+            .as_nanos();
+        let path = directory.join(format!("{stamp}-{}-{}.json", self.child.id(), self.order));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut record = options.open(path).map_err(failure)?;
+        // Only private process/profile evidence. No page URL, boot payload,
+        // cookies, response bytes or credentials enter this incident record.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": 1, "profile": self.profile, "generation": self.order.to_string(),
+            "guardPid": self.child.id(), "nativePid": self.opened["nativePid"],
+            "runtimeName": self.runtime.file_name().map(|name| name.to_string_lossy()),
+            "receipt": proof
+        }))
+        .map_err(failure)?;
+        record.write_all(&bytes).map_err(failure)?;
+        record.sync_all().map_err(failure)?;
+        #[cfg(unix)]
+        {
+            // Persist the incident entry (and a newly created recoveries
+            // directory) before the old runtime can be retired.
+            std::fs::File::open(&directory)
+                .map_err(failure)?
+                .sync_all()
+                .map_err(failure)?;
+            std::fs::File::open(&self.directory)
+                .map_err(failure)?
+                .sync_all()
+                .map_err(failure)?;
+        }
+        Ok(())
+    }
+
     fn normal_guard(&self) -> Result<()> {
         let proof: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&self.guard_receipt).map_err(failure)?)
                 .map_err(failure)?;
         require_normal_guard(&proof)
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn require_recovery_directory(path: &std::path::Path) -> Result<()> {
+    let metadata = path.symlink_metadata().map_err(failure)?;
+    let plain = metadata.is_dir();
+    #[cfg(windows)]
+    let plain = {
+        use std::os::windows::fs::MetadataExt;
+        plain && metadata.file_attributes() & 0x400 == 0
+    };
+    if plain {
+        Ok(())
+    } else {
+        Err(Error::InvalidRequest(
+            "Browser recovery requires a plain owned directory.",
+        ))
+    }
+}
+
+/// This is abnormal recovery clearance, never a normal-shutdown receipt.
+/// Linux ECHILD / Windows empty Job can prove exhaustion after forced cleanup;
+/// the original nonzero root status and forced count remain in the incident.
+#[cfg(any(target_os = "linux", windows))]
+fn require_recovery_guard(proof: &serde_json::Value, guard_exit: Option<i32>) -> Result<()> {
+    let root = proof["rootExit"].as_i64();
+    let forced = proof["forcedCleanup"].as_u64();
+    if root.is_some()
+        && forced.is_some()
+        && (root != Some(0) || forced != Some(0))
+        && guard_exit == Some(if root == Some(0) { 0 } else { 1 })
+        && proof["complete"] == true
+        && proof["kernelNoChildren"] == true
+        && proof["remaining"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+        && proof.get("error") == Some(&serde_json::Value::Null)
+        && proof["cleanupErrors"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+        && proof["nonFatalErrors"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidRequest(
+            "Browser crash recovery needs complete process exhaustion; saved data is retained.",
+        ))
     }
 }
 /// A guard's receipt shows a normal end: the browser exited 0, nothing was
@@ -1524,6 +1811,160 @@ fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_clearance_preserves_abnormality_and_requires_kernel_exhaustion() {
+        let valid = serde_json::json!({"rootExit":-9,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":3,"error":null,"cleanupErrors":[],"nonFatalErrors":[]});
+        require_recovery_guard(&valid, Some(1)).unwrap();
+        assert!(require_normal_guard(&valid).is_err());
+        for (field, value) in [
+            ("rootExit", serde_json::json!("-9")),
+            ("forcedCleanup", serde_json::json!(-1)),
+            ("complete", serde_json::json!(false)),
+            ("kernelNoChildren", serde_json::json!(false)),
+            ("remaining", serde_json::json!([123])),
+            ("error", serde_json::json!("unconfirmed")),
+            ("cleanupErrors", serde_json::json!(["failed"])),
+            ("nonFatalErrors", serde_json::json!(["unknown status"])),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(require_recovery_guard(&bad, Some(1)).is_err(), "{field}");
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                require_recovery_guard(&missing, Some(1)).is_err(),
+                "missing {field}"
+            );
+        }
+        for status in [None, Some(0), Some(2)] {
+            assert!(require_recovery_guard(&valid, status).is_err());
+        }
+        let mut forced_only = valid.clone();
+        forced_only["rootExit"] = serde_json::json!(0);
+        require_recovery_guard(&forced_only, Some(0)).unwrap();
+        forced_only["forcedCleanup"] = serde_json::json!(0);
+        assert!(require_recovery_guard(&forced_only, Some(0)).is_err());
+        require_normal_guard(&forced_only).unwrap();
+    }
+
+    #[test]
+    fn recovery_waits_for_reader_completion_but_does_not_invent_it() {
+        let finished = Arc::new(AtomicBool::new(false));
+        assert!(!reader_finished_within(&finished, Duration::from_millis(1)));
+        let reader = finished.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            reader.store(true, Ordering::Release);
+        });
+        assert!(reader_finished_within(&finished, Duration::from_secs(2)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_archives_the_exact_ended_generation_without_clearing_either_profile() {
+        let root = std::env::temp_dir().join(format!("sumi-recovery-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let guard = root.join("crashed.py");
+        let proof = serde_json::json!({"rootExit":-9,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":2,"error":null,"cleanupErrors":[],"nonFatalErrors":[]});
+        std::fs::write(
+            &guard,
+            format!(
+                "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text({:?})\nsys.exit(1)\n",
+                proof.to_string()
+            ),
+        )
+        .unwrap();
+        let parent = spawner().unwrap();
+        let payload = work_payload();
+        let profile = payload.profile.clone();
+        let key = payload.key.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard.clone(),
+            root.join(&profile),
+            root.join("runtime"),
+            payload,
+            &parent,
+            true,
+        )
+        .unwrap();
+        let generation = process.order.to_string();
+        let guard_pid = process.child.id();
+        let runtime = process.runtime.clone();
+        assert!(exit_within(&mut process.child, Duration::from_secs(5))
+            .is_some_and(|status| status.code() == Some(1)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !process.reader_finished.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cache = root.join(&profile).join("cef-profiles");
+        private_directory(&cache.join(&profile)).unwrap();
+        std::fs::write(cache.join(&profile).join("kept"), b"Work").unwrap();
+        let personal = root.join("personal-kept");
+        std::fs::write(&personal, b"Personal").unwrap();
+        let mut state = State {
+            program: PathBuf::from("/bin/true"),
+            guard,
+            directory: root.clone(),
+            runtime_root: root.clone(),
+            no_sandbox: true,
+            processes: BTreeMap::from([(profile.clone(), process)]),
+            spawner: parent,
+        };
+        let phase = ExitPhase::default();
+        assert!(release_ended(&mut state, &profile, std::time::Instant::now()).is_err());
+        assert!(retire_for_recovery(&mut state, &profile, &key, "999999", &phase).is_err());
+        assert!(
+            retire_for_recovery(&mut state, &profile, "foreign key", &generation, &phase).is_err()
+        );
+        phase.state.store(1, Ordering::Release);
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        phase.state.store(0, Ordering::Release);
+        let process = state.processes.get_mut(&profile).unwrap();
+        process.uncertain = true;
+        assert!(process.recovery_proof(&key).is_err());
+        process.uncertain = false;
+        std::os::unix::fs::symlink(
+            format!("{}-{}", hostname(), std::process::id()),
+            cache.join("SingletonLock"),
+        )
+        .unwrap();
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        assert!(cache.join("SingletonLock").symlink_metadata().is_ok());
+        std::fs::remove_file(cache.join("SingletonLock")).unwrap(); // owned test lock only
+        let outside = root.join("outside");
+        private_directory(&outside).unwrap();
+        let records = root.join(&profile).join("recoveries");
+        std::os::unix::fs::symlink(&outside, &records).unwrap();
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_file(&records).unwrap(); // owned test link only
+        assert!(state.processes.contains_key(&profile));
+        retire_for_recovery(&mut state, &profile, &key, &generation, &phase).unwrap();
+        assert!(!state.processes.contains_key(&profile));
+        assert_eq!(
+            std::fs::read(cache.join(&profile).join("kept")).unwrap(),
+            b"Work"
+        );
+        assert_eq!(std::fs::read(&personal).unwrap(), b"Personal");
+        let files = std::fs::read_dir(&records)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let incident: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(files[0].path()).unwrap()).unwrap();
+        assert_eq!(incident["receipt"], proof);
+        assert_eq!(incident["guardPid"], guard_pid);
+        assert_eq!(incident["generation"], generation);
+        assert_eq!(incident["profile"], profile);
+        assert_eq!(runtime.exists(), setup::KEEP_ENDED_RUNTIME);
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
         // The test executable has no packaged `cef/` resources beside it, so
@@ -3433,9 +3874,9 @@ impl Drop for Process {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        // Every caller drops a browser right after verifying its guard's
-        // normal receipt; any other ended guard is dropped only at the App's
-        // end. A guard still running keeps its sockets and receipt.
+        // Normal reuse verifies the normal receipt; explicit recovery first
+        // archives a conclusive abnormal receipt. Other ended guards are
+        // dropped only at App exit. A live guard keeps its sockets/receipt.
         if !setup::KEEP_ENDED_RUNTIME && matches!(self.child.try_wait(), Ok(Some(_))) {
             if let Err(problem) = setup::remove_runtime(&self.runtime) {
                 eprintln!("A browser runtime directory was not removed: {problem}");

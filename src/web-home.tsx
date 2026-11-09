@@ -2,10 +2,12 @@ import { createSignal, For, Show } from "solid-js";
 import {
   CONNECTIONS_KEY, connectionKey, loadWebConnections, newWebConnection, type WebConnection,
 } from "./web-connections.ts";
+import { BrowserRecoveryRequired } from "./web-profile-recovery.ts";
 
 export function WebHome(props: {
   readonly open: (connection: WebConnection) => Promise<void>;
   readonly clearData?: (connection: WebConnection) => Promise<void>;
+  readonly recover?: (connection: WebConnection, ticket: BrowserRecoveryRequired) => Promise<void>;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly allowLegacyMobile?: boolean;
 }) {
@@ -18,6 +20,7 @@ export function WebHome(props: {
   const [clearCandidate, setClearCandidate] = createSignal<WebConnection>();
   const [clearing, setClearing] = createSignal(false);
   const [status, setStatus] = createSignal("");
+  const [recovery, setRecovery] = createSignal<{ connection: WebConnection; ticket: BrowserRecoveryRequired }>();
   const busy = () => Boolean(opening()) || clearing();
   const locked = () => busy() || clearCandidate() !== undefined;
   try {
@@ -42,12 +45,36 @@ export function WebHome(props: {
     if (locked()) return;
     setError("");
     setStatus("");
+    setRecovery(undefined);
     setOpening(connectionKey(connection));
     try {
       await props.open(connection);
       setLastOpened(connectionKey(connection));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "接続先を開けませんでした。");
+      if (cause instanceof BrowserRecoveryRequired &&
+        cause.profile === connection.profile && cause.key === connectionKey(connection)) {
+        setRecovery({ connection, ticket: cause });
+      }
+    } finally {
+      setOpening(undefined);
+    }
+  }
+
+  async function recover() {
+    const candidate = recovery();
+    const action = props.recover;
+    if (!candidate || !action || locked() || !connections().some((item) =>
+      connectionKey(item) === connectionKey(candidate.connection))) return;
+    setRecovery(undefined);
+    setError("");
+    setStatus("");
+    setOpening(connectionKey(candidate.connection));
+    try {
+      await action(candidate.connection, candidate.ticket);
+      setLastOpened(connectionKey(candidate.connection));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "ブラウザを開き直せませんでした。");
     } finally {
       setOpening(undefined);
     }
@@ -57,6 +84,7 @@ export function WebHome(props: {
     event.preventDefault();
     if (locked()) return;
     setError("");
+    setRecovery(undefined);
     try {
       const connection = newWebConnection(connections(), url(), name());
       const next = connections();
@@ -78,6 +106,7 @@ export function WebHome(props: {
     setClearing(true);
     setError("");
     setStatus("");
+    setRecovery(undefined);
     try {
       await clear(target);
       if (lastOpened() === connectionKey(target)) setLastOpened(undefined);
@@ -113,12 +142,12 @@ export function WebHome(props: {
                 </button>
                 <button class="web-remove" type="button" disabled={locked()}
                   aria-label={`${connection.name}を接続先から外す`}
-                  onClick={() => { setError(""); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
+                  onClick={() => { setError(""); setRecovery(undefined); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
                   接続先から外す
                 </button>
                 <Show when={props.clearData && connection.profile !== "shared"}>
                   <button class="web-remove" type="button" disabled={locked()}
-                    onClick={() => { setError(""); setStatus(""); setClearCandidate(connection); }}>
+                    onClick={() => { setError(""); setStatus(""); setRecovery(undefined); setClearCandidate(connection); }}>
                     保存データを消去…
                   </button>
                 </Show>
@@ -153,6 +182,16 @@ export function WebHome(props: {
         </form>
       </section>
       <Show when={error()}><p class="web-error" role="alert">{error()}</p></Show>
+      <Show when={props.recover && recovery()}>{(candidate) => (
+        <section aria-label="ブラウザの復帰">
+          <p class="web-note">{candidate().connection.name}を開き直します。保存データは消去しません。
+            直前の未保存の変更は戻らない場合があります。</p>
+          <button type="button" disabled={locked()} onClick={() => void recover()}>
+            保存データを保持して開き直す
+          </button>
+          <button type="button" disabled={locked()} onClick={() => setRecovery(undefined)}>今は開き直さない</button>
+        </section>
+      )}</Show>
       <Show when={status()}><p class="web-note" role="status">{status()}</p></Show>
       <Show when={props.allowLegacyMobile}>
         <details class="web-legacy">
