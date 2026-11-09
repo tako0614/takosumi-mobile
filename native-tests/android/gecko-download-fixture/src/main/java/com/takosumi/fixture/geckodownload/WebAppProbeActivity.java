@@ -228,7 +228,13 @@ public final class WebAppProbeActivity extends Activity {
                 selectedInput = uri;
                 inputContext = pending.page.context;
                 fileSelections++;
-                pending.result.complete(pending.prompt.confirm(getApplicationContext(), uri));
+                Uri delivered = materialize(uri);
+                trace("file picker materialized name=" + (delivered != null ? delivered.getLastPathSegment() : null));
+                if (!pending.prompt.isComplete()) {
+                    pending.result.complete(delivered != null
+                        ? pending.prompt.confirm(getApplicationContext(), delivered)
+                        : pending.prompt.dismiss());
+                }
             } else if (!pending.prompt.isComplete()) pending.result.complete(pending.prompt.dismiss());
             return;
         }
@@ -315,5 +321,39 @@ public final class WebAppProbeActivity extends Activity {
         // Instrumentation waits for this writer before removing only its
         // returned OS documents. Never delete a provider file under a live writer.
         super.onDestroy();
+    }
+
+    // Gecko's file-prompt confirm resolves each answer to a filesystem path
+    // and silently drops SAF document URIs it cannot map (Downloads and most
+    // other providers only expose externalstorage paths). Read the real OS
+    // bytes through the granted content URI and hand the page an app-owned
+    // file whose name preserves the original DISPLAY_NAME for the DOM File.
+    private Uri materialize(Uri uri) {
+        String name = null;
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) name = cursor.getString(0);
+        } catch (RuntimeException unreadable) { /* name falls back below */ }
+        if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+        if (name == null || name.isEmpty()) return null;
+        File dir = new File(getCacheDir(), "inputs");
+        File out = null;
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) return null;
+            out = new File(dir, name);
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                try (FileOutputStream stream = new FileOutputStream(out)) {
+                    byte[] buffer = new byte[8192];
+                    for (int count = in.read(buffer); count >= 0; count = in.read(buffer)) {
+                        stream.write(buffer, 0, count);
+                    }
+                }
+            }
+            return Uri.fromFile(out);
+        } catch (IOException | RuntimeException e) {
+            if (out != null) out.delete();
+            return null;
+        }
     }
 }
