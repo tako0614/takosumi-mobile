@@ -18,8 +18,8 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import androidx.test.platform.io.PlatformTestStorageRegistry;
 import java.io.*;
-import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -96,6 +96,22 @@ public final class WebAppOperationTest {
     private void tap(String text) {
         await("Missing native text " + text, () -> bounds(text, false, false) != null, 30);
         tap(bounds(text, false, false));
+    }
+
+    private void enterEditor(String profile) {
+        boolean[] entryTapped = {false};
+        await("Actual anonymous Photopea File menu did not load for " + profile, () -> {
+            if (bounds("File", false, false) != null) return true;
+            if (!entryTapped[0]) {
+                Rect start = bounds("Start using Photopea", false, false);
+                if (start != null) {
+                    entryTapped[0] = true;
+                    System.out.println("Native Photopea landing entry tap for " + profile);
+                    tap(start);
+                }
+            }
+            return false;
+        }, 60);
     }
 
     private void key(int code, int modifiers) {
@@ -181,14 +197,14 @@ public final class WebAppOperationTest {
             }
         } finally { decoded.recycle(); }
         // Only bytes read back from the actual OS output become evidence.
-        Files.write(new File(evidenceDirectory(), "export.png").toPath(), data);
+        try (OutputStream out = evidence("photopea-export.png")) { out.write(data); }
     }
 
     @Test public void photopeaNativeOpenAndExportPreserveTheEditorAndOtherProfile() throws Exception {
         createInput();
         scenario = ActivityScenario.launch(WebAppProbeActivity.class);
         scenario.onActivity(value -> activity = value);
-        await("Actual anonymous Photopea File menu did not load", () -> bounds("File", false, false) != null, 60);
+        enterEditor("Work");
         key(KeyEvent.KEYCODE_O, KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON);
         chooseInput();
         await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
@@ -200,7 +216,7 @@ public final class WebAppOperationTest {
         assertTrue(WebAppProbeActivity.site(uri));
 
         tap("Personal");
-        await("Independent Photopea profile did not load", () -> bounds("File", false, false) != null, 60);
+        enterEditor("Personal");
         assertNull("The imported Work document leaked to Personal", bounds(tabName, true, false));
         WebAppProbeActivity.Page personal = activity.pages.get(activity.personal);
         assertNotNull(personal);
@@ -269,21 +285,22 @@ public final class WebAppOperationTest {
         return value.substring(0, Math.min(200, value.length()));
     }
 
-    private File evidenceDirectory() {
-        File evidence = new File(instrumentation.getTargetContext().getExternalFilesDir(null), "web-app-evidence");
-        assertTrue(evidence.isDirectory() || evidence.mkdirs());
-        return evidence;
+    private OutputStream evidence(String name) throws IOException {
+        // The connected-test runner collects these before retiring its APKs.
+        // App-specific external files can disappear before a later adb pull.
+        return PlatformTestStorageRegistry.getInstance().openOutputFile(name);
     }
 
     @After public void retireOnlyOwnedFilesAfterWriterCompletion() throws Exception {
         // Retain native UI evidence before either owned Activity/picker closes.
         try {
-            File evidence = evidenceDirectory();
             // Encoding replaces a truncated surrogate; at most64k UTF-8 bytes.
-            Files.write(new File(evidence, "hierarchy.txt").toPath(), tree().getBytes(StandardCharsets.UTF_8));
+            try (OutputStream out = evidence("photopea-hierarchy.txt")) {
+                out.write(tree().getBytes(StandardCharsets.UTF_8));
+            }
             Bitmap screen = instrumentation.getUiAutomation().takeScreenshot();
             if (screen != null) {
-                try (OutputStream out = new FileOutputStream(new File(evidence, "screen.png"))) { screen.compress(Bitmap.CompressFormat.PNG, 100, out); }
+                try (OutputStream out = evidence("photopea-screen.png")) { screen.compress(Bitmap.CompressFormat.PNG, 100, out); }
                 finally { screen.recycle(); }
             }
         } finally {

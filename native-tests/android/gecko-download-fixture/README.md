@@ -41,6 +41,9 @@ alone cannot replace the product's completed-reset contract.
 
 The separate `WebAppOperationTest` opens the real public Photopea page in two
 fresh contexts. A new owned Downloads PNG contains a 128x96 red/blue image.
+Each fresh profile enters through the visible `Start using Photopea` button if
+the ordinary landing page is shown. There is at most one real tap per profile,
+and the same 60-second wait still requires the editor's File menu before Open.
 Actual native keyboard input opens Photopea's file prompt; the engine prompt
 uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes
@@ -61,6 +64,13 @@ and screenshot; no page/picker response is substituted. The copied PNG evidence
 comes from the actual OS output only after pixel verification. Cleanup waits
 for the owned writer and stream closure before removing only returned owned
 documents and the test's input row. A closure failure retains those files.
+Evidence uses AndroidX `PlatformTestStorage` and the connected runner's
+additional-test-output collection. CI requires the exported PNG there on a
+successful run, and uploads the bounded hierarchy/screenshot when available.
+It does not depend on app external files surviving Gradle's APK retirement.
+The EXIT trap records the captured emulator PID/birth, original step status,
+owned-stop result and same-shell child wait. That receipt concerns the direct
+emulator child, not exhaustion of descendants or shared adb services.
 
 The existing loopback test remains unchanged. The CI requires both exact test
 methods, two executed cases and zero failure/error/skip. This does not qualify

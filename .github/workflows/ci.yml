@@ -435,10 +435,9 @@ jobs:
           }
           cleanup() {
             result=$?
-            # Public anonymous page evidence only, from this exact owned AVD.
-            if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
-              timeout 10 adb -s emulator-5562 pull /sdcard/Android/data/com.takosumi.fixture.geckodownload/files/web-app-evidence "$RUNNER_TEMP/sumi-gecko-web-app" > "$RUNNER_TEMP/sumi-gecko-web-app-pull.log" 2>&1 || true
-            fi
+            step_result=$result
+            stop_result=""
+            wait_result=""
             if [[ "$result" != 0 ]]; then
               tail -c 65536 "$RUNNER_TEMP/sumi-gecko-emulator.log" || true
               if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
@@ -447,10 +446,30 @@ jobs:
             fi
             if [[ -n "$emulator_pid" ]]; then
               if python3 -B native-tests/android/owned_process.py stop "$emulator_pid" "$emulator_birth"; then
-                wait "$emulator_pid" || true
+                stop_result=0
+                if wait "$emulator_pid"; then wait_result=0; else wait_result=$?; fi
+                if [[ "$wait_result" == 127 ]]; then result=1; fi
               else
+                stop_result=$?
                 result=1
               fi
+            fi
+            if ! python3 - "$RUNNER_TEMP/sumi-gecko-process.json" "$emulator_pid" "$emulator_birth" "$$" "$avd_name" "$step_result" "$stop_result" "$wait_result" <<'PY'
+          import json, pathlib, sys
+          output, pid, birth, parent, avd, step, stopped, waited = sys.argv[1:]
+          receipt = {
+              'pid': int(pid) if pid else None, 'birthTicks': birth or None,
+              'launchingShellPid': int(parent), 'avdName': avd, 'serial': 'emulator-5562',
+              'originalStepExit': int(step),
+              'ownedStopExit': int(stopped) if stopped else None,
+              'directChildWaitExit': int(waited) if waited else None,
+              'directChildReaped': stopped == '0' and waited not in ('', '127'),
+              'scope': 'Captured emulator child only; no descendant or shared adb-service exhaustion claim',
+          }
+          pathlib.Path(output).write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
+            then
+              result=1
             fi
             trap - EXIT
             exit "$result"
@@ -485,6 +504,11 @@ jobs:
               raise SystemExit('Missing/extraneous actual Gecko operation tests; empty run is not a pass')
           if sum(int(root.get('tests', 0)) for root in roots) != 2 or any(int(root.get(k, 0)) for root in roots for k in ('failures', 'errors', 'skipped')):
               raise SystemExit('Gecko operation fixture failed or skipped')
+          # PlatformTestStorage output is collected by the connected-test
+          # runner before package retirement; no post-uninstall adb pull.
+          exported = list(pathlib.Path('native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output').rglob('photopea-export.png'))
+          if len(exported) != 1 or not 8 <= exported[0].stat().st_size <= 2 * 1024 * 1024:
+              raise SystemExit('Missing/ambiguous OS-export bytes from the successful actual Photopea test')
           print('PASS: original loopback responses and anonymous Photopea OS Open/export; product adapter, reset and real IdP remain separate')
           PY
           git diff --exit-code -- native-tests/android/gecko-download-fixture
@@ -496,8 +520,8 @@ jobs:
           path: |
             native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected/**/TEST-*.xml
             ${{ runner.temp }}/sumi-gecko-failure.log
-            ${{ runner.temp }}/sumi-gecko-web-app/**
-            ${{ runner.temp }}/sumi-gecko-web-app-pull.log
+            native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output/**/photopea-*
+            ${{ runner.temp }}/sumi-gecko-process.json
           if-no-files-found: warn
           retention-days: 14
 
