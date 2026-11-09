@@ -154,7 +154,16 @@ async function attach(process) {
   proof.stage={name:'external Page enable',pid:native.nativePid};
   await send('Page.enable');
   try {
-    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && ${appContent}`),'Actual anonymous app document did not load');
+    let readiness;
+    await settled(async()=>{
+      readiness=await evaluate(`({sameOrigin:location.origin===${JSON.stringify(origin)},ready:document.readyState,content:${appContent},visibility:document.visibilityState,focused:document.hasFocus()})`);
+      return readiness.sameOrigin&&readiness.ready==='complete'&&readiness.content;
+    },'Actual anonymous app document did not load').catch(error=>{
+      // The later failure screenshot/DOM read may already show a loaded page.
+      // Retain the last completed predicate evaluation without changing its
+      // bound or result; an evaluation error may follow that observation.
+      proof.lastStartupReadiness={pid:native.nativePid,...readiness};throw error;
+    });
     if(origin.includes('photopea') && await evaluate("document.body.innerText.includes('Start using Photopea')")) {
       proof.stage={name:'Photopea landing button',pid:native.nativePid};
       // The site has more than one equivalent CTA. Use the first visible

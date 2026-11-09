@@ -298,6 +298,10 @@ native/guard generations. A connection failure can therefore use the existing
 profile/ancestry/executable-checked kernel snapshot even before a CDP Client
 exists. No connection retry or longer timeout is added. If the failing guard
 already ended, a snapshot of another labeled live profile does not diagnose it.
+An initial document-readiness failure also retains the last completed predicate
+evaluation (origin match, ready state, app-content match and visibility/focus).
+It may precede an evaluation error; later DOM/screenshot readiness cannot
+retroactively pass the unchanged ten-second gate.
 
 With `fixture-inspection` and `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`, the CEF
 browser also writes bounded `SUMI_DOWNLOAD` observations to its existing
