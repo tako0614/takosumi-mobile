@@ -2,6 +2,7 @@ import XCTest
 
 final class DownloadUITests: XCTestCase {
     private let app = XCUIApplication(bundleIdentifier: "com.takosumi.fixture.download")
+    private let filesApp = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
     private var lastClosedAt: Date?
 
     override func setUpWithError() throws {
@@ -104,30 +105,63 @@ final class DownloadUITests: XCTestCase {
             screenshot.lifetime = .keepAlways
             add(screenshot)
         }
-        let save = app.buttons["Save"].firstMatch
-        XCTAssertTrue(save.waitForExistence(timeout: 10))
+        let save = filesElement("OS Files export Save did not open") { $0.buttons["Save"].firstMatch }
         // Files remembers the previously selected folder for the next export.
-        if app.navigationBars["Download Fixture"].exists {
+        if filesExists({ $0.navigationBars["Download Fixture"] }) {
             save.tap()
             XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
             return
         }
-        let local = app.otherElements["On My iPhone"].firstMatch
-        let localButton = app.buttons["On My iPhone"].firstMatch
-        let localText = app.staticTexts["On My iPhone"].firstMatch
-        if !local.exists && !localButton.exists && !localText.exists {
-            let browse = app.buttons["Browse"].firstMatch
-            if browse.waitForExistence(timeout: 3) { browse.tap() }
+        let localElement: (XCUIApplication) -> XCUIElement = { host in
+            let button = host.buttons["On My iPhone"].firstMatch
+            if button.exists { return button }
+            let text = host.staticTexts["On My iPhone"].firstMatch
+            if text.exists { return text }
+            return host.otherElements["On My iPhone"].firstMatch
         }
-        if localButton.exists { localButton.tap() }
-        else if localText.exists { localText.tap() }
-        else { XCTAssertTrue(local.waitForExistence(timeout: 5)); local.tap() }
-        let folder = app.staticTexts["Download Fixture"].firstMatch
-        XCTAssertTrue(folder.waitForExistence(timeout: 5))
-        folder.tap()
-        XCTAssertTrue(save.waitForExistence(timeout: 5))
-        save.tap()
+        if !filesExists(localElement) {
+            // Browse is an optional route inside the same real picker; tap it
+            // only when either hierarchy actually shows it.
+            if let browse = filesOptional({ $0.buttons["Browse"].firstMatch }, timeout: 3) { browse.tap() }
+        }
+        filesElement("Files On My iPhone did not appear", timeout: 5) { localElement($0) }.tap()
+        filesElement("Download Fixture folder did not appear", timeout: 5) { $0.staticTexts["Download Fixture"].firstMatch }.tap()
+        filesElement("OS Files export Save did not remain", timeout: 5) { $0.buttons["Save"].firstMatch }.tap()
         XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
+    }
+
+    // The iOS 26 Files export picker is hosted by com.apple.DocumentsApp. Its
+    // controls can surface inside the fixture's remote-view hierarchy or only
+    // in the provider's own process, depending on presentation. Query both real
+    // hierarchies within the same bound; a missing control stays a failure and
+    // never substitutes an export result for a touch.
+    private func filesElement(_ what: String, timeout: TimeInterval = 10, _ query: (XCUIApplication) -> XCUIElement) -> XCUIElement {
+        var element = query(app)
+        let deadline = Date().addingTimeInterval(timeout)
+        while !element.exists && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            let remote = query(filesApp)
+            element = remote.exists ? remote : query(app)
+        }
+        XCTAssertTrue(element.exists, what)
+        return element
+    }
+
+    private func filesOptional(_ query: (XCUIApplication) -> XCUIElement, timeout: TimeInterval) -> XCUIElement? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let element = query(app)
+            if element.exists { return element }
+            let remote = query(filesApp)
+            if remote.exists { return remote }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        let element = query(app)
+        return element.exists ? element : (query(filesApp).exists ? query(filesApp) : nil)
+    }
+
+    private func filesExists(_ query: (XCUIApplication) -> XCUIElement) -> Bool {
+        query(app).exists || query(filesApp).exists
     }
 
     func testOriginalResponsesExportAndRetireWithinTheirProfile() throws {
