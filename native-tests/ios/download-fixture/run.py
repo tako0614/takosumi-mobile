@@ -539,7 +539,23 @@ def main():
             save(out / "result.json", result)
             ca, cert, key = certificate(scratch)
             command(["xcrun", "simctl", "boot", udid], out / "boot.log")
-            command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
+            try:
+                command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log",
+                        timeout=180, boot_status=True)
+            except subprocess.TimeoutExpired as stalled:
+                # A created Simulator that made no recorded boot progress is
+                # dead, not slow: the command() continuation already gives a
+                # progressing boot its total 300-second budget. Retire the
+                # stalled owned device once and retry the same fresh boot; the
+                # readiness ceiling per attempt is unchanged, no third try.
+                (out / "bootstatus-stalled.txt").write_text(
+                    f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
+                command(["xcrun", "simctl", "shutdown", udid], out / "shutdown-stalled.log", timeout=60)
+                command(["xcrun", "simctl", "erase", udid], out / "erase-stalled.log", timeout=60)
+                command(["xcrun", "simctl", "boot", udid], out / "boot-retry.log")
+                command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus-retry.log",
+                        timeout=180, boot_status=True)
+                result["simulator"]["bootRetry"] = "stalled-erased-rebooted"
             # Trust only on this exact disposable Simulator, never host trust.
             command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
                     out / "trust.log", trust_trace=True)
