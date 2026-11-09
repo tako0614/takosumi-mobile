@@ -37,6 +37,37 @@ product permissions/popup/upload, or completed profile deletion. Gecko's
 `clearDataForSessionContext` dispatches without a completion result; calling it
 alone cannot replace the product's completed-reset contract.
 
+## Anonymous Photopea Open and OS export
+
+The separate `WebAppOperationTest` opens the real public Photopea page in two
+fresh contexts. A new owned Downloads PNG contains a 128x96 red/blue image.
+Actual native keyboard input opens Photopea's file prompt; the engine prompt
+uses Android's real Open Document picker and returns its URI to the same page.
+After switching to Personal and back without reloading Work, the test invokes
+Photopea's Save for web and receives the original HTTPS Blob response. Native
+confirmation and Create Document select a fresh owned PNG. A single worker
+copies the original stream to that provider URI, with no URL refetch or cookie
+export. The test reads the OS output once, checks every decoded pixel and the
+native navigation generation/URI, and keeps Personal's separate editor.
+
+This small fixture uses Gecko's existing file prompt/response interfaces,
+the same boundaries exposed by Android Components. It does not build or adopt
+Android Components or a new product browser. It covers one PNG, the English
+DocumentsUI, anonymous Photopea and foreground operation only. Real app input,
+selectors, HTTPS response and provider output must execute before any native
+success is claimed. An editor load or a successful Java compile is insufficient.
+Missing native controls stay failures with a bounded accessibility snapshot
+and screenshot; no page/picker response is substituted. The copied PNG evidence
+comes from the actual OS output only after pixel verification. Cleanup waits
+for the owned writer and stream closure before removing only returned owned
+documents and the test's input row. A closure failure retains those files.
+
+The existing loopback test remains unchanged. The CI requires both exact test
+methods, two executed cases and zero failure/error/skip. This does not qualify
+product integration, full profile storage/reset, IdP, media/popup/notifications,
+background recovery or other Web apps. Excalidraw scene Open/edit/export is the
+next separate operation comparison after this first actual public app result.
+
 ## Separate build and owned runtime
 
 The pinned [Mozilla POM](https://maven.mozilla.org/maven2/org/mozilla/geckoview/geckoview/159.0.20261102144711/geckoview-159.0.20261102144711.pom)
@@ -48,8 +79,8 @@ AGP 8.11 / Kotlin 1.9 build. The runtime fixture still targets API 36, on a fres
 API 36 x86_64 emulator. No AAR metadata constraint is suppressed.
 
 The CI `android-download-candidate` job compiles the exact pin, creates one owned
-AVD, refuses pre-existing devices and checks one non-skipped instrumentation
-method. It stops only the emulator PID/birth captured from its own launch.
+AVD, refuses pre-existing devices and checks two non-skipped instrumentation
+methods. It stops only the emulator PID/birth captured from its own launch.
 An incomplete/failed run stays RED. It neither retries an old failure nor changes
 the existing product native job. To compile on a prepared isolated host:
 

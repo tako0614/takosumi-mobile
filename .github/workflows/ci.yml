@@ -374,7 +374,7 @@ jobs:
           cat "$ANDROID_HOME/platforms/android-37.2/source.properties"
           gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture assembleDebug assembleDebugAndroidTest
           sha256sum native-tests/android/gecko-download-fixture/build/outputs/apk/debug/*.apk
-      - name: Original response cookie Blob and cancellation on owned emulator
+      - name: Original responses and Photopea OS file operation on owned emulator
         timeout-minutes: 10
         shell: bash
         run: |
@@ -435,6 +435,10 @@ jobs:
           }
           cleanup() {
             result=$?
+            # Public anonymous page evidence only, from this exact owned AVD.
+            if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
+              timeout 10 adb -s emulator-5562 pull /sdcard/Android/data/com.takosumi.fixture.geckodownload/files/web-app-evidence "$RUNNER_TEMP/sumi-gecko-web-app" > "$RUNNER_TEMP/sumi-gecko-web-app-pull.log" 2>&1 || true
+            fi
             if [[ "$result" != 0 ]]; then
               tail -c 65536 "$RUNNER_TEMP/sumi-gecko-emulator.log" || true
               if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
@@ -473,12 +477,15 @@ jobs:
           reports = list(pathlib.Path('native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
           roots = [E.parse(path).getroot() for path in reports]
           cases = {(case.get('classname'), case.get('name')) for root in roots for case in root.iter('testcase')}
-          required = ('com.takosumi.fixture.geckodownload.ResponseCapabilityTest', 'originalCookieBlobAndCancellationStayWithinTheirContext')
-          if not roots or required not in cases:
-              raise SystemExit('Missing real Gecko response test; empty run is not a pass')
-          if sum(int(root.get('tests', 0)) for root in roots) != 1 or any(int(root.get(k, 0)) for root in roots for k in ('failures', 'errors', 'skipped')):
-              raise SystemExit('Gecko response fixture failed or skipped')
-          print('PASS: one actual Gecko original-response test; product adapter, HTTPS, reset and real IdP remain separate')
+          required = {
+              ('com.takosumi.fixture.geckodownload.ResponseCapabilityTest', 'originalCookieBlobAndCancellationStayWithinTheirContext'),
+              ('com.takosumi.fixture.geckodownload.WebAppOperationTest', 'photopeaNativeOpenAndExportPreserveTheEditorAndOtherProfile'),
+          }
+          if not roots or cases != required:
+              raise SystemExit('Missing/extraneous actual Gecko operation tests; empty run is not a pass')
+          if sum(int(root.get('tests', 0)) for root in roots) != 2 or any(int(root.get(k, 0)) for root in roots for k in ('failures', 'errors', 'skipped')):
+              raise SystemExit('Gecko operation fixture failed or skipped')
+          print('PASS: original loopback responses and anonymous Photopea OS Open/export; product adapter, reset and real IdP remain separate')
           PY
           git diff --exit-code -- native-tests/android/gecko-download-fixture
       - name: Keep independent Gecko candidate evidence
@@ -489,6 +496,8 @@ jobs:
           path: |
             native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected/**/TEST-*.xml
             ${{ runner.temp }}/sumi-gecko-failure.log
+            ${{ runner.temp }}/sumi-gecko-web-app/**
+            ${{ runner.temp }}/sumi-gecko-web-app-pull.log
           if-no-files-found: warn
           retention-days: 14
 
