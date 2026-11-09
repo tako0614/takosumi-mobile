@@ -375,6 +375,29 @@ def require_test_pass(log):
         raise RuntimeError("Missing successful nonempty actual XCTest result")
 
 
+def export_test_attachments(out):
+    """Make a completed failed test's original UI evidence readable off macOS."""
+    result = {"diagnosticOnly": True, "status": "unavailable"}
+    try:
+        bundle = out / "Tests.xcresult"
+        if not bundle.is_dir() or bundle.is_symlink():
+            return result
+        # An interrupted xcodebuild can leave live descendants writing the bundle.
+        # Do not read it concurrently or infer completion from reaping its parent.
+        if any(item["log"] == str(out / "xcodebuild.log") for item in INTERRUPTED_COMMANDS):
+            result["status"] = "interrupted-test"
+            return result
+        command(["xcrun", "xcresulttool", "export", "attachments", "--path", str(bundle),
+                 "--output-path", str(out / "test-attachments")],
+                out / "attachment-export.log", timeout=60)
+        result["status"] = "exported"
+    except Exception as error:
+        # The caller retains the original test exception and verdict. This
+        # command uses the same owned-child retirement path on timeout.
+        result.update(status="export-failed", errorType=type(error).__name__)
+    return result
+
+
 def read_export(documents, name, limit=16384):
     path = documents / name
     info = path.lstat()
@@ -489,6 +512,7 @@ def main():
                 # only the exact logPath returned by our creation readback.
                 result["deviceLogs"] = preserve_device_logs(
                     created_device, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
+            result["testAttachments"] = export_test_attachments(out)
         finally:
             try:
                 if server is not None:

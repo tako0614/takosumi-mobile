@@ -26,6 +26,35 @@ class HarnessTests(unittest.TestCase):
             reset.start()
             self.addCleanup(reset.stop)
 
+    def test_attachment_export_preserves_missing_or_interrupted_bundle(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            with patch.object(fixture_runner, "command") as command:
+                self.assertEqual(fixture_runner.export_test_attachments(out)["status"], "unavailable")
+                (out / "Tests.xcresult").mkdir()
+                fixture_runner.INTERRUPTED_COMMANDS.append({"log": str(out / "xcodebuild.log"), "reaped": True})
+                self.assertEqual(fixture_runner.export_test_attachments(out)["status"], "interrupted-test")
+                command.assert_not_called()
+
+    def test_attachment_export_failure_is_diagnostic_and_original_bundle_is_preserved(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            bundle = out / "Tests.xcresult"
+            bundle.mkdir()
+            sentinel = bundle / "original"
+            sentinel.write_bytes(b"original failed XCTest")
+            for error in (None, RuntimeError("export unavailable"), subprocess.TimeoutExpired("xcrun", 60)):
+                with self.subTest(error=type(error).__name__), \
+                     patch.object(fixture_runner, "command", side_effect=error) as command:
+                    result = fixture_runner.export_test_attachments(out)
+                    self.assertTrue(result["diagnosticOnly"])
+                    self.assertEqual(result["status"], "export-failed" if error else "exported")
+                    command.assert_called_once_with(
+                        ["xcrun", "xcresulttool", "export", "attachments", "--path", str(bundle),
+                         "--output-path", str(out / "test-attachments")],
+                        out / "attachment-export.log", timeout=60)
+                    self.assertEqual(sentinel.read_bytes(), b"original failed XCTest")
+
     def test_timeout_reaps_only_owned_cli_and_keeps_original_failure(self):
         original = subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "owned-id", "-b"], 180)
         process = Mock(pid=424242)

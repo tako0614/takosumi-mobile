@@ -206,6 +206,12 @@ must contain the actual method pass and one executed test with zero failures.
 Logs, XCTest screenshots/hierarchy/result bundle and file receipts are retained;
 ephemeral private keys remain outside the uploaded evidence. The Python harness
 controls exercise real TLS/cookie and false-success checks, not native behavior.
+After a completed failed test, the runner also exports the original result
+bundle's attachments with the installed `xcresulttool`, so screenshots and the
+accessibility snapshot can be read without Xcode. This single diagnostic command
+has a 60-second wait and the same direct-child retirement rules. An absent
+bundle or interrupted xcodebuild is not exported; neither missing attachments
+nor export failure changes the original test failure. No test is retried.
 The fixture is unqualified until its actual Simulator run passes. It is not the
 whole Tauri UI, a physical device, a real IdP or an HTTP-auth qualification.
 

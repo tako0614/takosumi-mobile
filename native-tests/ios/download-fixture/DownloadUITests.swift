@@ -66,8 +66,14 @@ final class DownloadUITests: XCTestCase {
     }
 
     private func exportToFixtureDocuments(afterSessionClose: Bool = false) {
-        let saveToFiles = app.buttons["Save to Files"].firstMatch
-        // Standard English iOS fixture. Missing selectors fail; no fake export.
+        // The iOS 26 share sheet exposes this action as a Cell, as captured in
+        // the original failed XCTest hierarchy. Retain the older Button form;
+        // do not select the nested title text or substitute an export result.
+        let actionTypes = [XCUIElement.ElementType.cell.rawValue, XCUIElement.ElementType.button.rawValue] as NSArray
+        let saveToFiles = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@ AND elementType IN %@", "Save to Files", actionTypes)
+        ).firstMatch
+        // Standard English iOS fixture. Missing actions fail; no fake export.
         if !saveToFiles.waitForExistence(timeout: 5) { app.swipeUp() }
         XCTAssertTrue(saveToFiles.waitForExistence(timeout: 5))
         if afterSessionClose {
