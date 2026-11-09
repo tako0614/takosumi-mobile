@@ -67,6 +67,11 @@ or direct picker callback replaces the OS touch/selection.
 If a target recheck or UP fails after an accepted DOWN, the test attempts to cancel that
 same touch stream and retains the original failure (including cancellation
 failure if present). There is no repeat tap or recovery that hides the error.
+DocumentsUI's image grid can expose the owned name only in a compound content
+description, with a Preview overlay covering the thumbnail center. In that
+layout the test taps the actual `List view` control at most once, within the
+same 15-second image wait. Selection still requires the exact visible filename
+text and the original OS prompt result; it never taps a substring or preview.
 The engine prompt uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes
 Photopea's Save for web and receives the original HTTPS Blob response. Native

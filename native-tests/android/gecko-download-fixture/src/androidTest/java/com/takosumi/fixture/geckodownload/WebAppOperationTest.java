@@ -246,7 +246,24 @@ public final class WebAppOperationTest {
 
     private void chooseInput() {
         openDownloads();
-        await("OS picker did not show exact owned image", () -> picker() && bounds(inputName, false, false) != null, 15);
+        boolean[] listViewRequested = {false};
+        await("OS picker did not show exact owned image", () -> {
+            if (!picker()) return false;
+            if (bounds(inputName, false, false) != null) return true;
+            // DocumentsUI's image grid exposes the filename only in a compound
+            // description. Its thumbnail center can hit the Preview overlay.
+            // Use the real layout control once, then require the exact visible
+            // filename text in list view; do not match or tap the preview node.
+            if (!listViewRequested[0]) {
+                Rect listView = bounds("List view", false, true);
+                if (listView != null) {
+                    listViewRequested[0] = true;
+                    activity.trace("picker list view " + listView.toShortString());
+                    tap(listView);
+                }
+            }
+            return false;
+        }, 15);
         assertEquals(0, activity.fileSelections);
         tap(bounds(inputName, false, false));
         await("Original file prompt did not receive the OS answer", () -> activity.fileSelections == 1, 15);
