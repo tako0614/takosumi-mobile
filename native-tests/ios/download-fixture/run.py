@@ -565,8 +565,19 @@ def main():
                         timeout=180, boot_status=True)
                 result["simulator"]["bootRetry"] = "stalled-erased-rebooted"
             # Trust only on this exact disposable Simulator, never host trust.
-            command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
-                    out / "trust.log", trust_trace=True)
+            try:
+                command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
+                        out / "trust.log", trust_trace=True)
+            except subprocess.TimeoutExpired as stalled:
+                # A freshly booted Simulator's keychain service can still be
+                # settling past the fixed 60-second bound; retry the exact same
+                # owned CA import once at the same bound before failing. The
+                # harness's trust_trace contract keeps 60s either way.
+                (out / "trust-stalled.txt").write_text(
+                    f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
+                command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
+                        out / "trust-retry.log", trust_trace=True)
+                result["simulator"]["trustRetry"] = "stalled-retried"
             server = FixtureServer(cert, key)
             server.start()
             env = dict(os.environ, SUMI_DOWNLOAD_URL=server.url, SUMI_DOWNLOAD_SOURCE=str(HERE),
