@@ -41,6 +41,7 @@ LINUX_SOURCES = (
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/browser_main.rs",
+    "native-tests/cef-candidate/src/download_observation.rs",
     "native-tests/cef-candidate/src/guard_main.rs",
     "native-tests/cef-candidate/src/guard_entry.rs",
     "native-tests/cef-candidate/x11-owner.py",

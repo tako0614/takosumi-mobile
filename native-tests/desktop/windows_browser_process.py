@@ -132,6 +132,7 @@ WINDOWS_SOURCES = (
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/.cargo/config.toml",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/browser_main.rs",
+    "native-tests/cef-candidate/src/download_observation.rs",
     "native-tests/cef-candidate/src/browser_dll.rs",
     "native-tests/cef-candidate/src/guard_entry.rs", "native-tests/cef-candidate/src/guard_windows.rs",
     "native-tests/cef-candidate/src/guard_windows_identity.rs", "native-tests/cef-candidate/src/process_type.rs",

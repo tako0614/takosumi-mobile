@@ -299,6 +299,23 @@ profile/ancestry/executable-checked kernel snapshot even before a CDP Client
 exists. No connection retry or longer timeout is added. If the failing guard
 already ended, a snapshot of another labeled live profile does not diagnose it.
 
+With `fixture-inspection` and `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`, the CEF
+browser also writes bounded `SUMI_DOWNLOAD` observations to its existing
+profile `browser.log`. The observer explicitly preserves pinned CEF's default
+admission (`CanDownload=true`) and Chrome-style handling
+(`OnBeforeDownload=false`). It never invokes or retains a download callback.
+Only item IDs, status flags, byte counts and numeric interruption reasons are
+copied on the UI thread; URLs, paths, names, headers and content are omitted.
+A bounded nonblocking queue sends at most 64 observations plus one truncation
+marker to a separate stderr writer. No CEF object crosses threads. Product
+builds have no observer; no permission, download preference or deadline changes.
+An `observer-ready` line and sequence numbers help interpret retained output,
+but write errors or shutdown without joining/flushing can leave missing or
+partial diagnostics. Absence of an event is inconclusive. Native completion
+flags diagnose lifecycle; the real final file and exact bytes are still the
+download acceptance oracle. The fixture sources are included in Linux and
+Windows runtime source freezes.
+
 ## Desktop GTK runtime fixture
 
 On Linux with the Tauri GTK/WebKit SDK, Xvfb, xdotool, Python and OpenSSL, build

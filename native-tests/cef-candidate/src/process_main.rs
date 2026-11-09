@@ -41,6 +41,10 @@ pub(crate) mod mac_front;
 #[path = "mac_lifecycle.rs"]
 mod mac_lifecycle;
 
+#[cfg(feature = "fixture-inspection")]
+#[path = "download_observation.rs"]
+mod download_observation;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
     Idle,
@@ -809,6 +813,11 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(Lifetime::new(self.id,self.key.clone(),self.bound)) }
         fn load_handler(&self) -> Option<LoadHandler> {Some(Loads::new())}
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {Some(LinkMenu::new())}
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            #[cfg(feature = "fixture-inspection")]
+            if inspection() { return Some(download_observation::handler()); }
+            None
+        }
     }
 }
 /// `MENU_ID_USER_FIRST` in cef_types.h.
