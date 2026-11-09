@@ -313,6 +313,21 @@ class HarnessTests(unittest.TestCase):
             for log, allowed in ((entry(5, "launch") + entry(175, "launch"), False),
                                  (entry(5, "launch") + entry(20, "keys") + entry(175, "keys"), False),
                                  (entry(5, "launch") + entry(165, "safari") + entry(175, "safari"), True),
+                                 # Run 42672706585: migration ended and the boot
+                                 # reached Waiting on System App; that stage
+                                 # transition is the same forward motion.
+                                 ("Status=2, isTerminal=NO, Elapsed=02:00.\n"
+                                  "Reason:Running plugin keys (a.migrator)\n"
+                                  "Status=4, isTerminal=NO, Elapsed=02:58.\n"
+                                  "\tWaiting on System App\n", True),
+                                 # A boot stuck inside the same post-migration
+                                 # stage still produces no recent transition.
+                                 ("Status=2, isTerminal=NO, Elapsed=00:05.\n"
+                                  "Reason:Running plugin keys (a.migrator)\n"
+                                  "Status=4, isTerminal=NO, Elapsed=01:00.\n"
+                                  "\tWaiting on System App\n"
+                                  "Status=4, isTerminal=NO, Elapsed=02:55.\n"
+                                  "\tWaiting on System App\n", False),
                                  ("Status=4, isTerminal=NO, Elapsed=02:55.\n", False), ("", False)):
                 path.write_text(log)
                 self.assertEqual(fixture_runner.migration_progress(path)["recentMigrationProgress"], allowed)

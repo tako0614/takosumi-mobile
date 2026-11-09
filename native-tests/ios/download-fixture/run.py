@@ -84,6 +84,7 @@ def migration_progress(path):
         source.seek(max(0, source.tell() - 262144))
         text = source.read().decode("utf-8", errors="replace")
     transitions, elapsed, status, terminal, finished = [], 0, None, None, False
+    stage = None
     for line in text.splitlines():
         header = re.search(r"Status=(\d+), isTerminal=(YES|NO), Elapsed=(\d+):(\d+)\.", line)
         if header:
@@ -96,7 +97,14 @@ def migration_progress(path):
         if plugin and status == 2 and terminal == "NO":
             if not transitions or transitions[-1]["plugin"] != plugin[1]:
                 transitions.append({"plugin": plugin[1], "elapsed": elapsed})
-    recent = (len(transitions) >= 2 and status == 2 and terminal == "NO" and
+        waiting = re.search(r"Waiting on (.+?)\s*$", line)
+        if waiting and status is not None and terminal == "NO" and waiting[1] != stage:
+            # Advancing through native stages (BackBoard -> Data Migration ->
+            # System App) is the same forward motion as a completed plugin;
+            # the status==2 plugin gate cannot see post-migration progress.
+            stage = waiting[1]
+            transitions.append({"plugin": "stage:" + stage, "elapsed": elapsed})
+    recent = (len(transitions) >= 2 and status is not None and terminal == "NO" and
               elapsed >= 150 and 0 <= elapsed - transitions[-1]["elapsed"] <= 60)
     return {"transitions": transitions, "lastElapsed": elapsed, "recentMigrationProgress": recent,
             "extensionSeconds": 120 if recent else 0, "maximumBootSeconds": 300,
