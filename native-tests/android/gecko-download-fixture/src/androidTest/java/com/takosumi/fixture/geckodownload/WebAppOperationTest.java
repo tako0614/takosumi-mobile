@@ -267,7 +267,10 @@ public final class WebAppOperationTest {
         scenario = ActivityScenario.launch(WebAppProbeActivity.class);
         scenario.onActivity(value -> activity = value);
         enterEditor("Work");
-        key(KeyEvent.KEYCODE_O, KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON);
+        // Use the mobile editor's visible Open action. The original native
+        // hierarchy includes this leading EN QUAD after its computer icon.
+        // Ctrl+O did not open DocumentsUI; do not send both and risk two prompts.
+        tap("\u2000Open From Computer");
         chooseInput();
         await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);

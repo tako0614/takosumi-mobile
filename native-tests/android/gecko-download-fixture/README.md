@@ -52,8 +52,12 @@ replacement is used. All native taps must fit inside the active window.
 The main-thread viewport read waits at most one second within the remaining
 entry deadline. A stalled read fails and cancels its queued callback; a late
 read cannot inject input.
-Actual native keyboard input opens Photopea's file prompt; the engine prompt
-uses Android's real Open Document picker and returns its URI to the same page.
+One actual native tap on the visible `Open From Computer` action opens
+Photopea's file prompt. Its exact accessibility label includes the observed
+leading EN QUAD after the computer icon; visibility, enabled state and bounds
+remain required. The preceding Ctrl+O attempt never showed DocumentsUI, so the
+fixture uses the ordinary mobile action without a second shortcut/fallback.
+The engine prompt uses Android's real Open Document picker and returns its URI to the same page.
 After switching to Personal and back without reloading Work, the test invokes
 Photopea's Save for web and receives the original HTTPS Blob response. Native
 confirmation and Create Document select a fresh owned PNG. A single worker
