@@ -2560,10 +2560,12 @@ once for one second at 100 ms intervals, before Chromium's ten-second
 [teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
 PID/birth, guard ancestry and both executable paths are checked before and
 after; changed identity discards the output. The sample subprocess has a
-three-second limit and passes `-mayDie`, so symbol locations are grabbed
+five-second limit and passes `-mayDie`, so symbol locations are grabbed
 before the sampled browser can be watchdog-killed mid-run; the recorded tool
 support was kept for exactly this after a bare run timed out without a
-stack. Its retained stack text is capped at 4 MiB and stderr at
+stack, and the bound stays under the watchdog while letting symbol grab,
+the sample and the report write finish on a CEF-sized binary, which three
+seconds did not. Its retained stack text is capped at 4 MiB and stderr at
 8 KiB. A timeout retains any partial stack and stderr only after the same
 identity readback, and remains a failed diagnostic, never a native pass.
 The subprocess is reaped and the watcher joined before fixture cleanup.

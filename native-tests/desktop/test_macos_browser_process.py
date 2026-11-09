@@ -165,14 +165,14 @@ class EvidenceTests(unittest.TestCase):
             def sample(args, **options):
                 self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
                 self.assertEqual(args[4:6], ["-mayDie", "-file"])
-                self.assertEqual(options["timeout"], 3)
+                self.assertEqual(options["timeout"], 5)
                 Path(args[-1]).write_bytes(b"x" * 33)
                 return mock.Mock(returncode=0)
             with mock.patch.object(sampler, "LIMIT", 32), \
                     mock.patch.object(sampler.subprocess, "run", side_effect=sample):
                 result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
             self.assertEqual((result["status"], result["truncated"], output.stat().st_size), ("captured", True, 32))
-            with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 3)):
+            with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 5)):
                 result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
 
@@ -186,12 +186,12 @@ class EvidenceTests(unittest.TestCase):
                 with self.subTest(changed_identity=changed):
                     output = Path(directory) / f"sample-{changed}.log"
                     def sample(args, **options):
-                        self.assertEqual(options["timeout"], 3)
+                        self.assertEqual(options["timeout"], 5)
                         Path(args[-1]).write_bytes(b"s" * 33)
                         options["stderr"].write(b"e" * 17)
                         if changed:
                             processes.facts.side_effect = {11: parent, 12: dict(child, start=102)}.get
-                        raise sampler.subprocess.TimeoutExpired("sample", 3)
+                        raise sampler.subprocess.TimeoutExpired("sample", 5)
                     with mock.patch.object(sampler, "LIMIT", 32), \
                             mock.patch.object(sampler, "STDERR_LIMIT", 16), \
                             mock.patch.object(sampler.subprocess, "run", side_effect=sample):

@@ -78,12 +78,15 @@ def sample_owned(processes, child, parent, browser, guard, output):
             with diagnostic.open("wb") as stderr:
                 try:
                     # -mayDie grabs symbol locations first: the teardown watchdog
-                    # can kill the sampled browser mid-run, and post-sample
-                    # symbolication of a dead huge CEF binary is what timed out.
+                    # can kill the sampled browser mid-run. The bound stays
+                    # under that watchdog's window (pending detection plus this
+                    # limit ends before the kill) but lets symbol grab, the one
+                    # second sample and the report write finish on a CEF-sized
+                    # binary, which three seconds did not.
                     completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100",
                                                 "-mayDie", "-file", str(raw)],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                               stderr=stderr, timeout=3, check=False)
+                                               stderr=stderr, timeout=5, check=False)
                     result["sampleExit"] = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
