@@ -133,6 +133,46 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 select_runtime({"runtimes": [dict(runtime, **patch)]})
 
+    def test_deadline_boundary_requires_both_terminal_native_success_and_exit_zero(self):
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        # 2fd's native log ended this way, and retirement observed exit0
+        # without sending any signal. Preserve that actual event ordering.
+        waiting = "Status=4, isTerminal=NO, Elapsed=03:06.\n\tWaiting on System App\n"
+        finished = "Status=4294967295, isTerminal=YES, Elapsed=03:10.\n\tFinished\n"
+        cases = ((waiting + finished, 0, True), (waiting + finished, None, False),
+                 (waiting + finished, 1, False), (waiting + "Finished\n", 0, False),
+                 (finished.replace("Finished", "Failed"), 0, False), (finished + waiting, 0, False))
+        for log, exit_code, accepted in cases:
+            with self.subTest(log=log, exit_code=exit_code):
+                process = Mock(pid=424242)
+                original = subprocess.TimeoutExpired(argv, 180)
+                process.wait.side_effect = [original, -15]
+                process.poll.return_value = exit_code
+
+                def spawn(*_, **kwargs):
+                    kwargs["stdout"].write(log.encode())
+                    kwargs["stdout"].flush()
+                    return process
+
+                with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+                    path = Path(raw) / "bootstatus.log"
+                    with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn) as launch:
+                        if accepted:
+                            self.assertEqual(fixture_runner.command(argv, path, timeout=180, boot_status=True), log)
+                            process.wait.assert_called_once_with(timeout=180)
+                            process.terminate.assert_not_called()
+                            process.kill.assert_not_called()
+                            self.assertFalse(path.with_suffix(".process.json").exists())
+                            proof = json.loads(path.with_suffix(".progress.json").read_text())
+                            self.assertTrue(proof["terminalReady"])
+                            self.assertEqual(proof["deadlineBoundaryExit"], 0)
+                            self.assertEqual(proof["extensionSeconds"], 0)
+                        else:
+                            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                                fixture_runner.command(argv, path, timeout=180, boot_status=True)
+                            self.assertIs(caught.exception, original)
+                        launch.assert_called_once()
+
     def test_cleanup_requires_exact_created_identity(self):
         device = {"udid": "id", "name": "owned", "state": "Booted"}
         inventory = {"devices": {"runtime": [device]}}

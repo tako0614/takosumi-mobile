@@ -140,6 +140,13 @@ product adapter completion, OS export, HTTPS or real IdP qualification.
 
 ### iOS download runtime qualification
 
+At the boot-status wait deadline, the runner can observe that the same CLI has
+already exited successfully. It accepts this only together with the latest
+native terminal `Finished` record, and saves that paired readback. There is no
+additional wait, reboot or retry. A live/nonzero CLI or a nonterminal/error log
+still preserves the timeout. The original 2fd run did not reach XCTest; its
+later cleanup inventory timeout remains a separate unresolved observation.
+
 The WKDownload candidate has policy cases for active Web-home/frame origins,
 the explicit same-origin Blob exception, attachment disposition and safe
 filename handling. The whole App SDK lane compiles its UIKit/WebKit wiring.

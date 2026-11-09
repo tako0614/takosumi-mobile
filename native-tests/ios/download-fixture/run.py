@@ -36,17 +36,20 @@ def save(path, value):
 
 
 def migration_progress(path):
-    """Only distinct native migration plugins justify one cold-start continuation."""
+    """Read native migration progress and explicit terminal success from this CLI."""
     with path.open("rb") as source:
         source.seek(0, 2)
         source.seek(max(0, source.tell() - 262144))
         text = source.read().decode("utf-8", errors="replace")
-    transitions, elapsed, status, terminal = [], 0, None, None
+    transitions, elapsed, status, terminal, finished = [], 0, None, None, False
     for line in text.splitlines():
         header = re.search(r"Status=(\d+), isTerminal=(YES|NO), Elapsed=(\d+):(\d+)\.", line)
         if header:
             status, terminal = int(header[1]), header[2]
             elapsed = int(header[3]) * 60 + int(header[4])
+            finished = False
+        elif line.strip() == "Finished" and status == 4294967295 and terminal == "YES":
+            finished = True
         plugin = re.search(r"Reason:Running plugin ([\w.-]+) \(", line)
         if plugin and status == 2 and terminal == "NO":
             if not transitions or transitions[-1]["plugin"] != plugin[1]:
@@ -54,7 +57,8 @@ def migration_progress(path):
     recent = (len(transitions) >= 2 and status == 2 and terminal == "NO" and
               elapsed >= 150 and 0 <= elapsed - transitions[-1]["elapsed"] <= 60)
     return {"transitions": transitions, "lastElapsed": elapsed, "recentMigrationProgress": recent,
-            "extensionSeconds": 120 if recent else 0, "maximumBootSeconds": 300}
+            "extensionSeconds": 120 if recent else 0, "maximumBootSeconds": 300,
+            "terminalReady": finished}
 
 
 def retire_cli(process, path, original):
@@ -124,19 +128,26 @@ def command(argv, path, timeout=60, env=None, boot_status=False):
                 try:
                     progress = migration_progress(path)
                     progress["udid"] = argv[3]
+                    if progress["terminalReady"]:
+                        # The child can finish between wait's deadline and
+                        # this readback. Observe it; do not wait or signal it.
+                        progress["deadlineBoundaryExit"] = process.poll()
                     save(path.with_suffix(".progress.json"), progress)
                 except OSError as error:
                     original.add_note(f"No recorded migration progress: {type(error).__name__}")
                     raise original
-                if not progress["recentMigrationProgress"]:
+                if progress["terminalReady"] and progress.get("deadlineBoundaryExit") == 0:
+                    code = 0
+                elif not progress["recentMigrationProgress"]:
                     raise
-                # Continue this same readiness process once, without reboot,
-                # only after actual plugin transitions near the first deadline.
-                try:
-                    code = process.wait(timeout=120)
-                except subprocess.TimeoutExpired:
-                    original.add_note("Fresh-boot migration continued for 120 seconds, but readiness still timed out")
-                    raise original
+                else:
+                    # Continue this same readiness process once, without reboot,
+                    # only after actual plugin transitions near the first deadline.
+                    try:
+                        code = process.wait(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        original.add_note("Fresh-boot migration continued for 120 seconds, but readiness still timed out")
+                        raise original
         except BaseException as original:
             try:
                 retire_cli(process, path, original)
