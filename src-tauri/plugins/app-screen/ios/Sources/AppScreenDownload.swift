@@ -177,6 +177,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
 
     func resumePresentation() {
         guard state == .ready, let file = file, let presenter = context(),
+              presenter.viewIfLoaded?.window != nil, !presenter.isBeingDismissed,
               presenter.presentedViewController == nil, presenter.transitionCoordinator == nil else { return }
         let activity = UIActivityViewController(activityItems: [file], applicationActivities: nil)
         activity.popoverPresentationController?.sourceView = presenter.view
@@ -191,9 +192,15 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
             finish()
         }
         state = .exporting
-        if !present(activity) {
-            activity.completionWithItemsHandler = nil
-            state = .ready
+        modal = activity
+        // UIKit may forward or finish this presentation after present returns.
+        // An immediate presenter/controller comparison cannot revoke its file
+        // ownership: session removal could then unlink the OS service's input.
+        // From this handoff onward only the activity completion releases it.
+        observeLifecycle("export-present-requested")
+        presenter.present(activity, animated: false) { [weak self] in
+            // Presentation completion is diagnostic, not export completion.
+            self?.observeLifecycle("export-present-completed")
         }
     }
 

@@ -113,8 +113,14 @@ WebContent termination and backgrounding stop an unfinished transfer; partial
 files are removed after WebKit confirms cancellation. Once the file is handed
 to the OS activity, closing/switching the session leaves that activity and its
 input file alive until `completionWithItemsHandler` fires. The handler retains
-the download owner after the navigator releases it; a failed presentation clears
-that retention. Dismissing a view controller alone is not an export-completion
+the download owner after the navigator releases it. Before requesting export,
+the presenter must be attached, idle and not dismissing. Once UIKit receives
+the presentation request, an immediate controller comparison cannot revoke
+that ownership: presentation can finish later or be forwarded in the hierarchy.
+The presentation completion is observation only; it does not release the file.
+If UIKit silently refuses an already-issued request without an activity
+completion, the owner/file remain retained; no timeout unlinks a possibly
+active provider's input. Dismissing a view controller alone is not an export-completion
 signal. OS export retains its
 file until completion/cancellation, including a file-provider handoff. Prompts
 keep a three-second cooldown, restarted by the person's cancellation. Cleanup

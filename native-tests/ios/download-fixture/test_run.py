@@ -70,7 +70,9 @@ class HarnessTests(unittest.TestCase):
             value = {"diagnosticOnly": True, "samples": [{"unixSeconds": 1794204000.0,
                      "sourceExists": True, "sourceReadable": True, "sourceMatchesOriginal": True,
                      "activityAlive": True, "activityPresented": True}],
-                     "lifecycle": [{"unixSeconds": 1794203999.0, "event": "state", "state": "exporting"}],
+                     "lifecycle": [{"unixSeconds": 1794203999.0, "event": "state", "state": "exporting"},
+                                   {"unixSeconds": 1794203999.1, "event": "export-present-requested", "state": "exporting"},
+                                   {"unixSeconds": 1794203999.2, "event": "export-present-completed", "state": "exporting"}],
                      "lifecycleTruncated": False}
             source.write_text(json.dumps(value))
             with patch.object(fixture_runner, "command", return_value=str(container)) as command:

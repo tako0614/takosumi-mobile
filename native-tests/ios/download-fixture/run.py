@@ -458,7 +458,8 @@ def preserve_export_observations(created, udid, out):
                 raise RuntimeError("Invalid fixture observation sample")
         events = {"created", "state", "download-failed", "failure-cleanup", "activity-completed", "stop",
                   "present-refused", "present-unconfirmed", "present-confirmed", "remove-started",
-                  "remove-succeeded", "remove-failed", "finish"}
+                  "remove-succeeded", "remove-failed", "finish",
+                  "export-present-requested", "export-present-completed"}
         states = {"waiting", "confirming", "receiving", "ready", "exporting", "failed", "cancelling", "finished"}
         for event in value["lifecycle"]:
             if (not isinstance(event, dict) or set(event) != {"unixSeconds", "event", "state"} or
