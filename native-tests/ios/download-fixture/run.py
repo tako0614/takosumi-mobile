@@ -117,6 +117,7 @@ def command(argv, path, timeout=60, env=None, boot_status=False):
     if boot_status and (len(argv) != 5 or argv[:3] != ["xcrun", "simctl", "bootstatus"] or
                         argv[4] != "-b" or timeout != 180):
         raise ValueError("Cold-boot continuation is only for exact Simulator readiness")
+    boot_started = time.monotonic() if boot_status else None
     with path.open("xb") as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT,
                                    env=env, start_new_session=True)
@@ -126,28 +127,64 @@ def command(argv, path, timeout=60, env=None, boot_status=False):
             except subprocess.TimeoutExpired as original:
                 if not boot_status:
                     raise
+
+                def save_progress():
+                    try:
+                        save(path.with_suffix(".progress.json"), progress)
+                    except OSError as error:
+                        original.add_note(f"Boot progress evidence write failed: {type(error).__name__}")
+                        raise original
+
                 try:
                     progress = migration_progress(path)
                     progress["udid"] = argv[3]
+                    progress["originalDeadlineSeconds"] = timeout
                     if progress["terminalReady"]:
                         # The child can finish between wait's deadline and
-                        # this readback. Observe it; do not wait or signal it.
+                        # this readback. A native Finished line alone is not
+                        # the readiness CLI's successful exit.
                         progress["deadlineBoundaryExit"] = process.poll()
-                    save(path.with_suffix(".progress.json"), progress)
+                    save_progress()
                 except OSError as error:
                     original.add_note(f"No recorded migration progress: {type(error).__name__}")
                     raise original
+                # A diagnostic read/write can itself stall. Its earlier time
+                # must not authorize accepting exit0 after the total ceiling.
+                progress["remainingBootSeconds"] = max(0, 300 - (time.monotonic() - boot_started))
+                if progress["remainingBootSeconds"] <= 0:
+                    save_progress()
+                    original.add_note("Simulator readiness observation exceeded the total 300-second boot budget")
+                    raise original
                 if progress["terminalReady"] and progress.get("deadlineBoundaryExit") == 0:
                     code = 0
-                elif not progress["recentMigrationProgress"]:
+                elif not (progress["recentMigrationProgress"] or
+                          (progress["terminalReady"] and progress.get("deadlineBoundaryExit") is None)):
                     raise
                 else:
                     # Continue this same readiness process once, without reboot,
-                    # only after actual plugin transitions near the first deadline.
+                    # after recent native migration or explicit native Finished.
+                    # Include diagnostics in the existing total300s ceiling.
+                    progress["continuationReason"] = ("native-finished-cli-exit" if progress["terminalReady"]
+                                                       else "recent-migration")
+                    save_progress()
+                    # Recompute after the last write, immediately before wait.
+                    progress["remainingBootSeconds"] = max(0, 300 - (time.monotonic() - boot_started))
+                    progress["extensionSeconds"] = min(120, progress["remainingBootSeconds"])
+                    if progress["extensionSeconds"] <= 0:
+                        save_progress()
+                        original.add_note("Boot diagnostics consumed the remaining readiness budget")
+                        raise original
                     try:
-                        code = process.wait(timeout=120)
+                        code = process.wait(timeout=progress["extensionSeconds"])
                     except subprocess.TimeoutExpired:
-                        original.add_note("Fresh-boot migration continued for 120 seconds, but readiness still timed out")
+                        save_progress()
+                        original.add_note("Same bootstatus child did not exit within the remaining readiness budget")
+                        raise original
+                    progress["continuationExit"] = code
+                    progress["elapsedBootSeconds"] = time.monotonic() - boot_started
+                    save_progress()
+                    if code != 0 or progress["elapsedBootSeconds"] > 300:
+                        original.add_note("Continued bootstatus did not prove exit0 within the total 300-second budget")
                         raise original
         except BaseException as original:
             try:

@@ -139,7 +139,7 @@ class HarnessTests(unittest.TestCase):
         # without sending any signal. Preserve that actual event ordering.
         waiting = "Status=4, isTerminal=NO, Elapsed=03:06.\n\tWaiting on System App\n"
         finished = "Status=4294967295, isTerminal=YES, Elapsed=03:10.\n\tFinished\n"
-        cases = ((waiting + finished, 0, True), (waiting + finished, None, False),
+        cases = ((waiting + finished, 0, True),
                  (waiting + finished, 1, False), (waiting + "Finished\n", 0, False),
                  (finished.replace("Finished", "Failed"), 0, False), (finished + waiting, 0, False))
         for log, exit_code, accepted in cases:
@@ -172,6 +172,116 @@ class HarnessTests(unittest.TestCase):
                                 fixture_runner.command(argv, path, timeout=180, boot_status=True)
                             self.assertIs(caught.exception, original)
                         launch.assert_called_once()
+
+    def test_native_finished_live_cli_must_exit_zero_within_total_boot_budget(self):
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        # 6d0a's real log/progress observed native Finished at196s while poll
+        # still returned None; retirement then observed exit0 without signals.
+        log = (b"Status=4, isTerminal=NO, Elapsed=03:15.\n\tWaiting on System App\n"
+               b"Status=4294967295, isTerminal=YES, Elapsed=03:16.\n\tFinished\n")
+        for final, observed_at in ((0, 197), (1, 197), (subprocess.TimeoutExpired(argv, 104), 197), (0, 301)):
+            with self.subTest(final=final, observed_at=observed_at):
+                original = subprocess.TimeoutExpired(argv, 180)
+                process = Mock(pid=424242)
+                process.wait.side_effect = [original, final, -15]
+                process.poll.side_effect = [None, final if isinstance(final, int) else None]
+
+                def spawn(*_, **kwargs):
+                    kwargs["stdout"].write(log)
+                    kwargs["stdout"].flush()
+                    return process
+
+                with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+                    path = Path(raw) / "bootstatus.log"
+                    with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn) as launch, \
+                         patch.object(fixture_runner.time, "monotonic", side_effect=[0, 196, 196, observed_at]):
+                        if final == 0 and observed_at <= 300:
+                            self.assertEqual(fixture_runner.command(argv, path, timeout=180, boot_status=True), log.decode())
+                            process.terminate.assert_not_called()
+                            process.kill.assert_not_called()
+                            self.assertFalse(path.with_suffix(".process.json").exists())
+                        else:
+                            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                                fixture_runner.command(argv, path, timeout=180, boot_status=True)
+                            self.assertIs(caught.exception, original)
+                        launch.assert_called_once()
+                        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list[:2]], [180, 104])
+                        proof = json.loads(path.with_suffix(".progress.json").read_text())
+                        self.assertEqual(proof["continuationReason"], "native-finished-cli-exit")
+                        self.assertEqual(proof["originalDeadlineSeconds"], 180)
+                        self.assertEqual(proof["extensionSeconds"], 104)
+
+    def test_boot_diagnostics_do_not_extend_the_total_readiness_budget(self):
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        for exit_code, delayed_write in ((0, 1), (None, 2)):
+            with self.subTest(exit_code=exit_code, delayed_write=delayed_write):
+                original = subprocess.TimeoutExpired(argv, 180)
+                process = Mock(pid=424242)
+                process.wait.side_effect = original
+                process.poll.side_effect = [exit_code, 0]
+                clock = [0]
+                writes = [0]
+                save = fixture_runner.save
+
+                def spawn(*_, **kwargs):
+                    kwargs["stdout"].write(b"Status=4294967295, isTerminal=YES, Elapsed=03:16.\nFinished\n")
+                    kwargs["stdout"].flush()
+                    return process
+
+                def slow_diagnostic(path, value):
+                    save(path, value)
+                    if path.name.endswith(".progress.json"):
+                        writes[0] += 1
+                        clock[0] = 301 if writes[0] >= delayed_write else 196
+
+                with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+                    path = Path(raw) / "bootstatus.log"
+                    with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn) as launch, \
+                         patch.object(fixture_runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                         patch.object(fixture_runner, "save", side_effect=slow_diagnostic):
+                        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                            fixture_runner.command(argv, path, timeout=180, boot_status=True)
+                        self.assertIs(caught.exception, original)
+                        launch.assert_called_once()
+                        process.wait.assert_called_once_with(timeout=180)
+                        process.terminate.assert_not_called()
+                        process.kill.assert_not_called()
+                        proof = json.loads(path.with_suffix(".progress.json").read_text())
+                        self.assertEqual(proof["remainingBootSeconds"], 0)
+
+    def test_continuation_evidence_failure_preserves_original_timeout_and_reaps_child(self):
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        original = subprocess.TimeoutExpired(argv, 180)
+        process = Mock(pid=424242)
+        process.wait.side_effect = [original, -15]
+        process.poll.return_value = None
+        save = fixture_runner.save
+        writes = [0]
+
+        def spawn(*_, **kwargs):
+            kwargs["stdout"].write(b"Status=4294967295, isTerminal=YES, Elapsed=03:16.\nFinished\n")
+            kwargs["stdout"].flush()
+            return process
+
+        def fail_continuation_write(path, value):
+            if path.name.endswith(".progress.json"):
+                writes[0] += 1
+                if writes[0] == 2:
+                    raise OSError("fixture progress write failure")
+            save(path, value)
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "bootstatus.log"
+            with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn) as launch, \
+                 patch.object(fixture_runner, "save", side_effect=fail_continuation_write):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    fixture_runner.command(argv, path, timeout=180, boot_status=True)
+                self.assertIs(caught.exception, original)
+                self.assertTrue(any("progress" in note and "OSError" in note for note in original.__notes__))
+                launch.assert_called_once()
+                process.terminate.assert_called_once_with()
+                self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [180, 5])
+                self.assertTrue(json.loads(path.with_suffix(".process.json").read_text())["reaped"])
 
     def test_cleanup_requires_exact_created_identity(self):
         device = {"udid": "id", "name": "owned", "state": "Booted"}

@@ -142,10 +142,12 @@ product adapter completion, OS export, HTTPS or real IdP qualification.
 
 At the boot-status wait deadline, the runner can observe that the same CLI has
 already exited successfully. It accepts this only together with the latest
-native terminal `Finished` record, and saves that paired readback. There is no
-additional wait, reboot or retry. A live/nonzero CLI or a nonterminal/error log
-still preserves the timeout. The original 2fd run did not reach XCTest; its
-later cleanup inventory timeout remains a separate unresolved observation.
+native terminal `Finished` record, and saves that paired readback. If the native
+boot finished but the CLI is still live, it waits for that same child once within
+the remaining total boot budget below. There is no reboot or new CLI attempt.
+An unfinished/nonzero CLI or an observation beyond the total ceiling preserves
+the original timeout. The original 2fd and 6d0a runs did not reach XCTest; their
+cleanup inventory timeouts remain separate unresolved observations.
 On failure after creation readback, the runner retains bounded `.log` tails
 from that exact new device's recorded log directory before cleanup. It refuses
 foreign paths, directory aliases, symlinks and multiply linked files; at most
@@ -161,10 +163,13 @@ It needs existing Xcode, XcodeGen, OpenSSL and an available iOS 17+ iPhone runti
 on macOS. It creates one disposable Simulator, trusts a new loopback HTTPS CA
 only inside that device, and deletes that exact device after an identity readback.
 It does not install SDKs/runtimes, alter host trust or use signing credentials.
-The first cold boot has a 180-second readiness budget. Only distinct native
-migration-plugin transitions near that deadline permit the same readiness
-process to continue once for 120 seconds; elapsed counters alone do not.
-Terminal `bootstatus` success is still required before trust or tests. A timeout
+The first cold boot has a 180-second initial wait. Distinct native migration-plugin
+transitions near that deadline or explicit native `Finished` permit the same
+readiness process to continue once, for at most 120 seconds within a total
+300-second ceiling; elapsed counters alone do not. Monotonic time is rechecked
+after diagnostic writes before accepting an exit or starting the continuation,
+and after that wait. Actual `bootstatus` exit0 within the budget is required
+before trust or tests; native text alone cannot pass. A timeout
 retires only the directly owned CLI, preserving the original failure separately
 from termination errors. Interrupted commands retain scratch even if their
 direct child reaps, because that alone cannot prove spawned build/test children
