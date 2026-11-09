@@ -56,11 +56,11 @@ define_class!(
 
         /// Cocoa's quit (the Dock menu, logout) would end the process with
         /// `exit()` and skip CEF's shutdown. The App owns this browser's
-        /// lifetime (its Shutdown request, or the end of its input), so a
-        /// quit from the system is only reported.
+        /// lifetime. Forward the intent; the App sends numbered Shutdown
+        /// requests, preserving sequential close and beforeunload cancellation.
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: Option<&AnyObject>) {
-            eprintln!("The system asked the browser to quit; the App ends it.");
+            super::request_system_quit();
         }
 
         /// Chrome-style beforeunload cancellation sends this selector even

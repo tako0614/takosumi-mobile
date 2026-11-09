@@ -58,6 +58,19 @@ struct State {
     spawner: mpsc::Sender<SpawnRequest>,
 }
 type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+struct SpawnOptions {
+    no_sandbox: bool,
+    on_quit: Option<Box<dyn Fn() + Send>>,
+}
+// Standalone native/protocol fixtures have no Tauri App exit owner.
+impl From<bool> for SpawnOptions {
+    fn from(no_sandbox: bool) -> Self {
+        Self {
+            no_sandbox,
+            on_quit: None,
+        }
+    }
+}
 /// The App's end of a browser's control pipe: non-blocking on Linux, a
 /// bounded writer thread on Windows (`process_windows::Input`).
 #[cfg(unix)]
@@ -439,7 +452,14 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 runtime,
                 payload,
                 &state.spawner,
-                state.no_sandbox,
+                SpawnOptions {
+                    no_sandbox: state.no_sandbox,
+                    on_quit: Some(Box::new(move || {
+                        // The reader never takes the backend lock. request_exit
+                        // latches now and drains on a separate blocking worker.
+                        request_exit(&app, 0);
+                    })),
+                },
             )?;
             // Retain ownership before waiting for the native creation reply.
             let result = process.expect_open(1, &key);
@@ -785,8 +805,12 @@ impl Process {
         runtime: PathBuf,
         payload: OpenRequest,
         spawner: &mpsc::Sender<SpawnRequest>,
-        no_sandbox: bool,
+        options: impl Into<SpawnOptions>,
     ) -> Result<Self> {
+        let SpawnOptions {
+            no_sandbox,
+            on_quit,
+        } = options.into();
         #[cfg(target_os = "macos")]
         let executable = macos::Executable::open(&program).map_err(failure)?;
         private_directory(&directory)?;
@@ -1073,6 +1097,16 @@ impl Process {
                             }
                             continue;
                         }
+                        Ok(Reply::QuitRequested { profile }) if profile != owner => {
+                            Err("Foreign browser quit request".to_string())
+                        }
+                        Ok(Reply::QuitRequested { .. }) => {
+                            if let Some(on_quit) = &on_quit {
+                                on_quit();
+                                continue;
+                            }
+                            Err("Browser quit request has no App owner".to_string())
+                        }
                         other => other,
                     };
                     let failed = reply.is_err();
@@ -1146,9 +1180,9 @@ impl Process {
             }
             let actual = match &reply {
                 // The reply reader consumes these; one here is a protocol fault.
-                Reply::OpenExternal { .. } => {
+                Reply::OpenExternal { .. } | Reply::QuitRequested { .. } => {
                     return Err(Wait::Fault(Error::InvalidRequest(
-                        "Unexpected external link request.",
+                        "Unexpected unsolicited browser event.",
                     )))
                 }
                 Reply::Opened { id, .. }
@@ -2373,6 +2407,116 @@ sys.stdin.read()' "$1"
         );
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn system_quit_events_do_not_poison_cancel_or_the_next_shutdown() {
+        let root = std::env::temp_dir().join(format!("sumi-system-quit-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nfirst=json.loads(sys.stdin.readline())\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nprint(json.dumps({{'event':'cancelled','id':first['id'],'profile':'{profile}'}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let requested = Arc::new(AtomicU64::new(0));
+        let observed = requested.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: Some(Box::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })),
+            },
+        )
+        .unwrap();
+        let first = process.shutdown();
+        let uncertain = process.uncertain;
+        let last = if matches!(first, Ok(false)) {
+            process.shutdown()
+        } else {
+            Ok(false)
+        };
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(first, Ok(false)),
+            "quit intent must not become a command reply: {first:?}"
+        );
+        assert!(!uncertain, "cancel must leave the profile usable");
+        assert!(
+            matches!(last, Ok(true)),
+            "the next numbered shutdown must still complete: {last:?}"
+        );
+        assert_eq!(
+            requested.load(Ordering::SeqCst),
+            2,
+            "both intents reached the App owner"
+        );
+    }
+    #[test]
+    fn system_quit_rejects_foreign_or_unowned_requests() {
+        let root = std::env::temp_dir().join(format!("sumi-quit-refusal-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let parent = spawner().unwrap();
+        let own = "11111111-1111-4111-8111-111111111111";
+        let requested = Arc::new(AtomicU64::new(0));
+        for (index, foreign) in [true, false].into_iter().enumerate() {
+            let profile = if foreign {
+                "22222222-2222-4222-8222-222222222222"
+            } else {
+                own
+            };
+            let directory = root.join(index.to_string());
+            private_directory(&directory).unwrap();
+            let guard = directory.join("guard.py");
+            std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nsys.stdin.read()\n")).unwrap();
+            let payload = serde_json::from_value(serde_json::json!({
+                "key":format!("web-home:{own}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":own,"webHome":true
+            }))
+            .unwrap();
+            let observed = requested.clone();
+            let callback: Box<dyn Fn() + Send> = Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut process = Process::spawn(
+                PathBuf::from("/bin/true"),
+                guard,
+                directory.join("p").join(own),
+                directory.join("r"),
+                payload,
+                &parent,
+                SpawnOptions {
+                    no_sandbox: true,
+                    on_quit: foreign.then_some(callback),
+                },
+            )
+            .unwrap();
+            let result = process.shutdown();
+            let uncertain = process.uncertain;
+            drop(process);
+            let expected = if foreign {
+                "Foreign browser quit request"
+            } else {
+                "Browser quit request has no App owner"
+            };
+            assert!(
+                matches!(result, Err(Error::Desktop(ref message)) if message == expected),
+                "{result:?}"
+            );
+            assert!(uncertain);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(requested.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn external_link_requests_never_reach_command_replies() {

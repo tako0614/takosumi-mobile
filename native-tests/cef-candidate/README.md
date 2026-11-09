@@ -2000,8 +2000,12 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   with the reason, when the executable is not in one), installs
   `TakosumiCefApplication` (`mac_front.rs`: the `NSApplication` subclass with
   CEF's protocols, the regular activation policy) and runs the browser. A
-  quit from the system (`terminate:`) is only reported: the App owns the
-  browser's lifetime. objc2 adds a protocol to the class only when the
+  quit from the system (`terminate:`) sends a profile-bound `quitRequested`
+  intent to the parent App. Its reply reader consumes the intent separately
+  from command replies and enters the App's ordinary sequential exit path.
+  The parent retains nonzero Shutdown IDs, beforeunload cancellation and the
+  ability to reopen a retained profile; the child does not call Cocoa exit
+  or overwrite an in-flight Shutdown ID. objc2 adds a protocol to the class only when the
   runtime knows it and skips a missing one silently, so
   `install_application` requires `CrAppProtocol` and `CrAppControlProtocol`
   to exist and the class to conform to both, and takes `sharedApplication`
@@ -2010,6 +2014,17 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   with a drop guard (also when an Objective-C exception unwinds through
   it), and the raise holds the NSWindow retained while it sends it
   messages.
+
+  The M3 fixture's first two quit requests use AppKit's
+  `NSRunningApplication.terminate()` on the already attested browser PID.
+  A fixture-only helper rechecks browser/guard PID, parent and birth before
+  sending the normal request; the observer also rechecks the pinned images.
+  Request acceptance is not completion: real beforeunload cancellation,
+  retained profiles/reopen and normal guard receipts remain required. The
+  final quit still comes from the Tauri host. This covers the OS quit API,
+  not physical Cmd-Q/Dock/menu input, and does not fix or mask the separate
+  Chromium teardown-watchdog failure. The API has no atomic PID/birth form;
+  the small race after the last identity check remains a fixture limitation.
 - `helper_main.rs` (new executable `takosumi-cef-browser-helper`): enters the
   seatbelt sandbox, loads the framework and runs the process type CEF asked
   for, as CEF's own helper and cef-rs's cefsimple helper do. No application

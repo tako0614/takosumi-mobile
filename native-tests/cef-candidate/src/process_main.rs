@@ -102,6 +102,22 @@ fn error(id: u64, message: &str) {
         message: message.into(),
     });
 }
+#[cfg(target_os = "macos")]
+pub(super) fn request_system_quit() {
+    // Cocoa calls this on its main thread. Before initialization/after exit
+    // there is no owned state; an existing numbered shutdown keeps its ID.
+    let profile = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .filter(|state| !state.quitting && state.shutdown.is_none())
+            .map(|state| state.profile.clone())
+    });
+    if let Some(profile) = profile {
+        mac_lifecycle::record("system-quit-request", mac_lifecycle::BROWSER, None);
+        reply(Reply::QuitRequested { profile });
+    }
+}
 fn maybe_quit() {
     let done = with_state(|state| {
         if state.live == 0 && state.pending == 0 {
@@ -155,7 +171,11 @@ fn admission(shutdown: bool, id: u64, last_id: u64, recorded: bool, quitting: bo
 fn close_all(id: Option<u64>, failed: bool) {
     #[cfg(target_os = "macos")]
     mac_lifecycle::record(
-        if failed { "abnormal-shutdown-request" } else { "shutdown-request" },
+        if failed {
+            "abnormal-shutdown-request"
+        } else {
+            "shutdown-request"
+        },
         mac_lifecycle::BROWSER,
         None,
     );

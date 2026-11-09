@@ -131,6 +131,12 @@ pub enum Reply {
         profile: String,
         url: String,
     },
+    /// The system asked an owned browser app to quit. Only the parent App
+    /// may begin the numbered, sequential shutdown of all its profiles.
+    /// This unsolicited intent is never a command reply or a page API.
+    QuitRequested {
+        profile: String,
+    },
 }
 
 /// A link the person may open outside the App: an absolute http(s) URL in
@@ -265,6 +271,20 @@ mod tests {
         assert!(matches!(reply, Reply::OpenExternal { .. }));
     }
 
+    #[test]
+    fn system_quit_intent_carries_no_command_identity() {
+        let bytes = serde_json::to_vec(&Reply::QuitRequested {
+            profile: PROFILE.into(),
+        })
+        .unwrap();
+        assert!(
+            matches!(serde_json::from_slice::<Reply>(&bytes).unwrap(), Reply::QuitRequested { profile } if profile == PROFILE)
+        );
+        for extra in [r#", "id":0"#, r#", "url":"https://example.com""#] {
+            let value = format!(r#"{{"event":"quitRequested","profile":"{PROFILE}"{extra}}}"#);
+            assert!(serde_json::from_str::<Reply>(&value).is_err());
+        }
+    }
     #[test]
     fn shared_open_request_and_its_reuse_flag_survive_the_pipe() {
         let request = decode(&serde_json::to_vec(&open()).unwrap(), PROFILE).unwrap();

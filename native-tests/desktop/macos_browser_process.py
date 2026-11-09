@@ -4,7 +4,7 @@
 Reuses the Linux/Windows App flow and the Windows observer's platform-neutral
 CDP, dialog and checkpoint helpers. Anonymous Excalidraw or Photopea only;
 synthetic storage markers, no login, credential, Keychain change or TLS bypass.
-The three launches exercise reuse, sequential quit cancellation, restart and
+The three launches exercise reuse, OS quit intent/cancellation, restart and
 one-profile clear. Page.close drives a browser close on relaunch; OS window
 switching, native dialogs/files, notifications and packaging are not qualified.
 
@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
 from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
-from macos_shutdown_sample import watch_shutdowns  # noqa: E402
+from macos_shutdown_sample import same_owner, watch_shutdowns  # noqa: E402
 from macos_process_image import PinnedImage  # noqa: E402
 
 
@@ -104,11 +104,29 @@ def normal_receipt(receipt):
 
 
 class MacObserver(Observer):
-    def __init__(self, data, site, phase, processes, browser, guard):
+    def __init__(self, data, site, phase, processes, browser, guard, quit_helper=None):
         super().__init__(data, REAL_SITES[site]["origin"], 0, phase, real_site=site)
         self.processes, self.browser, self.guard = processes, browser, guard
         self.identities = []
+        self.quit_helper = quit_helper
         self.proof["scope"] = f"macOS actual App {phase or 'first'}; anonymous {site}, synthetic markers, no login"
+
+    def system_quit(self, page):
+        identities = {item["pid"]: item for item in self.identities}
+        child, parent = identities[page.native["nativePid"]], identities[page.process["pid"]]
+        require(self.quit_helper is not None and same_owner(self.processes, child, parent, self.browser, self.guard),
+                "OS quit target is no longer the owned browser")
+        result = subprocess.run([str(self.quit_helper), str(child["pid"]), str(parent["pid"]),
+                                 str(child["start"]), str(parent["start"])],
+                                capture_output=True, text=True, timeout=5, check=False)
+        require(result.returncode == 0, f"Normal OS quit request was refused ({result.returncode})")
+        require(json.loads(result.stdout) == {"requested": True, "pid": child["pid"]}, "Invalid OS quit receipt")
+        # beforeunload is armed: a quit that bypasses it and kills the process
+        # must fail here. Acceptance alone cannot satisfy a close/cancel case.
+        require(same_owner(self.processes, child, parent, self.browser, self.guard),
+                "OS quit target changed before beforeunload was answered")
+        self.proof.setdefault("systemQuitRequests", []).append({"pid": child["pid"], "start": child["start"],
+                                                                "requested": True, "completionProven": False})
 
     def attach(self, process):
         native = process["opened"]
@@ -221,6 +239,7 @@ class MacObserver(Observer):
         self.case("home-reuses-document")
         mark, other = self.beforeunload(work), personal.cdp.mark()
         self.checkpoint("request-exit")
+        self.system_quit(work)
         dialog = self.dialog(work, mark, "beforeunload", "Work beforeunload did not open")
         personal.cdp.drain()
         require(not any(event["method"].startswith("Page.javascriptDialog") for event in personal.cdp.since(other))
@@ -235,6 +254,7 @@ class MacObserver(Observer):
         mark = self.beforeunload(personal)
         with watch_shutdowns(self, [work]):
             self.checkpoint("request-partial-exit")
+            self.system_quit(personal)
             dialog = self.dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30)
             receipt = self.normal_receipt(work.process["guardReceipt"], "Work did not close normally before Personal")
         cancelled_by = self.cancel_dialog(personal, mark, "Personal cancel was not observed", dialog)
@@ -337,6 +357,14 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
              "executables": {str(path): digest(path) for path in (binary, browser, guard)}}
     print(f"M3 case: {case}", flush=True)
     try:
+        quit_helper = case / "normal-system-quit"
+        quit_source = HERE / "macos_system_quit.m"
+        build = subprocess.run(["/usr/bin/clang", "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
+                                str(quit_source), "-framework", "AppKit", "-lproc", "-o", str(quit_helper)],
+                               capture_output=True, text=True, timeout=30, check=False)
+        (case / "system-quit-build.log").write_text(build.stdout + build.stderr)
+        require(build.returncode == 0, "Native OS quit helper did not compile")
+        proof["systemQuitHelper"] = {"sourceSHA256": digest(quit_source), "binarySHA256": digest(quit_helper)}
         for phase in ("", "restart", "reset"):
             name = phase or "first"
             env = dict(os.environ)
@@ -353,7 +381,7 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
             entry = {"name": name}
             proof["phases"].append(entry)
             outer_receipt = case / f"app-guard-{name}.json"
-            observer = MacObserver(case, args.site, phase, processes, browser_image, guard_image)
+            observer = MacObserver(case, args.site, phase, processes, browser_image, guard_image, quit_helper)
             with open(case / f"app-{name}.log", "xb") as log:
                 app_guard = subprocess.Popen([str(guard), str(outer_receipt), str(binary)], env=env,
                                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

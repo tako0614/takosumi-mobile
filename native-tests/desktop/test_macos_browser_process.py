@@ -82,6 +82,33 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(len(saved), 2)
             self.assertEqual(saved, observer.proof["shutdownSamples"])
 
+    def test_system_quit_requires_same_owned_identity_and_exact_request_receipt(self):
+        child = {"pid": 12, "parent": 11, "group": 11, "start": 101}
+        parent = {"pid": 11, "parent": 10, "group": 11, "start": 100}
+        processes = mock.Mock()
+        processes.facts.side_effect = {11: parent, 12: child}.get
+        processes.image.side_effect = {11: self.guard, 12: self.browser}.get
+        observer = runner.MacObserver(self.root, "excalidraw", "", processes,
+                                      self.browser_image, self.guard_image, self.root / "normal-system-quit")
+        observer.identities = [parent, child]
+        page = mock.Mock(native={"nativePid": 12}, process={"pid": 11})
+        reply = mock.Mock(returncode=0, stdout='{"requested":true,"pid":12}')
+        with mock.patch.object(runner.subprocess, "run", return_value=reply) as command:
+            observer.system_quit(page)
+        self.assertEqual(command.call_args.args[0], [str(self.root / "normal-system-quit"), "12", "11", "101", "100"])
+        self.assertEqual(observer.proof["systemQuitRequests"], [{"pid": 12, "start": 101, "requested": True, "completionProven": False}])
+        for valid in [(False, False), (True, False)]:
+            with mock.patch.object(runner, "same_owner", side_effect=valid), \
+                    mock.patch.object(runner.subprocess, "run", return_value=reply) as command, \
+                    self.assertRaises(runner.Failure):
+                observer.system_quit(page)
+            self.assertEqual(command.call_count, int(valid[0]))
+        for bad in [mock.Mock(returncode=4, stdout=''), mock.Mock(returncode=0, stdout='{"requested":false,"pid":12}'),
+                    mock.Mock(returncode=0, stdout='{"requested":true,"pid":13}')]:
+            with mock.patch.object(runner.subprocess, "run", return_value=bad), self.assertRaises(runner.Failure):
+                observer.system_quit(page)
+        self.assertEqual(len(observer.proof["systemQuitRequests"]), 1)
+
     def test_shutdown_watch_ignores_old_birth_and_completed_shutdown(self):
         identity = {"pid": 12, "start": 101}
         def event(kind, start=101):

@@ -577,6 +577,9 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
     println!("first: quitting (Work's beforeunload expected)");
+    // Mac's observer sends the normal OS Quit to the owned browser app.
+    // Only its unsolicited intent may initiate this App's first two exits.
+    #[cfg(not(target_os = "macos"))]
     app.exit(0);
     checkpoint(view, case, "cancel-inspected").await?;
     let stopped = exit_cancelled(view, app, 0).await?;
@@ -619,6 +622,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // Work now agrees to leave and closes first; Personal cancels, so the quit
     // stops with only Personal kept (the accepted sequential trade-off).
     println!("first: quitting again (Work closes, Personal cancels)");
+    #[cfg(not(target_os = "macos"))]
     app.exit(0);
     checkpoint(view, case, "partial-inspected").await?;
     let partial = exit_cancelled(view, app, 1).await?;
