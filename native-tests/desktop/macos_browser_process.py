@@ -207,7 +207,30 @@ class MacObserver(Observer):
             # Keep events/target/receipt before the owned failure cleanup.
             # This never answers a dialog or changes its acceptance/bound.
             self.dialog_failure(what, [(page, mark)], error)
+            self.dialog_native_state(page)
             raise
+
+    def dialog_native_state(self, page):
+        # After a failed dialog step, record whether the owned native browser
+        # is even alive and the tail of its own log. Distinguishes a quit
+        # that never reached CEF's close path (busy runloop, queued terminate)
+        # from a dialog the loaded page itself suppressed.
+        try:
+            entry = self.proof["dialogFailures"][-1]["pages"][-1]
+            native = page.native
+            try:
+                os.kill(native["nativePid"], 0)
+                entry["nativeAlive"] = True
+            except OSError:
+                entry["nativeAlive"] = False
+            log = Path(native["directory"]) / "cef-native.log"
+            if log.is_file():
+                size = log.stat().st_size
+                with log.open("rb") as stream:
+                    stream.seek(max(0, size - 8 * 1024))
+                    entry["nativeLogTail"] = stream.read().decode("utf-8", "replace")[-4000:]
+        except Exception as failure:  # diagnostics only; keep the original failure
+            entry["nativeStateError"] = repr(failure)[:200]
 
     @staticmethod
     def remove_beforeunload(page):
