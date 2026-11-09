@@ -212,7 +212,9 @@ public final class WebAppOperationTest {
             if (!entryTapped[0]) {
                 Rect viewport = visibleWebViewport(deadline);
                 Rect start = bounds("Start using Photopea", false, false);
-                if (start != null && viewport.contains(start)) {
+                // The landing CTA re-lays out like the other panels; defer the
+                // tap until its rect survives half a second unchanged.
+                if (start != null && viewport.contains(start) && stable("cta", start) != null) {
                     entryTapped[0] = true;
                     activity.trace("landing tap " + profile + " viewport=" + viewport.toShortString() + " action=" + start.toShortString());
                     tap(start);

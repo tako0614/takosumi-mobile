@@ -107,6 +107,12 @@ public final class WebAppProbeActivity extends Activity {
                     if (pendingFile != null && pendingFile.page == Page.this) dismissFile();
                     if (pendingExport != null && pendingExport.page == Page.this) cancelPendingExport();
                 }
+                // A black WebView with an empty a11y tree cannot tell apart
+                // "document still loading" from "loaded but no DOM"; record
+                // the real page-stop so the next failure names which one.
+                @Override public void onPageStop(GeckoSession owner, boolean success) {
+                    trace("page stop success=" + success + " uri=" + uri + " generation=" + generation);
+                }
             });
             session.setPromptDelegate(new GeckoSession.PromptDelegate() {
                 @Override public GeckoResult<PromptResponse> onFilePrompt(GeckoSession owner, FilePrompt prompt) {
@@ -166,6 +172,7 @@ public final class WebAppProbeActivity extends Activity {
                         }).setOnCancelListener(dialog -> cancelPendingExport()).show();
                 }
                 @Override public void onCrash(GeckoSession owner) { failure = "Gecko content process crashed"; }
+                @Override public void onKill(GeckoSession owner) { failure = "Gecko content process killed"; }
             });
             session.open(ResponseProbeActivity.runtime);
         }
