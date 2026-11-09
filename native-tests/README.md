@@ -276,6 +276,11 @@ Chromium sandbox/Rust-guard notification combinations remain unqualified.
 `node --test native-tests/desktop/notification-route.test.mjs` rejects wrong
 reply serial/client/service, duplicate/malformed replies and actions for a
 different notification. Those protocol controls are not native evidence.
+Before the first inspection HTTP request, the observer retains the attested
+native/guard generations. A connection failure can therefore use the existing
+profile/ancestry/executable-checked kernel snapshot even before a CDP Client
+exists. No connection retry or longer timeout is added. If the failing guard
+already ended, a snapshot of another labeled live profile does not diagnose it.
 
 ## Desktop GTK runtime fixture
 

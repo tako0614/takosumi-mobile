@@ -89,7 +89,7 @@ async function normalReceipt(file,message) {
 }
 async function failureClient() {
   const live=[];
-  for(const c of clients) {
+  for(const c of [...clients,...attachments]) {
     if(!c.binding)continue;
     try{if(!(await guardEnded(c.binding.process.guardReceipt)))live.push(c);}
     catch(e){proof.snapshotTargetError=String(e);return undefined;}
@@ -121,18 +121,28 @@ async function attach(process) {
     throw new Error(`No inspection.json: build the browser with --features fixture-inspection (${error.code})`);
   }));
   assert.equal(inspection.pid,native.nativePid);
+  const binding={process,nativeStart:await startTime(native.nativePid),guardStart:await startTime(process.pid)};
   const rows=(await readFile('/proc/net/tcp','utf8')).split('\n').slice(1).map(line=>line.trim().split(/\s+/));
   const row=rows.find(r=>r[1]===`0100007F:${inspection.port.toString(16).toUpperCase().padStart(4,'0')}`&&r[3]==='0A');
   assert(row,'Only a loopback native inspection listener is allowed');
   const fds=await readdir(`/proc/${native.nativePid}/fd`);
   const links=await Promise.all(fds.map(fd=>readlink(`/proc/${native.nativePid}/fd/${fd}`).catch(()=>'')));
   assert(links.includes(`socket:[${row[9]}]`),'Attested native PID must own the endpoint');
+  assert.equal(await startTime(native.nativePid),binding.nativeStart,'Native generation changed while inspecting its listener');
+  assert.equal(await startTime(process.pid),binding.guardStart,'Guard generation changed while inspecting its listener');
+  // Keep the attested generation before the first HTTP/WebSocket operation.
+  // A failed attach has no Client yet, but still needs the existing validated
+  // kernel snapshot. This adds no connection retry or alternate endpoint.
+  const attaching={binding,events:[]};attachments.push(attaching);
+  proof.inspectionEndpoint={pid:native.nativePid,port:inspection.port,nativeStart:binding.nativeStart,guardStart:binding.guardStart};
   const info=await (await fetch(`http://127.0.0.1:${inspection.port}/json/version`,{signal:AbortSignal.timeout(5000)})).json();
   const endpoint=new URL(info.webSocketDebuggerUrl);assert.equal(endpoint.hostname,'127.0.0.1');assert.equal(endpoint.port,String(inspection.port));
   const socket=new WebSocket(endpoint);
+  attaching.socket=socket;
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('CDP handshake timeout')),5000);socket.onopen=()=>{clearTimeout(timer);resolve();};socket.onerror=()=>{clearTimeout(timer);reject(Error('CDP handshake error'));};});
   const c=new Client(socket);clients.push(c);
-  c.binding={process,nativeStart:await startTime(native.nativePid),guardStart:await startTime(process.pid)};
+  c.binding=binding;
+  attachments.splice(attachments.indexOf(attaching),1);
   const targets=(await c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   assert.equal(targets.length,1,'Exactly one initial document per process');
   const target=targets[0], session=(await c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
@@ -724,17 +734,18 @@ async function firstLaunch() {
   proof.passed=true;
 }
 const clients=[];
+const attachments=[];
 try {
   if(phase)await relaunchFlow(phase);
   else await firstLaunch();
 }catch(error){
   proof.error=String(error);
-  if(!proof.processSnapshot&&clients.length) {
+  if(!proof.processSnapshot&&(clients.length||attachments.length)) {
     const target=await failureClient();
     if(target)await failureSnapshot(target);
     else {
       // No live process to inspect, e.g. the stage page crashed: still keep its in-memory events.
-      const stage=clients.find(c=>c.binding?.process.opened.nativePid===proof.stage?.pid);
+      const stage=[...clients,...attachments].find(c=>c.binding?.process.opened.nativePid===proof.stage?.pid);
       if(stage)proof.failureEvents=diagnosticEvents(stage.events);
     }
   }
@@ -742,6 +753,7 @@ try {
 }
 finally {
   for(const c of clients)c.socket.close();
+  for(const c of attachments)c.socket?.close();
   if(notifier&&!notifier.proof.stopped)await notifier.stop().catch(e=>{proof.notifierStopError=String(e);});
   await writeFile(path.join(data,`browser-observation${suffix}.json`),JSON.stringify(proof,null,2)+'\n');
 }
