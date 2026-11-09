@@ -344,9 +344,13 @@ def main():
             server.start()
             env = dict(os.environ, SUMI_DOWNLOAD_URL=server.url, SUMI_DOWNLOAD_SOURCE=str(HERE),
                        SUMI_DOWNLOAD_PRODUCT=str(PRODUCT))
-            # Absolute source references keep generated project/build output off source.
-            command(["xcodegen", "generate", "--spec", str(HERE / "project.yml"), "--project", str(scratch)],
+            # Keep the project base and output together. Otherwise XcodeGen puts
+            # files beside the spec (App.swift) at the relocated project's root.
+            # Absolute source references still read the frozen originals.
+            command(["xcodegen", "generate", "--spec", str(HERE / "project.yml"),
+                     "--project-root", str(scratch), "--project", str(scratch)],
                     out / "project.log", env=env)
+            shutil.copyfile(scratch / "DownloadFixture.xcodeproj/project.pbxproj", out / "project.pbxproj")
             log = command(["xcodebuild", "test", "-project", str(scratch / "DownloadFixture.xcodeproj"),
                            "-scheme", "DownloadFixture", "-destination", f"id={udid}",
                            "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),
