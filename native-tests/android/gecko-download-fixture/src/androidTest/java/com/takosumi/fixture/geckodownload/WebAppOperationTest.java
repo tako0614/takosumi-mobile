@@ -27,6 +27,7 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.FutureTask;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -268,11 +269,11 @@ public final class WebAppOperationTest {
 
     private void openDownloads() {
         await("Actual DocumentsUI is required", this::picker, 15);
-        Rect roots = bounds("Show roots", false, true);
-        if (roots != null) {
-            tap(roots);
-            await("Missing Downloads root", () -> picker() && bounds("Downloads", false, false) != null, 10);
-            tap(bounds("Downloads", false, false));
+        if (bounds("Show roots", false, true) != null) {
+            tap(awaitRect("Show roots control did not settle",
+                () -> stable("roots", bounds("Show roots", false, true)), 10));
+            tap(awaitRect("Missing settled Downloads root",
+                () -> picker() ? stable("downloads", bounds("Downloads", false, false)) : null, 15));
         } else {
             // A missing drawer is not an alternate fake picker. Require the
             // actual provider to already show its Downloads title.
@@ -280,18 +281,61 @@ public final class WebAppOperationTest {
         }
     }
 
+    private final Map<String, Rect> lastBounds = new HashMap<>();
+    private final Map<String, Long> lastChanged = new HashMap<>();
+
+    // A node whose screen rect is still moving between polls can eat an
+    // injected tap during the same transition: the drawer slide-in moved a
+    // captured row onto its scrim, and a settling grid consumed its own
+    // List-view toggle. Only a rect that survives unchanged for half a
+    // second may be tapped.
+    private Rect stable(String key, Rect rect) {
+        if (rect == null) { lastBounds.remove(key); lastChanged.remove(key); return null; }
+        Rect previous = lastBounds.get(key);
+        if (!rect.equals(previous)) {
+            lastBounds.put(key, new Rect(rect));
+            lastChanged.put(key, SystemClock.elapsedRealtime());
+            return null;
+        }
+        return SystemClock.elapsedRealtime() - lastChanged.get(key) >= 500 ? rect : null;
+    }
+
+    private Rect awaitRect(String message, Supplier<Rect> read, int seconds) {
+        Rect[] found = {null};
+        await(message, () -> (found[0] = read.get()) != null, seconds);
+        return found[0];
+    }
+
+    // The owned file as a selectable item: in list view its filename is a
+    // text node; in the image grid only the item card's compound description
+    // carries the name. Either is the real item; the preview hotspot node is
+    // a different description and stays untouched.
+    private Rect itemBounds() {
+        Rect text = bounds(inputName, false, false);
+        if (text != null) return stable("file-text", text);
+        return stable("file-card", bounds(inputName, true, true));
+    }
+
+    // Tap inside the item's own activation region, shifted left of any
+    // right-edge preview hotspot and right of the leading icon/select area.
+    private Rect itemTap(Rect item) {
+        int x = item.left + (int) (item.width() * 0.3f);
+        int y = item.centerY();
+        return new Rect(x, y, x + 2, y + 2);
+    }
+
     private void chooseInput() {
         openDownloads();
         boolean[] listViewRequested = {false};
         await("OS picker did not show exact owned image", () -> {
             if (!picker()) return false;
-            if (bounds(inputName, false, false) != null) return true;
+            if (itemBounds() != null) return true;
             // DocumentsUI's image grid exposes the filename only in a compound
             // description. Its thumbnail center can hit the Preview overlay.
-            // Use the real layout control once, then require the exact visible
-            // filename text in list view; do not match or tap the preview node.
+            // Use the real layout control once, only after it settles; the
+            // grid card itself already exposes the owned file as an item.
             if (!listViewRequested[0]) {
-                Rect listView = bounds("List view", false, true);
+                Rect listView = stable("listview", bounds("List view", false, true));
                 if (listView != null) {
                     listViewRequested[0] = true;
                     activity.trace("picker list view " + listView.toShortString());
@@ -313,14 +357,14 @@ public final class WebAppOperationTest {
         await("Original file prompt did not receive the OS answer", () -> {
             if (activity.fileSelections == 1) return true;
             if (!picker()) return false;
-            Rect file = bounds(inputName, false, false);
+            Rect file = itemBounds();
             if (file == null) return false;
             long now = SystemClock.elapsedRealtime();
             if (inputTaps[0] < 3 && now - lastInputTap[0] >= 2000) {
                 inputTaps[0]++;
                 lastInputTap[0] = now;
                 activity.trace("input tap attempt=" + inputTaps[0] + " " + file.toShortString());
-                tap(file);
+                tap(itemTap(file));
             }
             return false;
         }, 30);
