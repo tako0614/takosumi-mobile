@@ -247,6 +247,36 @@ Use neither a replacement URLSession fetch nor a synthetic WKDownload delegate
 result as the success oracle. Real IdP, device, HTTP-auth and distribution
 qualification remain separate.
 
+## Linux pending notification close
+
+The actual App/browser-process runner's existing `--notifications /owned/dunst`
+phase now keeps Dunst and Work alive while Personal closes normally with one
+pending standard page Notification. This follows the native permission,
+same-tag isolation and trusted-click baseline; that baseline alone is not the
+new close evidence. It uses the existing disposable Xvfb/private D-Bus session.
+
+The unique Personal Notify call is tied to its D-Bus sender, call serial, the
+owned daemon's exact reply ID and the sender's attested native browser PID.
+After Personal's normal zero-forced-cleanup receipt, the probe records whether
+the alert remains. It does not impose a disappearance deadline or require an
+event from a destroyed page. If the alert remains, one real pointer-checked
+click must produce a default ActionInvoked for that same daemon/client/ID.
+An unrelated alert or action cannot pass. Work's guard remains live, and its
+notification witness, URL, top-level document and page-target set must remain
+unchanged during a recorded one-second observation after retirement/action.
+
+`notification-pending-close-result.json` and the original D-Bus trace retain
+that result before the daemon stops normally. An absent alert proves only its
+observed absence, not the cause. This is a bounded wrong-profile regression,
+not proof of arbitrarily delayed delivery, notification-driven reopening of a
+retired profile, profile reset, Service Worker/Web Push or other OSes. The
+current runner's notification path uses the fixture Python guard as root;
+Chromium sandbox/Rust-guard notification combinations remain unqualified.
+
+`node --test native-tests/desktop/notification-route.test.mjs` rejects wrong
+reply serial/client/service, duplicate/malformed replies and actions for a
+different notification. Those protocol controls are not native evidence.
+
 ## Desktop GTK runtime fixture
 
 On Linux with the Tauri GTK/WebKit SDK, Xvfb, xdotool, Python and OpenSSL, build

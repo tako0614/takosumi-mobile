@@ -229,6 +229,10 @@ async function relaunchFlow(kind) {
   proof.passed=true;
 }
 async function closePersonalAfterRelaunch(personal,kind) {
+  await retirePersonal(personal,kind);
+  await requestWorkExit(kind);
+}
+async function retirePersonal(personal,kind) {
   step(`Personal native close after ${kind}`,personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
@@ -241,6 +245,9 @@ async function closePersonalAfterRelaunch(personal,kind) {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     proof.personalClosed=receipt;return true;
   },`Personal guard did not finish after ${kind}`);
+  return proof.personalClosed;
+}
+async function requestWorkExit(kind) {
   step(`Work ordinary exit after ${kind}`);
   await writeFile(path.join(data,`${kind}-request-exit`),'ready',{flag:'wx'});
 }
@@ -260,7 +267,7 @@ async function startNotifier() {
   await writeFile(path.join(data,'notify-backend-ready'),'ready',{flag:'wx'});
 }
 async function notifyProbes(pages) {
-  const [,personal]=pages;
+  const [work,personal]=pages;
   await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
   const {probeNotifications}=await import('../cef-candidate/notifications.mjs');
   const {inspectPermissions}=await import('../cef-candidate/permissions.mjs');
@@ -273,10 +280,23 @@ async function notifyProbes(pages) {
       command:()=>{throw Error('Unscoped browser command is forbidden across processes');},
       notificationProbe:({pages,windows})=>probeNotifications({pages,windows,data,nonce,desktop:desktopAsync,backend})});
     assert(proof.permissions.permissionPassed&&proof.permissions.nativeNotifications.passed,'Native permission and notification probes must pass');
+    const {probePendingNotificationClose}=await import('./notification-close.mjs');
+    const workGuard=await guardState(work.process.pid);
+    assert(workGuard&&!['Z','X'].includes(workGuard.state),'Work guard must be live before Personal retirement');
+    step('pending Personal notification across native close',personal);
+    proof.pendingNotificationClose=await probePendingNotificationClose({pages:probePages,data,nonce,desktop:desktopAsync,backend,
+      retirePersonal:()=>retirePersonal(personal,'notify'),
+      workLive:async()=>{
+        const current=await guardState(work.process.pid);
+        assert(current&&current.start===workGuard.start&&!['Z','X'].includes(current.state),'The same Work guard must remain live');
+        assert(!(await guardEnded(work.process.guardReceipt)),'Work must not exit during pending notification inspection');
+        return current;
+      }});
+    assert(proof.pendingNotificationClose.passed,'Pending Personal notification retirement must pass');
   } finally {
     await backend.stop();
   }
-  await closePersonalAfterRelaunch(personal,'notify');
+  await requestWorkExit('notify');
   proof.passed=true;
 }
 // files (runner --files, Excalidraw only): the actual OS file chooser through

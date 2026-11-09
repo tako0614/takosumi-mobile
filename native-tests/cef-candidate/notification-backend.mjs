@@ -31,6 +31,12 @@ export async function startNotificationBackend({binary,data,nonce,env,desktop}) 
       assert.equal(pid,`(uint32 ${daemon.pid},)`,'Refusing another notification service');
       return pid;
     },
+    async clientPid(uniqueName) {
+      assert(/^:\d+\.\d+$/.test(uniqueName),'Require an observed unique D-Bus connection');
+      const value=await desktop('gdbus',dbus('GetConnectionUnixProcessID',uniqueName));
+      const match=/^\(uint32 (\d+),\)$/.exec(value);assert(match,'Missing notification client process');
+      return Number(match[1]);
+    },
     async count(field) {
       assert(['displayed','waiting','history'].includes(field));
       const text=await service('org.freedesktop.DBus.Properties.Get','org.dunstproject.cmd0',`${field}Length`);
@@ -62,13 +68,16 @@ export async function startNotificationBackend({binary,data,nonce,env,desktop}) 
     }
     assert(ready,'No private notification service');
     proof.dbusOwner=await backend.owner();
+    const serviceName=await desktop('gdbus',dbus('GetNameOwner',name));
+    const uniqueName=/^\('(:\d+\.\d+)',\)$/.exec(serviceName);assert(uniqueName,'Missing owned notification service connection');
+    proof.uniqueName=uniqueName[1];
     proof.server=await service('org.freedesktop.Notifications.GetServerInformation');
     assert.equal(proof.server,"('dunst', 'knopwob', '1.12.2 (2025-03-05)', '1.2')",'This fixture uses the inspected Dunst 1.12.2 backend');
     proof.capabilities=await service('org.freedesktop.Notifications.GetCapabilities');
     assert(proof.capabilities.includes("'actions'"),'The real backend must support native actions');
     assert.equal(await backend.count('displayed'),0);assert.equal(await backend.count('waiting'),0);
     const buslog=await open(path.join(data,'notification-bus.log'),'wx',0o600);
-    monitor=spawn('dbus-monitor',['--session',"interface='org.freedesktop.Notifications'","interface='org.freedesktop.portal.Notification'","interface='org.freedesktop.impl.portal.Notification'"],{env,stdio:['ignore',buslog.fd,buslog.fd]});
+    monitor=spawn('dbus-monitor',['--session',"interface='org.freedesktop.Notifications'","interface='org.freedesktop.portal.Notification'","interface='org.freedesktop.impl.portal.Notification'",`type='method_return',sender='${proof.uniqueName}'`],{env,stdio:['ignore',buslog.fd,buslog.fd]});
     monitorEnded=new Promise((resolve,reject)=>{monitor.once('exit',resolve);monitor.once('error',reject)});
     await buslog.close();
     const monitorReady=Date.now()+5000;let attached=false;

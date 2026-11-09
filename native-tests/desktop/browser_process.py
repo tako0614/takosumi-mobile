@@ -35,6 +35,8 @@ LINUX_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/browser/guard.py", "native-tests/desktop/web_home.py",
     "native-tests/desktop/browser_process.py", "native-tests/desktop/browser-process.mjs",
+    "native-tests/desktop/notification-close.mjs",
+    "native-tests/desktop/notification-route.mjs",
     "native-tests/desktop/browser_snapshot.py", "native-tests/desktop/test_browser_snapshot.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs",
