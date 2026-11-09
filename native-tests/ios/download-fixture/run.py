@@ -442,16 +442,30 @@ def preserve_export_observations(created, udid, out):
         if len(raw) > 16384:
             raise RuntimeError("Oversized fixture observations")
         value = json.loads(raw)
-        if (not isinstance(value, dict) or set(value) != {"diagnosticOnly", "samples"} or
+        if (not isinstance(value, dict) or
+                set(value) != {"diagnosticOnly", "samples", "lifecycle", "lifecycleTruncated"} or
                 value["diagnosticOnly"] is not True or not isinstance(value["samples"], list) or
-                not 1 <= len(value["samples"]) <= 32):
+                not 1 <= len(value["samples"]) <= 32 or
+                not isinstance(value["lifecycle"], list) or not 1 <= len(value["lifecycle"]) <= 64 or
+                type(value["lifecycleTruncated"]) is not bool):
             raise RuntimeError("Invalid fixture observations")
+        observations = ("sourceExists", "sourceReadable", "sourceMatchesOriginal", "activityAlive", "activityPresented")
         for sample in value["samples"]:
             if (not isinstance(sample, dict) or
-                    set(sample) != {"unixSeconds", "sourceMatchesOriginal", "activityAlive", "activityPresented"} or
+                    set(sample) != {"unixSeconds", *observations} or
                     type(sample["unixSeconds"]) not in (int, float) or not 0 < sample["unixSeconds"] < 1e11 or
-                    any(type(sample[key]) is not bool for key in ("sourceMatchesOriginal", "activityAlive", "activityPresented"))):
+                    any(type(sample[key]) is not bool for key in observations)):
                 raise RuntimeError("Invalid fixture observation sample")
+        events = {"created", "state", "download-failed", "failure-cleanup", "activity-completed", "stop",
+                  "present-refused", "present-unconfirmed", "present-confirmed", "remove-started",
+                  "remove-succeeded", "remove-failed", "finish"}
+        states = {"waiting", "confirming", "receiving", "ready", "exporting", "failed", "cancelling", "finished"}
+        for event in value["lifecycle"]:
+            if (not isinstance(event, dict) or set(event) != {"unixSeconds", "event", "state"} or
+                    type(event["unixSeconds"]) not in (int, float) or not 0 < event["unixSeconds"] < 1e11 or
+                    not isinstance(event["event"], str) or event["event"] not in events or
+                    not isinstance(event["state"], str) or event["state"] not in states):
+                raise RuntimeError("Invalid fixture lifecycle event")
         save(out / "fixture-export-observations.json", value)
         result.update(status="retained", samples=len(value["samples"]))
     except Exception as error:

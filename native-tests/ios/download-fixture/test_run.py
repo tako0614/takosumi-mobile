@@ -68,7 +68,10 @@ class HarnessTests(unittest.TestCase):
             (out / "xcodebuild.log").write_text("original XCTest failed")
             source = docs / "fixture-export-observations.json"
             value = {"diagnosticOnly": True, "samples": [{"unixSeconds": 1794204000.0,
-                     "sourceMatchesOriginal": True, "activityAlive": True, "activityPresented": True}]}
+                     "sourceExists": True, "sourceReadable": True, "sourceMatchesOriginal": True,
+                     "activityAlive": True, "activityPresented": True}],
+                     "lifecycle": [{"unixSeconds": 1794203999.0, "event": "state", "state": "exporting"}],
+                     "lifecycleTruncated": False}
             source.write_text(json.dumps(value))
             with patch.object(fixture_runner, "command", return_value=str(container)) as command:
                 result = fixture_runner.preserve_export_observations({"dataPath": str(data)}, udid, out)
@@ -78,7 +81,9 @@ class HarnessTests(unittest.TestCase):
                     out / "observation-container.log", timeout=20)
                 self.assertEqual(json.loads((out / source.name).read_bytes()), value)
             retained = (out / source.name).read_bytes()
-            for mode in ("extra-field", "oversized", "symlink", "hardlink", "foreign-container"):
+            for mode in ("extra-field", "oversized", "symlink", "hardlink", "foreign-container",
+                         "unknown-event", "unknown-state", "event-extra-field", "event-overflow",
+                         "event-time", "sample-type", "truncation-type"):
                 with self.subTest(mode=mode):
                     source.unlink()
                     source.write_text(json.dumps(value))
@@ -92,8 +97,25 @@ class HarnessTests(unittest.TestCase):
                         source.symlink_to(out / source.name)
                     elif mode == "hardlink":
                         os.link(source, root / "alias")
-                    else:
+                    elif mode == "foreign-container":
                         target = root / "foreign"
+                    else:
+                        invalid = copy.deepcopy(value)
+                        if mode == "unknown-event":
+                            invalid["lifecycle"][0]["event"] = "private payload must not copy"
+                        elif mode == "unknown-state":
+                            invalid["lifecycle"][0]["state"] = "unexpected"
+                        elif mode == "event-extra-field":
+                            invalid["lifecycle"][0]["url"] = "must not copy"
+                        elif mode == "event-overflow":
+                            invalid["lifecycle"] *= 65
+                        elif mode == "event-time":
+                            invalid["lifecycle"][0]["unixSeconds"] = float("nan")
+                        elif mode == "sample-type":
+                            invalid["samples"][0]["sourceReadable"] = 1
+                        else:
+                            invalid["lifecycleTruncated"] = 1
+                        source.write_text(json.dumps(invalid))
                     with patch.object(fixture_runner, "command", return_value=str(target)):
                         self.assertEqual(fixture_runner.preserve_export_observations(
                             {"dataPath": str(data)}, udid, out)["status"], "unavailable")

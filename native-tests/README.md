@@ -212,13 +212,26 @@ accessibility snapshot can be read without Xcode. This single diagnostic command
 has a 60-second wait and the same direct-child retirement rules. An absent
 bundle or interrupted xcodebuild is not exported; neither missing attachments
 nor export failure changes the original test failure. No test is retried.
-For a failure after the Save to Files tap, the fixture also keeps an immediate
-post-tap screenshot and up to 32 observations of the original input file and
+If the test reaches the Save to Files tap, it keeps an immediate post-tap
+screenshot. Independently, it keeps up to 32 observations of the original input file and
 the same activity's presentation after session removal: one immediately, then
 on a one-second timer whose cadence is not a hard wall-time guarantee. The observer
 holds the activity weakly and records only timestamps and boolean observations;
 it neither retains the download owner nor writes an exported file. These
-in-process reads/writes have no hard I/O deadline. After a completed failed test,
+observations distinguish file existence, readable bytes and exact-byte equality;
+the existence/read operations are separate observations, not an atomic snapshot.
+Only this fixture target defines `SUMI_DOWNLOAD_FIXTURE`. It enables a weakly
+capturing observer of the product owner's closed event/state names: presentation
+outcome, transfer failure, activity completion, state changes and cleanup. The
+first 64 events and an explicit truncation flag accompany the samples, without
+owners, controllers, URLs, errors or response data. Ordinary App builds have no
+observer. It neither intercepts callbacks nor changes transitions or verdicts.
+Events only append in memory; the existing sample timer persists them. Events
+after the last sample remain unknown. The trace covers this first cookie flow,
+has no owner identifiers, and cannot establish attribution for concurrent
+downloads. Callback/check events are not proof of completed cleanup or final UI
+state; `remove-succeeded` separately records the actual removal return.
+These in-process reads/writes have no hard I/O deadline. After a completed failed test,
 one bounded `get_app_container` call (20 seconds) locates this fixture's data on
 the exact owned Simulator. The reader refuses foreign paths, symlinks, hardlinks,
 oversized data and unexpected fields. Missing observations stay unknown; they

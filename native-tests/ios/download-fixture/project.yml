@@ -21,6 +21,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.takosumi.fixture.download
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: '$(inherited) SUMI_DOWNLOAD_FIXTURE'
         GENERATE_INFOPLIST_FILE: 'YES'
         INFOPLIST_KEY_CFBundleDisplayName: Download Fixture
         INFOPLIST_KEY_UILaunchScreen_Generation: 'YES'

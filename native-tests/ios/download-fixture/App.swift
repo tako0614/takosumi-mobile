@@ -28,6 +28,8 @@ final class FixtureHome: UIViewController {
     private var inspectionTimer: Timer?
     private var exportObservationTimer: Timer?
     private var exportObservations: [[String: Any]] = []
+    private var downloadLifecycle: [[String: Any]] = []
+    private var lifecycleTruncated = false
     private var closedDuringTransfer = false
     private var closeTimedOut = false
     private var closedDuringExport = false
@@ -41,6 +43,16 @@ final class FixtureHome: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        AppScreenDownload.lifecycleObserver = { [weak self] event, state in
+            guard let self = self else { return }
+            if self.downloadLifecycle.count < 64 {
+                self.downloadLifecycle.append([
+                    "unixSeconds": Date().timeIntervalSince1970,
+                    "event": event,
+                    "state": state,
+                ])
+            } else { self.lifecycleTruncated = true }
+        }
         view.backgroundColor = .systemBackground
         do {
             try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
@@ -174,19 +186,29 @@ final class FixtureHome: UIViewController {
 
     private func samplePendingExport(source: URL, activity: UIActivityViewController?) -> Bool {
         let presented = activity?.presentingViewController != nil
+        let exists = FileManager.default.fileExists(atPath: source.path)
+        let bytes = try? Data(contentsOf: source)
         exportObservations.append([
             "unixSeconds": Date().timeIntervalSince1970,
-            "sourceMatchesOriginal": (try? Data(contentsOf: source)) == cookieBytes,
+            "sourceExists": exists,
+            "sourceReadable": bytes != nil,
+            "sourceMatchesOriginal": bytes == cookieBytes,
             "activityAlive": activity != nil,
             "activityPresented": presented,
         ])
-        let value: [String: Any] = ["diagnosticOnly": true, "samples": exportObservations]
+        saveExportObservations()
+        return presented && exportObservations.count < 32
+    }
+
+    private func saveExportObservations() {
+        guard !exportObservations.isEmpty else { return }
+        let value: [String: Any] = ["diagnosticOnly": true, "samples": exportObservations,
+                                  "lifecycle": downloadLifecycle, "lifecycleTruncated": lifecycleTruncated]
         // No file bytes, URLs, paths or credentials enter this receipt.
         // Failure to save diagnostics does not alter any export assertion.
         if let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) {
             try? bytes.write(to: documents.appendingPathComponent("fixture-export-observations.json"), options: .atomic)
         }
-        return presented && exportObservations.count < 32
     }
 
     private func temporaryDownloads() -> [URL] {

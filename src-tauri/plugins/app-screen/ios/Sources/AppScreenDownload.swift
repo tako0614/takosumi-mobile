@@ -16,8 +16,15 @@ protocol AppScreenDownloadActivity: AnyObject {
 @MainActor
 final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDelegate {
     let id: UUID
-    private enum State { case waiting, confirming, receiving, ready, exporting, failed, cancelling, finished }
-    private var state = State.waiting
+    private enum State: String { case waiting, confirming, receiving, ready, exporting, failed, cancelling, finished }
+    private var state = State.waiting {
+        didSet { observeLifecycle("state") }
+    }
+#if SUMI_DOWNLOAD_FIXTURE
+    // The standalone fixture observes closed event/state names only. It never
+    // receives or retains this owner, a controller, a URL or response data.
+    static var lifecycleObserver: ((String, String) -> Void)?
+#endif
     private let download: WKDownload
     private let sourceOrigin: String
     private let context: () -> UIViewController?
@@ -41,6 +48,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
         self.declined = declined
         self.ended = ended
         super.init()
+        observeLifecycle("created")
         backgroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -147,6 +155,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        if download === self.download { observeLifecycle("download-failed") }
         guard download === self.download, state != .cancelling, state != .finished else { return }
         fail()
     }
@@ -157,6 +166,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
         progressObservation = nil
         dismissModal { [weak self] in
             guard let self = self, self.state == .failed else { return }
+            self.observeLifecycle("failure-cleanup")
             self.removeTemporaryFile()
             let alert = UIAlertController(title: "保存できませんでした",
                                           message: "ページからもう一度ダウンロードしてください。", preferredStyle: .alert)
@@ -176,6 +186,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
         // may still be reading this URL, so its completion owns both us and the
         // file. A view-controller dismissal completion is not that boundary.
         activity.completionWithItemsHandler = { [self, weak activity] _, _, _, _ in
+            observeLifecycle("activity-completed")
             activity?.completionWithItemsHandler = nil
             finish()
         }
@@ -200,6 +211,7 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
     }
 
     private func stop(reportFailure: Bool) {
+        observeLifecycle("stop")
         // After handing the file to the OS, session changes stop owning this
         // flow but must not dismiss its activity or unlink a provider's input.
         // The activity's own completion releases it, even if the session is gone.
@@ -230,12 +242,20 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
 
     private func present(_ controller: UIViewController) -> Bool {
         guard let presenter = context(), presenter.presentedViewController == nil,
-              !presenter.isBeingDismissed, presenter.transitionCoordinator == nil else { return false }
+              !presenter.isBeingDismissed, presenter.transitionCoordinator == nil else {
+            observeLifecycle("present-refused")
+            return false
+        }
         modal = controller
         // Complete presentation before a tiny download can synchronously finish
         // and replace this alert with its export controller.
         presenter.present(controller, animated: false)
-        if presenter.presentedViewController !== controller { modal = nil; return false }
+        if presenter.presentedViewController !== controller {
+            observeLifecycle("present-unconfirmed")
+            modal = nil
+            return false
+        }
+        observeLifecycle("present-confirmed")
         return true
     }
 
@@ -249,17 +269,21 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
 
     private func removeTemporaryFile() {
         guard let directory = directory else { return }
+        observeLifecycle("remove-started")
         do {
             try FileManager.default.removeItem(at: directory)
+            observeLifecycle("remove-succeeded")
             self.directory = nil
             file = nil
         } catch {
+            observeLifecycle("remove-failed")
             // No path, response URL, suggested filename or credential in logs.
             NSLog("AppScreen download temporary cleanup failed")
         }
     }
 
     private func finish() {
+        observeLifecycle("finish")
         guard state != .finished else { return }
         state = .finished
         reply(with: nil)
@@ -272,5 +296,11 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
         modal = nil
         removeTemporaryFile()
         ended()
+    }
+
+    private func observeLifecycle(_ event: String) {
+#if SUMI_DOWNLOAD_FIXTURE
+        Self.lifecycleObserver?(event, state.rawValue)
+#endif
     }
 }
