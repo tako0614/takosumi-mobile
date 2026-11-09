@@ -2541,6 +2541,13 @@ qualification. No heap, environment, page contents or binary crash dump is
 requested. Existing first-launch/restart/reset and zero-forced-cleanup
 requirements remain unchanged.
 
+The CI also records the installed `/usr/bin/sample` usage (with no process
+argument) and its installed manual, each capped at 16 KiB, in
+`macos-sample-capabilities.json`. This read only identifies available diagnostic
+options: it attaches to no process and does not select a new flag or extend the
+sampling/shutdown deadlines. It is needed when symbol processing times out
+without leaving a stack, so the next diagnostic can use observed tool support.
+
 At `6a1f7ff` (run 42497100922), Photopea completed all three launches with
 normal receipts and no stack sampling. Excalidraw instead stopped at the
 partial quit: Work exited 0 but its guard forced one leftover process, so

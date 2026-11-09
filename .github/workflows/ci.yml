@@ -1682,6 +1682,9 @@ jobs:
       # M3 reuses the built guard/browser; the actual WKWebView home runs
       # the same shared App flow. Both sites get a distinct home-store UUID,
       # and each must restore that same store on restart. No IdP or account.
+      - name: Read installed Mac sampling options (no process attachment)
+        if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
+        run: python3 -B native-tests/desktop/macos_sample_capabilities.py --out "$RUNNER_TEMP/macos-sample-capabilities.json"
       - name: Build the actual macOS App fixture
         id: app-build
         if: ${{ !cancelled() && steps.fixture-build.outcome == 'success' }}
@@ -1704,6 +1707,7 @@ jobs:
         with:
           name: cef-macos-smoke
           path: |
+            ${{ runner.temp }}/macos-sample-capabilities.json
             ${{ runner.temp }}/sumi-cef-smoke-*/summary.json
             ${{ runner.temp }}/sumi-cef-smoke-*/*.log
             ${{ runner.temp }}/m1-product/bundle.json
