@@ -46,6 +46,11 @@ jobs:
         working-directory: takosumi-mobile
       - run: bun run check
         working-directory: takosumi-mobile
+      - name: iOS download fixture harness controls (not native qualification)
+        run: python3 -B native-tests/ios/download-fixture/test_run.py
+        working-directory: takosumi-mobile
+        env:
+          TMPDIR: ${{ runner.temp }}
 
   # The native plugin tests `bun run check` does not run: the takosumi-push
   # plugin's RFC 8291 decryption and Declarative Web Push parsing (Kotlin on
@@ -473,6 +478,19 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: bash native-tests/ios/build-simulator.sh
         working-directory: takosumi-mobile
+      - name: Actual iOS profile download and OS file export
+        if: runner.os == 'macOS'
+        timeout-minutes: 22
+        run: python3 -B native-tests/ios/download-fixture/run.py --out "$RUNNER_TEMP/ios-download-evidence"
+        working-directory: takosumi-mobile
+      - name: Keep iOS download runtime evidence (no fixture keys)
+        if: ${{ always() && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios-download-runtime
+          path: ${{ runner.temp }}/ios-download-evidence
+          if-no-files-found: warn
+          retention-days: 14
       - name: Actual GTK profile, navigation and popup fixture
         if: runner.os == 'Linux'
         shell: bash

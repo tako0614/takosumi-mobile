@@ -135,17 +135,33 @@ cached compiler files are not accepted App artifacts or runtime evidence.
 The WKDownload candidate has policy cases for active Web-home/frame origins,
 the explicit same-origin Blob exception, attachment disposition and safe
 filename handling. The whole App SDK lane compiles its UIKit/WebKit wiring.
-There is no download runtime fixture yet, and these checks must not be reported
-as a successful authenticated file transfer or OS export.
+The first runtime fixture is `ios/download-fixture/run.py --out /absolute/new/evidence`.
+It needs existing Xcode, XcodeGen, OpenSSL and an available iOS 17+ iPhone runtime
+on macOS. It creates one disposable Simulator, trusts a new loopback HTTPS CA
+only inside that device, and deletes that exact device after an identity readback.
+It does not install SDKs/runtimes, alter host trust or use signing credentials.
+Its small host compiles the product coordinator, navigator, policy and download
+owner directly; only the unused Tauri shell signal is replaced with a refusal.
+The existing desktop macOS CI job runs it after the whole App SDK build.
 
-The next native case must use the actual AppScreen WebView with a disposable
-HTTPS fixture: establish its own session cookie, select an attachment and a
-Blob from visible controls, accept the native prompt, export through the OS,
-and verify exact bytes/name. A separate profile must not inherit that cookie.
-Exercise decline, transfer cancellation, navigation before consent, session
-close and an adapted export presentation; verify only the owned temporary
-directory is removed after writing/export actually stops. Include a tiny file
-that finishes during modal transitions and return from an inactive application.
+The actual XCTest uses visible links, a fixture session cookie, the native Save
+prompt and the OS Save to Files UI. It reads the cookie/Blob exports from the
+fixture App's Documents and requires their exact bytes. A second UUID profile
+must receive the cookie-denied page. Decline, partial transfer Cancel and actual
+session removal must remove only owned temporary files, keeping unrelated
+sentinels. The server must observe both slow responses disconnect before their
+last bytes; server shutdown cannot stand in for a WebKit cancel. Test output
+must contain the actual method pass and one executed test with zero failures.
+Logs, XCTest screenshots/hierarchy/result bundle and file receipts are retained;
+ephemeral private keys remain outside the uploaded evidence. The Python harness
+controls exercise real TLS/cookie and false-success checks, not native behavior.
+The fixture is unqualified until its actual Simulator run passes. It is not the
+whole Tauri UI, a physical device, a real IdP or an HTTP-auth qualification.
+
+After this first case, cover navigation before consent, adapted/iPad export
+presentation and return from an inactive application. The tiny exported files
+already exercise completion during modal transitions, but that timing still
+needs an actual Simulator result.
 Use neither a replacement URLSession fetch nor a synthetic WKDownload delegate
 result as the success oracle. Real IdP, device, HTTP-auth and distribution
 qualification remain separate.
