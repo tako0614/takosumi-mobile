@@ -110,7 +110,12 @@ needs actual native proof.
 
 Page commits cancel an unconfirmed request. Session removal/switching,
 WebContent termination and backgrounding stop an unfinished transfer; partial
-files are removed after WebKit confirms cancellation. OS export retains its
+files are removed after WebKit confirms cancellation. Once the file is handed
+to the OS activity, closing/switching the session leaves that activity and its
+input file alive until `completionWithItemsHandler` fires. The handler retains
+the download owner after the navigator releases it; a failed presentation clears
+that retention. Dismissing a view controller alone is not an export-completion
+signal. OS export retains its
 file until completion/cancellation, including a file-provider handoff. Prompts
 keep a three-second cooldown, restarted by the person's cancellation. Cleanup
 only targets that activity's directory; failures are logged without URLs or

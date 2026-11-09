@@ -232,7 +232,8 @@ def verify_exports(documents, evidence):
         digests[name] = hashlib.sha256(actual).hexdigest()
     receipt = json.loads(read_export(documents, "fixture-receipt.json"))
     if receipt != {"cookie": True, "blob": True, "temporaryCount": 0, "sentinel": True,
-                   "closedDuringTransfer": True, "closeTimedOut": False}:
+                   "closedDuringTransfer": True, "closeTimedOut": False,
+                   "closedDuringExport": True, "exportFileRetained": True, "exportCloseTimedOut": False}:
         raise RuntimeError("Incomplete actual App file/teardown observations")
     save(evidence / "fixture-receipt.json", receipt)
     return digests

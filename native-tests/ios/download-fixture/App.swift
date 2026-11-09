@@ -28,6 +28,9 @@ final class FixtureHome: UIViewController {
     private var inspectionTimer: Timer?
     private var closedDuringTransfer = false
     private var closeTimedOut = false
+    private var closedDuringExport = false
+    private var exportFileRetained = false
+    private var exportCloseTimedOut = false
     private let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     private let sentinel = FileManager.default.temporaryDirectory.appendingPathComponent("fixture-sentinel-\(UUID().uuidString)")
     private let sentinelBytes = Data("unrelated fixture file\n".utf8)
@@ -51,6 +54,7 @@ final class FixtureHome: UIViewController {
         for (name, action) in [
             ("Work", #selector(openWork)),
             ("Personal", #selector(openPersonal)),
+            ("Work, close during export", #selector(openAndCloseExport)),
             ("Work, close during transfer", #selector(openAndClose)),
             ("Inspect files", #selector(inspectFiles)),
         ] {
@@ -71,8 +75,9 @@ final class FixtureHome: UIViewController {
         ])
     }
 
-    private func open(profile: String, closeOnBytes: Bool = false) {
+    private func open(profile: String, closeOnBytes: Bool = false, closeOnExport: Bool = false) {
         inspectionTimer?.invalidate()
+        closeTimer?.invalidate()
         guard let raw = ProcessInfo.processInfo.environment["SUMI_DOWNLOAD_URL"],
               let url = URL(string: raw), let key = AppScreenPolicy.webHomeKey(raw, profile: profile) else {
             fatalError("Missing canonical HTTPS fixture URL")
@@ -82,6 +87,7 @@ final class FixtureHome: UIViewController {
         request.profile = profile
         do { try AppScreenCoordinator.shared.open(request, from: self) }
         catch { fatalError("Actual AppScreen open failed: \(error)") }
+        if closeOnExport { closeDuringExport(key: key) }
         if closeOnBytes {
             let deadline = Date().addingTimeInterval(25)
             closeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
@@ -107,6 +113,44 @@ final class FixtureHome: UIViewController {
     @objc private func openWork() { open(profile: work) }
     @objc private func openPersonal() { open(profile: personal) }
     @objc private func openAndClose() { open(profile: work, closeOnBytes: true) }
+    @objc private func openAndCloseExport() { open(profile: work, closeOnExport: true) }
+
+    private func closeDuringExport(key: String) {
+        let deadline = Date().addingTimeInterval(60)
+        var closedAt: Date?
+        var source: URL?
+        var activity: UIActivityViewController?
+        closeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            if let closedAt = closedAt {
+                if Date().timeIntervalSince(closedAt) >= 0.5 {
+                    // Observe the real product file after removal/dismissal
+                    // callbacks had time to run, before OS export is selected.
+                    self.exportFileRetained = source.flatMap { try? Data(contentsOf: $0) } == self.cookieBytes &&
+                        activity?.presentingViewController != nil
+                    timer.invalidate()
+                }
+            } else {
+                var top: UIViewController = self
+                while let presented = top.presentedViewController { top = presented }
+                if let export = top as? UIActivityViewController {
+                    let files = self.temporaryDownloads().map { $0.appendingPathComponent("cookie.txt") }
+                        .filter { (try? Data(contentsOf: $0)) == self.cookieBytes }
+                    guard files.count == 1 else { self.exportCloseTimedOut = true; timer.invalidate(); return }
+                    source = files[0]
+                    activity = export
+                    self.closedDuringExport = true
+                    // No substitute exporter or completion callback. Remove
+                    // the actual session while UIKit still owns its activity.
+                    AppScreenCoordinator.shared.remove(key)
+                    closedAt = Date()
+                } else if Date() >= deadline {
+                    self.exportCloseTimedOut = true
+                    timer.invalidate()
+                }
+            }
+        }
+    }
 
     private func temporaryDownloads() -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: FileManager.default.temporaryDirectory,
@@ -134,6 +178,9 @@ final class FixtureHome: UIViewController {
                 (try? Data(contentsOf: documents.appendingPathComponent("keep.txt"))) == sentinelBytes,
             "closedDuringTransfer": closedDuringTransfer,
             "closeTimedOut": closeTimedOut,
+            "closedDuringExport": closedDuringExport,
+            "exportFileRetained": exportFileRetained,
+            "exportCloseTimedOut": exportCloseTimedOut,
         ]
         do {
             let bytes = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])

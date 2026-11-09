@@ -171,7 +171,11 @@ The existing desktop macOS CI job runs it after the whole App SDK build.
 The actual XCTest uses visible links, a fixture session cookie, the native Save
 prompt and the OS Save to Files UI. It reads the cookie/Blob exports from the
 fixture App's Documents and requires their exact bytes. A second UUID profile
-must receive the cookie-denied page. Decline, partial transfer Cancel and actual
+must receive the cookie-denied page. During the first cookie export, the host
+removes the actual session while UIKit's activity is pending, observes that its
+original file still exists with exact bytes, then the test completes Save to
+Files. The final receipt requires this removal/retention observation and later
+temporary cleanup; an omitted observation cannot pass. Decline, partial transfer Cancel and actual
 session removal must remove only owned temporary files, keeping unrelated
 sentinels. The server must observe both slow responses disconnect before their
 last bytes; server shutdown cannot stand in for a WebKit cancel. Test output

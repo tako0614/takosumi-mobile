@@ -58,16 +58,29 @@ final class DownloadUITests: XCTestCase {
                   let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
             return value["cookie"] as? Bool == cookie && value["blob"] as? Bool == blob &&
                 value["temporaryCount"] as? Int == 0 && value["sentinel"] as? Bool == true &&
-                value["closedDuringTransfer"] as? Bool == closed && value["closeTimedOut"] as? Bool == false
+                value["closedDuringTransfer"] as? Bool == closed && value["closeTimedOut"] as? Bool == false &&
+                value["closedDuringExport"] as? Bool == true && value["exportFileRetained"] as? Bool == true &&
+                value["exportCloseTimedOut"] as? Bool == false
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 10), .completed, app.staticTexts["fixture-receipt"].label)
     }
 
-    private func exportToFixtureDocuments() {
+    private func exportToFixtureDocuments(afterSessionClose: Bool = false) {
         let saveToFiles = app.buttons["Save to Files"].firstMatch
         // Standard English iOS fixture. Missing selectors fail; no fake export.
         if !saveToFiles.waitForExistence(timeout: 5) { app.swipeUp() }
         XCTAssertTrue(saveToFiles.waitForExistence(timeout: 5))
+        if afterSessionClose {
+            // Keep the real activity pending while the host removes the
+            // session and observes the input file. Final receipt also requires
+            // that removal and byte observation actually happened.
+            let started = Date()
+            let retained = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                Date().timeIntervalSince(started) >= 1
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [retained], timeout: 3), .completed)
+            XCTAssertTrue(saveToFiles.exists, "Session removal dismissed the OS export")
+        }
         saveToFiles.tap()
         let save = app.buttons["Save"].firstMatch
         XCTAssertTrue(save.waitForExistence(timeout: 10))
@@ -96,13 +109,13 @@ final class DownloadUITests: XCTestCase {
     }
 
     func testOriginalResponsesExportAndRetireWithinTheirProfile() throws {
-        try XCTContext.runActivity(named: "Cookie response: real sign-in, download, OS export and bytes") { _ in
-            app.buttons["Work"].tap()
+        try XCTContext.runActivity(named: "Cookie response: retain original file across session removal until OS export") { _ in
+            app.buttons["Work, close during export"].tap()
             tapLink("Fixture sign in")
             XCTAssertTrue(app.webViews.staticTexts["Fixture signed in"].waitForExistence(timeout: 10))
             tapLink("Cookie attachment")
             acceptSave()
-            exportToFixtureDocuments()
+            exportToFixtureDocuments(afterSessionClose: true)
             closeScreen()
             try inspect(cookie: true, blob: false)
         }

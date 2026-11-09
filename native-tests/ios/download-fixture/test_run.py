@@ -207,9 +207,21 @@ class HarnessTests(unittest.TestCase):
             for name, data in {"cookie.txt": COOKIE_BYTES, "blob.txt": BLOB_BYTES, "keep.txt": SENTINEL_BYTES}.items():
                 (docs / name).write_bytes(data)
             receipt = {"cookie": True, "blob": True, "temporaryCount": 0, "sentinel": True,
-                       "closedDuringTransfer": True, "closeTimedOut": False}
+                       "closedDuringTransfer": True, "closeTimedOut": False,
+                       "closedDuringExport": True, "exportFileRetained": True, "exportCloseTimedOut": False}
             (docs / "fixture-receipt.json").write_text(json.dumps(receipt))
             self.assertEqual(len(verify_exports(docs, evidence)), 3)
+            for field in ("closedDuringExport", "exportFileRetained", "exportCloseTimedOut"):
+                for observed in (None, not receipt[field]):
+                    bad = dict(receipt)
+                    if observed is None:
+                        bad.pop(field)
+                    else:
+                        bad[field] = observed
+                    (docs / "fixture-receipt.json").write_text(json.dumps(bad))
+                    with self.assertRaises(RuntimeError):
+                        verify_exports(docs, evidence)
+            (docs / "fixture-receipt.json").write_text(json.dumps(receipt))
             (docs / "cookie.txt").write_bytes(b"different")
             with self.assertRaises(RuntimeError):
                 verify_exports(docs, evidence)

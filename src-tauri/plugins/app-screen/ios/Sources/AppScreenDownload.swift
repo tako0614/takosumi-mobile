@@ -172,9 +172,18 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
         activity.popoverPresentationController?.sourceView = presenter.view
         activity.popoverPresentationController?.sourceRect = CGRect(
             x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
-        activity.completionWithItemsHandler = { [weak self] _, _, _, _ in self?.finish() }
+        // The navigator can release us when its session closes. An OS service
+        // may still be reading this URL, so its completion owns both us and the
+        // file. A view-controller dismissal completion is not that boundary.
+        activity.completionWithItemsHandler = { [self, weak activity] _, _, _, _ in
+            activity?.completionWithItemsHandler = nil
+            finish()
+        }
         state = .exporting
-        if !present(activity) { state = .ready }
+        if !present(activity) {
+            activity.completionWithItemsHandler = nil
+            state = .ready
+        }
     }
 
     func cancelUnconfirmed() {
@@ -191,8 +200,11 @@ final class AppScreenDownload: NSObject, AppScreenDownloadActivity, WKDownloadDe
     }
 
     private func stop(reportFailure: Bool) {
-        guard state != .cancelling, state != .finished else { return }
-        let alreadyStopped = state == .ready || state == .exporting || state == .failed
+        // After handing the file to the OS, session changes stop owning this
+        // flow but must not dismiss its activity or unlink a provider's input.
+        // The activity's own completion releases it, even if the session is gone.
+        guard state != .exporting, state != .cancelling, state != .finished else { return }
+        let alreadyStopped = state == .ready || state == .failed
         state = .cancelling
         progressObservation = nil
         reply(with: nil)
