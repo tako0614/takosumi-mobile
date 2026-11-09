@@ -262,8 +262,9 @@ the alert remains. It does not impose a disappearance deadline or require an
 event from a destroyed page. If the alert remains, one real pointer-checked
 click must produce a default ActionInvoked for that same daemon/client/ID.
 An unrelated alert or action cannot pass. Work's guard remains live, and its
-notification witness, URL, top-level document and page-target set must remain
-unchanged during a recorded one-second observation after retirement/action.
+URL, top-level document and page-target set must remain unchanged during a
+recorded one-second observation after retirement/action. The baseline's closed
+Notification objects are not an oracle for absence of later click delivery.
 
 `notification-pending-close-result.json` and the original D-Bus trace retain
 that result before the daemon stops normally. An absent alert proves only its
@@ -272,6 +273,22 @@ not proof of arbitrarily delayed delivery, notification-driven reopening of a
 retired profile, profile reset, Service Worker/Web Push or other OSes. The
 current runner's notification path uses the fixture Python guard as root;
 Chromium sandbox/Rust-guard notification combinations remain unqualified.
+
+Add `--notification-reset` to that command to extend the same phase: after
+Personal closes normally, the actual home confirms its saved-data clear and
+proves its `cef-profiles` directory absent before reopening the same saved
+connection. Work's native process and profile directory stay live. The observer
+attaches the new Personal native/guard generation and requires actual
+`Notification.permission === 'default'`, Permissions API `prompt`, and removal
+of the fixture's own synthetic storage/cookie, while Work retains its grant and
+distinct fixture state. No permission override is used. The old alert, if still
+present, receives one native click bound to its original daemon/client/reply ID.
+Both live pages' URL, focus/visibility/pageshow observations, target inventory and
+fixture state must stay unchanged for the recorded interval. This proves a
+bounded absence of page/window rerouting, not an `onclick` result on a destroyed
+Notification object or a Web Push result. New Personal then closes normally
+before Work exits. The nested reset receipt records both native generations and
+the actual home clear; the ordinary `--notifications` path stays separate.
 
 `node --test native-tests/desktop/notification-route.test.mjs` rejects wrong
 reply serial/client/service, duplicate/malformed replies and actions for a

@@ -276,6 +276,65 @@ async function startNotifier() {
   notifier=await startNotificationBackend({binary,data,nonce,env:process.env,desktop:desktopAsync});
   await writeFile(path.join(data,'notify-backend-ready'),'ready',{flag:'wx'});
 }
+// This is deliberately separate from the ordinary close probe. The fixture
+// seeds only its own nonce, then the real home's clear must remove it and the
+// native permission. No permission override or replacement page API is used.
+async function prepareNotificationReset(work,personal) {
+  const key=`sumi_notification_reset_${nonce.replaceAll('-','')}`;
+  const state=page=>page.evaluate(`(async()=>({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)},permission:Notification.permission,query:(await navigator.permissions.query({name:'notifications'})).state}))()`);
+  const reset={passed:false,scope:'Home clear and same saved Personal reopen; real permission revocation and bounded page/window routing; no direct onclick oracle for destroyed Notification objects'};
+  proof.notificationReset=reset;
+  for(const [i,page] of [work,personal].entries()) {
+    const value=`${i}:${nonce}`;
+    await page.evaluate(`(()=>{if(localStorage.getItem(${JSON.stringify(key)})!==null||${cookieOf(key)}!==null)throw Error('Fresh reset fixture key required');localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(value)});document.cookie=${JSON.stringify(key+'='+value+'; Path=/; SameSite=Lax; Secure')};return true})()`);
+    assert.deepEqual(await state(page),{storage:value,cookie:value,permission:'granted',query:'granted'});
+  }
+  reset.workBefore=await state(work);reset.personalBefore=await state(personal);
+  reset.oldPersonal={process:personal.process,nativeStart:personal.c.binding.nativeStart,guardStart:personal.c.binding.guardStart};
+  return async()=>{
+    step('home clears and reopens closed Personal',work);
+    await writeFile(path.join(data,'notify-personal-retired'),'ready',{flag:'wx'});
+    reset.home=await marker('app-browser-process-notify-reopened.json');
+    assert.equal(reset.home.personalDataRemoved,true);
+    assert.equal(reset.home.workRootBefore,reset.home.workRootAfter);
+    const saved=reset.home.connections.find(c=>c.name==='Personal');
+    assert.equal(saved?.profile,personal.process.profile);
+    assert.equal(reset.home.processes.length,2);
+    assert.deepEqual(reset.home.processes.find(p=>p.profile===work.process.profile),work.process,'The original Work process must survive the home clear');
+    const process=reset.home.processes.find(p=>p.profile===saved.profile);assert(process);
+    assert.notEqual(process.guardReceipt,personal.process.guardReceipt,'Reopen must have its own guard receipt');
+    const reopened=await attach(process);
+    reset.newPersonal={process,nativeStart:reopened.c.binding.nativeStart,guardStart:reopened.c.binding.guardStart,target:reopened.target,context:reopened.context};
+    assert.notDeepEqual([process.pid,reopened.c.binding.guardStart],[personal.process.pid,personal.c.binding.guardStart]);
+    assert.notDeepEqual([reopened.native.nativePid,reopened.c.binding.nativeStart],[personal.native.nativePid,personal.c.binding.nativeStart]);
+    reset.personalAfter=await state(reopened);
+    assert.deepEqual(reset.personalAfter,{storage:null,cookie:null,permission:'default',query:'prompt'});
+    assert.deepEqual(await state(work),reset.workBefore,'Personal clear must retain Work permission and fixture data');
+    const witness=key+'_routing';
+    for(const page of [work,reopened])await page.evaluate(`(()=>{if(globalThis[${JSON.stringify(witness)}])throw Error('Fresh routing witness required');const s=globalThis[${JSON.stringify(witness)}]={focus:0,pageshow:0,visibility:0};window.addEventListener('focus',()=>s.focus++);window.addEventListener('pageshow',()=>s.pageshow++);document.addEventListener('visibilitychange',()=>s.visibility++);return true})()`);
+    const routeState=async page=>({state:await state(page),page:await page.evaluate(`({href:location.href,origin:location.origin,top:window===top,focused:document.hasFocus(),visibility:document.visibilityState,events:globalThis[${JSON.stringify(witness)}]})`),
+      targets:(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page').map(t=>({id:t.targetId,url:t.url,context:t.browserContextId??null,opener:t.openerId??null})).sort((a,b)=>a.id.localeCompare(b.id))});
+    reset.routingBefore=await Promise.all([work,reopened].map(routeState));
+    const live=async()=>{
+      for(const page of [work,reopened]) {
+        assert.equal(await startTime(page.native.nativePid),page.c.binding.nativeStart,'Native browser generation must stay live');
+        const guard=await guardState(page.process.pid);
+        assert(guard&&guard.start===page.c.binding.guardStart&&!['Z','X'].includes(guard.state),'Guard generation must stay live');
+        assert(!(await guardEnded(page.process.guardReceipt)));
+      }
+    };
+    await live();
+    step('old Personal alert with reopened Personal alive',reopened);
+    return {proof:reset,observe:async()=>{
+      await live();
+      reset.routingAfter=await Promise.all([work,reopened].map(routeState));
+      assert.deepEqual(reset.routingAfter,reset.routingBefore,'Old Personal alert must not reroute to Work or reopened Personal');
+    },finish:async()=>{
+      reset.newPersonalClose=await retirePersonal(reopened,'notify-reset');
+      reset.passed=true;
+    }};
+  };
+}
 async function notifyProbes(pages) {
   const [work,personal]=pages;
   await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
@@ -293,9 +352,10 @@ async function notifyProbes(pages) {
     const {probePendingNotificationClose}=await import('./notification-close.mjs');
     const workGuard=await guardState(work.process.pid);
     assert(workGuard&&!['Z','X'].includes(workGuard.state),'Work guard must be live before Personal retirement');
+    const afterPersonalClose=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET==='1'?await prepareNotificationReset(work,personal):null;
     step('pending Personal notification across native close',personal);
     proof.pendingNotificationClose=await probePendingNotificationClose({pages:probePages,data,nonce,desktop:desktopAsync,backend,
-      retirePersonal:()=>retirePersonal(personal,'notify'),
+      retirePersonal:()=>retirePersonal(personal,'notify'),afterPersonalClose,
       workLive:async()=>{
         const current=await guardState(work.process.pid);
         assert(current&&current.start===workGuard.start&&!['Z','X'].includes(current.state),'The same Work guard must remain live');

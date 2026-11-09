@@ -444,6 +444,90 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         Duration::from_secs(if kind == "files" { 80 } else { 30 })
     };
     checkpoint_within(view, case, &format!("{kind}-inspected"), bound).await?;
+    #[cfg(target_os = "linux")]
+    if kind == "notify"
+        && std::env::var("TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET").as_deref() == Ok("1")
+    {
+        checkpoint(view, case, "notify-personal-retired").await?;
+        // The observer has read Personal's normal zero-forced-close receipt.
+        // Drive the real home confirmation; Work stays open throughout.
+        // status() includes ended entries until clear_profile's release_ended
+        // verifies/reaps them. Only the post-clear map must contain Work alone.
+        let work = Value::Array(
+            opened
+                .as_array()
+                .ok_or("Missing opened profiles")?
+                .iter()
+                .filter(|p| p["profile"] != personal)
+                .cloned()
+                .collect(),
+        );
+        if work.as_array().map(Vec::len) != Some(1)
+            || !browser_status(app)?
+                .as_array()
+                .is_some_and(|items| items.contains(&work[0]))
+        {
+            return Err("Notification reset must retain the original Work process".into());
+        }
+        let personal_root = personal_data.join("cef-profiles");
+        let metadata = personal_root
+            .symlink_metadata()
+            .map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_dir() {
+            return Err("Notification reset requires the original real Personal directory".into());
+        }
+        let personal_identity = root_identity(&personal_root)?;
+        let work_profile = work[0]["profile"].as_str().ok_or("Missing Work profile")?;
+        let work_root = personal_data
+            .parent()
+            .ok_or("Missing profile parent")?
+            .join(work_profile)
+            .join("cef-profiles");
+        let work_identity = root_identity(&work_root)?;
+        tap_in_row(view, "Personal", "保存データを消去…").await?;
+        ready(view, "document.querySelector('.web-clear')").await?;
+        tap_in_row(view, "Personal", "保存データを消去").await?;
+        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') || document.querySelector('.web-error')").await?;
+        if let Value::String(error) = eval(
+            view,
+            "document.querySelector('.web-error')?.textContent ?? null",
+        )
+        .await?
+        {
+            return Err(format!(
+                "Notification reset of closed Personal was refused: {error}"
+            ));
+        }
+        ready(view, "!document.querySelector('.web-clear')").await?;
+        match personal_root.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err("Notification reset did not prove Personal's CEF profile absent".into())
+            }
+        }
+        if browser_status(app)? != work || root_identity(&work_root)? != work_identity {
+            return Err("Personal notification reset changed Work".into());
+        }
+        open_saved(view, app, "Personal", 2).await?;
+        if root_identity(&work_root)? != work_identity {
+            return Err("Reopening Personal changed Work's profile root".into());
+        }
+        let reopened_connections = eval(
+            view,
+            "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+        )
+        .await?;
+        if reopened_connections != connections {
+            return Err("Notification reset changed the saved connections".into());
+        }
+        let reopened = serde_json::json!({"connections":reopened_connections,"processes":browser_status(app)?,"personalRootBefore":personal_identity,"personalDataRemoved":true,"workRootBefore":work_identity,"workRootAfter":root_identity(&work_root)?});
+        std::fs::write(
+            case.join("app-browser-process-notify-reopened.json"),
+            serde_json::to_vec_pretty(&reopened).unwrap(),
+        )
+        .map_err(|error| error.to_string())?;
+        println!("notify: closed Personal cleared and reopened from the home; Work retained");
+    }
     checkpoint_within(view, case, &format!("{kind}-request-exit"), bound).await?;
     if kind == "reset" {
         // The observer closed Personal normally in this session: now it can be

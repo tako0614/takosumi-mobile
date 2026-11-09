@@ -7,15 +7,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { notificationRoute,notificationActions,requireNotificationAction } from './notification-route.mjs';
 
-export async function probePendingNotificationClose({pages,data,nonce,desktop,backend,retirePersonal,workLive}) {
+export async function probePendingNotificationClose({pages,data,nonce,desktop,backend,retirePersonal,workLive,afterPersonalClose}) {
   const [work,personal]=pages;
   const key=`sumi_pending_notification_${nonce.replaceAll('-','')}`;
-  const baselineKey=`sumi_notification_${nonce.replaceAll('-','')}`;
   const title=`Closing Personal ${nonce}`;
   const proof={passed:false,scope:'Actual Linux App pending nonpersistent notification and normal Personal close; bounded Work isolation observation, no Web Push/reset qualification'};
   const counts=async()=>({displayed:await backend.count('displayed'),waiting:await backend.count('waiting')});
   const actions=trace=>notificationActions(trace).length;
-  const workState=()=>work.evaluate(`(()=>{const n=globalThis[${JSON.stringify(baselineKey)}];return {href:location.href,origin:location.origin,top:window===top,witness:globalThis[${JSON.stringify(key)}],notification:n?{clicks:n.clicks,errors:n.errors,trusted:n.trusted}:null}})()`);
+  const workState=()=>work.evaluate('({href:location.href,origin:location.origin,top:window===top})');
   const targets=async()=>((await work.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page')
     .map(t=>({id:t.targetId,url:t.url,context:t.browserContextId??null,opener:t.openerId??null})).sort((a,b)=>a.id.localeCompare(b.id)));
   async function waitFor(predicate,message) {
@@ -26,9 +25,9 @@ export async function probePendingNotificationClose({pages,data,nonce,desktop,ba
   try {
     await backend.owner();
     assert.deepEqual(await counts(),{displayed:0,waiting:0},'The preceding baseline must have closed its alerts');
-    // Observe the real Work Notification object left by the preceding native
-    // click test, without creating another alert or replacing any page API.
-    await work.evaluate(`(()=>{if(globalThis[${JSON.stringify(key)}])throw Error('Fresh Work witness required');const n=globalThis[${JSON.stringify(baselineKey+'_object')}];if(!n)throw Error('Missing real Work Notification');const s=globalThis[${JSON.stringify(key)}]={nonce:${JSON.stringify(nonce)},clicks:0};n.addEventListener('click',()=>s.clicks++);return true})()`);
+    // The baseline's Notification objects are already closed. Their counters
+    // cannot establish absence of later click delivery; observe live pages and
+    // the exact old D-Bus route instead.
     proof.workBefore=await workState();
     assert.equal(proof.workBefore.origin,work.context.origin);assert.equal(proof.workBefore.top,true);
     proof.workTargetsBefore=await targets();
@@ -54,9 +53,14 @@ export async function probePendingNotificationClose({pages,data,nonce,desktop,ba
     proof.workGuardAfterClose=await workLive();
     proof.afterCloseCounts=await counts();
     assert.equal(proof.afterCloseCounts.waiting,0);
-    assert([0,1].includes(proof.afterCloseCounts.displayed),'Unexpected alert after the only pending profile closed');
-    if(proof.afterCloseCounts.displayed===0) {
-      proof.outcome='OS alert absent after normal profile close; removal cause not inferred';
+    assert([0,1].includes(proof.afterCloseCounts.displayed),'Unexpected alert immediately after Personal close');
+    const reset=afterPersonalClose?await afterPersonalClose():null;
+    if(reset){proof.reset=reset.proof;proof.scope='Actual Linux App pending nonpersistent notification across Personal close, home clear and same-profile reopen; bounded page/window routing observation, no Web Push qualification';}
+    proof.beforeActionCounts=await counts();
+    assert.equal(proof.beforeActionCounts.waiting,0);
+    assert([0,1].includes(proof.beforeActionCounts.displayed),'Unexpected alert after the only pending profile closed');
+    if(proof.beforeActionCounts.displayed===0) {
+      proof.outcome='OS alert absent before native input; removal cause not inferred';
     } else {
       await backend.owner();
       const ids=(await desktop('xdotool',['search','--onlyvisible','--name',`^${backend.title}$`],true)).split(/\s+/).filter(Boolean);
@@ -93,8 +97,9 @@ export async function probePendingNotificationClose({pages,data,nonce,desktop,ba
     proof.workSamples=0;
     do {
       await workLive();
-      assert.deepEqual(await workState(),proof.workBefore,'Personal notification must not change Work or deliver a Work click');
+      assert.deepEqual(await workState(),proof.workBefore,'Personal notification must not change the Work page');
       assert.deepEqual(await targets(),proof.workTargetsBefore,'Personal notification must not open or navigate a Work target');
+      if(reset)await reset.observe();
       proof.workSamples++;
       await delay(100);
     } while(Date.now()-started<1000);
@@ -105,6 +110,7 @@ export async function probePendingNotificationClose({pages,data,nonce,desktop,ba
     assert.deepEqual(proof.finalCounts,{displayed:0,waiting:0},'No unrelated alert may replace the retired one');
     assert.equal(proof.actionCountAfter,proof.actionCountBefore+(proof.nativeAction?1:0),'Only the observed native input may invoke an action');
     proof.workGuardFinal=await workLive();
+    if(reset)await reset.finish();
     proof.passed=true;return proof;
   }catch(error){proof.error=String(error);throw error;}
   finally {

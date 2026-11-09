@@ -276,6 +276,8 @@ def main():
                         help="relaunch and verify the native OS Open/Save As chooser in Work (Excalidraw only)")
     parser.add_argument("--notifications", type=Path,
                         help="relaunch with this owned Dunst binary and verify native permission UI and OS notifications")
+    parser.add_argument("--notification-reset", action="store_true",
+                        help="with --notifications, clear and reopen Personal from the home before acting on its old alert")
     parser.add_argument("--guard", type=Path, default=GUARD,
                         help="the App's per-profile browser guard (default: the fixture guard.py; "
                              "or the Rust takosumi-browser-guard binary)")
@@ -286,6 +288,8 @@ def main():
                                        "account, so the browsers run with the Chromium sandbox")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.notification_reset and not args.notifications:
+        parser.error("--notification-reset requires --notifications")
     args.binary = args.binary.resolve(strict=True)
     args.browser = args.browser.resolve(strict=True)
     args.data = args.data.absolute()
@@ -312,7 +316,8 @@ def main():
     env = dict(os.environ)
     # Only --restart selects the restart phase; never inherit it from the caller.
     env.pop("TAKOSUMI_BROWSER_PROCESS_PHASE", None)
-    for key in ("TAKOSUMI_BROWSER_PROCESS_FILES_INPUT", "TAKOSUMI_BROWSER_PROCESS_FILES_NONCE"):
+    for key in ("TAKOSUMI_BROWSER_PROCESS_FILES_INPUT", "TAKOSUMI_BROWSER_PROCESS_FILES_NONCE",
+                "TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET"):
         env.pop(key, None)
     for key, name in {"HOME":"home", "XDG_DATA_HOME":"data", "XDG_CONFIG_HOME":"config",
                       "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "TMPDIR":"tmp"}.items():
@@ -415,7 +420,8 @@ def main():
         # Another launch: native Chrome permission UI and real OS notifications
         # per profile, through an owned notification daemon on the session bus.
         notify = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="notify",
-                                        TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications)),
+                                        TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications),
+                                        TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET="1" if args.notification_reset else "0"),
                              files, before, head, "-notify")
         require(notify["passed"] is True, "The notification native execution did not pass")
     if args.files:
