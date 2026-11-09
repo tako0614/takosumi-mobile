@@ -131,6 +131,12 @@ public final class WebAppOperationTest {
                         activity.trace("open touch phase=" + action + " sent=" + bounds.toShortString() +
                             " current=" + (currentAction == null ? "missing" : currentAction.toShortString()) +
                             " window=" + window.toShortString() + " filePrompts=" + activity.filePrompts);
+                        // A settled action that still moves by dispatch lands
+                        // on the wrong card; an abort leaves honest evidence
+                        // and the outer catch cancels a half-sent gesture.
+                        if (currentAction != null && !currentAction.contains(bounds))
+                            throw new AssertionError("open action moved after settle: sent="
+                                + bounds.toShortString() + " current=" + currentAction.toShortString());
                     } catch (RuntimeException observation) {
                         activity.trace("open touch observation unavailable " + observation.getClass().getSimpleName());
                     }
@@ -458,7 +464,12 @@ public final class WebAppOperationTest {
         catch (IOException | RuntimeException observation) {
             activity.trace("before-open capture unavailable " + observation.getClass().getSimpleName());
         }
-        tap(bounds(openAction, false, false), openAction);
+        // The home panel re-lays out between an a11y bounds read and touch
+        // delivery: a captured open-action rect once landed on the New
+        // Project card instead. Only tap a rect that survived unchanged for
+        // half a second, the same gate the picker rows already use.
+        tap(awaitRect("Open action did not settle",
+            () -> stable("open", bounds(openAction, false, false)), 15), openAction);
         chooseInput();
         await("The actual editor did not open the selected image", () -> !picker() && bounds(tabName, true, false) != null, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);
