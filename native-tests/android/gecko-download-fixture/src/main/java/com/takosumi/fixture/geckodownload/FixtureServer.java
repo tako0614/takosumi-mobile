@@ -85,7 +85,7 @@ final class FixtureServer implements AutoCloseable {
             } else if (path.equals("/")) {
                 html(output, 200, "<h1>" + (signedIn ? "Fixture signed in" : "Fixture signed out") + "</h1>"
                     + "<a href='/login'>Fixture sign in</a><br><a href='/cookie'>Cookie attachment</a><br>"
-                    + "<button onclick=\"const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['Original Gecko Blob response\\n'],{type:'application/octet-stream'}));a.download='blob.txt';a.click();\">Blob export</button><br>"
+                    + "<button onclick=\"this.textContent='Blob click received';try{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['Original Gecko Blob response\\n'],{type:'application/octet-stream'}));a.download='blob.txt';a.click();this.textContent='Blob click dispatched';}catch(e){this.textContent='Blob click failed';}\">Blob export</button><br>"
                     + "<a href='/slow'>Slow attachment</a>");
             } else {
                 html(output, 404, "Missing fixture route");

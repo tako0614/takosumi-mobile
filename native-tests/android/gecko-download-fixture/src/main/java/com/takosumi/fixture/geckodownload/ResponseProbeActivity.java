@@ -25,6 +25,23 @@ public final class ResponseProbeActivity extends Activity {
     File directory;
     volatile String failure;
     boolean destroyed;
+    private final ArrayDeque<String> events = new ArrayDeque<>();
+
+    private synchronized void trace(String event) {
+        if (events.size() == 32) events.removeFirst();
+        events.addLast(event);
+    }
+
+    synchronized String diagnostics() {
+        return "Owned Gecko events: " + events + "\nFailure: " + failure;
+    }
+
+    private String uriKind(String uri) {
+        if (uri == null) return "none";
+        if (uri.startsWith(server.url())) return "fixture-http";
+        if (uri.startsWith("blob:" + server.url())) return "fixture-blob";
+        return "outside-fixture";
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -72,11 +89,23 @@ public final class ResponseProbeActivity extends Activity {
         session.setNavigationDelegate(new GeckoSession.NavigationDelegate() {
             @Override public GeckoResult<AllowOrDeny> onLoadRequest(GeckoSession owner, LoadRequest request) {
                 boolean local = request.uri.startsWith(server.url()) || request.uri.startsWith("blob:" + server.url());
+                trace("load " + uriKind(request.uri) + " allow=" + local + " target=" + request.target
+                    + " gesture=" + request.hasUserGesture);
                 return GeckoResult.fromValue(local ? AllowOrDeny.ALLOW : AllowOrDeny.DENY);
+            }
+            @Override public GeckoResult<String> onLoadError(GeckoSession owner, String uri, WebRequestError error) {
+                trace("load-error " + uriKind(uri) + " category=" + error.category + " code=" + error.code);
+                return null;
+            }
+            @Override public GeckoResult<GeckoSession> onNewSession(GeckoSession owner, String uri) {
+                trace("new-session " + uriKind(uri) + " default-refusal");
+                return null;
             }
         });
         session.setContentDelegate(new GeckoSession.ContentDelegate() {
             @Override public void onExternalResponse(GeckoSession owner, WebResponse response) {
+                trace("external-response " + uriKind(response.uri) + " active=" + (owner == selected)
+                    + " context=" + (context.equals(work) ? "Work" : "Personal") + " status=" + response.statusCode);
                 Transfer transfer = new Transfer(owner, context, response);
                 transfers.add(transfer);
                 if (destroyed) {
@@ -91,7 +120,10 @@ public final class ResponseProbeActivity extends Activity {
                     failure = "Response executor rejected ownership";
                 }
             }
-            @Override public void onCrash(GeckoSession owner) { failure = "Gecko content process crashed"; }
+            @Override public void onCrash(GeckoSession owner) {
+                failure = "Gecko content process crashed";
+                trace("content-crash");
+            }
         });
         session.open(runtime);
         return session;

@@ -101,7 +101,8 @@ public final class ResponseCapabilityTest {
         assertTrue("Unexpected extra original response", activity.responses.isEmpty());
         tap(link);
         ResponseProbeActivity.Transfer transfer = activity.responses.poll(20, TimeUnit.SECONDS);
-        assertNotNull("No actual external response from Gecko", transfer);
+        if (transfer == null) fail("No actual external response from Gecko for " + link + "\n"
+            + activity.diagnostics() + "\n" + visibleTree());
         assertEquals(activity.work, transfer.context);
         return transfer;
     }

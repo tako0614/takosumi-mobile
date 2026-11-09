@@ -22,6 +22,14 @@ enabled; it still injects actual pointer input. A failed wait includes a bounded
 accessibility snapshot captured before Activity cleanup, without relaxing text
 matching or invoking button handlers directly.
 
+If an original response does not arrive, the same 20-second wait now reports
+the visible accessibility tree and the last 32 native navigation/response events.
+Events record only fixture URI classes, decisions and numeric error codes, not
+URLs, cookies or bodies. The Blob button updates its own page text when its
+actual click handler starts, dispatches the anchor click, or throws. These
+observations distinguish missed input, page script failure, navigation refusal
+and missing engine response; none is accepted in place of original bytes.
+
 The server binds only `127.0.0.1` on an ephemeral port. Its synthetic HTTP cookie
 is not a real credential. This first transport experiment does **not** qualify
 HTTPS/Secure cookies, external IdP login, OS Save to Files, background recovery,
