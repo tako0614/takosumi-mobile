@@ -215,6 +215,7 @@ class MacObserver(Observer):
         # is even alive and the tail of its own log. Distinguishes a quit
         # that never reached CEF's close path (busy runloop, queued terminate)
         # from a dialog the loaded page itself suppressed.
+        entry = {}
         try:
             entry = self.proof["dialogFailures"][-1]["pages"][-1]
             native = page.native
