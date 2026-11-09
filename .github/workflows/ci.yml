@@ -345,6 +345,153 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  android-download-candidate:
+    # Independent Java-only engine experiment. Its SDK/Gradle/dependency graph
+    # must not upgrade the product's API36/AGP8/Kotlin build.
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          gradle-version: "9.3.1"
+      - name: Compile isolated Gecko response fixture
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          if shutil.disk_usage(os.environ['RUNNER_TEMP']).free < 12 * 1024**3:
+              raise SystemExit('Need 12 GiB for isolated SDK/engine/emulator; no broad cleanup')
+          PY
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.2" "system-images;android-36;google_apis;x86_64"
+          cat "$ANDROID_HOME/platforms/android-37.2/source.properties"
+          gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture assembleDebug assembleDebugAndroidTest
+          sha256sum native-tests/android/gecko-download-fixture/build/outputs/apk/debug/*.apk
+      - name: Original response cookie Blob and cancellation on owned emulator
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/sumi-gecko-avd"
+          test ! -e "$ANDROID_AVD_HOME"
+          mkdir -m 700 "$ANDROID_AVD_HOME"
+          # Refuse another device, even on the hosted runner. No adb kill-server.
+          python3 - <<'PY'
+          import subprocess
+          lines = subprocess.check_output(['adb', 'devices'], text=True, timeout=10).splitlines()[1:]
+          if any(line.strip() for line in lines):
+              raise SystemExit('Existing Android device: do not adopt or stop it')
+          PY
+          avd_name="sumi-gecko-response-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          echo no | avdmanager create avd --name "$avd_name" --package "system-images;android-36;google_apis;x86_64"
+          emulator_pid=""
+          emulator_birth=""
+          owned_device() {
+            python3 - "$emulator_pid" "$emulator_birth" "$$" "$avd_name" <<'PY'
+          import os, pathlib, select, subprocess, sys
+          sys.path.insert(0, 'native-tests/android')
+          from owned_process import identity
+          pid, birth, parent = map(int, sys.argv[1:4])
+          fd = os.pidfd_open(pid)
+          try:
+              poll = select.poll()
+              poll.register(fd, select.POLLIN)
+              if poll.poll(0) or identity(pid) != (parent, birth):
+                  raise SystemExit('Owned emulator identity is not live')
+              sockets = set()
+              for item in pathlib.Path(f'/proc/{pid}/fd').iterdir():
+                  try:
+                      target = os.readlink(item)
+                  except FileNotFoundError:
+                      continue
+                  if target.startswith('socket:['):
+                      sockets.add(target[8:-1])
+              listeners = set()
+              for name, address in [('tcp', '0100007F'), ('tcp6', '00000000000000000000000001000000')]:
+                  for line in pathlib.Path('/proc/net', name).read_text().splitlines()[1:]:
+                      parts = line.split()
+                      if parts[1] == f'{address}:15BA' and parts[3] == '0A':  # loopback console port5562
+                          listeners.add(parts[9])
+              if not listeners or not listeners <= sockets:
+                  raise SystemExit('Emulator console listener is not owned by captured process')
+              rows = subprocess.check_output(['adb', 'devices'], text=True, timeout=5).splitlines()[1:]
+              if [row.split() for row in rows if row.strip()] != [['emulator-5562', 'device']]:
+                  raise SystemExit('Unexpected Android device set')
+              name = subprocess.check_output(['adb', '-s', 'emulator-5562', 'emu', 'avd', 'name'], text=True, timeout=5).splitlines()
+              if name != [sys.argv[4], 'OK'] or poll.poll(0) or identity(pid) != (parent, birth):
+                  raise SystemExit('Owned AVD readback mismatch')
+          finally:
+              os.close(fd)
+          PY
+          }
+          cleanup() {
+            result=$?
+            if [[ "$result" != 0 ]]; then
+              tail -c 65536 "$RUNNER_TEMP/sumi-gecko-emulator.log" || true
+              if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
+                timeout 10 adb -s emulator-5562 logcat -d -t 200 -v brief '*:E' > "$RUNNER_TEMP/sumi-gecko-failure.log" 2>&1 || true
+              fi
+            fi
+            if [[ -n "$emulator_pid" ]]; then
+              if python3 -B native-tests/android/owned_process.py stop "$emulator_pid" "$emulator_birth"; then
+                wait "$emulator_pid" || true
+              else
+                result=1
+              fi
+            fi
+            trap - EXIT
+            exit "$result"
+          }
+          trap cleanup EXIT
+          "$ANDROID_HOME/emulator/emulator" -avd "$avd_name" -port 5562 -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim -no-snapshot -wipe-data > "$RUNNER_TEMP/sumi-gecko-emulator.log" 2>&1 &
+          emulator_pid=$!
+          emulator_birth="$(python3 -B native-tests/android/owned_process.py birth "$emulator_pid" "$$")"
+          test "$emulator_birth" != exited
+          timeout 180 adb -s emulator-5562 wait-for-device
+          booted=0
+          for attempt in {1..90}; do
+            owned_device
+            if [[ "$(adb -s emulator-5562 shell getprop sys.boot_completed | tr -d '\r')" == 1 ]]; then booted=1; break; fi
+            sleep 2
+          done
+          test "$booted" = 1
+          owned_device
+          adb -s emulator-5562 shell input keyevent 82
+          owned_device
+          gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture connectedDebugAndroidTest
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as E
+          reports = list(pathlib.Path('native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
+          roots = [E.parse(path).getroot() for path in reports]
+          cases = {(case.get('classname'), case.get('name')) for root in roots for case in root.iter('testcase')}
+          required = ('com.takosumi.fixture.geckodownload.ResponseCapabilityTest', 'originalCookieBlobAndCancellationStayWithinTheirContext')
+          if not roots or required not in cases:
+              raise SystemExit('Missing real Gecko response test; empty run is not a pass')
+          if sum(int(root.get('tests', 0)) for root in roots) != 1 or any(int(root.get(k, 0)) for root in roots for k in ('failures', 'errors', 'skipped')):
+              raise SystemExit('Gecko response fixture failed or skipped')
+          print('PASS: one actual Gecko original-response test; product adapter, HTTPS, reset and real IdP remain separate')
+          PY
+          git diff --exit-code -- native-tests/android/gecko-download-fixture
+      - name: Keep independent Gecko candidate evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-gecko-response-candidate
+          path: |
+            native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected/**/TEST-*.xml
+            ${{ runner.temp }}/sumi-gecko-failure.log
+          if-no-files-found: warn
+          retention-days: 14
+
   desktop:
     needs: [quality, native-plugins]
     # Wait for native checks, but collect independent OS evidence even if an

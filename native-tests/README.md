@@ -130,6 +130,14 @@ Compiler caches are saved after non-cancelled SDK failures as well as success,
 so a source repair can reuse completed compilation. Failed checks stay failed;
 cached compiler files are not accepted App artifacts or runtime evidence.
 
+### Android original-response comparison
+
+The standalone [Gecko download fixture](android/gecko-download-fixture/README.md)
+compares original cookie/Blob response streams, UUID context isolation/reopen and
+cancel/close cleanup. Its Java-only toolchain and pinned engine are separate from
+the product. It is a loopback HTTP capability experiment, not engine adoption,
+product adapter completion, OS export, HTTPS or real IdP qualification.
+
 ### iOS download runtime qualification
 
 The WKDownload candidate has policy cases for active Web-home/frame origins,
