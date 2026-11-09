@@ -55,6 +55,70 @@ class HarnessTests(unittest.TestCase):
                         out / "attachment-export.log", timeout=60)
                     self.assertEqual(sentinel.read_bytes(), b"original failed XCTest")
 
+    def test_export_observations_retain_only_exact_owned_bounded_data(self):
+        udid = "7F0B0D20-C07F-4BED-ABA8-B7C316ED4BAD"
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            root = Path(raw).resolve()
+            data = root / udid / "data"
+            container = data / "Containers/Data/Application/609105A8-68B2-4EB1-888D-C411B22215F5"
+            docs = container / "Documents"
+            docs.mkdir(parents=True)
+            out = root / "evidence"
+            out.mkdir()
+            (out / "xcodebuild.log").write_text("original XCTest failed")
+            source = docs / "fixture-export-observations.json"
+            value = {"diagnosticOnly": True, "samples": [{"unixSeconds": 1794204000.0,
+                     "sourceMatchesOriginal": True, "activityAlive": True, "activityPresented": True}]}
+            source.write_text(json.dumps(value))
+            with patch.object(fixture_runner, "command", return_value=str(container)) as command:
+                result = fixture_runner.preserve_export_observations({"dataPath": str(data)}, udid, out)
+                self.assertEqual(result, {"diagnosticOnly": True, "status": "retained", "samples": 1})
+                command.assert_called_once_with(
+                    ["xcrun", "simctl", "get_app_container", udid, fixture_runner.BUNDLE, "data"],
+                    out / "observation-container.log", timeout=20)
+                self.assertEqual(json.loads((out / source.name).read_bytes()), value)
+            retained = (out / source.name).read_bytes()
+            for mode in ("extra-field", "oversized", "symlink", "hardlink", "foreign-container"):
+                with self.subTest(mode=mode):
+                    source.unlink()
+                    source.write_text(json.dumps(value))
+                    target = container
+                    if mode == "extra-field":
+                        source.write_text(json.dumps({**value, "private": "must not copy"}))
+                    elif mode == "oversized":
+                        source.write_bytes(b" " * 16385)
+                    elif mode == "symlink":
+                        source.unlink()
+                        source.symlink_to(out / source.name)
+                    elif mode == "hardlink":
+                        os.link(source, root / "alias")
+                    else:
+                        target = root / "foreign"
+                    with patch.object(fixture_runner, "command", return_value=str(target)):
+                        self.assertEqual(fixture_runner.preserve_export_observations(
+                            {"dataPath": str(data)}, udid, out)["status"], "unavailable")
+                    self.assertEqual((out / source.name).read_bytes(), retained)
+                    self.assertEqual((out / "xcodebuild.log").read_text(), "original XCTest failed")
+
+    def test_export_observations_do_not_touch_interrupted_test_or_hide_cli_failure(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            with patch.object(fixture_runner, "command") as command:
+                self.assertEqual(fixture_runner.preserve_export_observations({}, "unused", out)["status"], "unavailable")
+                (out / "xcodebuild.log").write_text("original failure")
+                fixture_runner.INTERRUPTED_COMMANDS.append({"log": str(out / "xcodebuild.log"), "reaped": True})
+                self.assertEqual(fixture_runner.preserve_export_observations({}, "unused", out)["status"], "interrupted-test")
+                command.assert_not_called()
+            fixture_runner.INTERRUPTED_COMMANDS.clear()
+            udid = "7F0B0D20-C07F-4BED-ABA8-B7C316ED4BAD"
+            data = out / udid / "data"
+            data.mkdir(parents=True)
+            with patch.object(fixture_runner, "command", side_effect=subprocess.TimeoutExpired("simctl", 20)):
+                result = fixture_runner.preserve_export_observations({"dataPath": str(data.resolve())}, udid, out)
+                self.assertEqual(result["errorType"], "TimeoutExpired")
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual((out / "xcodebuild.log").read_text(), "original failure")
+
     def test_timeout_reaps_only_owned_cli_and_keeps_original_failure(self):
         original = subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "owned-id", "-b"], 180)
         process = Mock(pid=424242)

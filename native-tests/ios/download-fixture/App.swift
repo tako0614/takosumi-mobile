@@ -26,6 +26,8 @@ final class FixtureHome: UIViewController {
     private let receipt = UILabel()
     private var closeTimer: Timer?
     private var inspectionTimer: Timer?
+    private var exportObservationTimer: Timer?
+    private var exportObservations: [[String: Any]] = []
     private var closedDuringTransfer = false
     private var closeTimedOut = false
     private var closedDuringExport = false
@@ -119,7 +121,8 @@ final class FixtureHome: UIViewController {
         let deadline = Date().addingTimeInterval(60)
         var closedAt: Date?
         var source: URL?
-        var activity: UIActivityViewController?
+        // Observing retention must not keep UIKit's activity alive for it.
+        weak var activity: UIActivityViewController?
         closeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             if let closedAt = closedAt {
@@ -128,7 +131,11 @@ final class FixtureHome: UIViewController {
                     // callbacks had time to run, before OS export is selected.
                     self.exportFileRetained = source.flatMap { try? Data(contentsOf: $0) } == self.cookieBytes &&
                         activity?.presentingViewController != nil
+                    if let source = source, let activity = activity {
+                        self.observePendingExport(source: source, activity: activity)
+                    }
                     timer.invalidate()
+                    self.closeTimer = nil
                 }
             } else {
                 var top: UIViewController = self
@@ -150,6 +157,36 @@ final class FixtureHome: UIViewController {
                 }
             }
         }
+    }
+
+    private func observePendingExport(source: URL, activity: UIActivityViewController) {
+        // Passive diagnostics for the same original file after session removal.
+        // Neither this timer nor its samples retain UIKit's export controller
+        // or the product download owner. Never create a replacement export.
+        exportObservationTimer?.invalidate()
+        exportObservations = []
+        guard samplePendingExport(source: source, activity: activity) else { return }
+        exportObservationTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self, weak activity] timer in
+            guard let self = self else { timer.invalidate(); return }
+            if !self.samplePendingExport(source: source, activity: activity) { timer.invalidate() }
+        }
+    }
+
+    private func samplePendingExport(source: URL, activity: UIActivityViewController?) -> Bool {
+        let presented = activity?.presentingViewController != nil
+        exportObservations.append([
+            "unixSeconds": Date().timeIntervalSince1970,
+            "sourceMatchesOriginal": (try? Data(contentsOf: source)) == cookieBytes,
+            "activityAlive": activity != nil,
+            "activityPresented": presented,
+        ])
+        let value: [String: Any] = ["diagnosticOnly": true, "samples": exportObservations]
+        // No file bytes, URLs, paths or credentials enter this receipt.
+        // Failure to save diagnostics does not alter any export assertion.
+        if let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) {
+            try? bytes.write(to: documents.appendingPathComponent("fixture-export-observations.json"), options: .atomic)
+        }
+        return presented && exportObservations.count < 32
     }
 
     private func temporaryDownloads() -> [URL] {

@@ -212,6 +212,17 @@ accessibility snapshot can be read without Xcode. This single diagnostic command
 has a 60-second wait and the same direct-child retirement rules. An absent
 bundle or interrupted xcodebuild is not exported; neither missing attachments
 nor export failure changes the original test failure. No test is retried.
+For a failure after the Save to Files tap, the fixture also keeps an immediate
+post-tap screenshot and up to 32 observations of the original input file and
+the same activity's presentation after session removal: one immediately, then
+on a one-second timer whose cadence is not a hard wall-time guarantee. The observer
+holds the activity weakly and records only timestamps and boolean observations;
+it neither retains the download owner nor writes an exported file. These
+in-process reads/writes have no hard I/O deadline. After a completed failed test,
+one bounded `get_app_container` call (20 seconds) locates this fixture's data on
+the exact owned Simulator. The reader refuses foreign paths, symlinks, hardlinks,
+oversized data and unexpected fields. Missing observations stay unknown; they
+cannot replace the original failure or satisfy the successful export receipt.
 The fixture is unqualified until its actual Simulator run passes. It is not the
 whole Tauri UI, a physical device, a real IdP or an HTTP-auth qualification.
 

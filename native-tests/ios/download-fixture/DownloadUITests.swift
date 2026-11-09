@@ -88,6 +88,11 @@ final class DownloadUITests: XCTestCase {
             XCTAssertTrue(saveToFiles.exists, "Session removal dismissed the OS export")
         }
         saveToFiles.tap()
+        XCTContext.runActivity(named: "Immediately after the real Save to Files action") { _ in
+            let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+        }
         let save = app.buttons["Save"].firstMatch
         XCTAssertTrue(save.waitForExistence(timeout: 10))
         // Files remembers the previously selected folder for the next export.

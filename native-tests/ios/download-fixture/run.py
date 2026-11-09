@@ -406,6 +406,61 @@ def read_export(documents, name, limit=16384):
     return path.read_bytes()
 
 
+def preserve_export_observations(created, udid, out):
+    """Retain only bounded observations from the exact failed fixture's data."""
+    result = {"diagnosticOnly": True, "status": "unavailable"}
+    try:
+        if not (out / "xcodebuild.log").is_file():
+            return result
+        if any(item["log"] == str(out / "xcodebuild.log") for item in INTERRUPTED_COMMANDS):
+            result["status"] = "interrupted-test"
+            return result
+        data = Path(created["dataPath"])
+        if (not data.is_absolute() or data != data.resolve() or data.name != "data" or
+                data.parent.name.upper() != str(uuid.UUID(udid)).upper()):
+            raise RuntimeError("Invalid owned Simulator data directory")
+        container = Path(command(["xcrun", "simctl", "get_app_container", udid, BUNDLE, "data"],
+                                 out / "observation-container.log", timeout=20).strip())
+        relative = container.relative_to(data / "Containers/Data/Application")
+        if len(relative.parts) != 1 or str(uuid.UUID(relative.name)).upper() != relative.name.upper():
+            raise RuntimeError("Invalid fixture data container")
+        # Hold every directory and refuse aliases before reading this one file.
+        # No shared Simulator logs, directory search or exported file contents.
+        with ExitStack() as stack:
+            def open_at(path, flags, parent=None):
+                fd = os.open(path, flags | os.O_NOFOLLOW, dir_fd=parent)
+                stack.callback(os.close, fd)
+                return fd
+            parent = open_at(data, os.O_RDONLY | os.O_DIRECTORY)
+            for part in ("Containers", "Data", "Application", relative.name, "Documents"):
+                parent = open_at(part, os.O_RDONLY | os.O_DIRECTORY, parent)
+            fd = open_at("fixture-export-observations.json", os.O_RDONLY | os.O_NONBLOCK, parent)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16384:
+                raise RuntimeError("Unsafe fixture observations")
+            raw = os.read(fd, 16385)
+        if len(raw) > 16384:
+            raise RuntimeError("Oversized fixture observations")
+        value = json.loads(raw)
+        if (not isinstance(value, dict) or set(value) != {"diagnosticOnly", "samples"} or
+                value["diagnosticOnly"] is not True or not isinstance(value["samples"], list) or
+                not 1 <= len(value["samples"]) <= 32):
+            raise RuntimeError("Invalid fixture observations")
+        for sample in value["samples"]:
+            if (not isinstance(sample, dict) or
+                    set(sample) != {"unixSeconds", "sourceMatchesOriginal", "activityAlive", "activityPresented"} or
+                    type(sample["unixSeconds"]) not in (int, float) or not 0 < sample["unixSeconds"] < 1e11 or
+                    any(type(sample[key]) is not bool for key in ("sourceMatchesOriginal", "activityAlive", "activityPresented"))):
+                raise RuntimeError("Invalid fixture observation sample")
+        save(out / "fixture-export-observations.json", value)
+        result.update(status="retained", samples=len(value["samples"]))
+    except Exception as error:
+        # Absence or diagnostic/CLI failure never replaces the original test
+        # error. A timeout still uses command's direct-child retirement path.
+        result.update(status="unavailable", errorType=type(error).__name__)
+    return result
+
+
 def verify_exports(documents, evidence):
     expected = {"cookie.txt": COOKIE_BYTES, "blob.txt": BLOB_BYTES, "keep.txt": SENTINEL_BYTES}
     digests = {}
@@ -512,6 +567,7 @@ def main():
                 # only the exact logPath returned by our creation readback.
                 result["deviceLogs"] = preserve_device_logs(
                     created_device, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
+                result["exportObservations"] = preserve_export_observations(created_device, udid, out)
             result["testAttachments"] = export_test_attachments(out)
         finally:
             try:
