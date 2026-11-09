@@ -164,6 +164,7 @@ class EvidenceTests(unittest.TestCase):
             output = Path(directory) / "sample.log"
             def sample(args, **options):
                 self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
+                self.assertEqual(args[4:6], ["-mayDie", "-file"])
                 self.assertEqual(options["timeout"], 3)
                 Path(args[-1]).write_bytes(b"x" * 33)
                 return mock.Mock(returncode=0)

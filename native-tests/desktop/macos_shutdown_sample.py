@@ -77,7 +77,11 @@ def sample_owned(processes, child, parent, browser, guard, output):
             timed_out = False
             with diagnostic.open("wb") as stderr:
                 try:
-                    completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100", "-file", str(raw)],
+                    # -mayDie grabs symbol locations first: the teardown watchdog
+                    # can kill the sampled browser mid-run, and post-sample
+                    # symbolication of a dead huge CEF binary is what timed out.
+                    completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100",
+                                                "-mayDie", "-file", str(raw)],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                                stderr=stderr, timeout=3, check=False)
                     result["sampleExit"] = completed.returncode
