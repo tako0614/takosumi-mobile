@@ -7,6 +7,7 @@ import copy
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -285,6 +286,51 @@ class EvidenceTests(unittest.TestCase):
                                            "Personal beforeunload did not open always fail", 30)
         self.assertIn("always fail after the busy-renderer window", str(raised.exception))
         self.assertEqual(len(calls), 2)
+
+    def test_quiet_renderer_waits_for_one_frame_silent_window_then_asks_anyway(self):
+        page = mock.Mock()
+        page.process = {"profile": "profile-id"}
+        marks, events, drains = [0], [], []
+        page.cdp.mark.side_effect = lambda: marks.append(len(events)) or marks[-1]
+        page.cdp.since.side_effect = lambda mark: events[mark:]
+        page.cdp.drain.side_effect = lambda seconds: drains.append(seconds)
+
+        # No frame events at all: the first quiet window qualifies and the
+        # proof records the wait honestly.
+        observer = mock.Mock()
+        observer.proof = {}
+        runner.MacObserver.quiet_renderer(observer, page, quiet=0.05, bound=1)
+        self.assertEqual(drains, [0.05])
+        self.assertEqual(observer.proof["quietRenderer"],
+                         [{"profile": "profile-id", "quietSeconds": 0.05,
+                           "waitedSeconds": observer.proof["quietRenderer"][0]["waitedSeconds"],
+                           "arrived": True}])
+        self.assertLess(observer.proof["quietRenderer"][0]["waitedSeconds"], 0.5)
+
+        # Frame churn plus a non-frame event: only frame lifecycle counts as
+        # the storm; once it stops the next window qualifies.
+        drains.clear()
+        events.extend([{"method": "Page.frameAttached"}, {"method": "Page.domContentEventFired"}])
+        page.cdp.drain.side_effect = lambda seconds: (drains.append(seconds),
+                                                    len(drains) == 1 and events.append({"method": "Page.frameDetached"}))
+        observer.proof = {}
+        runner.MacObserver.quiet_renderer(observer, page, quiet=0.05, bound=1)
+        self.assertEqual(len(drains), 2)
+        self.assertTrue(observer.proof["quietRenderer"][0]["arrived"])
+
+        # A storm that never breaks still asks on time: the bound is
+        # honored, arrival is recorded false, and nothing raises.
+        drains.clear()
+        marks.clear()
+        marks.append(0)
+        events.clear()
+        page.cdp.since.side_effect = lambda mark: [{"method": "Page.frameAttached"}]
+        page.cdp.drain.side_effect = lambda seconds: drains.append(seconds)
+        observer.proof = {}
+        started = time.monotonic()
+        runner.MacObserver.quiet_renderer(observer, page, quiet=0.02, bound=0.15)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(observer.proof["quietRenderer"][0]["arrived"], False)
 
     def test_attach_refuses_an_unowned_or_changed_process_before_cdp(self):
         browser, guard = self.browser, self.guard

@@ -32,7 +32,7 @@ import uuid
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
-from windows_browser_observer import Cdp, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
+from windows_browser_observer import Cdp, FRAME_EVENTS, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
 from macos_shutdown_sample import same_owner, watch_shutdowns  # noqa: E402
 from macos_process_image import PinnedImage  # noqa: E402
 
@@ -225,6 +225,28 @@ class MacObserver(Observer):
                     f"{what} and the profile had already exited")
             return self.dialog(page, mark, kind, f"{what} after the busy-renderer window", 30)
 
+    def quiet_renderer(self, page, quiet=4.0, bound=30):
+        # The storm does not always break inside the dialog wait itself (run
+        # 42843941116: 179/195 frame events across both 30 s windows, native
+        # alive and guard pending the whole time). Ask for the quit only
+        # after one frame-silent window so the beforeunload task can be
+        # scheduled first — bounded, and never skipped: if the storm never
+        # breaks the request goes out on time anyway and the unchanged
+        # dialog bound still measures the real result.
+        start = time.monotonic()
+        end = start + bound
+        mark = page.cdp.mark()
+        arrived = False
+        while time.monotonic() < end:
+            page.cdp.drain(quiet)
+            if not any(event["method"] in FRAME_EVENTS for event in page.cdp.since(mark)):
+                arrived = True
+                break
+            mark = page.cdp.mark()
+        self.proof.setdefault("quietRenderer", []).append(
+            {"profile": page.process["profile"], "quietSeconds": quiet,
+             "waitedSeconds": round(time.monotonic() - start, 1), "arrived": arrived})
+
     def dialog_native_state(self, page):
         # After a failed dialog step, record whether the owned native browser
         # is even alive and the tail of its own log. Distinguishes a quit
@@ -280,6 +302,7 @@ class MacObserver(Observer):
         self.case("home-reuses-document")
         mark, other = self.beforeunload(work), personal.cdp.mark()
         self.checkpoint("request-exit")
+        self.quiet_renderer(work)
         self.system_quit(work)
         dialog = self.busy_dialog(work, mark, "beforeunload", "Work beforeunload did not open")
         personal.cdp.drain()
@@ -295,6 +318,7 @@ class MacObserver(Observer):
         mark = self.beforeunload(personal)
         with watch_shutdowns(self, [work]):
             self.checkpoint("request-partial-exit")
+            self.quiet_renderer(personal)
             self.system_quit(personal)
             dialog = self.busy_dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30)
             receipt = self.normal_receipt(work.process["guardReceipt"], "Work did not close normally before Personal")
