@@ -445,8 +445,12 @@ jobs:
                 # activity manager record kills at I level. Keep those tags and
                 # the guest's own memory view so a killed content process is
                 # proven from the dump, not inferred from the callback name.
-                timeout 10 adb -s emulator-5562 logcat -d -t 400 -v brief \
-                  ActivityManager:I ActivityTaskManager:I lowmemorykiller:I lmkd:I '*:E' \
+                # Native crashes print their tombstone to the crash buffer,
+                # not main: -b crash carries the DEBUG summary while the
+                # cleared main buffer (below, before the run) reaches the
+                # kill or crash moment, not just the cleanup.
+                timeout 10 adb -s emulator-5562 logcat -d -b main -b crash -t 2000 -v brief \
+                  ActivityManager:I ActivityTaskManager:I lowmemorykiller:I lmkd:I DEBUG:I '*:E' \
                   > "$RUNNER_TEMP/sumi-gecko-failure.log" 2>&1 || true
                 { timeout 15 adb -s emulator-5562 shell dumpsys meminfo com.takosumi.fixture.geckodownload;
                   timeout 10 adb -s emulator-5562 shell 'head -5 /proc/meminfo'; } \
@@ -502,6 +506,11 @@ jobs:
           test "$booted" = 1
           owned_device
           adb -s emulator-5562 shell input keyevent 82
+          owned_device
+          # Clear the ring buffers so a failure tail below covers the whole
+          # instrumented window: a mid-test process death once left only the
+          # post-test pkg-removed cleanup in the last 400 lines.
+          adb -s emulator-5562 logcat -c
           owned_device
           gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture connectedDebugAndroidTest
           python3 - <<'PY'
