@@ -356,6 +356,37 @@ public final class WebAppOperationTest {
         }
     }
 
+
+    // The profile buttons run select() on the main thread, and the released
+    // surface's a11y tree can outlive the swap, so neither the delivered tap
+    // nor a node match proves the displayed session changed. Read which
+    // session the GeckoView actually attached.
+    private boolean displayedIs(WebAppProbeActivity.Page expected) {
+        Handler main = new Handler(Looper.getMainLooper());
+        FutureTask<Boolean> read = new FutureTask<>(() -> activity.view.getSession() == expected.session);
+        try {
+            assertTrue("Main thread rejected the session read", main.post(read));
+            return read.get(10, TimeUnit.SECONDS);
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new AssertionError("Displayed session read unavailable", error);
+        } finally {
+            // A queued or late callback only reads identity. It must never
+            // perform delayed native input after this test has failed.
+            main.removeCallbacks(read);
+            read.cancel(false);
+        }
+    }
+
+    // The switch settles only when the expected page owns the view and the
+    // imported document node has left the active window's tree. A real leak
+    // keeps this false: the tab would still match inside the freshly
+    // attached session, so the wait times out and the capture shows it.
+    private boolean switchedWithoutTab(String context) {
+        WebAppProbeActivity.Page page = activity.pages.get(context);
+        return page != null && displayedIs(page) && anyBounds(tabName) == null;
+    }
+
     private void swipeUp(Rect viewport) {
         assertTrue(viewport.width() > 0 && viewport.height() > 0);
         long down = SystemClock.uptimeMillis();
@@ -651,6 +682,11 @@ public final class WebAppOperationTest {
         assertTrue(WebAppProbeActivity.site(uri));
 
         tap("Personal");
+        // The switch is asynchronous: Work's released surface still answers
+        // File and still lists the imported tab until its tree is reaped, so
+        // neither the tap nor enterEditor proves Personal is displayed.
+        await("Personal editor did not settle after the native switch",
+            () -> switchedWithoutTab(activity.personal), 30);
         enterEditor("Personal");
         assertNull("The imported Work document leaked to Personal", anyBounds(tabName));
         WebAppProbeActivity.Page personal = activity.pages.get(activity.personal);
@@ -693,6 +729,12 @@ public final class WebAppOperationTest {
         assertEquals(uri, work.uri);
         assertNotNull(anyBounds(tabName));
         tap("Personal");
+        await("Personal editor did not settle after the native switch",
+            () -> switchedWithoutTab(activity.personal), 30);
+        // Personal is a resident editor here, so enterEditor's File wait is
+        // also the proof its tree is live: without it, the gate can pass on
+        // the empty interregnum and assertNull would measure a vacuum.
+        enterEditor("Personal");
         assertSame(personal, activity.pages.get(activity.personal));
         assertEquals(personalDocument, personal.generation);
         assertEquals(personalUri, personal.uri);
