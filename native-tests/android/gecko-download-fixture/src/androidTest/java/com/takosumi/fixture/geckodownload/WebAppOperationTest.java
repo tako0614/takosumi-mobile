@@ -140,6 +140,30 @@ public final class WebAppOperationTest {
         } finally { root.recycle(); }
     }
 
+    // Photopea's in-page dialog chrome ignores injected Escape keys: run
+    // 42725834124 left the New Project overlay open for the whole bound after
+    // KEYCODE_ESCAPE. A user closes it through the unnamed X at the right end
+    // of its title row, so locate that row by the dialog title and return the
+    // close corner. The X itself exposes no text, description or click flag.
+    private Rect dialogClose() {
+        AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+        if (root == null) return null;
+        try {
+            // The dialog must exist in this same snapshot: after it unmounts
+            // the landing " New Project" card still contains the title text
+            // and would yield a close rect computed from unrelated content.
+            if (find(root, "Create", false, false, true, 0) == null) return null;
+            Rect win = new Rect(); root.getBoundsInScreen(win);
+            AccessibilityNodeInfo title = findAny(root, "New Project", 0);
+            if (title == null) return null;
+            try {
+                Rect t = new Rect(); title.getBoundsInScreen(t);
+                return new Rect(win.right - 32, t.centerY() - 12,
+                    win.right - 4, t.centerY() + 12);
+            } finally { if (title != root) title.recycle(); }
+        } finally { root.recycle(); }
+    }
+
     private void tap(Rect bounds) {
         tap(bounds, null);
     }
@@ -533,10 +557,11 @@ public final class WebAppOperationTest {
         // and the failure tree showed the New Project dialog). That is a
         // human-shaped miss, not a pass: when the tap produced no prompt
         // and the recognizable New Project dialog (its Create button)
-        // appeared, dismiss it like a user — Escape, never BACK into page
-        // history — re-read the now-settled action and tap once more. Any
-        // other silent miss keeps the original failure evidence; the real
-        // OS-picker oracle is unchanged.
+        // appeared, dismiss it like a user — through its title-row X, never
+        // BACK into page history — re-read the now-settled action and tap
+        // once more. Any other silent miss keeps the original failure
+        // evidence; the real OS-picker oracle is unchanged. Injected Escape
+        // does not reach this dialog chrome, so dismissal is the X tap.
         boolean[] missDismissed = {false};
         try {
             await("Open tap produced no real file prompt", () -> {
@@ -544,7 +569,6 @@ public final class WebAppOperationTest {
                 if (bounds("Create", false, false) != null) {
                     missDismissed[0] = true;
                     activity.trace("open tap opened the New Project dialog; dismissing once and retrying");
-                    key(KeyEvent.KEYCODE_ESCAPE, 0);
                     return true;
                 }
                 return false;
@@ -555,8 +579,22 @@ public final class WebAppOperationTest {
             if (activity.filePrompts == 0) throw noPrompt;
         }
         if (missDismissed[0] && activity.filePrompts == 0) {
-            await("Missed-tap New Project dialog did not dismiss",
-                () -> activity.filePrompts > 0 || bounds("Create", false, false) == null, 10);
+            int[] closeTaps = {0};
+            long[] lastCloseTap = {0};
+            await("Missed-tap New Project dialog did not dismiss", () -> {
+                if (activity.filePrompts > 0 || bounds("Create", false, false) == null) return true;
+                long now = SystemClock.elapsedRealtime();
+                if (closeTaps[0] < 3 && now - lastCloseTap[0] >= 2000) {
+                    Rect close = dialogClose();
+                    if (close != null) {
+                        closeTaps[0]++;
+                        lastCloseTap[0] = now;
+                        activity.trace("dialog close tap " + close.toShortString());
+                        tap(close);
+                    }
+                }
+                return false;
+            }, 10);
             if (activity.filePrompts == 0) {
                 tap(awaitRect("Retried open action did not settle",
                     () -> stable("open-retry", bounds(openAction, false, false)), 15), openAction);
