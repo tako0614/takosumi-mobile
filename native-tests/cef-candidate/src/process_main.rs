@@ -813,6 +813,7 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(Lifetime::new(self.id,self.key.clone(),self.bound)) }
         fn load_handler(&self) -> Option<LoadHandler> {Some(Loads::new())}
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {Some(LinkMenu::new())}
+        fn permission_handler(&self) -> Option<PermissionHandler> {Some(Permissions::new())}
         fn download_handler(&self) -> Option<DownloadHandler> {
             #[cfg(feature = "fixture-inspection")]
             if inspection() { return Some(download_observation::handler()); }
@@ -864,6 +865,28 @@ wrap_load_handler! {
                 std::fs::write(directory.join(format!("load-ready-{}.json",browser.identifier())),serde_json::to_vec(
                     &serde_json::json!({"pid":std::process::id(),"browserId":browser.identifier(),"mainFrame":true})).unwrap()).unwrap();
             }
+        }
+    }
+}
+
+wrap_permission_handler! {
+    // The browser never decides a permission itself: each request is recorded
+    // in the profile's own browser.log (stderr) while the return value leaves
+    // the Chrome runtime's own handling untouched. Whether its prompt is
+    // shown, held, or denied per platform is evidence, not policy — a real
+    // grant prompt routed to the person is a later App-owner decision.
+    struct Permissions;
+    impl PermissionHandler {
+        fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, _callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
+            eprintln!("permission: media origin={} permissions={requested_permissions:#x}", requesting_origin.map(ToString::to_string).unwrap_or_default());
+            0
+        }
+        fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, requesting_origin: Option<&CefString>, requested_permissions: u32, _callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
+            eprintln!("permission: prompt id={prompt_id} origin={} permissions={requested_permissions:#x}", requesting_origin.map(ToString::to_string).unwrap_or_default());
+            0
+        }
+        fn on_dismiss_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, result: PermissionRequestResult) {
+            eprintln!("permission: dismissed id={prompt_id} result={result:?}");
         }
     }
 }

@@ -305,6 +305,9 @@ class MacObserver(Observer):
                 and self.sample(personal) == expected[1], "Partial quit did not retain the same Personal document")
         self.remove_beforeunload(personal)
         self.case("quit-partial-order", {"workReceipt": receipt, "cancelledBy": cancelled_by})
+        # The prompt (if the runtime shows one) stays pending through the final
+        # quit below: its dismissal is itself permission-handler evidence.
+        self.probe_permission(personal)
         with watch_shutdowns(self, [personal]):
             self.checkpoint("request-final-exit")
             self.finish_final_quit([personal])

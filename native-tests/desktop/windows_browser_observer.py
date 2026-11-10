@@ -1116,6 +1116,42 @@ class Observer:
             return []
         return [line[:300] for line in text.splitlines() if RAISE_REFUSED in line]
 
+    def probe_permission(self, page):
+        """What a page's own notification request actually does on this route.
+        The request runs with user activation (evaluate's userGesture); its
+        resolution — denied, granted, or still pending after the bound — is
+        recorded, never decided. Whether Chromium asked the browser process's
+        permission handler, and what its own runtime did with it, is read back
+        from the profile's browser.log, where the handler only records."""
+        self.step("notification permission probe", page)
+        key = json.dumps("__sumiPermissionProbe")
+        try:
+            page.evaluate(
+                f"(()=>{{const g=globalThis[{key}]={{result:null,error:null}};"
+                f"g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));return true}})()",
+                True)
+        except Failure as error:
+            # A missing Notification API or a synchronous refusal is the same
+            # evidence class as an async denial; it is not a fixture failure.
+            entry = {"permission": None, "result": None, "error": str(error)[:300],
+                     "profile": page.process["profile"]}
+            self.proof["permissionProbe"] = entry
+            self.case("permission-probe", entry)
+            return entry
+        deadline = time.monotonic() + 10
+        state = {}
+        while time.monotonic() < deadline:
+            state = page.evaluate(
+                f"(()=>({{permission:Notification.permission,result:globalThis[{key}].result,"
+                f"error:globalThis[{key}].error,activation:navigator.userActivation.isActive}}))()", True)
+            if state["result"] or state["error"]:
+                break
+            time.sleep(0.2)
+        entry = dict(state, profile=page.process["profile"])
+        self.proof["permissionProbe"] = entry
+        self.case("permission-probe", entry)
+        return entry
+
     def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
         return page.cdp.wait_event(
             lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
@@ -1607,6 +1643,9 @@ class Observer:
                           "delete window.__sumiBeforeUnload;return true})()")
         self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
                                          "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
+        # The prompt (if the runtime shows one) stays pending through the
+        # App's close below: its dismissal is itself permission evidence.
+        self.probe_permission(personal)
         self.step("Personal final exit", personal)
         if not self.real:
             # Personal's own popup stays open for the final quit: its native
