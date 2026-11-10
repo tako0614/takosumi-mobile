@@ -1,6 +1,7 @@
 package com.takosumi.fixture.geckodownload;
 
 import android.app.Instrumentation;
+import android.content.Context;
 import android.content.ContentValues;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -17,6 +18,8 @@ import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+import android.view.inputmethod.InputMethodManager;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -271,7 +274,7 @@ public final class WebAppOperationTest {
                 try {
                     if (systemPicker) assertTrue("Owned picker touch stream could not be cancelled",
                         instrumentation.getUiAutomation().injectInputEvent(cancel, true));
-                    else instrumentation.sendPointerSync(cancel);
+                    else sendOwnUid(cancel);
                 } catch (RuntimeException | Error cancellation) { failure.addSuppressed(cancellation); }
                 finally { cancel.recycle(); }
             }
@@ -293,6 +296,8 @@ public final class WebAppOperationTest {
                 String detail = String.valueOf(refused.getMessage()) + " " +
                     (refused.getCause() == null ? "" : String.valueOf(refused.getCause().getMessage()));
                 if (attempt >= 4 || !detail.contains("not directed at a window owned by uid")) {
+                    if (activity != null) activity.trace("own-uid injection refused; covering windows: "
+                        + coveringWindows(event));
                     if (refused instanceof RuntimeException) throw (RuntimeException) refused;
                     throw new IllegalStateException(refused);
                 }
@@ -301,6 +306,44 @@ public final class WebAppOperationTest {
                 SystemClock.sleep(200);
             }
         }
+    }
+
+    // Interactive windows from other uids containing the point: a
+    // self-targeted event is refused while one sits on top. Naming the
+    // surface (2 = input method, system bars, sheets) lets the next refusal
+    // classify itself instead of guessing at a transient.
+    private String coveringWindows(MotionEvent event) {
+        StringBuilder names = new StringBuilder();
+        try {
+            for (AccessibilityWindowInfo window : instrumentation.getUiAutomation().getWindows()) {
+                if (window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                Rect area = new Rect();
+                window.getBoundsInScreen(area);
+                if (area.contains((int) event.getX(), (int) event.getY()))
+                    names.append(names.length() == 0 ? "" : ", ").append("type=")
+                        .append(window.getType()).append('@').append(area.toShortString());
+            }
+        } catch (RuntimeException unavailable) { /* evidence only */ }
+        return names.toString();
+    }
+
+    // The soft keyboard is a separate-uid window: while it covers a target,
+    // self-targeted events are refused for as long as it stays open — no
+    // retry bound helps. A real user closes it to reach the dialog; hide it
+    // only when an input field is actually accepting text, then let the
+    // caller's settled-bounds await measure the reflowed target.
+    private void dismissCoveringIme(String what) {
+        if (activity == null) return;
+        final boolean[] dismissed = new boolean[1];
+        instrumentation.runOnMainSync(() -> {
+            InputMethodManager imm =
+                (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null && imm.isAcceptingText() && activity.getWindow() != null) {
+                imm.hideSoftInputFromWindow(activity.getWindow().getDecorView().getWindowToken(), 0);
+                dismissed[0] = true;
+            }
+        });
+        if (dismissed[0]) activity.trace("dismissed the soft input covering " + what);
     }
 
     private MotionEvent touch(long down, int action, Rect bounds) {
@@ -735,6 +778,12 @@ public final class WebAppOperationTest {
         tap(awaitRect("Photopea PNG export item did not open or settle",
             () -> stable("export-png", bounds("PNG", false, false)), 15));
         await("Actual Photopea Save for web dialog did not open", () -> bounds("Save for web", false, false) != null, 20);
+        // The dialog's number fields summon the soft keyboard — a
+        // foreign-uid window over the lower half that swallowed this export
+        // tap under both earlier signatures. A user closes it first; the
+        // settled-bounds await below then samples the reflowed button, so
+        // hiding now never lands a stale tap.
+        dismissCoveringIme("Save for web");
         // A settled Save rect is still not proof of a hit: the dialog can
         // still be expanding (the preview paints late), so the delivered
         // position can predate the button's final row — the missed tap once
