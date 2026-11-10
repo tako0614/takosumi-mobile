@@ -10,6 +10,8 @@
     "app-screen:allow-capabilities",
     "app-screen:allow-clear-profile",
     "app-screen:allow-recover-profile",
+    "app-screen:allow-pending-permissions",
+    "app-screen:allow-resolve-permission",
     "core:default",
     "core:event:default",
     "core:path:default",

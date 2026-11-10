@@ -67,7 +67,14 @@ test("the app-screen plugin's commands are granted to the shell's capability onl
   expect(granting.map((capability) => capability.identifier).sort()).toEqual(["default", "mobile"]);
   expect(granting.find((capability) => capability.identifier === "default")?.permissions.filter(
     (permission) => typeof permission === "string" && permission.startsWith("app-screen:"),
-  )).toEqual(["app-screen:allow-open", "app-screen:allow-capabilities", "app-screen:allow-clear-profile", "app-screen:allow-recover-profile"]);
+  )).toEqual([
+    "app-screen:allow-open",
+    "app-screen:allow-capabilities",
+    "app-screen:allow-clear-profile",
+    "app-screen:allow-recover-profile",
+    "app-screen:allow-pending-permissions",
+    "app-screen:allow-resolve-permission",
+  ]);
   const permissions = await Bun.file(
     new URL("plugins/app-screen/permissions/default.toml", root),
   ).text();
@@ -82,6 +89,17 @@ test("the app-screen plugin's commands are granted to the shell's capability onl
   expect(permissions).not.toContain('"allow-recover-profile"');
   expect(granting.find((capability) => capability.identifier === "mobile")?.permissions)
     .not.toContain("app-screen:allow-recover-profile");
+  // Held site permission prompts belong to the desktop browser, never the
+  // mobile default set; each trusted shell grants them explicitly.
+  for (const command of ["pending_permissions", "resolve_permission"]) {
+    expect({ command, built: build.includes(`"${command}"`) }).toEqual({
+      command,
+      built: true,
+    });
+    expect(permissions).not.toContain(`"allow-${command.replaceAll("_", "-")}"`);
+    expect(granting.find((capability) => capability.identifier === "mobile")?.permissions)
+      .not.toContain(`app-screen:allow-${command.replaceAll("_", "-")}`);
+  }
   for (const command of [
     "capabilities",
     "open",

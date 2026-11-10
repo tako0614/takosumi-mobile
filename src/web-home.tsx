@@ -1,13 +1,20 @@
-import { createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import {
   CONNECTIONS_KEY, connectionKey, loadWebConnections, newWebConnection, type WebConnection,
 } from "./web-connections.ts";
 import { BrowserRecoveryRequired } from "./web-profile-recovery.ts";
+import {
+  permissionLabels,
+  type PendingPermission,
+  type PermissionAnswer,
+  type WebPermissionPrompts,
+} from "./web-permissions.ts";
 
 export function WebHome(props: {
   readonly open: (connection: WebConnection) => Promise<void>;
   readonly clearData?: (connection: WebConnection) => Promise<void>;
   readonly recover?: (connection: WebConnection, ticket: BrowserRecoveryRequired) => Promise<void>;
+  readonly permissionPrompts?: WebPermissionPrompts;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly allowLegacyMobile?: boolean;
 }) {
@@ -21,6 +28,30 @@ export function WebHome(props: {
   const [clearing, setClearing] = createSignal(false);
   const [status, setStatus] = createSignal("");
   const [recovery, setRecovery] = createSignal<{ connection: WebConnection; ticket: BrowserRecoveryRequired }>();
+  const [pendingPermissions, setPendingPermissions] = createSignal<readonly PendingPermission[]>([]);
+  const [answering, setAnswering] = createSignal<string>();
+  createEffect(() => {
+    const prompts = props.permissionPrompts;
+    if (!prompts) {
+      setPendingPermissions([]);
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void prompts.list()
+      .then((list) => {
+        if (!disposed) setPendingPermissions(list);
+      })
+      .catch(() => {});
+    void prompts.watch(setPendingPermissions).then((release) => {
+      if (disposed) release();
+      else unlisten = release;
+    });
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
+  });
   const busy = () => Boolean(opening()) || clearing();
   const locked = () => busy() || clearCandidate() !== undefined;
   try {
@@ -119,6 +150,33 @@ export function WebHome(props: {
     }
   }
 
+  async function answer(prompt: PendingPermission, decision: PermissionAnswer) {
+    const prompts = props.permissionPrompts;
+    if (!prompts || answering() !== undefined) return;
+    setAnswering(`${prompt.profile}:${prompt.promptId}`);
+    setError("");
+    try {
+      setPendingPermissions(await prompts.answer(prompt, decision));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "許可設定を登録できませんでした。");
+    } finally {
+      setAnswering(undefined);
+    }
+  }
+
+  function connectionNameOf(prompt: PendingPermission): string {
+    return connections().find((item) => item.profile === prompt.profile)?.name ??
+      "この接続先";
+  }
+
+  function originHost(origin: string): string {
+    try {
+      return new URL(origin).host;
+    } catch {
+      return origin;
+    }
+  }
+
   return (
     <main class="web-home">
       <header class="web-heading">
@@ -181,6 +239,25 @@ export function WebHome(props: {
           <button class="web-primary" type="submit" disabled={locked()}>保存して開く</button>
         </form>
       </section>
+      <Show when={pendingPermissions().length}>
+        <section aria-labelledby="permissions-heading">
+          <h2 id="permissions-heading">アクセスの許可</h2>
+          <For each={pendingPermissions()}>{(prompt) => (
+            <section class="web-clear"
+              aria-label={`${originHost(prompt.origin)}からのアクセスの要求`}>
+              <h3>{originHost(prompt.origin)}が{permissionLabels(prompt.permissions).join("・")}を求めています</h3>
+              <p>接続先「{connectionNameOf(prompt)}」で開いているサイトだけに適用されます。</p>
+              <button type="button" disabled={answering() !== undefined}
+                onClick={() => void answer(prompt, "deny")}>許可しない</button>
+              <button type="button" disabled={answering() !== undefined}
+                onClick={() => void answer(prompt, "allow")}>
+                {answering() === `${prompt.profile}:${prompt.promptId}`
+                  ? "登録しています…" : "許可する"}
+              </button>
+            </section>
+          )}</For>
+        </section>
+      </Show>
       <Show when={error()}><p class="web-error" role="alert">{error()}</p></Show>
       <Show when={props.recover && recovery()}>{(candidate) => (
         <section aria-label="ブラウザの復帰">

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
-use crate::{is_isolated_profile, Error, OpenRequest, Result};
+use crate::{is_isolated_profile, Error, OpenRequest, PermissionDecision, PermissionKind, Result};
 
 pub const MAX_PACKET_BYTES: usize = 64 * 1024;
 
@@ -174,24 +174,6 @@ pub enum Reply {
     },
     /// The held callback was resolved with the App's decision.
     PermissionResolved { id: u64 },
-}
-
-/// Which runtime callback a permission prompt is holding.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionKind {
-    /// A Chrome permission prompt (`on_show_permission_prompt`).
-    Prompt,
-    /// A camera/microphone media access request.
-    Media,
-}
-
-/// The App's answer to a held permission prompt.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionDecision {
-    Allow,
-    Deny,
 }
 
 /// A link the person may open outside the App: an absolute http(s) URL in

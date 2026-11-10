@@ -11,10 +11,10 @@ use super::{failure, private_directory, process_setup as setup};
 use crate::browser_process::write_until;
 use crate::{
     browser_process::{
-        external_link, read_packet, PermissionDecision, PermissionKind, Reply, Request,
-        MAX_PACKET_BYTES,
+        external_link, read_packet, Reply, Request, MAX_PACKET_BYTES,
     },
-    Error, OpenRequest, Result,
+    Error, OpenRequest, PendingPermission, PermissionDecision, PermissionKind,
+    ResolvePermissionRequest, Result,
 };
 use std::{
     collections::BTreeMap,
@@ -34,7 +34,7 @@ use std::{
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     process::ChildStdin,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Clone)]
 pub(super) struct Backend(Arc<Mutex<State>>, Arc<ExitPhase>);
@@ -70,14 +70,15 @@ struct SpawnOptions {
     /// each dismissal of one still held) exactly once. Whoever opts in owns
     /// answering every request — an ignored event leaves its prompt held.
     on_permission_event: Option<Box<dyn Fn(PermissionEvent) + Send>>,
+    /// Runs once when this Process is dropped, on whichever thread drops it —
+    /// callers removing a Process already hold the state lock, so the closure
+    /// must only touch state of its own (held-prompt hygiene for its profile).
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 /// A site permission prompt the profile's browser is holding for the App's
 /// answer, or the end of one (dismissed or superseded before any answer).
 #[derive(Debug)]
-// The App's prompt surface reads these fields once it ships; the adapter's
-// protocol test reads them meanwhile.
-#[allow(dead_code)]
-enum PermissionEvent {
+pub(super) enum PermissionEvent {
     Requested {
         prompt_id: u64,
         origin: String,
@@ -88,6 +89,62 @@ enum PermissionEvent {
         prompt_id: u64,
     },
 }
+
+/// Every prompt the App is currently holding, behind its own lock — never
+/// inside the backend state lock. The process reader dispatches events while
+/// a command holds that lock, so this map must lock independently and
+/// briefly.
+#[derive(Clone, Default)]
+pub(super) struct PermissionPrompts(
+    std::sync::Arc<Mutex<BTreeMap<(String, u64), PendingPermission>>>,
+);
+
+impl PermissionPrompts {
+    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, u64), PendingPermission>> {
+        // A poisoned map still holds every recorded prompt; recovering it is
+        // strictly better than silently dropping a held-prompt event.
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    fn note(&self, profile: &str, event: PermissionEvent) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        match event {
+            PermissionEvent::Requested {
+                prompt_id,
+                origin,
+                kind,
+                permissions,
+            } => {
+                prompts.insert(
+                    (profile.to_owned(), prompt_id),
+                    PendingPermission {
+                        profile: profile.to_owned(),
+                        prompt_id,
+                        origin,
+                        kind,
+                        permissions,
+                    },
+                );
+            }
+            PermissionEvent::Dismissed { prompt_id } => {
+                prompts.remove(&(profile.to_owned(), prompt_id));
+            }
+        }
+        prompts.values().cloned().collect()
+    }
+    fn drop(&self, profile: &str, prompt_id: u64) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        prompts.remove(&(profile.to_owned(), prompt_id));
+        prompts.values().cloned().collect()
+    }
+    fn drop_profile(&self, profile: &str) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        prompts.retain(|(owner, _), _| owner != profile);
+        prompts.values().cloned().collect()
+    }
+    pub(super) fn list(&self) -> Vec<PendingPermission> {
+        self.locked().values().cloned().collect()
+    }
+}
 // Standalone native/protocol fixtures have no Tauri App exit owner.
 impl From<bool> for SpawnOptions {
     fn from(no_sandbox: bool) -> Self {
@@ -95,6 +152,7 @@ impl From<bool> for SpawnOptions {
             no_sandbox,
             on_quit: None,
             on_permission_event: None,
+            on_drop: None,
         }
     }
 }
@@ -212,6 +270,9 @@ struct Process {
     /// (`None` before any reopen); reported by `status`.
     #[cfg(windows)]
     foreground_grant: Option<bool>,
+    /// Profile-scoped cleanup the owner registered at spawn (held-prompt
+    /// hygiene), run once at the top of drop.
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 struct ReaderFinished(Arc<AtomicBool>);
 impl Drop for ReaderFinished {
@@ -347,6 +408,7 @@ pub(super) fn install<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<()> {
                 Arc::new(Mutex::new(state)),
                 Arc::new(ExitPhase::default()),
             ));
+            app.manage(PermissionPrompts::default());
         }
         Err(error) => {
             let reason = format!("The desktop browser is unavailable: {error}");
@@ -521,6 +583,31 @@ fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Re
         #[cfg(windows)]
         setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
         let runtime = free_runtime(&state.runtime_root)?;
+        // Opt in only when the App's prompt surface exists: a registered map
+        // both holds the answer path and advertises each held prompt. The
+        // reader dispatch cannot take the state lock, so the map is its own
+        // mutex; the drop hook retires the profile's entries with it.
+        let (on_permission_event, on_drop) = match app.try_state::<PermissionPrompts>() {
+            Some(prompts) => {
+                let prompts = prompts.inner().clone();
+                let note_profile = profile.clone();
+                let note_app = app.clone();
+                let note_prompts = prompts.clone();
+                let on_event = Box::new(move |event| {
+                    let list = note_prompts.note(&note_profile, event);
+                    let _ = note_app.emit("app-screen:permission-prompts", &list);
+                }) as Box<dyn Fn(PermissionEvent) + Send>;
+                let drop_profile = profile.clone();
+                let drop_app = app.clone();
+                let on_drop = Box::new(move || {
+                    let list = prompts.drop_profile(&drop_profile);
+                    let _ = drop_app.emit("app-screen:permission-prompts", &list);
+                }) as Box<dyn FnOnce() + Send>;
+                (Some(on_event), Some(on_drop))
+            }
+            // Without the surface the runtime's own prompt stays untouched.
+            None => (None, None),
+        };
         let mut process = Process::spawn(
             state.program.clone(),
             state.guard.clone(),
@@ -535,9 +622,8 @@ fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Re
                     // latches now and drains on a separate blocking worker.
                     request_exit(&app, 0);
                 })),
-                // The App's own permission-prompt surface is a later unit;
-                // until it can answer, the runtime's own prompt stays.
-                on_permission_event: None,
+                on_permission_event,
+                on_drop,
             },
         )?;
         // Retain ownership before waiting for the native creation reply.
@@ -814,6 +900,50 @@ pub(super) async fn clear_profile(
     .map_err(failure)?
 }
 
+/// The App answers one held site permission prompt. `Ok` carries the prompts
+/// still held afterwards: the browser answered, so the entry is retired
+/// whether it applied the decision or reported the prompt already gone. An
+/// `Err` keeps the entry — the answer may not have reached the callback.
+pub(super) async fn resolve_permission(
+    app: AppHandle,
+    payload: ResolvePermissionRequest,
+) -> Result<Vec<PendingPermission>> {
+    payload.validate()?;
+    let backend = app.state::<Backend>().inner().clone();
+    let prompts = app
+        .try_state::<PermissionPrompts>()
+        .ok_or(Error::InvalidRequest(
+            "Browser permission prompts are unavailable on this backend.",
+        ))?
+        .inner()
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let mut state = backend.0.lock().map_err(failure)?;
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let process = state
+            .processes
+            .get_mut(&payload.profile)
+            .ok_or(Error::InvalidRequest(
+                "This connection has no open browser to answer.",
+            ))?;
+        process.resolve_permission(
+            payload.prompt_id,
+            payload.decision,
+            std::time::Instant::now() + Duration::from_secs(15),
+        )?;
+        let list = prompts.drop(&payload.profile, payload.prompt_id);
+        let _ = app.emit("app-screen:permission-prompts", &list);
+        Ok(list)
+    })
+    .await
+    .map_err(failure)?
+}
+
 /// Drop this profile's tracked browser once it has ended normally. One whose
 /// last window was just closed is still exiting for a moment, so wait within
 /// the bounded deadline before refusing it as still open; an abnormal end
@@ -965,6 +1095,7 @@ impl Process {
             no_sandbox,
             on_quit,
             on_permission_event,
+            on_drop,
         } = options.into();
         #[cfg(target_os = "macos")]
         let executable = macos::Executable::open(&program).map_err(failure)?;
@@ -1225,6 +1356,7 @@ impl Process {
             stop,
             #[cfg(windows)]
             foreground_grant: None,
+            on_drop,
         };
         #[cfg(unix)]
         nonblocking(process.input.as_ref().unwrap())?;
@@ -1521,16 +1653,16 @@ impl Process {
     /// event's `prompt_id`). `PermissionResolved` confirms the runtime
     /// applied it; an outright refusal (`Reply::Error`) was answered, so it
     /// leaves the profile usable — anything else leaves it in doubt, as an
-    /// unconfirmed create or close does.
-    // Only the prompt surface the App ships later calls this; the adapter's
-    // own protocol test exercises it meanwhile.
-    #[allow(dead_code)]
-    fn resolve_permission(
+    /// unconfirmed create or close does. The bool says the held prompt is
+    /// over on the browser side: `true` resolved, `false` refused because
+    /// it was already gone — either way the App retires its entry. An `Err`
+    /// means the answer may not have arrived, so the entry stays.
+    pub(super) fn resolve_permission(
         &mut self,
         prompt_id: u64,
         decision: PermissionDecision,
         deadline: std::time::Instant,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.uncertain {
             return Err(Error::InvalidRequest(
                 "Previous browser command is incomplete; profile data is retained.",
@@ -1553,8 +1685,8 @@ impl Process {
             return Err(error);
         }
         match self.receive(id, deadline) {
-            Ok(Reply::PermissionResolved { .. }) => Ok(()),
-            Err(Wait::Rejected(message)) => Err(failure(message)),
+            Ok(Reply::PermissionResolved { .. }) => Ok(true),
+            Err(Wait::Rejected(_)) => Ok(false),
             Ok(_) => Err(Error::InvalidRequest(
                 "Browser permission reply was not confirmed.",
             )),
@@ -3001,6 +3133,7 @@ sys.stdin.read()' "$1"
                     observed.fetch_add(1, Ordering::SeqCst);
                 })),
                 on_permission_event: None,
+                on_drop: None,
             },
         )
         .unwrap();
@@ -3065,6 +3198,7 @@ sys.stdin.read()' "$1"
                     no_sandbox: true,
                     on_quit: foreign.then_some(callback),
                     on_permission_event: None,
+                    on_drop: None,
                 },
             )
             .unwrap();
@@ -3117,6 +3251,7 @@ sys.stdin.read()' "$1"
                 on_permission_event: Some(Box::new(move |event| {
                     captured.lock().unwrap().push(event);
                 })),
+                on_drop: None,
             },
         )
         .unwrap();
@@ -3159,6 +3294,77 @@ sys.stdin.read()' "$1"
             },
             "https://excalidraw.com"
         );
+    }
+    #[test]
+    fn permission_prompts_track_and_retire_their_entries() {
+        // The App-side map: requests add, dismissals and answers retire a
+        // single (profile, prompt) pair, and a dropped process retires every
+        // prompt its profile still held.
+        let prompts = PermissionPrompts::default();
+        let requested = |prompt_id: u64| PermissionEvent::Requested {
+            prompt_id,
+            origin: "https://photopea.com".to_owned(),
+            kind: PermissionKind::Prompt,
+            permissions: 8,
+        };
+        assert!(prompts.list().is_empty());
+        assert_eq!(prompts.note("p", requested(7)).len(), 1);
+        assert_eq!(prompts.note("p", requested(9)).len(), 2);
+        assert_eq!(prompts.note("q", requested(3)).len(), 3);
+        assert_eq!(
+            prompts
+                .note("p", PermissionEvent::Dismissed { prompt_id: 7 })
+                .len(),
+            2
+        );
+        assert_eq!(prompts.drop("p", 7).len(), 2);
+        let list = prompts.drop("p", 9);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].profile, "q");
+        assert!(prompts.drop_profile("q").is_empty());
+    }
+    #[test]
+    fn resolve_permission_accepts_a_prompt_the_browser_already_dropped() {
+        // The held prompt ended browser-side before the App's answer: the
+        // runtime refuses the resolve, which the App reads as answered — the
+        // entry is stale and retires, never an uncertainty.
+        let root =
+            std::env::temp_dir().join(format!("sumi-permission-stale-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "22222222-2222-4222-8222-222222222222";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,sys\nline=json.loads(sys.stdin.readline())\nassert line['operation']=='resolvePermission',line\nprint(json.dumps({{'event':'error','id':line['id'],'message':'prompt is no longer held'}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nassert last['operation']=='shutdown',last\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://photopea.com"),
+            "url":"https://photopea.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: None,
+                on_permission_event: None,
+                on_drop: None,
+            },
+        )
+        .unwrap();
+        let resolved = process.resolve_permission(
+            7,
+            PermissionDecision::Deny,
+            std::time::Instant::now() + Duration::from_secs(20),
+        );
+        let stopped = process.shutdown();
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(resolved, Ok(false)), "{resolved:?}");
+        assert!(matches!(stopped, Ok(true)), "{stopped:?}");
     }
     #[test]
     fn external_link_requests_never_reach_command_replies() {
@@ -4051,6 +4257,11 @@ impl Drop for Unowned {
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        // Held-prompt hygiene runs first: its entries are dead the moment
+        // this Process is, and must not wait on the drain below.
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
         self.input.take();
         if matches!(self.child.try_wait(), Ok(None)) {
             // A live, unreaped direct Child cannot have its PID recycled.

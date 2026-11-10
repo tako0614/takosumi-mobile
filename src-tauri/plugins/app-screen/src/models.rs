@@ -505,6 +505,8 @@ pub struct CapabilitiesResponse {
     pub clear_profile: bool,
     #[serde(default)]
     pub recover_profile: bool,
+    #[serde(default)]
+    pub permission_prompts: bool,
 }
 
 /// A separate user-confirmed restart of one ended browser generation. The
@@ -576,6 +578,60 @@ impl ClearProfileRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ClearProfileResponse {
     pub cleared: bool,
+}
+
+/// Which runtime callback a held permission prompt is waiting on. Shared by
+/// the browser-process protocol and the App's prompt surface.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionKind {
+    /// A Chrome permission prompt (`on_show_permission_prompt`).
+    Prompt,
+    /// A camera/microphone media access request.
+    Media,
+}
+
+/// The App's answer to a held permission prompt.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+/// One site permission prompt the profile's browser is holding for the
+/// App's answer. `prompt_id` is only unique inside its profile; the pair is
+/// the App-side identifier.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPermission {
+    pub profile: String,
+    pub prompt_id: u64,
+    pub origin: String,
+    pub kind: PermissionKind,
+    pub permissions: u32,
+}
+
+/// The App's answer to one held prompt. The decision reaches the browser's
+/// held callback; a prompt already gone on the browser side is retired
+/// without one.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvePermissionRequest {
+    pub profile: String,
+    pub prompt_id: u64,
+    pub decision: PermissionDecision,
+}
+
+impl ResolvePermissionRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !is_isolated_profile(&self.profile) || self.prompt_id == 0 {
+            return Err(crate::Error::InvalidRequest(
+                "A browser permission answer needs its held prompt.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
