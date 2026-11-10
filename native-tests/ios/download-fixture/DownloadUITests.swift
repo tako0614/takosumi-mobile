@@ -45,7 +45,13 @@ final class DownloadUITests: XCTestCase {
             XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed)
         }
         let link = app.webViews.links[name].firstMatch
-        XCTAssertTrue(link.waitForExistence(timeout: 15), name)
+        // The wait's own verdict never changes; on a painted page that still
+        // misses its link, the counts name which mechanism actually failed:
+        // an extra full-screen window, a second live webview, or a webview
+        // whose web-content accessibility never arrived (links stays 0 while
+        // the native bar and scroll bars still enumerate).
+        XCTAssertTrue(link.waitForExistence(timeout: 15),
+                      "\(name); windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count)")
         link.tap()
     }
 
