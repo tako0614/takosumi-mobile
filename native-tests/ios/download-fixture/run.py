@@ -591,6 +591,11 @@ def main():
                 # harness's trust_trace contract keeps 60s either way.
                 (out / "trust-stalled.txt").write_text(
                     f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
+                # Two back-to-back attempts give the service only the attempt
+                # bound itself; the observed stall pair (run 42843941116:
+                # two empty 60 s hangs right after a 287 s reboot) needed real
+                # settle time between them. Bounded, recorded, still one retry.
+                time.sleep(30)
                 command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
                         out / "trust-retry.log", trust_trace=True)
                 result["simulator"]["trustRetry"] = "stalled-retried"
