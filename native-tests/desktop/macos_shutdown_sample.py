@@ -62,6 +62,39 @@ def retain_bounded(source, output, limit):
     return {"bytes": min(len(data), limit), "truncated": len(data) > limit}
 
 
+def capture_state(child, output):
+    """Kernel-side state for the owned PID: process row, thread rows, open FDs.
+
+    Unlike sample these reads never wait on the target: when the wedged
+    browser cannot be symbolicated at all, they still name the subsystem it
+    was holding (thread states, its live sockets/files). Best effort only;
+    each probe records its own exit and changes no verdict.
+    """
+    record = {}
+    chunks = []
+    for name, argv, bound in (
+        ("ps", ["/bin/ps", "-o", "pid,ppid,pgid,stat,etime,time,comm", "-p", str(child["pid"])], 10),
+        ("threads", ["/bin/ps", "-M", "-p", str(child["pid"])], 10),
+        ("files", ["/usr/sbin/lsof", "-nP", "-p", str(child["pid"])], 15),
+    ):
+        try:
+            completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, timeout=bound, check=False)
+            record[name] = {"exit": completed.returncode}
+            chunks.append(b"$ " + " ".join(argv).encode() + b"\n" + completed.stdout[:262144])
+        except subprocess.TimeoutExpired:
+            record[name] = {"errorType": "TimeoutExpired"}
+        except Exception as error:
+            record[name] = {"errorType": type(error).__name__}
+    try:
+        with output.open("xb") as stream:
+            stream.write(b"\n".join(chunks)[:LIMIT])
+        record["stateBytes"] = output.stat().st_size
+    except OSError as error:
+        record["stateWriteError"] = type(error).__name__
+    return record
+
+
 def sample_owned(processes, child, parent, browser, guard, output):
     """One one-second sample; discard output if process identity changed meanwhile."""
     result = {"pid": child["pid"], "start": child["start"], "diagnosticOnly": True}
@@ -69,6 +102,7 @@ def sample_owned(processes, child, parent, browser, guard, output):
         if not same_owner(processes, child, parent, browser, guard):
             return dict(result, status="identity-changed-before")
         output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        result["state"] = capture_state(child, output.with_suffix(".state.log"))
         # sample owns only its new temporary output. A timeout kills/reaps
         # that subprocess through subprocess.run, never the sampled browser.
         with tempfile.TemporaryDirectory(prefix="sample-", dir=output.parent) as scratch:
