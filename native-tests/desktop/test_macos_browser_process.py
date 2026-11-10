@@ -143,16 +143,21 @@ class EvidenceTests(unittest.TestCase):
                     processes.image.side_effect = lambda pid: (Path("/foreign") if mutation == "image"
                                                                 else {11: guard, 12: browser}[pid])
                     def sample(args, **options):
-                        Path(args[-1]).write_text("untrusted old process sample")
-                        facts[12] = dict(child, start=102)
-                        return mock.Mock(returncode=0)
+                        # Only the sampler itself is the sampled-process probe;
+                        # kernel-side state probes run first under the same
+                        # identity gate and must not touch args[-1] as a file.
+                        if args[0] == "/usr/bin/sample":
+                            Path(args[-1]).write_text("untrusted old process sample")
+                            facts[12] = dict(child, start=102)
+                        return mock.Mock(returncode=0, stdout=b"")
                     output = Path(directory) / f"{mutation}.log"
                     with mock.patch.object(sampler.subprocess, "run", side_effect=sample) as command:
                         result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
                     self.assertEqual(result["status"], f"identity-changed-{'after' if mutation == 'after' else 'before'}")
                     self.assertFalse(output.exists())
                     self.assertFalse(output.with_suffix(".stderr.log").exists())
-                    self.assertEqual(command.call_count, int(mutation == "after"))
+                    self.assertEqual(output.with_suffix(".state.log").exists(), mutation == "after")
+                    self.assertEqual(command.call_count, 4 if mutation == "after" else 0)
 
     def test_stack_sample_bounds_output_and_uses_owned_subprocess_timeout(self):
         child, parent = {"pid": 12, "parent": 11, "start": 101}, {"pid": 11, "start": 100}
@@ -163,6 +168,8 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="m3-sample-bounds-") as directory:
             output = Path(directory) / "sample.log"
             def sample(args, **options):
+                if args[0] != "/usr/bin/sample":
+                    return mock.Mock(returncode=0, stdout=b"")
                 self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
                 self.assertEqual(args[4:6], ["-mayDie", "-file"])
                 self.assertEqual(options["timeout"], 7)
@@ -186,6 +193,8 @@ class EvidenceTests(unittest.TestCase):
                 with self.subTest(changed_identity=changed):
                     output = Path(directory) / f"sample-{changed}.log"
                     def sample(args, **options):
+                        if args[0] != "/usr/bin/sample":
+                            return mock.Mock(returncode=0, stdout=b"")
                         self.assertEqual(options["timeout"], 7)
                         Path(args[-1]).write_bytes(b"s" * 33)
                         options["stderr"].write(b"e" * 17)
