@@ -238,6 +238,54 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(runner.Failure):
             runner.normal_receipt({"rootExit": 0, "complete": True})
 
+    def test_busy_dialog_retries_only_while_the_profile_still_runs(self):
+        receipt = self.root / "guard.json"
+        page = mock.Mock()
+        page.process = {"guardReceipt": str(receipt)}
+        calls = []
+
+        def dialog(page_arg, mark, kind, what, bound=runner.SETTLE_WAIT):
+            calls.append((page_arg, mark, kind, what, bound))
+            if "always fail" in what:
+                raise runner.Failure(what)
+            if len(calls) == 1:
+                raise runner.Failure("Personal beforeunload did not open")
+            return {"what": what}
+
+        # The real staticmethod reads the receipt path: a missing file means
+        # the guard has not ended, so the quit is still pending and the same
+        # mark (events arriving in the inter-wait gap are not missed) gets one
+        # more bounded window.
+        observer = mock.Mock()
+        observer.dialog.side_effect = dialog
+        observer.guard_ended = runner.MacObserver.guard_ended
+        result = runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                                "Personal beforeunload did not open", 30)
+        self.assertEqual(result, {"what": "Personal beforeunload did not open after the busy-renderer window"})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], (page, "mark", "beforeunload",
+                                    "Personal beforeunload did not open after the busy-renderer window", 30))
+
+        # A parseable receipt means the profile exited without ever opening
+        # the dialog: the quit skipped it, so there is no retry to hide that.
+        receipt.write_text("{}")
+        calls.clear()
+        with self.assertRaises(runner.Failure) as raised:
+            runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                           "Personal beforeunload did not open", 30)
+        self.assertIn("already exited", str(raised.exception))
+        self.assertEqual(len(calls), 1)
+
+        # The allowance is exactly one more window: a still-pending quit whose
+        # dialog never surfaces fails rather than waiting forever.
+        receipt.unlink()
+        calls.clear()
+        with self.assertRaises(runner.Failure) as raised:
+            runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                           "Personal beforeunload did not open always fail", 30)
+        self.assertIn("always fail after the busy-renderer window", str(raised.exception))
+        self.assertEqual(len(calls), 2)
+
     def test_attach_refuses_an_unowned_or_changed_process_before_cdp(self):
         browser, guard = self.browser, self.guard
         identities = {11: {"pid": 11, "parent": 10, "group": 11, "start": 100},
