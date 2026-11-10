@@ -1,8 +1,11 @@
 //! Opt-in browser service for Linux, Windows and macOS. Its only control
 //! input is the parent's pipe.
-//! No remote-page IPC/V8 extension or permission handler. Explicit fixture
-//! inspection (`fixture-inspection` builds only) uses a loopback DevTools
-//! port, never the parent's control pipe.
+//! No remote-page IPC/V8 extension. The permission handler is logging-only:
+//! it records each request in the profile's browser.log and leaves the
+//! runtime's own handling untouched — a real grant prompt routed to the
+//! person is a later App-owner decision. Explicit fixture inspection
+//! (`fixture-inspection` builds only) uses a loopback DevTools port, never
+//! the parent's control pipe.
 //!
 //! The browser itself, entered through `run`: from the executable
 //! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
