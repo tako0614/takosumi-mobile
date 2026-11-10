@@ -164,6 +164,33 @@ public final class WebAppOperationTest {
         } finally { root.recycle(); }
     }
 
+    // Flag-agnostic bounds for a node whose a11y visibility flag is wrong.
+    // Run 42729892985 proved the opened document tab is painted on screen
+    // while isVisibleToUser stays false for the whole bound, so a flag-gated
+    // bounds() misses it and a flag-gated assertNull passes on a real leak.
+    // Presence alone is never the oracle: callers pair this with painted()
+    // for "really on screen" or assertNull for "truly absent".
+    private Rect anyBounds(String text) {
+        AccessibilityNodeInfo root = instrumentation.getUiAutomation().getRootInActiveWindow();
+        if (root == null) return null;
+        try {
+            AccessibilityNodeInfo hit = findAny(root, text, 0);
+            if (hit == null) return null;
+            try {
+                Rect b = new Rect(); hit.getBoundsInScreen(b);
+                return b.isEmpty() ? null : b;
+            } finally { if (hit != root) hit.recycle(); }
+        } finally { root.recycle(); }
+    }
+
+    // The actual open oracle: the document tab node exists in the tree and
+    // its region holds real painted content — strictly the evidence the
+    // broken visibility flag was a proxy for, never the flag itself.
+    private boolean tabOpened(String name) {
+        Rect tab = anyBounds(name);
+        return tab != null && painted(tab);
+    }
+
     private void tap(Rect bounds) {
         tap(bounds, null);
     }
@@ -614,7 +641,7 @@ public final class WebAppOperationTest {
                 lastNodeState[0] = state;
                 activity.trace("open-await t=+" + (SystemClock.elapsedRealtime() - fileConfirmedAt) + "ms " + state);
             }
-            return !picker() && bounds(tabName, true, false) != null;
+            return !picker() && tabOpened(tabName);
         }, 30);
         WebAppProbeActivity.Page work = activity.pages.get(activity.work);
         assertNotNull(work);
@@ -625,14 +652,14 @@ public final class WebAppOperationTest {
 
         tap("Personal");
         enterEditor("Personal");
-        assertNull("The imported Work document leaked to Personal", bounds(tabName, true, false));
+        assertNull("The imported Work document leaked to Personal", anyBounds(tabName));
         WebAppProbeActivity.Page personal = activity.pages.get(activity.personal);
         assertNotNull(personal);
         assertNotSame(work.session, personal.session);
         int personalDocument = personal.generation;
         String personalUri = personal.uri;
         tap("Work");
-        await("Work editor was lost on native reattach", () -> bounds(tabName, true, false) != null, 15);
+        await("Work editor was lost on native reattach", () -> tabOpened(tabName), 15);
         assertEquals(document, work.generation);
         assertEquals(uri, work.uri);
 
@@ -654,12 +681,12 @@ public final class WebAppOperationTest {
         key(KeyEvent.KEYCODE_ESCAPE, 0);
         assertEquals(document, work.generation);
         assertEquals(uri, work.uri);
-        assertNotNull(bounds(tabName, true, false));
+        assertNotNull(anyBounds(tabName));
         tap("Personal");
         assertSame(personal, activity.pages.get(activity.personal));
         assertEquals(personalDocument, personal.generation);
         assertEquals(personalUri, personal.uri);
-        assertNull(bounds(tabName, true, false));
+        assertNull(anyBounds(tabName));
         assertEquals(1, activity.filePrompts);
         assertEquals(1, activity.fileSelections);
         assertEquals(1, activity.exports.size());
