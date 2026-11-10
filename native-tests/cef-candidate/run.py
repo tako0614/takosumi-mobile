@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--app", choices=("photopea", "excalidraw"), required=True)
-    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications"), default="operate")
+    parser.add_argument("--mode", choices=("inspect", "operate", "profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications", "pipe-permission"), default="operate")
     parser.add_argument("--notification-daemon", type=Path, help="Already available Dunst 1.12.2 executable, used only inside the owned notification fixture")
     parser.add_argument("--process-layout", choices=("single", "per-profile"), default="single",
                         help="Experimental process-per-profile notification comparison; no App runtime change")
@@ -46,6 +46,8 @@ def main():
         parser.error("The native-picker probe currently targets Excalidraw only")
     if args.mode in ("profiles", "profile-popup", "permission-inspect", "site-permissions", "site-notifications") and args.files != "cdp":
         parser.error("The profile probe does not operate file dialogs")
+    if args.mode == "pipe-permission" and args.files != "cdp":
+        parser.error("The pipe permission proof does not operate file dialogs")
     for tool in ("node", "python3", "xvfb-run", "dbus-run-session", "timeout", "convert"):
         if shutil.which(tool) is None:
             parser.error(f"Required existing capability is missing: {tool}")
@@ -83,7 +85,7 @@ def main():
     nonce = str(uuid.uuid4())
     (data / ".owned-browser-reference").write_text(nonce)
     fixture = create_input(data, args.app, nonce)
-    sources = [HERE / name for name in ("src/main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "operate-processes.mjs", "runtime.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "notification-backend.mjs", "notifications.mjs", "x11-owner.py", "run.py")]
+    sources = [HERE / name for name in ("src/main.rs", "src/browser_main.rs", "src/process_main.rs", "Cargo.toml", "Cargo.lock", "operate.mjs", "operate-processes.mjs", "runtime.mjs", "gtk-readiness.mjs", "profiles.mjs", "permissions.mjs", "notification-backend.mjs", "notifications.mjs", "pipe-permission.mjs", "x11-owner.py", "run.py")]
     sources += [HERE.parent / name for name in (
         "desktop/browser_apps.py", "desktop/web_home.py", "browser/guard.py", "browser/lifecycle.ts",
     )]
@@ -124,10 +126,15 @@ def main():
               "sourcesUnchanged": False, "runtimeUnchanged": False, "daemonUnchanged": False, "passed": False}
     try:
         with (data / "session.log").open("x") as output:
+            if args.mode == "pipe-permission":
+                driver = ["node", str(HERE / "pipe-permission.mjs"), str(data), str(binary)]
+            else:
+                driver = ["node", str(HERE / ("operate-processes.mjs" if args.process_layout == "per-profile" else "operate.mjs")),
+                          str(data), args.app, args.mode, str(binary), args.files,
+                          *([str(daemon)] if daemon else [])]
             run_desktop_session([
                 "xvfb-run", "-a", "dbus-run-session", "--", "timeout", "150",
-                "node", str(HERE / ("operate-processes.mjs" if args.process_layout == "per-profile" else "operate.mjs")), str(data), args.app, args.mode, str(binary), args.files,
-                *([str(daemon)] if daemon else []),
+                *driver,
             ], env, timeout=170, stdout=output, stderr=subprocess.STDOUT)
         result["exitCode"] = 0
     except subprocess.CalledProcessError as error:
