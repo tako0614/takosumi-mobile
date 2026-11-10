@@ -711,10 +711,33 @@ public final class WebAppOperationTest {
         tap(awaitRect("Photopea PNG export item did not open or settle",
             () -> stable("export-png", bounds("PNG", false, false)), 15));
         await("Actual Photopea Save for web dialog did not open", () -> bounds("Save for web", false, false) != null, 20);
-        tap(awaitRect("Save for web export action did not settle", () -> {
-            Rect save = bounds("Save", false, false);
-            return stable("export-save", save != null ? save : bounds("OK", false, false));
-        }, 15));
+        // A settled Save rect is still not proof of a hit: the dialog can
+        // still be expanding (the preview paints late), so the delivered
+        // position can predate the button's final row — the missed tap once
+        // landed inside the Width/Height row instead. The real effect is
+        // the dialog closing or the response arriving; a surviving dialog
+        // means the tap missed and earns exactly one fresh-bounds retry —
+        // the original-response oracle is unchanged.
+        for (int saveAttempt = 0; saveAttempt < 2; saveAttempt++) {
+            // The first tap may have landed while the close ran late —
+            // never retap into a dialog that already left or a response
+            // that already arrived; either means the export went out.
+            if (saveAttempt > 0 && (activity.responses.peek() != null
+                    || bounds("Save for web", false, false) == null)) break;
+            tap(awaitRect("Save for web export action did not settle", () -> {
+                Rect save = bounds("Save", false, false);
+                return stable("export-save", save != null ? save : bounds("OK", false, false));
+            }, 15));
+            try {
+                await("Save for web dialog did not close after its export action",
+                    () -> activity.responses.peek() != null
+                        || bounds("Save for web", false, false) == null, 10);
+                break;
+            } catch (AssertionError stillOpen) {
+                if (saveAttempt == 1) throw stillOpen;
+                activity.trace("export action left the Save for web dialog open; retrying on fresh bounds");
+            }
+        }
         WebAppProbeActivity.Export transfer = activity.responses.poll(20, TimeUnit.SECONDS);
         assertNotNull("No original Photopea export response\n" + activity.diagnostics() + "\n" + tree(), transfer);
         assertSame(work, transfer.page);
