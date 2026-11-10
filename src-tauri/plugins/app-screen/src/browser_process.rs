@@ -60,12 +60,23 @@ pub enum Request {
     Open { id: u64, payload: OpenRequest },
     Close { id: u64, key: String },
     Shutdown { id: u64 },
+    /// The App's answer to one permission prompt the browser reported on the
+    /// pipe. `prompt_id` names the pending request, never a site or origin:
+    /// the browser alone maps it back to the held callback and profile.
+    ResolvePermission {
+        id: u64,
+        prompt_id: u64,
+        decision: PermissionDecision,
+    },
 }
 
 impl Request {
     pub fn id(&self) -> u64 {
         match self {
-            Self::Open { id, .. } | Self::Close { id, .. } | Self::Shutdown { id } => *id,
+            Self::Open { id, .. }
+            | Self::Close { id, .. }
+            | Self::Shutdown { id }
+            | Self::ResolvePermission { id, .. } => *id,
         }
     }
 
@@ -84,6 +95,11 @@ impl Request {
             }
             Self::Close { key, .. } if key.trim().is_empty() || key.len() > 512 => {
                 return Err(Error::InvalidRequest("Invalid browser screen key."));
+            }
+            Self::ResolvePermission { prompt_id, .. } if *prompt_id == 0 => {
+                return Err(Error::InvalidRequest(
+                    "Invalid browser permission prompt identity.",
+                ));
             }
             _ => {}
         }
@@ -137,6 +153,45 @@ pub enum Reply {
     QuitRequested {
         profile: String,
     },
+    /// The runtime is asking this profile's owner for a site permission
+    /// (e.g. notifications, camera). Emitted only when the App opted in to
+    /// answering prompts itself: the browser holds the runtime callback open
+    /// until the App's `resolvePermission`. Never a command reply; the App
+    /// shows it to the person as this profile's own prompt.
+    PermissionRequested {
+        profile: String,
+        prompt_id: u64,
+        origin: String,
+        kind: PermissionKind,
+        permissions: u32,
+    },
+    /// A held prompt ended on the browser side before any App answer
+    /// (dismissed, navigated away or superseded): its `prompt_id` is gone
+    /// and must not be answered. Never a command reply.
+    PermissionDismissed {
+        profile: String,
+        prompt_id: u64,
+    },
+    /// The held callback was resolved with the App's decision.
+    PermissionResolved { id: u64 },
+}
+
+/// Which runtime callback a permission prompt is holding.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionKind {
+    /// A Chrome permission prompt (`on_show_permission_prompt`).
+    Prompt,
+    /// A camera/microphone media access request.
+    Media,
+}
+
+/// The App's answer to a held permission prompt.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
 }
 
 /// A link the person may open outside the App: an absolute http(s) URL in
@@ -289,6 +344,55 @@ mod tests {
     fn shared_open_request_and_its_reuse_flag_survive_the_pipe() {
         let request = decode(&serde_json::to_vec(&open()).unwrap(), PROFILE).unwrap();
         assert!(matches!(request, Request::Open { id: 1, payload } if payload.resume));
+    }
+
+    #[test]
+    fn permission_requests_events_and_decisions_survive_the_pipe() {
+        for (decision, text) in [
+            (PermissionDecision::Allow, "allow"),
+            (PermissionDecision::Deny, "deny"),
+        ] {
+            let request = Request::ResolvePermission {
+                id: 3,
+                prompt_id: 7,
+                decision,
+            };
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"operation":"resolvePermission","id":3,"prompt_id":7,"decision":text})
+            );
+            assert!(matches!(decode(&bytes, PROFILE).unwrap(), Request::ResolvePermission { id: 3, prompt_id: 7, .. }));
+        }
+        let missing = br#"{"operation":"resolvePermission","id":3,"prompt_id":0,"decision":"allow"}"#;
+        assert!(decode(missing, PROFILE).is_err());
+        for reply in [
+            serde_json::json!({"event":"permissionRequested","profile":PROFILE,
+                "prompt_id":7,"origin":"https://excalidraw.com","kind":"prompt","permissions":8}),
+            serde_json::json!({"event":"permissionDismissed","profile":PROFILE,"prompt_id":7}),
+            serde_json::json!({"event":"permissionResolved","id":3}),
+        ] {
+            let reply: Reply = serde_json::from_value(reply).unwrap();
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            assert!(serde_json::from_slice::<Reply>(&bytes).is_ok());
+        }
+        let foreign = serde_json::json!({"event":"permissionRequested","profile":"other",
+            "prompt_id":7,"origin":"https://excalidraw.com","kind":"media","permissions":3});
+        assert!(matches!(
+            serde_json::from_value::<Reply>(foreign).unwrap(),
+            Reply::PermissionRequested { kind: PermissionKind::Media, permissions: 3, .. }
+        ));
+        // An extra field or an unknown kind/decision is rejected.
+        for bad in [
+            serde_json::json!({"event":"permissionRequested","profile":PROFILE,
+                "prompt_id":7,"origin":"https://excalidraw.com","kind":"prompt","permissions":8,"extra":1}),
+            serde_json::json!({"event":"permissionRequested","profile":PROFILE,
+                "prompt_id":7,"origin":"https://excalidraw.com","kind":"other","permissions":8}),
+            serde_json::json!({"operation":"resolvePermission","id":3,"prompt_id":7,"decision":"maybe"}),
+        ] {
+            assert!(serde_json::from_value::<Reply>(bad.clone()).is_err() || decode(&serde_json::to_vec(&bad).unwrap(), PROFILE).is_err());
+        }
     }
 
     #[test]

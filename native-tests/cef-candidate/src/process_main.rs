@@ -1,11 +1,12 @@
 //! Opt-in browser service for Linux, Windows and macOS. Its only control
 //! input is the parent's pipe.
-//! No remote-page IPC/V8 extension. The permission handler is logging-only:
-//! it records each request in the profile's browser.log and leaves the
-//! runtime's own handling untouched — a real grant prompt routed to the
-//! person is a later App-owner decision. Explicit fixture inspection
-//! (`fixture-inspection` builds only) uses a loopback DevTools port, never
-//! the parent's control pipe.
+//! No remote-page IPC/V8 extension. The permission handler records each
+//! request in the profile's browser.log; only when the App opted in
+//! (`TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS=1`) does it hold the
+//! runtime's callback open for the App's `resolvePermission` answer —
+//! otherwise the runtime's own prompt handling stays untouched. Explicit
+//! fixture inspection (`fixture-inspection` builds only) uses a loopback
+//! DevTools port, never the parent's control pipe.
 //!
 //! The browser itself, entered through `run`: from the executable
 //! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
@@ -24,7 +25,10 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 use tauri_plugin_app_screen::{
-    browser_process::{decode, external_link, link_host, read_packet, Reply, Request},
+    browser_process::{
+        decode, external_link, link_host, read_packet, PermissionDecision, PermissionKind, Reply,
+        Request,
+    },
     OpenRequest,
 };
 
@@ -70,6 +74,17 @@ struct State {
     boot: Option<Vec<u8>>,
     screens: BTreeMap<i32, Screen>,
     pending_close: BTreeMap<i32, u64>,
+    /// Runtime permission callbacks this process holds open for the App's
+    /// answer, by the pipe's own `prompt_id` sequence (`permission_seq`).
+    /// Filled only while the App opted in (`permission_events`); a bounded
+    /// count keeps a site from exhausting memory with prompts nobody
+    /// answers.
+    pending_permissions: BTreeMap<u64, HeldPermission>,
+    permission_seq: u64,
+    /// The App answers its profile's site permission prompts itself
+    /// (`TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS=1`). Without it the
+    /// handler stays observation-only and the runtime's own prompt shows.
+    permission_events: bool,
     pending: usize,
     live: usize,
     last_id: u64,
@@ -83,6 +98,23 @@ struct State {
     quitting: bool,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
+/// A permission callback the runtime left to this process. `Prompt` also
+/// records CEF's own prompt id, which is what `on_dismiss_permission_prompt`
+/// reports back; media requests have no such id.
+enum HeldPermission {
+    Prompt {
+        callback: PermissionPromptCallback,
+        cef_id: u64,
+    },
+    Media {
+        callback: MediaAccessCallback,
+        permissions: u32,
+    },
+}
+/// Held permission prompts the App has not answered yet: past this bound a
+/// new request falls back to the runtime's own handling rather than piling
+/// up unanswered.
+const MAX_PENDING_PERMISSIONS: usize = 16;
 /// Whether the control pipe's reader may still post a request to the UI
 /// thread. Closed before the message loop is asked to quit, under the same
 /// lock the reader holds while it posts, so nothing is posted afterwards.
@@ -872,24 +904,71 @@ wrap_load_handler! {
     }
 }
 
+/// Hold a runtime permission callback for the App's own answer and report it
+/// on the pipe once. `None` — the caller then returns 0 and the runtime keeps
+/// its own handling — when the App did not opt in, or the bounded wait set is
+/// full (a site spamming unanswered prompts never starves the browser).
+fn hold_permission(
+    held: HeldPermission,
+    origin: String,
+    kind: PermissionKind,
+    permissions: u32,
+) -> Option<u64> {
+    with_state(|state| {
+        if !state.permission_events
+            || state.pending_permissions.len() >= MAX_PENDING_PERMISSIONS
+        {
+            return None;
+        }
+        state.permission_seq += 1;
+        let prompt_id = state.permission_seq;
+        state.pending_permissions.insert(prompt_id, held);
+        reply(Reply::PermissionRequested {
+            profile: state.profile.clone(),
+            prompt_id,
+            origin,
+            kind,
+            permissions,
+        });
+        Some(prompt_id)
+    })
+}
+
 wrap_permission_handler! {
     // The browser never decides a permission itself: each request is recorded
-    // in the profile's own browser.log (stderr) while the return value leaves
-    // the Chrome runtime's own handling untouched. Whether its prompt is
-    // shown, held, or denied per platform is evidence, not policy — a real
-    // grant prompt routed to the person is a later App-owner decision.
+    // in the profile's own browser.log (stderr). Without the App's opt-in the
+    // return value leaves the Chrome runtime's own handling untouched; with
+    // it the callback is held open for the App's `resolvePermission` — its
+    // prompt is then the App's UX, not Chrome's. `on_dismiss` covers only
+    // prompts the runtime itself ended; an App-resolved one is already gone.
     struct Permissions;
     impl PermissionHandler {
-        fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, _callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
-            eprintln!("permission: media origin={} permissions={requested_permissions:#x}", requesting_origin.map(ToString::to_string).unwrap_or_default());
+        fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
+            let origin=requesting_origin.map(ToString::to_string).unwrap_or_default();
+            eprintln!("permission: media origin={origin} permissions={requested_permissions:#x}");
+            if let Some(callback)=callback {
+                if hold_permission(HeldPermission::Media{callback:callback.clone(),permissions:requested_permissions},origin,PermissionKind::Media,requested_permissions).is_some() { return 1; }
+            }
             0
         }
-        fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, requesting_origin: Option<&CefString>, requested_permissions: u32, _callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
-            eprintln!("permission: prompt id={prompt_id} origin={} permissions={requested_permissions:#x}", requesting_origin.map(ToString::to_string).unwrap_or_default());
+        fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
+            let origin=requesting_origin.map(ToString::to_string).unwrap_or_default();
+            eprintln!("permission: prompt id={prompt_id} origin={origin} permissions={requested_permissions:#x}");
+            if let Some(callback)=callback {
+                if hold_permission(HeldPermission::Prompt{callback:callback.clone(),cef_id:prompt_id},origin,PermissionKind::Prompt,requested_permissions).is_some() { return 1; }
+            }
             0
         }
         fn on_dismiss_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, result: PermissionRequestResult) {
             eprintln!("permission: dismissed id={prompt_id} result={result:?}");
+            let gone=with_state(|state| {
+                let seq=state.pending_permissions.iter().find_map(|(seq,held)|
+                    matches!(held,HeldPermission::Prompt{cef_id,..} if *cef_id==prompt_id).then_some(*seq));
+                seq.inspect(|seq|{state.pending_permissions.remove(seq);})
+            });
+            if let Some(seq)=gone {
+                reply(Reply::PermissionDismissed{profile:with_state(|state|state.profile.clone()),prompt_id:seq});
+            }
         }
     }
 }
@@ -1059,6 +1138,26 @@ fn dispatch(bytes: Option<&[u8]>) {
                 });
             } else {
                 close_all(Some(id), false);
+            }
+        }
+        Request::ResolvePermission { id, prompt_id, decision } => {
+            let held = with_state(|state| state.pending_permissions.remove(&prompt_id));
+            match held {
+                Some(HeldPermission::Prompt { callback, .. }) => {
+                    callback.cont(match decision {
+                        PermissionDecision::Allow => PermissionRequestResult::ACCEPT,
+                        PermissionDecision::Deny => PermissionRequestResult::DENY,
+                    });
+                    reply(Reply::PermissionResolved { id });
+                }
+                Some(HeldPermission::Media { callback, permissions }) => {
+                    match decision {
+                        PermissionDecision::Allow => callback.cont(permissions),
+                        PermissionDecision::Deny => callback.cancel(),
+                    }
+                    reply(Reply::PermissionResolved { id });
+                }
+                None => error(id, "No pending browser permission prompt"),
             }
         }
     }
@@ -1385,6 +1484,11 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
             boot: Some(boot),
             screens: BTreeMap::new(),
             pending_close: BTreeMap::new(),
+            pending_permissions: BTreeMap::new(),
+            permission_seq: 0,
+            permission_events: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS")
+                .as_deref()
+                == Some(std::ffi::OsStr::new("1")),
             pending: 1,
             live: 0,
             last_id: 0,

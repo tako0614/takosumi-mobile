@@ -10,7 +10,10 @@ use super::{failure, private_directory, process_setup as setup};
 #[cfg(unix)]
 use crate::browser_process::write_until;
 use crate::{
-    browser_process::{external_link, read_packet, Reply, Request, MAX_PACKET_BYTES},
+    browser_process::{
+        external_link, read_packet, PermissionDecision, PermissionKind, Reply, Request,
+        MAX_PACKET_BYTES,
+    },
     Error, OpenRequest, Result,
 };
 use std::{
@@ -61,6 +64,29 @@ type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
 struct SpawnOptions {
     no_sandbox: bool,
     on_quit: Option<Box<dyn Fn() + Send>>,
+    /// When set, the browser holds every site permission prompt of this
+    /// profile for the App's `resolve_permission` instead of the runtime's
+    /// own prompt handling; the callback receives each held request (and
+    /// each dismissal of one still held) exactly once. Whoever opts in owns
+    /// answering every request — an ignored event leaves its prompt held.
+    on_permission_event: Option<Box<dyn Fn(PermissionEvent) + Send>>,
+}
+/// A site permission prompt the profile's browser is holding for the App's
+/// answer, or the end of one (dismissed or superseded before any answer).
+#[derive(Debug)]
+// The App's prompt surface reads these fields once it ships; the adapter's
+// protocol test reads them meanwhile.
+#[allow(dead_code)]
+enum PermissionEvent {
+    Requested {
+        prompt_id: u64,
+        origin: String,
+        kind: PermissionKind,
+        permissions: u32,
+    },
+    Dismissed {
+        prompt_id: u64,
+    },
 }
 // Standalone native/protocol fixtures have no Tauri App exit owner.
 impl From<bool> for SpawnOptions {
@@ -68,6 +94,7 @@ impl From<bool> for SpawnOptions {
         Self {
             no_sandbox,
             on_quit: None,
+            on_permission_event: None,
         }
     }
 }
@@ -508,6 +535,9 @@ fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Re
                     // latches now and drains on a separate blocking worker.
                     request_exit(&app, 0);
                 })),
+                // The App's own permission-prompt surface is a later unit;
+                // until it can answer, the runtime's own prompt stays.
+                on_permission_event: None,
             },
         )?;
         // Retain ownership before waiting for the native creation reply.
@@ -934,6 +964,7 @@ impl Process {
         let SpawnOptions {
             no_sandbox,
             on_quit,
+            on_permission_event,
         } = options.into();
         #[cfg(target_os = "macos")]
         let executable = macos::Executable::open(&program).map_err(failure)?;
@@ -1131,6 +1162,13 @@ impl Process {
             .open(directory.join("browser.log"))
             .map_err(failure)?;
         command.env("TAKOSUMI_BROWSER_PROCESS_DIRECTORY", &directory);
+        // An opted-in App answers this profile's permission prompts itself:
+        // the browser then holds each runtime callback open until
+        // `resolve_permission`. Without an owner the runtime's own prompt
+        // handling stays untouched.
+        if on_permission_event.is_some() {
+            command.env("TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS", "1");
+        }
         #[cfg(target_os = "linux")]
         command.env("LD_LIBRARY_PATH", program.parent().unwrap());
         command
@@ -1236,6 +1274,41 @@ impl Process {
                             }
                             Err("Browser quit request has no App owner".to_string())
                         }
+                        // An opted-in App answers this profile's site
+                        // permission prompts itself; another profile's is a
+                        // protocol fault, and an event with no owner means
+                        // the child was told to emit something nobody reads.
+                        Ok(Reply::PermissionRequested { profile, .. }) if profile != owner => {
+                            Err("Foreign browser permission request".to_string())
+                        }
+                        Ok(Reply::PermissionRequested {
+                            prompt_id,
+                            origin,
+                            kind,
+                            permissions,
+                            ..
+                        }) => {
+                            if let Some(on_event) = &on_permission_event {
+                                on_event(PermissionEvent::Requested {
+                                    prompt_id,
+                                    origin,
+                                    kind,
+                                    permissions,
+                                });
+                                continue;
+                            }
+                            Err("Browser permission request has no App owner".to_string())
+                        }
+                        Ok(Reply::PermissionDismissed { profile, .. }) if profile != owner => {
+                            Err("Foreign browser permission dismissal".to_string())
+                        }
+                        Ok(Reply::PermissionDismissed { prompt_id, .. }) => {
+                            if let Some(on_event) = &on_permission_event {
+                                on_event(PermissionEvent::Dismissed { prompt_id });
+                                continue;
+                            }
+                            Err("Browser permission dismissal has no App owner".to_string())
+                        }
                         other => other,
                     };
                     let failed = reply.is_err();
@@ -1309,7 +1382,10 @@ impl Process {
             }
             let actual = match &reply {
                 // The reply reader consumes these; one here is a protocol fault.
-                Reply::OpenExternal { .. } | Reply::QuitRequested { .. } => {
+                Reply::OpenExternal { .. }
+                | Reply::QuitRequested { .. }
+                | Reply::PermissionRequested { .. }
+                | Reply::PermissionDismissed { .. } => {
                     return Err(Wait::Fault(Error::InvalidRequest(
                         "Unexpected unsolicited browser event.",
                     )))
@@ -1319,7 +1395,8 @@ impl Process {
                 | Reply::Stopped { id }
                 | Reply::Error { id, .. }
                 | Reply::CloseBlocked { id, .. }
-                | Reply::Cancelled { id, .. } => *id,
+                | Reply::Cancelled { id, .. }
+                | Reply::PermissionResolved { id } => *id,
             };
             // A reply to an earlier request that timed out (e.g. a person answering
             // a beforeunload dialog late) is stale, not a protocol fault.
@@ -1439,6 +1516,53 @@ impl Process {
             return Err(error);
         }
         self.expect_open_until(id, &key, deadline)
+    }
+    /// The App's answer to one held permission prompt (an `Requested`
+    /// event's `prompt_id`). `PermissionResolved` confirms the runtime
+    /// applied it; an outright refusal (`Reply::Error`) was answered, so it
+    /// leaves the profile usable — anything else leaves it in doubt, as an
+    /// unconfirmed create or close does.
+    // Only the prompt surface the App ships later calls this; the adapter's
+    // own protocol test exercises it meanwhile.
+    #[allow(dead_code)]
+    fn resolve_permission(
+        &mut self,
+        prompt_id: u64,
+        decision: PermissionDecision,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        if self.uncertain {
+            return Err(Error::InvalidRequest(
+                "Previous browser command is incomplete; profile data is retained.",
+            ));
+        }
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
+        let id = self.next;
+        if let Err(error) = self.send(
+            Request::ResolvePermission {
+                id,
+                prompt_id,
+                decision,
+            },
+            deadline,
+        ) {
+            self.uncertain = true;
+            return Err(error);
+        }
+        match self.receive(id, deadline) {
+            Ok(Reply::PermissionResolved { .. }) => Ok(()),
+            Err(Wait::Rejected(message)) => Err(failure(message)),
+            Ok(_) => Err(Error::InvalidRequest(
+                "Browser permission reply was not confirmed.",
+            )),
+            Err(wait) => {
+                self.uncertain = true;
+                Err(wait.into())
+            }
+        }
     }
     fn shutdown(&mut self) -> Result<bool> {
         // A person answers each window's beforeunload in turn: the reply bound
@@ -2876,6 +3000,7 @@ sys.stdin.read()' "$1"
                 on_quit: Some(Box::new(move || {
                     observed.fetch_add(1, Ordering::SeqCst);
                 })),
+                on_permission_event: None,
             },
         )
         .unwrap();
@@ -2939,6 +3064,7 @@ sys.stdin.read()' "$1"
                 SpawnOptions {
                     no_sandbox: true,
                     on_quit: foreign.then_some(callback),
+                    on_permission_event: None,
                 },
             )
             .unwrap();
@@ -2958,6 +3084,81 @@ sys.stdin.read()' "$1"
         }
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(requested.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn held_permission_prompts_reach_the_app_owner_and_resolve() {
+        // The stand-in browser reports one held prompt, is answered through
+        // `resolve_permission`, confirms it, then reports a dismissal and the
+        // shutdown. The events reach the registered owner only — never the
+        // command replies — and the opt-in env reaches the child.
+        let root = std::env::temp_dir().join(format!("sumi-permission-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,os,sys\nassert os.environ.get('TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS')=='1'\nprint(json.dumps({{'event':'permissionRequested','profile':'{profile}','prompt_id':7,'origin':'https://excalidraw.com','kind':'prompt','permissions':8}}),flush=True)\nline=json.loads(sys.stdin.readline())\nassert line['operation']=='resolvePermission' and line['prompt_id']==7 and line['decision']=='allow',line\nprint(json.dumps({{'event':'permissionResolved','id':line['id']}}),flush=True)\nprint(json.dumps({{'event':'permissionDismissed','profile':'{profile}','prompt_id':9}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nassert last['operation']=='shutdown',last\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: None,
+                on_permission_event: Some(Box::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                })),
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while events.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !events.lock().unwrap().is_empty(),
+            "the held prompt must reach the App owner"
+        );
+        process
+            .resolve_permission(
+                7,
+                PermissionDecision::Allow,
+                std::time::Instant::now() + Duration::from_secs(20),
+            )
+            .unwrap();
+        let stopped = process.shutdown();
+        drop(process);
+        let events = std::mem::take(&mut *events.lock().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(stopped, Ok(true)), "{stopped:?}");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PermissionEvent::Requested {
+                    prompt_id: 7,
+                    kind: PermissionKind::Prompt,
+                    permissions: 8,
+                    ..
+                }, PermissionEvent::Dismissed { prompt_id: 9 }]
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            match &events[0] {
+                PermissionEvent::Requested { origin, .. } => origin.as_str(),
+                _ => "",
+            },
+            "https://excalidraw.com"
+        );
     }
     #[test]
     fn external_link_requests_never_reach_command_replies() {
