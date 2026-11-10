@@ -296,10 +296,13 @@ public final class WebAppOperationTest {
                 String detail = String.valueOf(refused.getMessage()) + " " +
                     (refused.getCause() == null ? "" : String.valueOf(refused.getCause().getMessage()));
                 if (attempt >= 4 || !detail.contains("not directed at a window owned by uid")) {
+                    String covering = coveringWindows(event);
                     if (activity != null) activity.trace("own-uid injection refused; covering windows: "
-                        + coveringWindows(event));
-                    if (refused instanceof RuntimeException) throw (RuntimeException) refused;
-                    throw new IllegalStateException(refused);
+                        + covering);
+                    // A plain rethrow loses the covering-window evidence:
+                    // this error bypasses fail() and its diagnostics deque.
+                    throw new IllegalStateException("own-uid input refused ("
+                        + detail.trim() + "); covering windows: " + covering, refused);
                 }
                 if (activity != null)
                     activity.trace("own-uid injection refused by a transient foreign window; retry " + attempt);
@@ -826,6 +829,11 @@ public final class WebAppOperationTest {
         assertEquals(document, work.generation);
         assertEquals(uri, work.uri);
         assertNotNull(anyBounds(tabName));
+        // The export dialog keeps its filename field focused, so the soft
+        // keyboard re-opens over the lower half (IME_INSETS_SHOW_ANIMATION was
+        // still running at the observed refusal). Hide it before the top-bar
+        // tap or the point resolves to the foreign window again.
+        dismissCoveringIme("Personal tab");
         tap("Personal");
         await("Personal editor did not settle after the native switch",
             () -> switchedWithoutTab(activity.personal), 30);
