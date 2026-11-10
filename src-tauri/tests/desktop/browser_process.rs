@@ -225,6 +225,12 @@ async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
         serde_json::to_string(name).unwrap(),
         serde_json::to_string(label).unwrap(),
     );
+    // The clear button only exists after the capabilities invoke wires
+    // clearData (entry.tsx resolves it asynchronously), and any home lock
+    // disables every row button: wait for the unique enabled labeled button
+    // before clicking instead of racing the wire-up. A genuinely missing
+    // capability still fails at the same bound, now named honestly.
+    ready(view,&format!("(()=>{{const rows=[...document.querySelectorAll('.web-connections > li')].filter(row=>row.querySelector('.web-connection strong')?.textContent==={name});return rows.length===1 && [...rows[0].querySelectorAll('button')].filter(button=>button.textContent.trim()==={label}&&!button.disabled).length===1}})()")).await?;
     eval(view,&format!("(()=>{{const rows=[...document.querySelectorAll('.web-connections > li')].filter(row=>row.querySelector('.web-connection strong')?.textContent==={name});if(rows.length!==1)throw Error('Unique saved row required');const buttons=[...rows[0].querySelectorAll('button')].filter(button=>button.textContent.trim()==={label}&&!button.disabled);if(buttons.length!==1)throw Error('Unique enabled row button required');buttons[0].click();return true}})()")).await?;
     Ok(())
 }
