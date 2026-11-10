@@ -49,16 +49,28 @@ test("list decodes only well-formed held prompts and tolerates transport failure
     null,
     { promptId: "7" },
     { ...good, promptId: 0 },
+    // Any origin text passes through: filtering one would hold its browser
+    // callback forever with no way to answer it.
     { ...good, origin: "http://insecure.example" },
+    { ...good, origin: 7 },
     { ...good, permissions: -1 },
   ]);
-  expect(decoded).toEqual([{
-    profile,
-    promptId: 7,
-    origin: "https://work.example",
-    kind: "prompt",
-    permissions: 8,
-  }]);
+  expect(decoded).toEqual([
+    {
+      profile,
+      promptId: 7,
+      origin: "https://work.example",
+      kind: "prompt",
+      permissions: 8,
+    },
+    {
+      profile,
+      promptId: 7,
+      origin: "http://insecure.example",
+      kind: "prompt",
+      permissions: 8,
+    },
+  ]);
   expect(decodePendingPermissions({})).toBeUndefined();
   const list = await createWebPermissionPrompts(async <T>() => {
     throw new Error("down") as T;

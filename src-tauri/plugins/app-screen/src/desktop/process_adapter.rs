@@ -105,7 +105,14 @@ impl PermissionPrompts {
         // strictly better than silently dropping a held-prompt event.
         self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
-    fn note(&self, profile: &str, event: PermissionEvent) -> Vec<PendingPermission> {
+    // The emit stays under the map lock: the resolve command and the reader
+    // thread can then never deliver a stale list over a newer one.
+    fn note(
+        &self,
+        profile: &str,
+        event: PermissionEvent,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
         let mut prompts = self.locked();
         match event {
             PermissionEvent::Requested {
@@ -129,17 +136,32 @@ impl PermissionPrompts {
                 prompts.remove(&(profile.to_owned(), prompt_id));
             }
         }
-        prompts.values().cloned().collect()
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
     }
-    fn drop(&self, profile: &str, prompt_id: u64) -> Vec<PendingPermission> {
+    fn drop(
+        &self,
+        profile: &str,
+        prompt_id: u64,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
         let mut prompts = self.locked();
         prompts.remove(&(profile.to_owned(), prompt_id));
-        prompts.values().cloned().collect()
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
     }
-    fn drop_profile(&self, profile: &str) -> Vec<PendingPermission> {
+    fn drop_profile(
+        &self,
+        profile: &str,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
         let mut prompts = self.locked();
         prompts.retain(|(owner, _), _| owner != profile);
-        prompts.values().cloned().collect()
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
     }
     pub(super) fn list(&self) -> Vec<PendingPermission> {
         self.locked().values().cloned().collect()
@@ -594,14 +616,16 @@ fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Re
                 let note_app = app.clone();
                 let note_prompts = prompts.clone();
                 let on_event = Box::new(move |event| {
-                    let list = note_prompts.note(&note_profile, event);
-                    let _ = note_app.emit("app-screen:permission-prompts", &list);
+                    note_prompts.note(&note_profile, event, |list| {
+                        let _ = note_app.emit("app-screen:permission-prompts", list);
+                    });
                 }) as Box<dyn Fn(PermissionEvent) + Send>;
                 let drop_profile = profile.clone();
                 let drop_app = app.clone();
                 let on_drop = Box::new(move || {
-                    let list = prompts.drop_profile(&drop_profile);
-                    let _ = drop_app.emit("app-screen:permission-prompts", &list);
+                    prompts.drop_profile(&drop_profile, |list| {
+                        let _ = drop_app.emit("app-screen:permission-prompts", list);
+                    });
                 }) as Box<dyn FnOnce() + Send>;
                 (Some(on_event), Some(on_drop))
             }
@@ -936,8 +960,9 @@ pub(super) async fn resolve_permission(
             payload.decision,
             std::time::Instant::now() + Duration::from_secs(15),
         )?;
-        let list = prompts.drop(&payload.profile, payload.prompt_id);
-        let _ = app.emit("app-screen:permission-prompts", &list);
+        let list = prompts.drop(&payload.profile, payload.prompt_id, |list| {
+            let _ = app.emit("app-screen:permission-prompts", list);
+        });
         Ok(list)
     })
     .await
@@ -1687,9 +1712,12 @@ impl Process {
         match self.receive(id, deadline) {
             Ok(Reply::PermissionResolved { .. }) => Ok(true),
             Err(Wait::Rejected(_)) => Ok(false),
-            Ok(_) => Err(Error::InvalidRequest(
-                "Browser permission reply was not confirmed.",
-            )),
+            Ok(_) => {
+                self.uncertain = true;
+                Err(Error::InvalidRequest(
+                    "Browser permission reply was not confirmed.",
+                ))
+            }
             Err(wait) => {
                 self.uncertain = true;
                 Err(wait.into())
@@ -3308,20 +3336,40 @@ sys.stdin.read()' "$1"
             permissions: 8,
         };
         assert!(prompts.list().is_empty());
-        assert_eq!(prompts.note("p", requested(7)).len(), 1);
-        assert_eq!(prompts.note("p", requested(9)).len(), 2);
-        assert_eq!(prompts.note("q", requested(3)).len(), 3);
+        let emitted = Mutex::new(Vec::<Vec<(String, u64)>>::new());
+        let record = |list: &[PendingPermission]| {
+            emitted.lock().unwrap().push(
+                list.iter()
+                    .map(|item| (item.profile.clone(), item.prompt_id))
+                    .collect(),
+            );
+        };
+        assert_eq!(prompts.note("p", requested(7), &record).len(), 1);
+        assert_eq!(prompts.note("p", requested(9), &record).len(), 2);
+        assert_eq!(prompts.note("q", requested(3), &record).len(), 3);
         assert_eq!(
             prompts
-                .note("p", PermissionEvent::Dismissed { prompt_id: 7 })
+                .note("p", PermissionEvent::Dismissed { prompt_id: 7 }, &record)
                 .len(),
             2
         );
-        assert_eq!(prompts.drop("p", 7).len(), 2);
-        let list = prompts.drop("p", 9);
+        assert_eq!(prompts.drop("p", 7, &record).len(), 2);
+        let list = prompts.drop("p", 9, &record);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].profile, "q");
-        assert!(prompts.drop_profile("q").is_empty());
+        assert!(prompts.drop_profile("q", &record).is_empty());
+        assert_eq!(
+            emitted.lock().unwrap().as_slice(),
+            [
+                vec![("p".to_owned(), 7)],
+                vec![("p".to_owned(), 7), ("p".to_owned(), 9)],
+                vec![("p".to_owned(), 7), ("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("q".to_owned(), 3)],
+                vec![],
+            ]
+        );
     }
     #[test]
     fn resolve_permission_accepts_a_prompt_the_browser_already_dropped() {

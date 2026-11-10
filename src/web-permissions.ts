@@ -73,7 +73,9 @@ export function decodePendingPermissions(
       typeof record.profile !== "string" || !record.profile ||
       typeof record.promptId !== "number" ||
       !Number.isSafeInteger(record.promptId) || record.promptId <= 0 ||
-      typeof record.origin !== "string" || !record.origin.startsWith("https://") ||
+      // Any origin text passes through: a filtered one would hold its
+      // browser callback forever with no way to answer it.
+      typeof record.origin !== "string" ||
       typeof record.permissions !== "number" ||
       !Number.isSafeInteger(record.permissions) || record.permissions < 0
     ) continue;

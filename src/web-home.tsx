@@ -38,15 +38,23 @@ export function WebHome(props: {
     }
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void prompts.list()
-      .then((list) => {
+    void (async () => {
+      // Subscribe before the snapshot: an emit during the first list() call
+      // reaches the live listener, and the later snapshot overwrites with
+      // state at least as new. A failed subscription still gets the snapshot.
+      try {
+        const release = await prompts.watch(setPendingPermissions);
+        if (disposed) {
+          release();
+          return;
+        }
+        unlisten = release;
+      } catch { /* Live updates are unavailable; the snapshot still applies. */ }
+      try {
+        const list = await prompts.list();
         if (!disposed) setPendingPermissions(list);
-      })
-      .catch(() => {});
-    void prompts.watch(setPendingPermissions).then((release) => {
-      if (disposed) release();
-      else unlisten = release;
-    });
+      } catch { /* An unavailable surface shows no prompts. */ }
+    })();
     onCleanup(() => {
       disposed = true;
       unlisten?.();
