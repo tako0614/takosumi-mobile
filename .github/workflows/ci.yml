@@ -441,7 +441,16 @@ jobs:
             if [[ "$result" != 0 ]]; then
               tail -c 65536 "$RUNNER_TEMP/sumi-gecko-emulator.log" || true
               if [[ -n "$emulator_pid" && "$emulator_birth" != exited ]] && owned_device; then
-                timeout 10 adb -s emulator-5562 logcat -d -t 200 -v brief '*:E' > "$RUNNER_TEMP/sumi-gecko-failure.log" 2>&1 || true
+                # E-level alone cannot attribute a Gecko onKill: lmkd and the
+                # activity manager record kills at I level. Keep those tags and
+                # the guest's own memory view so a killed content process is
+                # proven from the dump, not inferred from the callback name.
+                timeout 10 adb -s emulator-5562 logcat -d -t 400 -v brief \
+                  ActivityManager:I ActivityTaskManager:I lowmemorykiller:I lmkd:I '*:E' \
+                  > "$RUNNER_TEMP/sumi-gecko-failure.log" 2>&1 || true
+                { timeout 15 adb -s emulator-5562 shell dumpsys meminfo com.takosumi.fixture.geckodownload;
+                  timeout 10 adb -s emulator-5562 shell 'head -5 /proc/meminfo'; } \
+                  > "$RUNNER_TEMP/sumi-gecko-meminfo.log" 2>&1 || true
               fi
             fi
             if [[ -n "$emulator_pid" ]]; then
@@ -475,7 +484,11 @@ jobs:
             exit "$result"
           }
           trap cleanup EXIT
-          "$ANDROID_HOME/emulator/emulator" -avd "$avd_name" -port 5562 -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim -no-snapshot -wipe-data > "$RUNNER_TEMP/sumi-gecko-emulator.log" 2>&1 &
+          # The AVD auto-floor of 2560MB cannot hold two Photopea editor
+          # sessions (Work and Personal stay resident for the isolation and
+          # reattach checks); the OS killed the shared content process on the
+          # second load. 4096MB matches a mid-range phone, not a raised oracle.
+          "$ANDROID_HOME/emulator/emulator" -avd "$avd_name" -port 5562 -memory 4096 -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim -no-snapshot -wipe-data > "$RUNNER_TEMP/sumi-gecko-emulator.log" 2>&1 &
           emulator_pid=$!
           emulator_birth="$(python3 -B native-tests/android/owned_process.py birth "$emulator_pid" "$$")"
           test "$emulator_birth" != exited
@@ -522,6 +535,7 @@ jobs:
             native-tests/android/gecko-download-fixture/build/reports/androidTests/connected/debug/**
             ${{ runner.temp }}/sumi-gecko-emulator.log
             ${{ runner.temp }}/sumi-gecko-failure.log
+            ${{ runner.temp }}/sumi-gecko-meminfo.log
             native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output/**/photopea-*
             ${{ runner.temp }}/sumi-gecko-process.json
           if-no-files-found: warn
