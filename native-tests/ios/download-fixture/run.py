@@ -85,6 +85,7 @@ def migration_progress(path):
         text = source.read().decode("utf-8", errors="replace")
     transitions, elapsed, status, terminal, finished = [], 0, None, None, False
     stage = None
+    running = None
     for line in text.splitlines():
         header = re.search(r"Status=(\d+), isTerminal=(YES|NO), Elapsed=(\d+):(\d+)\.", line)
         if header:
@@ -95,6 +96,7 @@ def migration_progress(path):
             finished = True
         plugin = re.search(r"Reason:Running plugin ([\w.-]+) \(", line)
         if plugin and status == 2 and terminal == "NO":
+            running = plugin[1]
             if not transitions or transitions[-1]["plugin"] != plugin[1]:
                 transitions.append({"plugin": plugin[1], "elapsed": elapsed})
         waiting = re.search(r"Waiting on (.+?)\s*$", line)
@@ -106,8 +108,18 @@ def migration_progress(path):
             transitions.append({"plugin": "stage:" + stage, "elapsed": elapsed})
     recent = (len(transitions) >= 2 and status is not None and terminal == "NO" and
               elapsed >= 150 and 0 <= elapsed - transitions[-1]["elapsed"] <= 60)
+    # A migrator the OS still reports running is in flight, not stalled: run
+    # 42834538144 lost both created boots inside 00LaunchServicesMigrator at
+    # 137s+ (a healthy boot spent ~121s on it). The last Running-plugin line
+    # naming the last transition means migration has not moved on, and only
+    # the same 300-second ceiling decides whether it ever finishes — a dead
+    # boot still fails, just at the existing cap.
+    in_flight = (running is not None and transitions and
+                 transitions[-1]["plugin"] == running and status == 2 and
+                 terminal == "NO" and elapsed >= 150)
     return {"transitions": transitions, "lastElapsed": elapsed, "recentMigrationProgress": recent,
-            "extensionSeconds": 120 if recent else 0, "maximumBootSeconds": 300,
+            "activeMigration": in_flight,
+            "extensionSeconds": 120 if (recent or in_flight) else 0, "maximumBootSeconds": 300,
             "terminalReady": finished}
 
 
@@ -216,14 +228,18 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
                 if progress["terminalReady"] and progress.get("deadlineBoundaryExit") == 0:
                     code = 0
                 elif not (progress["recentMigrationProgress"] or
+                          progress["activeMigration"] or
                           (progress["terminalReady"] and progress.get("deadlineBoundaryExit") is None)):
                     raise
                 else:
                     # Continue this same readiness process once, without reboot,
-                    # after recent native migration or explicit native Finished.
+                    # after recent native migration, an in-flight migrator, or
+                    # explicit native Finished.
                     # Include diagnostics in the existing total300s ceiling.
-                    progress["continuationReason"] = ("native-finished-cli-exit" if progress["terminalReady"]
-                                                       else "recent-migration")
+                    progress["continuationReason"] = (
+                        "native-finished-cli-exit" if progress["terminalReady"]
+                        else "recent-migration" if progress["recentMigrationProgress"]
+                        else "active-migration")
                     save_progress()
                     # Recompute after the last write, immediately before wait.
                     progress["remainingBootSeconds"] = max(0, 300 - (time.monotonic() - boot_started))

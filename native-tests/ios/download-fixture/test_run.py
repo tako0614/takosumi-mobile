@@ -310,16 +310,20 @@ class HarnessTests(unittest.TestCase):
                     f"Reason:Running plugin {plugin} (fixture.migrator)\n")
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
             path = Path(raw) / "bootstatus.log"
-            for log, allowed in ((entry(5, "launch") + entry(175, "launch"), False),
-                                 (entry(5, "launch") + entry(20, "keys") + entry(175, "keys"), False),
-                                 (entry(5, "launch") + entry(165, "safari") + entry(175, "safari"), True),
+            for log, recent, active in (
+                                 # Run 42834538144: the migrator the OS still
+                                 # reports running is in flight, not stalled —
+                                 # it can use the same 300-second ceiling.
+                                 (entry(5, "launch") + entry(175, "launch"), False, True),
+                                 (entry(5, "launch") + entry(20, "keys") + entry(175, "keys"), False, True),
+                                 (entry(5, "launch") + entry(165, "safari") + entry(175, "safari"), True, True),
                                  # Run 42672706585: migration ended and the boot
                                  # reached Waiting on System App; that stage
                                  # transition is the same forward motion.
                                  ("Status=2, isTerminal=NO, Elapsed=02:00.\n"
                                   "Reason:Running plugin keys (a.migrator)\n"
                                   "Status=4, isTerminal=NO, Elapsed=02:58.\n"
-                                  "\tWaiting on System App\n", True),
+                                  "\tWaiting on System App\n", True, False),
                                  # A boot stuck inside the same post-migration
                                  # stage still produces no recent transition.
                                  ("Status=2, isTerminal=NO, Elapsed=00:05.\n"
@@ -327,10 +331,39 @@ class HarnessTests(unittest.TestCase):
                                   "Status=4, isTerminal=NO, Elapsed=01:00.\n"
                                   "\tWaiting on System App\n"
                                   "Status=4, isTerminal=NO, Elapsed=02:55.\n"
-                                  "\tWaiting on System App\n", False),
-                                 ("Status=4, isTerminal=NO, Elapsed=02:55.\n", False), ("", False)):
+                                  "\tWaiting on System App\n", False, False),
+                                 ("Status=4, isTerminal=NO, Elapsed=02:55.\n", False, False),
+                                 ("", False, False)):
                 path.write_text(log)
-                self.assertEqual(fixture_runner.migration_progress(path)["recentMigrationProgress"], allowed)
+                proof = fixture_runner.migration_progress(path)
+                self.assertEqual(proof["recentMigrationProgress"], recent)
+                self.assertEqual(proof["activeMigration"], active)
+
+    def test_cold_boot_continues_while_one_named_migrator_is_still_running(self):
+        # Run 42834538144: both attempts died inside a still-running
+        # 00LaunchServicesMigrator. Its in-flight state earns the same bounded
+        # continuation once; a dead boot still fails at the 300-second cap.
+        argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
+        log = (b"Status=2, isTerminal=NO, Elapsed=00:09.\nReason:Running plugin launch (a.migrator)\n"
+               b"Status=2, isTerminal=NO, Elapsed=02:58.\nReason:Running plugin launch (a.migrator)\n")
+        process = Mock(pid=424242)
+        original = subprocess.TimeoutExpired(argv, 180)
+        process.wait.side_effect = [original, 0]
+        process.poll.return_value = None
+
+        def spawn(*_, **kwargs):
+            kwargs["stdout"].write(log)
+            kwargs["stdout"].flush()
+            return process
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "bootstatus.log"
+            with patch.object(fixture_runner.subprocess, "Popen", side_effect=spawn):
+                self.assertEqual(fixture_runner.command(argv, path, timeout=180, boot_status=True), log.decode())
+            proof = json.loads(path.with_suffix(".progress.json").read_text())
+            self.assertEqual(proof["continuationReason"], "active-migration")
+            self.assertEqual(proof["extensionSeconds"], 120)
+            self.assertEqual(proof["continuationExit"], 0)
 
     def test_cold_boot_continues_same_process_once_and_requires_exit_zero(self):
         argv = ["xcrun", "simctl", "bootstatus", "owned-id", "-b"]
