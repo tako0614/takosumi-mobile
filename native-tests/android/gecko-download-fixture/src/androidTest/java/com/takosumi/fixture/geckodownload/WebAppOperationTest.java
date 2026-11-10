@@ -663,10 +663,20 @@ public final class WebAppOperationTest {
         assertEquals(document, work.generation);
         assertEquals(uri, work.uri);
 
-        key(KeyEvent.KEYCODE_S, KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON |
-            KeyEvent.META_ALT_ON | KeyEvent.META_ALT_LEFT_ON | KeyEvent.META_SHIFT_ON | KeyEvent.META_SHIFT_LEFT_ON);
+        // Injected chords do not reliably reach Photopea's web layer on this
+        // stack (the same class of miss as the earlier New Project Escape).
+        // Drive the real menu instead: File -> Export As -> PNG, then the
+        // dialog's own export action — whichever of Save/OK the site renders.
+        tap("File");
+        tap(awaitRect("Photopea Export As entry did not open or settle",
+            () -> stable("export-as", bounds("Export As", true, false)), 15));
+        tap(awaitRect("Photopea PNG export item did not open or settle",
+            () -> stable("export-png", bounds("PNG", false, false)), 15));
         await("Actual Photopea Save for web dialog did not open", () -> bounds("Save for web", false, false) != null, 20);
-        key(KeyEvent.KEYCODE_ENTER, 0);
+        tap(awaitRect("Save for web export action did not settle", () -> {
+            Rect save = bounds("Save", false, false);
+            return stable("export-save", save != null ? save : bounds("OK", false, false));
+        }, 15));
         WebAppProbeActivity.Export transfer = activity.responses.poll(20, TimeUnit.SECONDS);
         assertNotNull("No original Photopea export response\n" + activity.diagnostics() + "\n" + tree(), transfer);
         assertSame(work, transfer.page);
