@@ -254,7 +254,7 @@ public final class WebAppOperationTest {
                     // shell input or direct file-prompt callback substitutes for it.
                     if (systemPicker) assertTrue("DocumentsUI rejected native touch",
                         instrumentation.getUiAutomation().injectInputEvent(event, true));
-                    else instrumentation.sendPointerSync(event);
+                    else sendOwnUid(event);
                     gestureStarted = action == MotionEvent.ACTION_DOWN;
                     if (action == MotionEvent.ACTION_DOWN) downDelivered = SystemClock.uptimeMillis();
                     else if (activity != null)
@@ -276,6 +276,30 @@ public final class WebAppOperationTest {
                 finally { cancel.recycle(); }
             }
             throw failure;
+        }
+    }
+
+    // sendPointerSync resolves the target window at injection time: a
+    // transient system surface (sheet, prompt, shade) on top of our window
+    // makes the OS refuse the event as "not directed at a window owned by
+    // uid". That is an input race, not a missed tap — bounded retries on that
+    // specific refusal only; every other failure keeps the original error.
+    private void sendOwnUid(MotionEvent event) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                instrumentation.sendPointerSync(event);
+                return;
+            } catch (Exception refused) {
+                String detail = String.valueOf(refused.getMessage()) + " " +
+                    (refused.getCause() == null ? "" : String.valueOf(refused.getCause().getMessage()));
+                if (attempt >= 4 || !detail.contains("not directed at a window owned by uid")) {
+                    if (refused instanceof RuntimeException) throw (RuntimeException) refused;
+                    throw new IllegalStateException(refused);
+                }
+                if (activity != null)
+                    activity.trace("own-uid injection refused by a transient foreign window; retry " + attempt);
+                SystemClock.sleep(200);
+            }
         }
     }
 
