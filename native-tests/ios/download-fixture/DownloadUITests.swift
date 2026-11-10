@@ -50,8 +50,11 @@ final class DownloadUITests: XCTestCase {
         // an extra full-screen window, a second live webview, or a webview
         // whose web-content accessibility never arrived (links stays 0 while
         // the native bar and scroll bars still enumerate).
+        // The screen's own Progress bar separates the two observed variants:
+        // "still loading" (run 42797894615: 10%, zero server requests) from
+        // "loaded but a11y-empty" (run 42729892985: page painted and served).
         XCTAssertTrue(link.waitForExistence(timeout: 15),
-                      "\(name); windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count)")
+                      "\(name); windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count) progress=\((app.progressIndicators["Progress"].firstMatch.value as? String) ?? "absent")")
         link.tap()
     }
 
