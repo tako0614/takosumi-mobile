@@ -704,8 +704,10 @@ public final class WebAppOperationTest {
         // Drive the real menu instead: File -> Export As -> PNG, then the
         // dialog's own export action — whichever of Save/OK the site renders.
         tap("File");
-        tap(awaitRect("Photopea Export As entry did not open or settle",
-            () -> stable("export-as", bounds("Export As", true, false)), 15));
+        // The menu's real label is "Export as" (lowercase, no ellipsis) —
+        // a contains "Export As" never matches the opened menu.
+        tap(awaitRect("Photopea Export as entry did not open or settle",
+            () -> stable("export-as", bounds("Export as", false, false)), 15));
         tap(awaitRect("Photopea PNG export item did not open or settle",
             () -> stable("export-png", bounds("PNG", false, false)), 15));
         await("Actual Photopea Save for web dialog did not open", () -> bounds("Save for web", false, false) != null, 20);
