@@ -339,7 +339,25 @@ public final class WebAppOperationTest {
                     .append(' ').append(owner);
             }
         } catch (RuntimeException unavailable) { /* evidence only */ }
-        return names.toString();
+        // The IME can intercept the tap while missing from getWindows()
+        // entirely (run 42953633716: empty list, keyboard visibly open in
+        // the failure capture) — a text field accepting input names it by
+        // elimination.
+        return names + "; acceptingText=" + acceptingText();
+    }
+
+    // Whether a text field currently accepts input — the on-screen
+    // keyboard is up or about to be, even when its window is absent from
+    // the accessibility window list.
+    private boolean acceptingText() {
+        if (activity == null) return false;
+        final boolean[] accepting = new boolean[1];
+        instrumentation.runOnMainSync(() -> {
+            InputMethodManager imm =
+                (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+            accepting[0] = imm != null && imm.isAcceptingText();
+        });
+        return accepting[0];
     }
 
     // The soft keyboard is a separate-uid window: while it covers a target,
@@ -812,10 +830,19 @@ public final class WebAppOperationTest {
             // that already arrived; either means the export went out.
             if (saveAttempt > 0 && (activity.responses.peek() != null
                     || bounds("Save for web", false, false) == null)) break;
-            tap(awaitRect("Save for web export action did not settle", () -> {
+            Rect saveRect = awaitRect("Save for web export action did not settle", () -> {
                 Rect save = bounds("Save", false, false);
                 return stable("export-save", save != null ? save : bounds("OK", false, false));
-            }, 15));
+            }, 15);
+            // The focused number field re-opens the keyboard over the lower
+            // half whenever the dialog settles into it — run 42953633716
+            // saw the refusal outlive every retry with the keyboard on the
+            // Save button. A user closes it again to reach the button, so
+            // dismissal belongs inside the attempt: each reopen earns the
+            // same close, and the bounds above were already sampled for
+            // this layout.
+            dismissCoveringIme("Save for web export action");
+            tap(saveRect);
             try {
                 await("Save for web dialog did not close after its export action",
                     () -> activity.responses.peek() != null
