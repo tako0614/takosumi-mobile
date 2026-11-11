@@ -10,6 +10,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import java.io.File;
 import java.nio.file.Files;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import org.junit.After;
@@ -88,13 +90,34 @@ public final class ResponseCapabilityTest {
 
     private void tap(String text) {
         visible(text);
-        Rect bounds = textBounds(text);
-        assertNotNull(bounds);
+        // A present label can still be mid-reflow right after a profile
+        // switch reloads the WebView; an injected tap on the rect just read
+        // lands where the node no longer is. Only a rect that survives
+        // unchanged for half a second may be tapped (same rule as
+        // WebAppOperationTest.stable).
+        Rect[] settled = {null};
+        await("Page text did not settle: " + text,
+            () -> (settled[0] = stable("tap " + text, textBounds(text))) != null, 15);
+        Rect bounds = settled[0];
         long down = SystemClock.uptimeMillis();
         for (int action : new int[] {MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
             MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, bounds.exactCenterX(), bounds.exactCenterY(), 0);
             try { instrumentation.sendPointerSync(event); } finally { event.recycle(); }
         }
+    }
+
+    private final Map<String, Rect> lastBounds = new HashMap<>();
+    private final Map<String, Long> lastChanged = new HashMap<>();
+
+    private Rect stable(String key, Rect rect) {
+        if (rect == null) { lastBounds.remove(key); lastChanged.remove(key); return null; }
+        Rect previous = lastBounds.get(key);
+        if (!rect.equals(previous)) {
+            lastBounds.put(key, new Rect(rect));
+            lastChanged.put(key, SystemClock.elapsedRealtime());
+            return null;
+        }
+        return SystemClock.elapsedRealtime() - lastChanged.get(key) >= 500 ? rect : null;
     }
 
     private ResponseProbeActivity.Transfer response(String link) throws Exception {
