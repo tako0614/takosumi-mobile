@@ -1164,9 +1164,18 @@ class Observer:
         self.checkpoint("permission-requested")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            state = page.evaluate(
-                f"(()=>({{permission:Notification.permission,result:globalThis[{key}].result,"
-                f"error:globalThis[{key}].error}}))()", True)
+            # A busy renderer can starve one poll's reply (run 42983025866's
+            # family); this loop already re-asks within its own 30 s bound,
+            # so a starved read just means ask again rather than fail the
+            # whole step on the first starved reply.
+            try:
+                state = page.evaluate(
+                    f"(()=>({{permission:Notification.permission,result:globalThis[{key}].result,"
+                    f"error:globalThis[{key}].error}}))()", True)
+            except Failure as error:
+                if "CDP timeout" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                continue
             if state["result"] or state["error"]:
                 break
             time.sleep(0.2)
