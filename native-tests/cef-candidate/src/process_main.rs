@@ -1599,6 +1599,24 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     drop(app);
     #[cfg(target_os = "macos")]
     mac_lifecycle::record("cef-shutdown-begin", mac_lifecycle::BROWSER, None);
+    // A site that keeps spawning helpers can leave CefShutdown waiting
+    // forever (run 42976970505: Photopea churned renderers for ~58 s past
+    // cef-shutdown-begin until teardown killed the tree; the App's
+    // sequential quit wedged behind it and the sibling profile's
+    // beforeunload was never asked). Every screen is already closed and
+    // the stopped reply was reported, so bound the teardown wait; past it,
+    // record and leave with the real outcome code. _exit skips atexit
+    // handlers that could re-enter the wedged runtime, and the guard still
+    // accounts for any helper left running.
+    #[cfg(target_os = "macos")]
+    let _ = std::thread::Builder::new()
+        .name("cef-shutdown-bound".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, None);
+            // SAFETY: immediate process exit; no user state remains unflushed.
+            unsafe { libc::_exit(i32::from(failed)) };
+        });
     shutdown();
     #[cfg(target_os = "macos")]
     mac_lifecycle::record("cef-shutdown-return", mac_lifecycle::BROWSER, None);
