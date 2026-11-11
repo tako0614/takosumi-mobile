@@ -55,6 +55,9 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_MESSAGE = 16 * 1024 * 1024
 MARKER_WAIT = 30
 SETTLE_WAIT = 10
+# One pure read's bound through a starved DevTools channel; the same order
+# of storm the driver's 60s cancel-inspected bound already waits out.
+STARVED_READ_WAIT = 60
 # The fixture site's documents: a navigation within a profile, or the boot
 # load of a new browser (the cef-candidate popup probe's 25 s load bound).
 LOAD_WAIT = 25
@@ -855,10 +858,31 @@ class Observer:
 
     def sample(self, page):
         key = json.dumps(self.key)
-        return page.evaluate(
+        return self.read_evaluate(page,
             f"({{document:globalThis[{key}],storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
             "origin:location.origin,frame:window===top,page:document.querySelector('main')?.dataset.page??null,"
             "user:document.querySelector('main')?.dataset.user??null})")
+
+    def read_evaluate(self, page, expression):
+        """One pure read through a starved DevTools channel. A busy renderer
+        can starve one reply while the cancelled quit's churn continues
+        (run 42961067390: Photopea kept Work's renderer busy through the
+        post-cancel sample); asking the same read again is the same
+        question, so it is bounded and recorded. Anything else raises."""
+        deadline = time.monotonic() + STARVED_READ_WAIT
+        attempts = 0
+        while True:
+            try:
+                value = page.evaluate(expression)
+                break
+            except Failure as error:
+                if "CDP timeout" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                attempts += 1
+                self.proof.setdefault("starvedReadRetries", []).append(
+                    {"attempt": attempts, "error": str(error)[:200]})
+                time.sleep(0.05)
+        return value
 
     def persisted(self, page):
         key = json.dumps(self.key)

@@ -179,7 +179,7 @@ class MacObserver(Observer):
 
     def sample(self, page):
         key = json.dumps(self.key)
-        return page.evaluate(f"({{document:globalThis[{key}]??null,storage:localStorage.getItem({key}),"
+        return self.read_evaluate(page, f"({{document:globalThis[{key}]??null,storage:localStorage.getItem({key}),"
                              f"cookie:{self.cookie_of()},origin:location.origin}})")
 
     def beforeunload(self, page):
