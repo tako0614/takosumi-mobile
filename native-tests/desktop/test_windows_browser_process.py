@@ -550,6 +550,51 @@ class CdpTests(unittest.TestCase):
         self.assertIn("Runtime.evaluate", page.calls)
         self.assertEqual(len(watch.proof["browserSampleFallbacks"]), 1)
 
+    def test_a_contended_sample_rides_out_a_starved_browser_read(self):
+        # Run 43090171027: the storm that still answered every control-pipe
+        # command starved getFrameTree's flat SETTLE_WAIT. The send claims
+        # its position and waits out one shared bound instead of failing on
+        # the first 10 s.
+        key = "sumi_app_process_no-such-case"
+        starved = {"n": 0}
+        def flaky(method):
+            starved["n"] += 1
+            if starved["n"] == 1:
+                return Failure("CDP timeout Page.getFrameTree (P)")
+            return {"frameTree": {"frame": {"id": "F", "securityOrigin": "https://site.test"}}}
+        class Sends(dict):
+            def setdefault(self, key, default=None):
+                # Keep the key absent so __missing__ keeps producing the
+                # flaky results; contended_page would otherwise pin a
+                # static default tree.
+                return default if key == "Page.getFrameTree" else super().setdefault(key, default)
+            def __missing__(self, method):
+                return flaky(method) if method == "Page.getFrameTree" else {}
+        sends = Sends({"DOMStorage.enable": {},
+                       "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
+                       "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
+        page = self.contended_page(sends, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertEqual([call for call in page.calls if call == "Page.getFrameTree"],
+                         ["Page.getFrameTree", "Page.getFrameTree"])
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertEqual(retries[0]["method"], "Page.getFrameTree")
+        self.assertIn("CDP timeout", retries[0]["error"])
+
+    def test_a_contended_sample_names_a_starved_browser_read_after_the_bound(self):
+        page = self.contended_page(
+            {"Page.getFrameTree": Failure("CDP timeout Page.getFrameTree (P)"),
+             "DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.object(observer, "STARVED_READ_WAIT", 0.001):
+            with self.assertRaisesRegex(Failure, "CDP timeout Page.getFrameTree"):
+                watch.contended_sample(page, 0)
+        self.assertEqual(watch.proof["starvedBrowserReadRetries"][0]["method"],
+                         "Page.getFrameTree")
+
 
 class TcpTableTests(unittest.TestCase):
     def row(self, state, address, port, pid):

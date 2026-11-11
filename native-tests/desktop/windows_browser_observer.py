@@ -918,21 +918,43 @@ class Observer:
         risk a load in flight. An engine without the storage read
         domains falls back to the claimed-position renderer read; the
         oracle is unchanged."""
+        # Browser-serviced reads still ride the same DevTools channel: under
+        # the same storm that dispatched and answered every control-pipe
+        # command, run 43090171027 starved Page.getFrameTree's flat
+        # SETTLE_WAIT on Work. Each send here claims its queue position and
+        # waits on it against ONE shared storm bound; a timeout is recorded
+        # and re-sent only while the bound lasts, then raised on its own
+        # name — never masked by the storage-domain fallback below.
+        deadline = time.monotonic() + STARVED_READ_WAIT
+        def starved(method, params=None):
+            while True:
+                try:
+                    return page.send(method, params,
+                                     max(5.0, deadline - time.monotonic()))
+                except Failure as error:
+                    if "CDP timeout" in str(error):
+                        self.proof.setdefault("starvedBrowserReadRetries", []).append(
+                            {"profile": page.process["profile"], "method": method,
+                             "error": str(error)[:200]})
+                        if time.monotonic() < deadline:
+                            time.sleep(0.05)
+                            continue
+                    raise
         # getFrameTree itself has no storage-domain fallback: without the root
         # frame's id the navigation scan below cannot run at all, so a missing
         # Page domain or a destroyed target fails here on its own name.
-        tree = page.send("Page.getFrameTree", timeout=SETTLE_WAIT)["frameTree"]["frame"]
+        tree = starved("Page.getFrameTree")["frameTree"]["frame"]
         root = tree["id"]
         origin = tree.get("securityOrigin")
         if origin is None:
             split = urlsplit(tree.get("url", ""))
             origin = f"{split.scheme}://{split.netloc}"
         try:
-            page.send("DOMStorage.enable", timeout=SETTLE_WAIT)
-            items = dict(page.send("DOMStorage.getDOMStorageItems",
-                                   {"storageId": {"securityOrigin": origin, "isLocalStorage": True}},
-                                   timeout=SETTLE_WAIT).get("entries") or [])
-            cookies = page.send("Network.getCookies", {"urls": [origin]}, timeout=SETTLE_WAIT)["cookies"]
+            starved("DOMStorage.enable")
+            items = dict(starved("DOMStorage.getDOMStorageItems",
+                                 {"storageId": {"securityOrigin": origin, "isLocalStorage": True}})
+                         .get("entries") or [])
+            cookies = starved("Network.getCookies", {"urls": [origin]})["cookies"]
             state = {"storage": items.get(self.key),
                      "cookie": next((item["value"] for item in cookies if item["name"] == self.key), None),
                      "origin": origin}
