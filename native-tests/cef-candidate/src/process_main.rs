@@ -137,9 +137,12 @@ fn reply(value: Reply) {
     let mut out = io::stdout().lock();
     // A broken parent pipe cannot authorize another operation. EOF also posts
     // the owned shutdown task; never print protocol data to the site's console.
-    let _ = serde_json::to_writer(&mut out, &value);
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    if serde_json::to_writer(&mut out, &value).is_err()
+        || out.write_all(b"\n").is_err()
+        || out.flush().is_err()
+    {
+        eprintln!("A browser reply could not be written to the control pipe.");
+    }
 }
 fn error(id: u64, message: &str) {
     reply(Reply::Error {
@@ -1029,6 +1032,7 @@ fn open(id: u64, payload: OpenRequest) {
             .map(|screen| screen.browser.clone())
     });
     if let Some(browser) = existing {
+        eprintln!("browser command {id}: reusing browser {}", browser.identifier());
         if !payload.resume {
             browser
                 .main_frame()
@@ -1076,6 +1080,7 @@ fn open(id: u64, payload: OpenRequest) {
         runtime_style: RuntimeStyle::CHROME,
         ..Default::default()
     };
+    eprintln!("browser command {id}: creating a new browser");
     if browser_host_create_browser(
         Some(&info),
         Some(&mut client),
@@ -1120,6 +1125,15 @@ fn dispatch(bytes: Option<&[u8]>) {
         }
     };
     let id = request.id();
+    eprintln!(
+        "browser command {id}: {}",
+        match &request {
+            Request::Open { .. } => "open",
+            Request::Close { .. } => "close",
+            Request::Shutdown { .. } => "shutdown",
+            Request::ResolvePermission { .. } => "resolve-permission",
+        }
+    );
     let shutdown = matches!(request, Request::Shutdown { .. });
     let admitted = with_state(|state| {
         let admitted = admission(
@@ -1583,7 +1597,14 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
                 break;
             }
             let mut task = PipeTask::new(bytes);
-            if post_task(ThreadId::UI, Some(&mut task)) != 1 || stop {
+            if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+                // A command the parent believes sent would otherwise vanish
+                // without a reply and no trace (run 43076506208's reopened
+                // Work Open is exactly this shape: sent, never answered).
+                eprintln!("A browser command could not reach the UI thread; the control reader ends.");
+                break;
+            }
+            if stop {
                 break;
             }
         }
