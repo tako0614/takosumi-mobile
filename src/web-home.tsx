@@ -253,7 +253,7 @@ export function WebHome(props: {
           <For each={pendingPermissions()}>{(prompt) => (
             <section class="web-clear"
               aria-label={`${originHost(prompt.origin)}からのアクセスの要求`}>
-              <h3>{originHost(prompt.origin)}が{permissionLabels(prompt.permissions).join("・")}を求めています</h3>
+              <h3>{originHost(prompt.origin)}が{permissionLabels(prompt.permissions, prompt.kind).join("・")}を求めています</h3>
               <p>接続先「{connectionNameOf(prompt)}」で開いているサイトだけに適用されます。</p>
               <button type="button" disabled={answering() !== undefined}
                 onClick={() => void answer(prompt, "deny")}>許可しない</button>

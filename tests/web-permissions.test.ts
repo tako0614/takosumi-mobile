@@ -96,3 +96,10 @@ test("labels name the CEF permission bits a site actually asks for", () => {
   expect(permissionLabels(0)).toEqual(["このサイトの機能"]);
   expect(permissionLabels(1 << 30)).toEqual(["このサイトの機能"]);
 });
+
+test("media labels decode the media access bit space, not prompt bits", () => {
+  expect(permissionLabels(1 << 0, "media")).toEqual(["マイク"]);
+  expect(permissionLabels((1 << 0) | (1 << 1), "media")).toEqual(["マイク", "カメラ"]);
+  expect(permissionLabels(1 << 3, "media")).toEqual(["画面共有"]);
+  expect(permissionLabels(0, "media")).toEqual(["このサイトの機能"]);
+});

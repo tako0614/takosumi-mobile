@@ -124,10 +124,24 @@ const PERMISSION_LABELS: readonly (readonly [number, string])[] = [
   [1 << 27, "この端末内のサービス"],
 ];
 
-export function permissionLabels(permissions: number): readonly string[] {
+// Chromium's cef_media_access_permission_types_t bits. Media requests report
+// in this separate space, so decoding them against the prompt bits above
+// mislabels a microphone ask as "ARセッション" (both are bit 0).
+const MEDIA_PERMISSION_LABELS: readonly (readonly [number, string])[] = [
+  [1 << 0, "マイク"],
+  [1 << 1, "カメラ"],
+  [1 << 2, "画面の音声"],
+  [1 << 3, "画面共有"],
+];
+
+export function permissionLabels(
+  permissions: number,
+  kind: PendingPermission["kind"] = "prompt",
+): readonly string[] {
   const labels: string[] = [];
   let unknown = permissions;
-  for (const [bit, label] of PERMISSION_LABELS) {
+  const known = kind === "media" ? MEDIA_PERMISSION_LABELS : PERMISSION_LABELS;
+  for (const [bit, label] of known) {
     if (permissions & bit) {
       labels.push(label);
       unknown &= ~bit;
