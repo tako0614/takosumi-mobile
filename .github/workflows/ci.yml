@@ -141,10 +141,12 @@ jobs:
             fi
             # An attempt ended during unpacking leaves dpkg to finish first,
             # once its lock is free (at most 60 s; a lock still held then makes
-            # dpkg fail the step visibly).
+            # dpkg fail the step visibly). An attempt cut during update instead
+            # leaves the killed apt-get holding the lists lock for a moment —
+            # same bound, wait for it to exit before the retry.
             if command -v fuser > /dev/null; then
               for _ in $(seq 60); do
-                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock > /dev/null 2>&1 || break
                 sleep 1
               done
             else
@@ -632,10 +634,12 @@ jobs:
             fi
             # An attempt ended during unpacking leaves dpkg to finish first,
             # once its lock is free (at most 60 s; a lock still held then makes
-            # dpkg fail the step visibly).
+            # dpkg fail the step visibly). An attempt cut during update instead
+            # leaves the killed apt-get holding the lists lock for a moment —
+            # same bound, wait for it to exit before the retry.
             if command -v fuser > /dev/null; then
               for _ in $(seq 60); do
-                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock > /dev/null 2>&1 || break
+                sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock > /dev/null 2>&1 || break
                 sleep 1
               done
             else
