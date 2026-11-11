@@ -746,9 +746,10 @@ class Page:
     def send(self, method, params=None, timeout=5.0):
         return self.cdp.command(method, params, self.session, timeout)
 
-    def evaluate(self, expression, gesture=False):
+    def evaluate(self, expression, gesture=False, timeout=5.0):
         result = self.send("Runtime.evaluate", {"expression": expression, "returnByValue": True,
-                                                "awaitPromise": True, "userGesture": gesture})
+                                                "awaitPromise": True, "userGesture": gesture},
+                           timeout)
         require(not result.get("exceptionDetails"), json.dumps(result.get("exceptionDetails"))[:1000])
         return result["result"].get("value")
 
@@ -872,22 +873,27 @@ class Observer:
         quit's churn continues (run 42961067390: Photopea kept Work's
         renderer busy through the post-cancel sample; run 42983025866:
         Photopea starved even the reply to the beforeunload listener's own
-        removal). Asking the same expression again is the same question for
-        a read and a no-op for an idempotent write, so it is bounded and
-        recorded. Anything else raises."""
+        removal). A timed-out evaluate still holds its queue position in
+        the renderer — run 43061069602 starved ELEVEN re-sent evaluates at
+        the back of a still-deep queue while the page's own tasks kept
+        running — so the bound is spent waiting on each request already
+        sent, not re-queuing behind the churn. Anything else raises."""
         deadline = time.monotonic() + STARVED_READ_WAIT
         attempts = 0
         while True:
             try:
-                value = page.evaluate(expression, gesture)
+                value = page.evaluate(expression, gesture,
+                                      max(5.0, deadline - time.monotonic()))
                 break
             except Failure as error:
-                if "CDP timeout" not in str(error) or time.monotonic() >= deadline:
-                    raise
-                attempts += 1
-                self.proof.setdefault("starvedEvaluateRetries", []).append(
-                    {"attempt": attempts, "error": str(error)[:200]})
-                time.sleep(0.05)
+                if "CDP timeout" in str(error):
+                    attempts += 1
+                    self.proof.setdefault("starvedEvaluateRetries", []).append(
+                        {"attempt": attempts, "error": str(error)[:200]})
+                    if time.monotonic() < deadline:
+                        time.sleep(0.05)
+                        continue
+                raise
         return value
 
     def persisted(self, page):

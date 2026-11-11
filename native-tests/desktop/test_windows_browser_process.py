@@ -404,6 +404,47 @@ class CdpTests(unittest.TestCase):
         self.assertEqual(cdp.mark(), 4200)
         self.assertEqual([event["method"] for event in cdp.since(4198)], ["E4198", "E4199"])
 
+    def test_a_starved_read_rides_the_sent_requests_queue_position(self):
+        calls = []
+
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                calls.append(timeout)
+                return {"ok": True}
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.read_evaluate(FakePage(), "1"), {"ok": True})
+        # The whole starved bound waits on the request already sent — it is
+        # not re-queued behind a still-deep renderer task queue.
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0], 5.0)
+
+    def test_a_timed_out_starved_read_is_recorded_before_raising(self):
+        calls = []
+
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                calls.append(timeout)
+                raise Failure("CDP timeout Runtime.evaluate (P)")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.object(observer, "STARVED_READ_WAIT", 0.001):
+            with self.assertRaisesRegex(Failure, "CDP timeout"):
+                watch.read_evaluate(FakePage(), "1")
+        retries = watch.proof["starvedEvaluateRetries"]
+        self.assertEqual(retries[0]["attempt"], 1)
+        self.assertIn("CDP timeout", retries[0]["error"])
+
+    def test_a_starved_read_reraises_non_timeout_failures_unrecorded(self):
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                raise Failure("CDP Runtime.evaluate failed (P): boom")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "boom"):
+            watch.read_evaluate(FakePage(), "1")
+        self.assertNotIn("starvedEvaluateRetries", watch.proof)
+
 
 class TcpTableTests(unittest.TestCase):
     def row(self, state, address, port, pid):
