@@ -1165,12 +1165,25 @@ class Observer:
         (dialog_failure) before it goes on."""
         attempt = time.monotonic()
         try:
-            try:
-                page.send("Page.handleJavaScriptDialog", {"accept": False})
-            except CdpError as error:
-                if not (self.real and opened is not None and error.error.get("message") == NO_DIALOG):
-                    raise
-                return self.cancelled_by_browser(page, what, opened, attempt, error)
+            for send_retry in range(3):
+                try:
+                    page.send("Page.handleJavaScriptDialog", {"accept": False})
+                    break
+                except CdpError as error:
+                    if not (self.real and opened is not None and error.error.get("message") == NO_DIALOG):
+                        raise
+                    return self.cancelled_by_browser(page, what, opened, attempt, error)
+                except Failure as error:
+                    # A busy renderer can starve one DevTools reply while the
+                    # dialog stays open (run 42953633716: Photopea kept
+                    # spawning renderers through Work's whole cancel window).
+                    # Asking again is the same cancel — the close event below
+                    # still proves it actually happened; a dead browser fails
+                    # there instead.
+                    if send_retry == 2 or "CDP timeout" not in str(error):
+                        raise
+                    self.proof.setdefault("dialogSendRetries", []).append(
+                        {"attempt": send_retry + 1, "error": str(error)[:200]})
             page.cdp.wait_event(
                 lambda event: event["method"] == "Page.javascriptDialogClosed"
                 and event.get("sessionId") == page.session and event["params"].get("result") is False,

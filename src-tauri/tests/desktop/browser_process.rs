@@ -775,7 +775,9 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // Only its unsolicited intent may initiate this App's first two exits.
     #[cfg(not(target_os = "macos"))]
     app.exit(0);
-    checkpoint(view, case, "cancel-inspected").await?;
+    // A busy real-site renderer can starve one DevTools reply; the
+    // observer's own bounded cancel retry lives inside this wait.
+    checkpoint_within(view, case, "cancel-inspected", Duration::from_secs(60)).await?;
     let stopped = exit_cancelled(view, app, 0).await?;
     let kept = stopped.as_array().ok_or("Missing process array")?;
     let unchanged = kept.len() == 2
@@ -818,7 +820,8 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     println!("first: quitting again (Work closes, Personal cancels)");
     #[cfg(not(target_os = "macos"))]
     app.exit(0);
-    checkpoint(view, case, "partial-inspected").await?;
+    // Same bounded observer retry room as the cancelled quit above.
+    checkpoint_within(view, case, "partial-inspected", Duration::from_secs(60)).await?;
     let partial = exit_cancelled(view, app, 1).await?;
     let personal_profile = connections
         .as_array()
