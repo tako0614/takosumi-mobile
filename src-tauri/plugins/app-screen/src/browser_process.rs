@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
-use crate::{is_isolated_profile, Error, OpenRequest, PermissionDecision, PermissionKind, Result};
+use crate::{is_isolated_profile, Error, OpenRequest, Result};
+// The prompt decision and kind live in models.rs with the App-side answer
+// surface; the pipe protocol Request and Reply name them, so external
+// consumers keep reaching them through browser_process.
+pub use crate::{PermissionDecision, PermissionKind};
 
 pub const MAX_PACKET_BYTES: usize = 64 * 1024;
 
