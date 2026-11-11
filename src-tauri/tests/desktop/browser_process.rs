@@ -826,14 +826,26 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&retained).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(view, case, "request-partial-exit").await?;
+    // On a real site the observer's own transition to the second quit
+    // (listener removal, samples, arming on a starved channel) can take
+    // minutes — run 43007950291 burned ~116 s there — so this checkpoint
+    // takes the real-site bound, not the fixture's 30 s.
+    checkpoint_within(view, case, "request-partial-exit", inspect_bound()).await?;
     // Work now agrees to leave and closes first; Personal cancels, so the quit
     // stops with only Personal kept (the accepted sequential trade-off).
     println!("first: quitting again (Work closes, Personal cancels)");
     #[cfg(not(target_os = "macos"))]
     app.exit(0);
     // Same bounded observer retry room as the cancelled quit above.
-    checkpoint_within(view, case, "partial-inspected", Duration::from_secs(60)).await?;
+    // The partial phase spans quiet + dialog + cancel on the same starved
+    // channel, so it also takes the real-site observer bound.
+    checkpoint_within(
+        view,
+        case,
+        "partial-inspected",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     let partial = exit_cancelled(view, app, 1).await?;
     let personal_profile = connections
         .as_array()
@@ -864,7 +876,10 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // the home's own prompt row is the person's answer surface. Clicking
     // 許可する resolves the held callback, which is the grant the observer
     // records from the page itself.
-    checkpoint(view, case, "permission-requested").await?;
+    // The observer's leg here (sample, removal, answer) is the same
+    // starved-retry work as the quit transitions, so the wait takes the
+    // real-site bound too (independent review on 479af73).
+    checkpoint_within(view, case, "permission-requested", inspect_bound()).await?;
     answer_permission(view).await?;
     println!("first: the held prompt was answered through the home; waiting for the final quit");
     // A held media prompt has no runtime dismissal of its own: it retires
@@ -873,7 +888,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // always does; the Windows/macOS flows do where their driver opted in
     // with the same flag (packaged runs leave it off on both sides).
     if std::env::var("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL").as_deref() == Ok("1") {
-        checkpoint(view, case, "media-requested").await?;
+        checkpoint_within(view, case, "media-requested", inspect_bound()).await?;
         // The notification answer already retired its row, so exactly one
         // held row now means the media prompt the page just raised; its
         // heading text goes into the marker as evidence for the observer.
@@ -899,7 +914,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
             .map_err(|error| error.to_string())?;
         std::fs::write(case.join("media-held-seen.json"), seen)
             .map_err(|error| error.to_string())?;
-        checkpoint(view, case, "media-navigated").await?;
+        checkpoint_within(view, case, "media-navigated", inspect_bound()).await?;
         // The same-site reload killed the document's held request: the
         // App's row must be gone, proving retirement reached the held map
         // rather than merely the browser.
@@ -907,7 +922,14 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         println!("first: the held media prompt retired with its document");
     }
     // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
-    checkpoint_within(view, case, "request-final-exit", Duration::from_secs(60)).await?;
+    // The 60 s fixture calibration stays as the floor.
+    checkpoint_within(
+        view,
+        case,
+        "request-final-exit",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
         b"{\"passed\":true}\n",
