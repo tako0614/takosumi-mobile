@@ -186,7 +186,8 @@ class MacObserver(Observer):
         self.step("beforeunload setup", page)
         mark = page.cdp.mark()
         state = self.read_evaluate(page,
-                              "(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
+                              "(()=>{window.__sumiBeforeUnload=window.__sumiBeforeUnload||"
+                              "(e=>{e.preventDefault();e.returnValue='';});"
                               "addEventListener('beforeunload',window.__sumiBeforeUnload);"
                               "return {stickyActivation:navigator.userActivation.hasBeenActive,"
                               "active:navigator.userActivation.isActive,visibility:document.visibilityState,"
