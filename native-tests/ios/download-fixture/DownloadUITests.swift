@@ -50,11 +50,27 @@ final class DownloadUITests: XCTestCase {
         // an extra full-screen window, a second live webview, or a webview
         // whose web-content accessibility never arrived (links stays 0 while
         // the native bar and scroll bars still enumerate).
-        // The screen's own Progress bar separates the two observed variants:
-        // "still loading" (run 42797894615: 10%, zero server requests) from
-        // "loaded but a11y-empty" (run 42729892985: page painted and served).
-        XCTAssertTrue(link.waitForExistence(timeout: 15),
-                      "\(name); windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count) progress=\((app.progressIndicators["Progress"].firstMatch.value as? String) ?? "absent")")
+        // The screen's own Progress bar separates the observed variants:
+        // "never fetched" (42797894615: 10%, zero server requests), "fetched
+        // but never painted" (43026070035: served, still 10%) and "loaded
+        // but a11y-empty" (42729892985: page painted and served).
+        let state = { [app] in
+            "windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count) progress=\((app.progressIndicators["Progress"].firstMatch.value as? String) ?? "absent")"
+        }
+        if !link.waitForExistence(timeout: 15) {
+            // A page still empty past the bound is the one a user reloads;
+            // send that same reload through the screen's own control once
+            // and re-wait. The oracle never changes — the link must appear
+            // for real — so a persistently broken or starved page still
+            // fails with both states named: whether the reload changed
+            // anything separates "recoverable stall" from "stays broken".
+            let starved = state()
+            let reload = app.buttons["再読み込み"].firstMatch
+            let reloaded = reload.exists
+            if reloaded { reload.tap() }
+            XCTAssertTrue(link.waitForExistence(timeout: 15),
+                          "\(name); userReload=\(reloaded ? "attempted" : "unavailable"); starved=[\(starved)] after=[\(state())]")
+        }
         link.tap()
     }
 
