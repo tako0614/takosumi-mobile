@@ -1647,9 +1647,19 @@ impl Process {
     }
     fn open(&mut self, payload: OpenRequest) -> Result<()> {
         if self.uncertain {
-            return Err(Error::InvalidRequest(
-                "Previous browser command is incomplete; profile data is retained.",
-            ));
+            // A command whose deadline passed may already have its reply
+            // queued: settle it once before refusing, without sending
+            // anything new (a starved browser can still answer late).
+            if self.recover()? {
+                return Err(Error::InvalidRequest(
+                    "The browser ended before its earlier command settled; open this connection again.",
+                ));
+            }
+            if self.uncertain {
+                return Err(Error::InvalidRequest(
+                    "Previous browser command is incomplete; profile data is retained.",
+                ));
+            }
         }
         let key = payload.key.clone();
         self.key = key.clone();
@@ -3035,6 +3045,76 @@ sys.stdin.read()' "$1"
         assert_eq!(process.opened["nativePid"], native_pid);
         stranger.kill().unwrap();
         stranger.wait().unwrap();
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn an_open_retries_after_a_queued_late_answer_settles_the_doubt() {
+        // The earlier request's reply can already be queued when the App's
+        // deadline passed (run 43076506208: a real site's cancelled quit
+        // starved the Work browser's own pipe so its resumed Open went
+        // unanswered). The open settles that doubt from the queued answer
+        // once instead of refusing the profile until exit.
+        let root = std::env::temp_dir().join(format!("sumi-open-recover-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let work = "11111111-1111-4111-8111-111111111111";
+        let guard = recovering_guard(&root);
+        let program = std::fs::canonicalize("/bin/sleep").unwrap();
+        let parent = spawner().unwrap();
+        let (mut process, send) = in_doubt(&root, &guard, &program, &parent, 1, work);
+        let key = format!("web-home:{work}:https://excalidraw.com");
+        process.opening = Some(key.clone());
+        let cache = process.directory.join("cef-profiles").join(work);
+        let native_pid: u32 = marker(&process.guard_receipt.with_file_name("native"))
+            .parse()
+            .unwrap();
+        // The timed-out Open's own verified answer, id 2, arrived late.
+        send.send(Ok(Reply::Opened {
+            id: 2,
+            key: key.clone(),
+            profile: work.to_owned(),
+            browser_id: 1,
+            cache_path: cache.to_string_lossy().into_owned(),
+            window_id: 7,
+            native_pid,
+        }))
+        .unwrap();
+        // The retry's reuse answer, id 3, lands while the retry waits.
+        let retry_send = send.clone();
+        let retry_key = key.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            retry_send
+                .send(Ok(Reply::Opened {
+                    id: 3,
+                    key: retry_key,
+                    profile: work.to_owned(),
+                    browser_id: 1,
+                    cache_path: cache.to_string_lossy().into_owned(),
+                    window_id: 7,
+                    native_pid,
+                }))
+                .unwrap();
+        });
+        let retry_payload: OpenRequest = serde_json::from_value(serde_json::json!({
+            "key":key,"url":"https://excalidraw.com/","title":"App","profile":work,
+            "webHome":true,"resume":true
+        }))
+        .unwrap();
+        process.open(retry_payload).unwrap();
+        assert!(!process.uncertain, "the queued answer settled the doubt");
+        assert_eq!(process.next, 3, "the retry sent exactly one new request");
+        assert_eq!(process.opened["nativePid"], native_pid);
+        drop(process);
+        // Without a queued answer the open is still refused while in doubt.
+        let (mut process, _send) = in_doubt(&root, &guard, &program, &parent, 2, work);
+        let refused_payload: OpenRequest = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{work}:https://excalidraw.com"),"url":"https://excalidraw.com/",
+            "title":"App","profile":work,"webHome":true,"resume":true
+        }))
+        .unwrap();
+        assert!(process.open(refused_payload).is_err(), "still in doubt");
+        assert!(process.uncertain, "an empty queue cannot settle it");
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();
     }
