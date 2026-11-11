@@ -250,6 +250,68 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(udid, replacement)
         self.assertEqual(calls, ["shutdown", "delete", "create", "list", "boot", "bootstatus"])
 
+    def test_stalled_boot_retry_failure_retires_the_named_replacement(self):
+        # If the retry fails after result.simulator was repointed at the
+        # replacement, main's locals still name the corpse and its finally
+        # could never reach the device the artifact names. The retry retires
+        # the replacement itself so cleanup cannot claim an absent device.
+        calls = []
+        replacement = "E13F1385-F0E1-41B7-A9A9-9019B6E3866B"
+        created = {}
+        def fake_command(argv, path, timeout=60, **kwargs):
+            calls.append((argv[2], Path(path).name))
+            if argv[2] in ("shutdown", "bootstatus"):
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[2] == "create":
+                created["name"] = argv[3]
+                return replacement + "\n"
+            if argv[2] == "list":
+                return json.dumps({"devices": {"runtime": [{"udid": replacement,
+                                                            "name": created["name"]}]}})
+            return ""
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "stalled-id", "name": "stalled-name"}}
+            with patch.object(fixture_runner, "command", side_effect=fake_command):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    fixture_runner.retry_boot_after_stall(
+                        out, subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "stalled-id", "-b"], 180),
+                        "stalled-id", "stalled-name", "device-type", "runtime", result, {})
+        self.assertEqual([call[0] for call in calls],
+                         ["shutdown", "delete", "create", "list", "boot", "bootstatus", "delete"])
+        self.assertEqual(result["simulator"]["udid"], replacement)
+        self.assertTrue(result["simulator"]["replacementDeleted"])
+        self.assertNotIn("bootRetry", result["simulator"])
+    def test_stalled_boot_retry_failure_records_owed_cleanup(self):
+        # A replacement that cannot even be deleted is recorded as owed
+        # cleanup instead of being silently leaked or claimed removed.
+        calls = []
+        replacement = "E13F1385-F0E1-41B7-A9A9-9019B6E3866B"
+        created = {}
+        def fake_command(argv, path, timeout=60, **kwargs):
+            calls.append((argv[2], Path(path).name))
+            if argv[2] == "shutdown" or argv[2] == "bootstatus":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[2] == "delete" and Path(path).name == "delete-replacement.log":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[2] == "create":
+                created["name"] = argv[3]
+                return replacement + "\n"
+            if argv[2] == "list":
+                return json.dumps({"devices": {"runtime": [{"udid": replacement,
+                                                            "name": created["name"]}]}})
+            return ""
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "stalled-id", "name": "stalled-name"}}
+            with patch.object(fixture_runner, "command", side_effect=fake_command):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    fixture_runner.retry_boot_after_stall(
+                        out, subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "stalled-id", "-b"], 180),
+                        "stalled-id", "stalled-name", "device-type", "runtime", result, {})
+        self.assertIn("replacementCleanupError", result["simulator"])
+        self.assertNotIn("replacementDeleted", result["simulator"])
+
     def test_real_timed_out_child_is_reaped(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
             with fixture_runner.owned_scratch(Path(raw)) as (scratch, state):

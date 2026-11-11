@@ -562,16 +562,31 @@ def retry_boot_after_stall(out, stalled, udid, name, device_type, runtime, resul
         if str(uuid.UUID(udid)).upper() != udid.upper():
             raise RuntimeError("Invalid created Simulator identity")
         result["simulator"].update({"udid": udid, "name": name})
-        devices = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"],
-                                    out / "created-retry.log"))
-        created_device = owned_device(devices, udid, name, runtime)
         retry_kind = "stalled-shutdown-failed-recreated"
     else:
         command(["xcrun", "simctl", "erase", udid], out / "erase-stalled.log", timeout=60)
         retry_kind = "stalled-erased-rebooted"
-    command(["xcrun", "simctl", "boot", udid], out / "boot-retry.log")
-    command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus-retry.log",
-            timeout=180, boot_status=True)
+    try:
+        if retry_kind == "stalled-shutdown-failed-recreated":
+            devices = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"],
+                                        out / "created-retry.log"))
+            created_device = owned_device(devices, udid, name, runtime)
+        command(["xcrun", "simctl", "boot", udid], out / "boot-retry.log")
+        command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus-retry.log",
+                timeout=180, boot_status=True)
+    except Exception:
+        if retry_kind == "stalled-shutdown-failed-recreated":
+            # result.simulator already names this replacement while main's
+            # locals still name the corpse the final cleanup targets, so the
+            # device named in the artifact could leak beside cleanup:true.
+            # Retire it here, or record the owed cleanup honestly.
+            try:
+                command(["xcrun", "simctl", "delete", udid],
+                        out / "delete-replacement.log", timeout=60)
+                result["simulator"]["replacementDeleted"] = True
+            except Exception as delete_error:
+                result["simulator"]["replacementCleanupError"] = str(delete_error)
+        raise
     result["simulator"]["bootRetry"] = retry_kind
     return udid, name, created_device
 
