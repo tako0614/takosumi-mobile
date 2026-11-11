@@ -856,10 +856,10 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     answer_permission(view).await?;
     println!("first: the held prompt was answered through the home; waiting for the final quit");
     // A held media prompt has no runtime dismissal of its own: it retires
-    // with its document. Only the Linux mjs observer drives this
-    // choreography (media-requested -> held row seen -> reload ->
-    // media-navigated); the Windows/macOS observer flows never write those
-    // checkpoints, so the gate keeps their first launch unchanged.
+    // with its document. Each observer drives the page side (media-requested
+    // -> held row seen -> reload -> media-navigated): the Linux mjs observer
+    // always does; the Windows/macOS flows do where their driver opted in
+    // with the same flag (packaged runs leave it off on both sides).
     if std::env::var("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL").as_deref() == Ok("1") {
         checkpoint(view, case, "media-requested").await?;
         // The notification answer already retired its row, so exactly one

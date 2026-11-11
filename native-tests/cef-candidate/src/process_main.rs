@@ -1261,6 +1261,7 @@ wrap_app! {
             // the feature switches from it.
             if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
             if let Some(command_line) = command_line {
+                let _ = &command_line;
                 #[cfg(windows)]
                 disable_native_occlusion(command_line);
                 #[cfg(feature = "fixture-inspection")]
