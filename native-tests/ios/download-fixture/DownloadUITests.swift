@@ -114,10 +114,18 @@ final class DownloadUITests: XCTestCase {
             screenshot.lifetime = .keepAlways
             add(screenshot)
         }
-        let save = filesElement("OS Files export Save did not open") { $0.buttons["Save"].firstMatch }
+        // The picker can reopen one level above the remembered folder — a
+        // location level where Save legitimately does not exist until a
+        // folder is chosen — and its remote view takes seconds to attach
+        // after a system stall (run 42961067390: the picker materialized
+        // past the old 10 s Save wait while its remote hierarchy errored).
+        // Wait for the picker itself before looking for any control in it.
+        filesElement("OS Files export picker did not open", timeout: 30) {
+            $0.otherElements["Browse View (Picker)"].firstMatch
+        }
         // Files remembers the previously selected folder for the next export.
         if filesExists({ $0.navigationBars["Download Fixture"] }) {
-            save.tap()
+            filesElement("OS Files export Save did not open") { $0.buttons["Save"].firstMatch }.tap()
             XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
             return
         }
@@ -128,12 +136,14 @@ final class DownloadUITests: XCTestCase {
             if text.exists { return text }
             return host.otherElements["On My iPhone"].firstMatch
         }
-        if !filesExists(localElement) {
+        // Already inside On My iPhone: its nav-bar title is not a row and
+        // must not be tapped as one; the folder list is reached directly.
+        if !filesExists({ $0.navigationBars.staticTexts["On My iPhone"].firstMatch }) {
             // Browse is an optional route inside the same real picker; tap it
             // only when either hierarchy actually shows it.
             if let browse = filesOptional({ $0.buttons["Browse"].firstMatch }, timeout: 3) { browse.tap() }
+            filesElement("Files On My iPhone did not appear", timeout: 5) { localElement($0) }.tap()
         }
-        filesElement("Files On My iPhone did not appear", timeout: 5) { localElement($0) }.tap()
         filesElement("Download Fixture folder did not appear", timeout: 5) { $0.staticTexts["Download Fixture"].firstMatch }.tap()
         filesElement("OS Files export Save did not remain", timeout: 5) { $0.buttons["Save"].firstMatch }.tap()
         XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
