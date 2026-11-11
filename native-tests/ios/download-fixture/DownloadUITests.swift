@@ -35,15 +35,8 @@ final class DownloadUITests: XCTestCase {
         app.terminate()
     }
 
-    private func tapLink(_ name: String) {
-        if name != "Fixture sign in", let closed = lastClosedAt {
-            // A normal later retry, after the product's three-second prompt
-            // cooldown. Do not repeatedly tap a blocked link or reset policy.
-            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                Date().timeIntervalSince(closed) >= 3.1
-            }, object: nil)
-            XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed)
-        }
+    private func tapLink(_ name: String, reopen: (() -> Void)? = nil) {
+        promptCooldown(name)
         let link = app.webViews.links[name].firstMatch
         // The wait's own verdict never changes; on a painted page that still
         // misses its link, the counts name which mechanism actually failed:
@@ -67,11 +60,46 @@ final class DownloadUITests: XCTestCase {
             let starved = state()
             let reload = app.buttons["再読み込み"].firstMatch
             let reloaded = reload.exists
+            var reopened = false
             if reloaded { reload.tap() }
-            XCTAssertTrue(link.waitForExistence(timeout: 15),
-                          "\(name); userReload=\(reloaded ? "attempted" : "unavailable"); starved=[\(starved)] after=[\(state())]")
+            if !link.waitForExistence(timeout: 15), let reopen {
+                // A reload that changed nothing — or no reload control at
+                // all while the screen still stands — means the WebView
+                // itself is suspect: close the screen and re-open the
+                // profile, the same recovery a user performs — a fresh
+                // WKWebView replaces a wedged or dead web-content process
+                // (run 43068513364: userReload=attempted, identical counts,
+                // zero server requests — the fetch never left the WebView).
+                // The caller's closure re-drives to the page this link lives
+                // on; closeScreen's own asserts keep a broken screen honest.
+                closeScreen()
+                reopen()
+                reopened = true
+            }
+            let settled = link.waitForExistence(timeout: 15)
+            if reloaded || reopened {
+                // Recoveries count too: a retried pass is not a clean pass.
+                print("\(name) retried: userReload=\(reloaded ? "attempted" : "unavailable") reopen=\(reopened ? "attempted" : "unavailable") settled=\(settled)")
+            }
+            XCTAssertTrue(settled,
+                          "\(name); userReload=\(reloaded ? "attempted" : "unavailable"); reopen=\(reopened ? "attempted" : "unavailable"); starved=[\(starved)] after=[\(state())]")
         }
+        // The prompt cooldown also governs a tap right after a reopened
+        // screen: closeScreen() re-stamps lastClosedAt, so a fast fresh
+        // render could land this tap inside the blocked window.
+        promptCooldown(name)
         link.tap()
+    }
+
+    private func promptCooldown(_ name: String) {
+        // The product's three-second prompt cooldown governs link taps that
+        // follow a screen close. Evaluated again right before the tap so a
+        // fast render after a reopen cannot land inside the blocked window.
+        guard name != "Fixture sign in", let closed = lastClosedAt else { return }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            Date().timeIntervalSince(closed) >= 3.1
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed)
     }
 
     private func acceptSave() {
@@ -222,9 +250,17 @@ final class DownloadUITests: XCTestCase {
     func testOriginalResponsesExportAndRetireWithinTheirProfile() throws {
         try XCTContext.runActivity(named: "Cookie response: retain original file across session removal until OS export") { _ in
             app.buttons["Work, close during export"].tap()
-            tapLink("Fixture sign in")
+            tapLink("Fixture sign in") { self.app.buttons["Work, close during export"].tap() }
             XCTAssertTrue(app.webViews.staticTexts["Fixture signed in"].waitForExistence(timeout: 10))
-            tapLink("Cookie attachment")
+            tapLink("Cookie attachment") {
+                self.app.buttons["Work, close during export"].tap()
+                // The cookie lives in the profile's data store, so a reopened
+                // screen may land already signed in; only re-sign-in when the
+                // sign-in link is what actually renders.
+                if self.app.webViews.links["Fixture sign in"].firstMatch.waitForExistence(timeout: 8) {
+                    self.tapLink("Fixture sign in")
+                }
+            }
             acceptSave()
             exportToFixtureDocuments(afterSessionClose: true)
             closeScreen()
@@ -232,7 +268,12 @@ final class DownloadUITests: XCTestCase {
         }
         try XCTContext.runActivity(named: "Blob response: real page Blob and OS export bytes") { _ in
             app.buttons["Work"].tap()
-            tapLink("Blob export")
+            tapLink("Blob export") {
+                self.app.buttons["Work"].tap()
+                if self.app.webViews.links["Fixture sign in"].firstMatch.waitForExistence(timeout: 8) {
+                    self.tapLink("Fixture sign in")
+                }
+            }
             acceptSave()
             exportToFixtureDocuments()
             closeScreen()
@@ -240,7 +281,7 @@ final class DownloadUITests: XCTestCase {
         }
         try XCTContext.runActivity(named: "Other UUID profile has no inherited cookie") { _ in
             app.buttons["Personal"].tap()
-            tapLink("Cookie attachment")
+            tapLink("Cookie attachment") { self.app.buttons["Personal"].tap() }
             XCTAssertTrue(app.webViews.staticTexts["Cookie denied"].waitForExistence(timeout: 10))
             XCTAssertFalse(app.alerts["ファイルを保存"].exists)
             closeScreen()
@@ -248,7 +289,12 @@ final class DownloadUITests: XCTestCase {
         }
         try XCTContext.runActivity(named: "Decline does not write a temporary file") { _ in
             app.buttons["Work"].tap()
-            tapLink("Cookie attachment")
+            tapLink("Cookie attachment") {
+                self.app.buttons["Work"].tap()
+                if self.app.webViews.links["Fixture sign in"].firstMatch.waitForExistence(timeout: 8) {
+                    self.tapLink("Fixture sign in")
+                }
+            }
             let alert = app.alerts["ファイルを保存"]
             XCTAssertTrue(alert.waitForExistence(timeout: 10))
             alert.buttons["キャンセル"].tap()
@@ -257,7 +303,12 @@ final class DownloadUITests: XCTestCase {
         }
         try XCTContext.runActivity(named: "Cancel a slow actual response and retire its partial file") { _ in
             app.buttons["Work"].tap()
-            tapLink("Slow attachment")
+            tapLink("Slow attachment") {
+                self.app.buttons["Work"].tap()
+                if self.app.webViews.links["Fixture sign in"].firstMatch.waitForExistence(timeout: 8) {
+                    self.tapLink("Fixture sign in")
+                }
+            }
             acceptSave()
             let progress = app.alerts["ダウンロード中"]
             XCTAssertTrue(progress.waitForExistence(timeout: 10))
@@ -269,7 +320,12 @@ final class DownloadUITests: XCTestCase {
         }
         try XCTContext.runActivity(named: "Real session removal stops an active writer before cleanup") { _ in
             app.buttons["Work, close during transfer"].tap()
-            tapLink("Slow attachment")
+            tapLink("Slow attachment") {
+                self.app.buttons["Work, close during transfer"].tap()
+                if self.app.webViews.links["Fixture sign in"].firstMatch.waitForExistence(timeout: 8) {
+                    self.tapLink("Fixture sign in")
+                }
+            }
             acceptSave()
             XCTAssertTrue(app.buttons["Inspect files"].waitForExistence(timeout: 30))
             try inspect(cookie: true, blob: true, closed: true)
