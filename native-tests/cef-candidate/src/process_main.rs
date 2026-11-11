@@ -1253,7 +1253,6 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 wrap_app! {
     struct Application;
     impl App {
