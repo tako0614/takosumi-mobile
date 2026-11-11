@@ -866,30 +866,33 @@ class Observer:
             "origin:location.origin,frame:window===top,page:document.querySelector('main')?.dataset.page??null,"
             "user:document.querySelector('main')?.dataset.user??null})")
 
-    def read_evaluate(self, page, expression):
-        """One pure read through a starved DevTools channel. A busy renderer
-        can starve one reply while the cancelled quit's churn continues
-        (run 42961067390: Photopea kept Work's renderer busy through the
-        post-cancel sample); asking the same read again is the same
-        question, so it is bounded and recorded. Anything else raises."""
+    def read_evaluate(self, page, expression, gesture=False):
+        """One pure read or same-effect write through a starved DevTools
+        channel. A busy renderer can starve one reply while the cancelled
+        quit's churn continues (run 42961067390: Photopea kept Work's
+        renderer busy through the post-cancel sample; run 42983025866:
+        Photopea starved even the reply to the beforeunload listener's own
+        removal). Asking the same expression again is the same question for
+        a read and a no-op for an idempotent write, so it is bounded and
+        recorded. Anything else raises."""
         deadline = time.monotonic() + STARVED_READ_WAIT
         attempts = 0
         while True:
             try:
-                value = page.evaluate(expression)
+                value = page.evaluate(expression, gesture)
                 break
             except Failure as error:
                 if "CDP timeout" not in str(error) or time.monotonic() >= deadline:
                     raise
                 attempts += 1
-                self.proof.setdefault("starvedReadRetries", []).append(
+                self.proof.setdefault("starvedEvaluateRetries", []).append(
                     {"attempt": attempts, "error": str(error)[:200]})
                 time.sleep(0.05)
         return value
 
     def persisted(self, page):
         key = json.dumps(self.key)
-        return page.evaluate(
+        return self.read_evaluate(page,
             f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
             "page:document.querySelector('main')?.dataset.page??null,"
             "user:document.querySelector('main')?.dataset.user??null})")

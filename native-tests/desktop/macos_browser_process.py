@@ -185,7 +185,8 @@ class MacObserver(Observer):
     def beforeunload(self, page):
         self.step("beforeunload setup", page)
         mark = page.cdp.mark()
-        state = page.evaluate("(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
+        state = self.read_evaluate(page,
+                              "(()=>{window.__sumiBeforeUnload=e=>{e.preventDefault();e.returnValue='';};"
                               "addEventListener('beforeunload',window.__sumiBeforeUnload);"
                               "return {stickyActivation:navigator.userActivation.hasBeenActive,"
                               "active:navigator.userActivation.isActive,visibility:document.visibilityState,"
@@ -272,9 +273,11 @@ class MacObserver(Observer):
         except Exception as failure:  # diagnostics only; keep the original failure
             entry["nativeStateError"] = repr(failure)[:200]
 
-    @staticmethod
-    def remove_beforeunload(page):
-        page.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
+    def remove_beforeunload(self, page):
+        # Idempotent listener removal; a busy renderer can starve the reply
+        # (run 42983025866), so it goes through the bounded evaluate retry.
+        self.read_evaluate(page,
+                      "(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);"
                       "delete window.__sumiBeforeUnload;return true})()")
 
     def first_launch(self):
@@ -287,7 +290,8 @@ class MacObserver(Observer):
             require(self.sample(page)["storage"] is None and self.sample(page)["cookie"] is None,
                     "Fresh profile already has this case's synthetic state")
             key, value = json.dumps(self.key), json.dumps(f"{index}:{self.nonce}")
-            page.evaluate(f"(()=>{{globalThis[{key}]={value};localStorage.setItem({key},{value});"
+            self.read_evaluate(page,
+                          f"(()=>{{globalThis[{key}]={value};localStorage.setItem({key},{value});"
                           f"document.cookie={key}+'='+{value}+'; Path=/; Max-Age=86400; Secure; SameSite=Lax';return true}})()")
         expected = [self.sample(page) for page in pages]
         require([item["storage"] for item in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"]
