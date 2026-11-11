@@ -797,11 +797,19 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     app.exit(0);
     // A busy real-site renderer can starve one DevTools reply; the
-    // observer's bounded cancel retry lives inside this wait: dialog wait
-    // (30s), renderer quiet + OS quit (~25s), the starved-send loop (60s +
-    // tail), then the close wait (10s). A shorter bound would fail before a
-    // legitimately retrying observer could record its dialog evidence.
-    checkpoint_within(view, case, "cancel-inspected", Duration::from_secs(150)).await?;
+    // observer's bounded cancel retry lives inside this wait: the first
+    // dialog window (10 s), renderer quiet + OS quit (~25 s), the
+    // starved-send loop (60 s + tail), then the close wait (10 s). The
+    // busy-renderer windows ahead of it can now add ~120 s more on a real
+    // site (four 30 s extras), so the wait carries the real-site inspect
+    // bound; the fixture keeps its deliberate 150 s calibration.
+    checkpoint_within(
+        view,
+        case,
+        "cancel-inspected",
+        inspect_bound().max(Duration::from_secs(150)),
+    )
+    .await?;
     let stopped = exit_cancelled(view, app, 0).await?;
     let kept = stopped.as_array().ok_or("Missing process array")?;
     let unchanged = kept.len() == 2

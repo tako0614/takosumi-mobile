@@ -258,6 +258,8 @@ class EvidenceTests(unittest.TestCase):
         # mark (events arriving in the inter-wait gap are not missed) gets one
         # more bounded window.
         observer = mock.Mock()
+        # A plain Mock would mint a truthy real attribute; pin the fixture path.
+        observer.real = None
         observer.dialog.side_effect = dialog
         observer.guard_ended = runner.MacObserver.guard_ended
         result = runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
@@ -286,6 +288,57 @@ class EvidenceTests(unittest.TestCase):
                                            "Personal beforeunload did not open always fail", 30)
         self.assertIn("always fail after the busy-renderer window", str(raised.exception))
         self.assertEqual(len(calls), 2)
+
+    def test_busy_dialog_real_site_keeps_measuring_while_the_profile_lives(self):
+        receipt = self.root / "guard.json"
+        page = mock.Mock()
+        page.process = {"guardReceipt": str(receipt)}
+        calls = []
+
+        def dialog(page_arg, mark, kind, what, bound=runner.SETTLE_WAIT):
+            calls.append(what)
+            if len(calls) < 4:
+                raise runner.Failure(what)
+            return {"what": what}
+
+        # A real site gets four extra bounded windows (about 150 s with the
+        # first): each retry re-checks the guard, so a late dialog still wins
+        # and a finished profile still fails with its real name.
+        observer = mock.Mock()
+        observer.real = {"origin": "https://example.invalid"}
+        observer.dialog.side_effect = dialog
+        observer.guard_ended = runner.MacObserver.guard_ended
+        result = runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                                "Personal beforeunload did not open", 30)
+        self.assertEqual(result, {"what": calls[-1]})
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[1:], ["Personal beforeunload did not open after the busy-renderer window",
+                                     "Personal beforeunload did not open after 2 busy-renderer windows",
+                                     "Personal beforeunload did not open after 3 busy-renderer windows"])
+
+        # A dialog that never surfaces while the browser stays alive still
+        # fails - after all five bounded windows, not on the first starve.
+        calls.clear()
+
+        def always_fail(page_arg, mark, kind, what, bound=runner.SETTLE_WAIT):
+            calls.append(what)
+            raise runner.Failure(what)
+
+        observer.dialog.side_effect = always_fail
+        with self.assertRaises(runner.Failure) as raised:
+            runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                           "Personal beforeunload did not open", 30)
+        self.assertIn("after 4 busy-renderer windows", str(raised.exception))
+        self.assertEqual(len(calls), 5)
+
+        # The profile ending between windows stops the retry at once.
+        receipt.write_text("{}")
+        calls.clear()
+        with self.assertRaises(runner.Failure) as raised:
+            runner.MacObserver.busy_dialog(observer, page, "mark", "beforeunload",
+                                           "Personal beforeunload did not open", 30)
+        self.assertIn("already exited", str(raised.exception))
+        self.assertEqual(len(calls), 1)
 
     def test_quiet_renderer_waits_for_one_frame_silent_window_then_asks_anyway(self):
         page = mock.Mock()

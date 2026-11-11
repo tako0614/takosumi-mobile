@@ -216,16 +216,29 @@ class MacObserver(Observer):
         # A real site's ad iframes can keep the renderer churning past the
         # bound after the quit request is delivered and beforeunload is armed
         # (run 42808568119: 155 frame events plus a Target.getTargets CDP
-        # timeout inside the window). While the profile's guard has not ended
-        # the dialog is still pending rather than refused, so allow one more
-        # bounded window on the same mark. If the profile already exited, the
-        # quit skipped the dialog and the original failure stands.
+        # timeout inside the window; run 43017266783: the quit was serviced in
+        # 0.7 s and the shutdown request arrived 13.6 s later, yet the armed
+        # renderer - alive throughout, 113 helper spawns, no exit - could not
+        # surface the dialog inside ~41 s under a sustained helper storm).
+        # While the profile's guard has not ended the dialog is still pending
+        # rather than refused, so a real site keeps measuring bounded windows
+        # on the same mark; every window is real evidence and a finished
+        # profile still fails with its real name. The fixture's renderer is
+        # quiet, so it keeps the original single extra window.
         try:
             return self.dialog(page, mark, kind, what, bound)
         except Failure:
-            require(not self.guard_ended(page.process["guardReceipt"]),
-                    f"{what} and the profile had already exited")
-            return self.dialog(page, mark, kind, f"{what} after the busy-renderer window", 30)
+            windows = 4 if self.real else 1
+            for extra in range(windows):
+                require(not self.guard_ended(page.process["guardReceipt"]),
+                        f"{what} and the profile had already exited")
+                attempt = ("after the busy-renderer window" if extra == 0
+                           else f"after {extra + 1} busy-renderer windows")
+                try:
+                    return self.dialog(page, mark, kind, f"{what} {attempt}", 30)
+                except Failure:
+                    if extra + 1 == windows:
+                        raise
 
     def quiet_renderer(self, page, quiet=4.0, bound=30):
         # The storm does not always break inside the dialog wait itself (run
@@ -271,6 +284,37 @@ class MacObserver(Observer):
                 with log.open("rb") as stream:
                     stream.seek(max(0, size - 8 * 1024))
                     entry["nativeLogTail"] = stream.read().decode("utf-8", "replace")[-4000:]
+            # The browser's own lifecycle records say whether the OS quit was
+            # even serviced and whether the close actually started, and the
+            # helper spawn/return counts distinguish a saturated renderer
+            # (alive, grinding) from a reply lost to a dead one (run
+            # 43017266783: quit serviced in 0.7 s, shutdown-request at +13.6
+            # s, 113 helper-enter, zero renderer exits - busy, not dead).
+            lifecycle = Path(page.process["directory"]) / "browser.log"
+            if lifecycle.is_file():
+                records, helpers = [], {"enter": 0, "cefReturn": 0, "beforeExit": 0}
+                for line in lifecycle.read_text(errors="replace").splitlines():
+                    if "takosumi-cef-mac-lifecycle: " not in line:
+                        continue
+                    try:
+                        record = json.loads(line.split("takosumi-cef-mac-lifecycle: ", 1)[1])
+                    except ValueError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    event = record.get("event")
+                    if event in ("system-quit-request", "shutdown-request",
+                                 "abnormal-shutdown-request", "cef-shutdown-begin",
+                                 "cef-shutdown-return", "cef-shutdown-bound"):
+                        records.append({key: record.get(key)
+                                        for key in ("event", "unixMicros", "pid", "role")})
+                    elif event == "helper-enter" and record.get("role") == "renderer":
+                        helpers["enter"] += 1
+                    elif event == "helper-cef-return" and record.get("role") == "renderer":
+                        helpers["cefReturn"] += 1
+                    elif event == "helper-before-exit" and record.get("role") == "renderer":
+                        helpers["beforeExit"] += 1
+                entry["quitLifecycle"] = {"records": records[-6:], "helpers": helpers}
         except Exception as failure:  # diagnostics only; keep the original failure
             entry["nativeStateError"] = repr(failure)[:200]
 
