@@ -534,6 +534,48 @@ def require_interrupted_transfers(events):
         raise RuntimeError("Need two actual incomplete responses disconnected by WebKit, before server shutdown")
 
 
+def retry_boot_after_stall(out, stalled, udid, name, device_type, runtime, result, created_device):
+    """One bounded recovery for a created Simulator that made no boot progress.
+
+    A clean shutdown still lets the same owned device erase and boot again.
+    When simctl itself cannot shut the stalled boot down (run 43076506208:
+    shutdown timed out past 60 s behind a wedged migration), an erase would be
+    refused or hang the same way, so the single retry moves to a replacement
+    device after a best-effort delete of the corpse. The readiness ceiling
+    and the attempt count are unchanged either way; the stalled device's
+    identity stays recorded for the next run's sweep.
+    """
+    (out / "bootstatus-stalled.txt").write_text(
+        f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
+    try:
+        command(["xcrun", "simctl", "shutdown", udid], out / "shutdown-stalled.log", timeout=60)
+    except Exception as shutdown_error:
+        (out / "shutdown-stalled.txt").write_text(f"{shutdown_error!r}\n")
+        try:
+            command(["xcrun", "simctl", "delete", udid], out / "delete-stalled.log", timeout=60)
+        except Exception as delete_error:
+            (out / "delete-stalled.txt").write_text(f"{delete_error!r}\n")
+        result["simulator"]["stalledUdid"] = udid
+        name = "sumi-download-" + str(uuid.uuid4())
+        udid = command(["xcrun", "simctl", "create", name, device_type, runtime],
+                       out / "create-retry.log").strip()
+        if str(uuid.UUID(udid)).upper() != udid.upper():
+            raise RuntimeError("Invalid created Simulator identity")
+        result["simulator"].update({"udid": udid, "name": name})
+        devices = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"],
+                                    out / "created-retry.log"))
+        created_device = owned_device(devices, udid, name, runtime)
+        retry_kind = "stalled-shutdown-failed-recreated"
+    else:
+        command(["xcrun", "simctl", "erase", udid], out / "erase-stalled.log", timeout=60)
+        retry_kind = "stalled-erased-rebooted"
+    command(["xcrun", "simctl", "boot", udid], out / "boot-retry.log")
+    command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus-retry.log",
+            timeout=180, boot_status=True)
+    result["simulator"]["bootRetry"] = retry_kind
+    return udid, name, created_device
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
@@ -581,14 +623,8 @@ def main():
                 # progressing boot its total 300-second budget. Retire the
                 # stalled owned device once and retry the same fresh boot; the
                 # readiness ceiling per attempt is unchanged, no third try.
-                (out / "bootstatus-stalled.txt").write_text(
-                    f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
-                command(["xcrun", "simctl", "shutdown", udid], out / "shutdown-stalled.log", timeout=60)
-                command(["xcrun", "simctl", "erase", udid], out / "erase-stalled.log", timeout=60)
-                command(["xcrun", "simctl", "boot", udid], out / "boot-retry.log")
-                command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus-retry.log",
-                        timeout=180, boot_status=True)
-                result["simulator"]["bootRetry"] = "stalled-erased-rebooted"
+                udid, name, created_device = retry_boot_after_stall(
+                    out, stalled, udid, name, device_type, runtime, result, created_device)
             # Trust only on this exact disposable Simulator, never host trust.
             try:
                 command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],

@@ -164,6 +164,92 @@ class HarnessTests(unittest.TestCase):
                 self.assertTrue(result["reaped"])
                 self.assertEqual(result["originalErrorType"], "TimeoutExpired")
 
+    def test_stalled_boot_retries_on_the_same_device_once_it_shuts_down(self):
+        calls = []
+        def fake_command(argv, path, timeout=60, **kwargs):
+            calls.append((argv[2], Path(path).name, timeout, kwargs.get("boot_status")))
+            return ""
+        original = {"udid": "stalled-id", "name": "stalled-name"}
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "stalled-id", "name": "stalled-name"}}
+            with patch.object(fixture_runner, "command", side_effect=fake_command):
+                udid, name, live = fixture_runner.retry_boot_after_stall(
+                    out, subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "stalled-id", "-b"], 180),
+                    "stalled-id", "stalled-name", "device-type", "runtime", result, original)
+            self.assertIn("first attempt", (out / "bootstatus-stalled.txt").read_text())
+        self.assertEqual((udid, name), ("stalled-id", "stalled-name"))
+        self.assertIs(live, original)
+        self.assertEqual([call[0] for call in calls],
+                         ["shutdown", "erase", "boot", "bootstatus"])
+        self.assertEqual(calls[-1][2:], (180, True))
+        self.assertEqual(result["simulator"]["bootRetry"], "stalled-erased-rebooted")
+        self.assertNotIn("stalledUdid", result["simulator"])
+    def test_stalled_boot_moves_to_a_replacement_when_shutdown_itself_fails(self):
+        # A stall that wedges simctl's own shutdown cannot be erased in place
+        # (run 43076506208: the 60 s shutdown bound expired behind the wedged
+        # migration). The single retry must still run, on a replacement
+        # device, with the corpse's identity preserved for evidence and the
+        # next run's sweep.
+        calls = []
+        replacement = "E13F1385-F0E1-41B7-A9A9-9019B6E3866B"
+        created = {}
+        def fake_command(argv, path, timeout=60, **kwargs):
+            calls.append((argv[2], Path(path).name, timeout, kwargs.get("boot_status")))
+            if argv[2] == "shutdown":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[2] == "create":
+                created["name"] = argv[3]
+                return replacement + "\n"
+            if argv[2] == "list":
+                return json.dumps({"devices": {"runtime": [{"udid": replacement,
+                                                            "name": created["name"],
+                                                            "logPath": f"/x/{replacement}"}]}})
+            return ""
+        original = {"udid": "stalled-id", "name": "stalled-name"}
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "stalled-id", "name": "stalled-name"}}
+            with patch.object(fixture_runner, "command", side_effect=fake_command):
+                udid, name, live = fixture_runner.retry_boot_after_stall(
+                    out, subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "stalled-id", "-b"], 180),
+                    "stalled-id", "stalled-name", "device-type", "runtime", result, original)
+            self.assertIn("TimeoutExpired", (out / "shutdown-stalled.txt").read_text())
+        self.assertEqual(udid, replacement)
+        self.assertEqual(live["udid"], replacement)
+        self.assertTrue(name.startswith("sumi-download-") and name != "stalled-name")
+        self.assertEqual([call[0] for call in calls],
+                         ["shutdown", "delete", "create", "list", "boot", "bootstatus"])
+        self.assertEqual(calls[-1][2:], (180, True))
+        self.assertEqual(result["simulator"]["stalledUdid"], "stalled-id")
+        self.assertEqual(result["simulator"]["bootRetry"], "stalled-shutdown-failed-recreated")
+        self.assertEqual(result["simulator"]["udid"], replacement)
+    def test_stalled_boot_delete_failure_is_recorded_not_masked(self):
+        calls = []
+        replacement = "E13F1385-F0E1-41B7-A9A9-9019B6E3866B"
+        created = {}
+        def fake_command(argv, path, timeout=60, **kwargs):
+            calls.append(argv[2])
+            if argv[2] in ("shutdown", "delete"):
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[2] == "create":
+                created["name"] = argv[3]
+                return replacement + "\n"
+            if argv[2] == "list":
+                return json.dumps({"devices": {"runtime": [{"udid": replacement,
+                                                            "name": created["name"]}]}})
+            return ""
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "stalled-id", "name": "stalled-name"}}
+            with patch.object(fixture_runner, "command", side_effect=fake_command):
+                udid, _name, _live = fixture_runner.retry_boot_after_stall(
+                    out, subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", "stalled-id", "-b"], 180),
+                    "stalled-id", "stalled-name", "device-type", "runtime", result, {})
+            self.assertIn("TimeoutExpired", (out / "delete-stalled.txt").read_text())
+        self.assertEqual(udid, replacement)
+        self.assertEqual(calls, ["shutdown", "delete", "create", "list", "boot", "bootstatus"])
+
     def test_real_timed_out_child_is_reaped(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
             with fixture_runner.owned_scratch(Path(raw)) as (scratch, state):
