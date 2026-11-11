@@ -445,6 +445,111 @@ class CdpTests(unittest.TestCase):
             watch.read_evaluate(FakePage(), "1")
         self.assertNotIn("starvedEvaluateRetries", watch.proof)
 
+    def contended_page(self, sends, events, evaluate=None, base=0):
+        class FakeCdp:
+            def __init__(self):
+                self.base = base
+
+            # Faithful to Cdp.since only while base == 0; tests needing a
+            # nonzero base refuse before reaching this scan.
+            def since(self, mark):
+                return events[mark:]
+
+        class FakePage:
+            def __init__(self):
+                self.cdp = FakeCdp()
+                self.session = "S1"
+                self.target = {"targetId": "T1"}
+                self.process = {"profile": "P"}
+                self.calls = []
+
+            def send(self, method, params=None, timeout=5.0):
+                self.calls.append(method)
+                result = sends[method]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                self.calls.append("Runtime.evaluate")
+                return evaluate or {"document": "0:n", "storage": "0:n",
+                                    "cookie": "0:n", "origin": "https://site.test"}
+
+            def pages(self):
+                return [self.target["targetId"]]
+
+        sends.setdefault(
+            "Page.getFrameTree",
+            {"frameTree": {"frame": {"id": "F", "securityOrigin": "https://site.test"}}})
+        return FakePage()
+
+    def test_a_contended_sample_reads_state_off_the_renderer_queue(self):
+        key = "sumi_app_process_no-such-case"
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"], ["other", "x"]]},
+             "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0),
+                         {"storage": "0:n", "cookie": "0:n", "origin": "https://site.test"})
+        self.assertNotIn("Runtime.evaluate", page.calls)
+
+    def test_a_contended_sample_refuses_a_main_frame_navigation(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Page.frameNavigated", "sessionId": "S1",
+              "params": {"frame": {"id": "F2", "parentId": "F"}}},
+             {"method": "Page.frameNavigated", "sessionId": "S1",
+              "params": {"frame": {"id": "F"}}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "replaced"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_a_main_frame_load(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Page.frameStartedLoading", "sessionId": "S1",
+              "params": {"frameId": "F"}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "began replacing"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_a_crashed_renderer(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Inspector.targetCrashed", "sessionId": "S1", "params": {}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "crashed"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_dropped_event_coverage(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [], base=5)
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "were dropped"):
+            watch.contended_sample(page, 0)
+        self.assertTrue(page.calls, "the sends precede the coverage check")
+
+    def test_a_contended_sample_falls_back_when_the_storage_domains_are_missing(self):
+        missing = observer.CdpError("CDP DOMStorage.enable failed (P): method missing",
+                                  {"message": "method missing"})
+        page = self.contended_page(
+            {"DOMStorage.enable": missing,
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertIn("Runtime.evaluate", page.calls)
+        self.assertEqual(len(watch.proof["browserSampleFallbacks"]), 1)
+
 
 class TcpTableTests(unittest.TestCase):
     def row(self, state, address, port, pid):

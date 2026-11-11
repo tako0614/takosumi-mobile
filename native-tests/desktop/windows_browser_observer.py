@@ -896,6 +896,70 @@ class Observer:
                 raise
         return value
 
+    def contended_sample(self, page, mark):
+        """A post-quit state read that never waits on the renderer's task
+        queue. A sustained ad-helper storm can starve a Runtime.evaluate
+        through its whole claimed-position bound (run 43068513364: the
+        Personal profile's single claimed position starved all 60 s while
+        ~20 renderer helpers kept spawning on the real site; run
+        43061069602 starved ELEVEN re-sent evaluates on Work). Every
+        element here is serviced by the browser process instead: the
+        frame tree's root frame gives the live document's origin, the
+        storage service answers localStorage, the network service answers
+        cookies, and the already-recorded event stream proves no
+        main-frame navigation committed or began and no renderer crash
+        landed since the given mark — together the same oracle the
+        evaluate sample proves: this document and its synthetic state are
+        unchanged (a killed-and-never-reloaded renderer would pass the
+        browser-serviced reads, so targetCrashed is part of the scan). A
+        frameRequestedNavigation alone is not a commit and
+        navigatedWithinDocument keeps the document, so neither counts; a
+        same-document fragment load on the root is refused rather than
+        risk a load in flight. An engine without the storage read
+        domains falls back to the claimed-position renderer read; the
+        oracle is unchanged."""
+        # getFrameTree itself has no storage-domain fallback: without the root
+        # frame's id the navigation scan below cannot run at all, so a missing
+        # Page domain or a destroyed target fails here on its own name.
+        tree = page.send("Page.getFrameTree", timeout=SETTLE_WAIT)["frameTree"]["frame"]
+        root = tree["id"]
+        origin = tree.get("securityOrigin")
+        if origin is None:
+            split = urlsplit(tree.get("url", ""))
+            origin = f"{split.scheme}://{split.netloc}"
+        try:
+            page.send("DOMStorage.enable", timeout=SETTLE_WAIT)
+            items = dict(page.send("DOMStorage.getDOMStorageItems",
+                                   {"storageId": {"securityOrigin": origin, "isLocalStorage": True}},
+                                   timeout=SETTLE_WAIT).get("entries") or [])
+            cookies = page.send("Network.getCookies", {"urls": [origin]}, timeout=SETTLE_WAIT)["cookies"]
+            state = {"storage": items.get(self.key),
+                     "cookie": next((item["value"] for item in cookies if item["name"] == self.key), None),
+                     "origin": origin}
+        except CdpError as error:
+            self.proof.setdefault("browserSampleFallbacks", []).append(
+                {"profile": page.process["profile"], "error": str(error)[:200]})
+            state = self.sample(page)
+        require(page.cdp.base <= mark,
+                "Events covering the quit window were dropped; document continuity is unproven")
+        # A crashed renderer that never reloads still answers every
+        # browser-serviced read above while its document is gone — targetCrashed
+        # is session-scoped and emitted without Inspector.enable, so the stream
+        # already holds it. A same-document fragment change can fire
+        # frameStartedLoading on the root: refused rather than risk a load in
+        # flight, and hash churn is not part of the quit window's contract.
+        nav = next((event for event in page.cdp.since(mark)
+                    if event.get("sessionId") == page.session
+                    and (event["method"] == "Inspector.targetCrashed"
+                         or event["method"] == "Page.frameNavigated"
+                         and (event.get("params") or {}).get("frame", {}).get("id") == root
+                         or event["method"] == "Page.frameStartedLoading"
+                         and (event.get("params") or {}).get("frameId") == root)), None)
+        require(nav is None,
+                f"The quit window replaced, began replacing, or crashed the main document: "
+                f"{json.dumps(nav)[:300]}")
+        return state
+
     def persisted(self, page):
         key = json.dumps(self.key)
         return self.read_evaluate(page,

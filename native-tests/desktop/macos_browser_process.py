@@ -361,7 +361,21 @@ class MacObserver(Observer):
         self.checkpoint("cancel-inspected")
         require(len(self.marker("app-browser-process-blocked.json")) == 2, "Cancelled quit lost a profile")
         self.marker("app-browser-process-cancelled.json")
-        require([self.sample(page) for page in pages] == expected, "Cancelled quit changed a document")
+        if self.real:
+            # A real site's ad storm can starve a renderer read through the
+            # whole claimed-position bound (run 43068513364: the never-quieted
+            # Personal profile's single send starved all 60 s under ~20
+            # renderer helper spawns). The same oracle is read through
+            # browser-serviced channels: storage, cookies, the live frame's
+            # origin, and no main-frame navigation since each mark.
+            cancelled = [self.contended_sample(work, mark),
+                         self.contended_sample(personal, other)]
+            unchanged = ([item["storage"] for item in cancelled] == [item["storage"] for item in expected]
+                         and [item["cookie"] for item in cancelled] == [item["cookie"] for item in expected]
+                         and [item["origin"] for item in cancelled] == [item["origin"] for item in expected])
+        else:
+            unchanged = [self.sample(page) for page in pages] == expected
+        require(unchanged, "Cancelled quit changed a document")
         self.remove_beforeunload(work)
         self.case("quit-cancel-stops", {"cancelledBy": cancelled_by})
         mark = self.beforeunload(personal)
@@ -374,8 +388,15 @@ class MacObserver(Observer):
         cancelled_by = self.cancel_dialog(personal, mark, "Personal cancel was not observed", dialog)
         self.checkpoint("partial-inspected")
         partial = self.marker("app-browser-process-partial.json")
-        require([item["profile"] for item in partial] == [personal.process["profile"]]
-                and self.sample(personal) == expected[1], "Partial quit did not retain the same Personal document")
+        if self.real:
+            retained = self.contended_sample(personal, mark)
+            kept = (retained["storage"] == expected[1]["storage"]
+                    and retained["cookie"] == expected[1]["cookie"]
+                    and retained["origin"] == expected[1]["origin"])
+        else:
+            kept = self.sample(personal) == expected[1]
+        require([item["profile"] for item in partial] == [personal.process["profile"]] and kept,
+                "Partial quit did not retain the same Personal document")
         self.remove_beforeunload(personal)
         self.case("quit-partial-order", {"workReceipt": receipt, "cancelledBy": cancelled_by})
         # The opted-in browser holds Personal's permission prompt for the
