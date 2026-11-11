@@ -1116,40 +1116,35 @@ class Observer:
             return []
         return [line[:300] for line in text.splitlines() if RAISE_REFUSED in line]
 
-    def probe_permission(self, page):
-        """What a page's own notification request actually does on this route.
-        The request runs with user activation (evaluate's userGesture); its
-        resolution — denied, granted, or still pending after the bound — is
-        recorded, never decided. Whether Chromium asked the browser process's
-        permission handler, and what its own runtime did with it, is read back
-        from the profile's browser.log, where the handler only records."""
-        self.step("notification permission probe", page)
+    def answer_permission(self, page):
+        """The App-held prompt round trip. The page asks for a notification
+        permission under user activation; this opted-in browser holds the
+        runtime callback open and reports it on the pipe instead of showing
+        its own prompt. The permission-requested checkpoint hands the prompt
+        to the App driver, whose click on the home's own row answers it; the
+        page's resolved value is the evidence, never assumed."""
+        self.step("notification permission answered through the App", page)
         key = json.dumps("__sumiPermissionProbe")
-        try:
-            page.evaluate(
-                f"(()=>{{const g=globalThis[{key}]={{result:null,error:null}};"
-                f"g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));return true}})()",
-                True)
-        except Failure as error:
-            # A missing Notification API or a synchronous refusal is the same
-            # evidence class as an async denial; it is not a fixture failure.
-            entry = {"permission": None, "result": None, "error": str(error)[:300],
-                     "profile": page.process["profile"]}
-            self.proof["permissionProbe"] = entry
-            self.case("permission-probe", entry)
-            return entry
-        deadline = time.monotonic() + 10
-        state = {}
+        state = page.evaluate(
+            f"(()=>{{const g=globalThis[{key}]={{result:null,error:null}};"
+            f"g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));"
+            f"return {{permission:Notification.permission}};}})()", True)
+        require(state["permission"] == "default",
+                f"A held prompt needs an undecided permission: {state}")
+        self.checkpoint("permission-requested")
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             state = page.evaluate(
                 f"(()=>({{permission:Notification.permission,result:globalThis[{key}].result,"
-                f"error:globalThis[{key}].error,activation:navigator.userActivation.isActive}}))()", True)
+                f"error:globalThis[{key}].error}}))()", True)
             if state["result"] or state["error"]:
                 break
             time.sleep(0.2)
+        require(state.get("result") == "granted",
+                f"The App's answer did not reach the held callback: {state}")
         entry = dict(state, profile=page.process["profile"])
-        self.proof["permissionProbe"] = entry
-        self.case("permission-probe", entry)
+        self.proof["permissionAnswered"] = entry
+        self.case("permission-answered-by-app", entry)
         return entry
 
     def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
@@ -1643,9 +1638,10 @@ class Observer:
                           "delete window.__sumiBeforeUnload;return true})()")
         self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
                                          "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
-        # The prompt (if the runtime shows one) stays pending through the
-        # App's close below: its dismissal is itself permission evidence.
-        self.probe_permission(personal)
+        # The opted-in browser holds Personal's permission prompt for the
+        # App's own answer: this run's checkpoint hands it to the driver,
+        # whose click on the home row grants it before the final quit.
+        self.answer_permission(personal)
         self.step("Personal final exit", personal)
         if not self.real:
             # Personal's own popup stays open for the final quit: its native

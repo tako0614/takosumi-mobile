@@ -883,6 +883,24 @@ async function firstLaunch() {
   proof.partial=await marker('app-browser-process-partial.json');
   assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
   await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  // The opted-in browser holds Personal's permission prompt for the App's
+  // own answer: the driver clicks the home's allow row, and the page's
+  // resolved grant is the round-trip evidence, never auto-answered here.
+  step('Notification permission answered through the App',personal);
+  const permissionRequested=await personal.evaluate('(()=>{const g=globalThis.__sumiPermissionProbe={result:null,error:null};g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));return {permission:Notification.permission}})()',true);
+  assert.equal(permissionRequested.permission,'default','A held prompt needs an undecided permission: '+JSON.stringify(permissionRequested));
+  await writeFile(path.join(data,'permission-requested'),'ready',{flag:'wx'});
+  {
+    const end=Date.now()+30000;
+    let answered;
+    while(Date.now()<end){
+      answered=await personal.evaluate('(()=>({permission:Notification.permission,result:globalThis.__sumiPermissionProbe.result,error:globalThis.__sumiPermissionProbe.error}))()');
+      if(answered.result||answered.error)break;
+      await delay(200);
+    }
+    proof.permissionAnswered=answered;
+    assert.equal(answered?.result,'granted',"The App's answer did not reach the held callback: "+JSON.stringify(answered));
+  }
   step('Personal popup open at the final quit',personal);
   proof.finalPopup=await openPopupForQuit(personal);
   step('Personal final exit',personal);

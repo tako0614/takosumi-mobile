@@ -219,6 +219,35 @@ async fn open_saved(view: &impl Shell, app: &AppHandle, name: &str, count: usize
         ))
     }
 }
+/// Answer the one held site-permission prompt through the home's own row, as
+/// the person does: the enabled 許可する click resolves the browser's held
+/// callback and the answered prompt leaves the section. A wrong or
+/// unresolved answer keeps the row (and .web-error on a failed invoke), so a
+/// fake click can never read as a grant.
+async fn answer_permission(view: &impl Shell) -> Result<()> {
+    const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
+    let enabled_allow = format!("(()=>{{const allow=[...document.querySelectorAll('{ROW} button')].filter(b=>b.textContent.trim()==='許可する'&&!b.disabled);return allow.length===1}})()");
+    ready(view, &enabled_allow).await?;
+    eval(
+        view,
+        &format!("(()=>{{const allow=[...document.querySelectorAll('{ROW} button')].find(b=>b.textContent.trim()==='許可する'&&!b.disabled);if(!allow)throw Error('One enabled allow button required');allow.click();return true}})()"),
+    )
+    .await?;
+    ready(
+        view,
+        "!document.querySelector('#permissions-heading') || document.querySelector('.web-error')",
+    )
+    .await?;
+    if eval(view, "Boolean(!document.querySelector('#permissions-heading'))").await? != Value::Bool(true) {
+        return Err(format!(
+            "The held prompt was not answered: {}",
+            eval(view, "document.querySelector('.web-error')?.textContent")
+                .await
+                .unwrap_or(Value::Null)
+        ));
+    }
+    Ok(())
+}
 /// Tap a button inside the saved connection's row, matched by its exact label.
 async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
     let (name, label) = (
@@ -814,7 +843,15 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&partial).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    println!("first: Work closed and Personal kept; waiting for the final quit");
+    println!("first: Work closed and Personal kept; the held permission prompt is next");
+    // The opted-in browser holds Personal's permission prompt for the App's
+    // own answer: the observer names this checkpoint after the page asks, and
+    // the home's own prompt row is the person's answer surface. Clicking
+    // 許可する resolves the held callback, which is the grant the observer
+    // records from the page itself.
+    checkpoint(view, case, "permission-requested").await?;
+    answer_permission(view).await?;
+    println!("first: the held prompt was answered through the home; waiting for the final quit");
     // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
     checkpoint_within(view, case, "request-final-exit", Duration::from_secs(60)).await?;
     std::fs::write(
