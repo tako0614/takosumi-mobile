@@ -855,6 +855,34 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     checkpoint(view, case, "permission-requested").await?;
     answer_permission(view).await?;
     println!("first: the held prompt was answered through the home; waiting for the final quit");
+    // A held media prompt has no runtime dismissal of its own: it retires
+    // with its document. Only the Linux mjs observer drives this
+    // choreography (media-requested -> held row seen -> reload ->
+    // media-navigated); the Windows/macOS observer flows never write those
+    // checkpoints, so the gate keeps their first launch unchanged.
+    if std::env::var("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL").as_deref() == Ok("1") {
+        checkpoint(view, case, "media-requested").await?;
+        // The notification answer already retired its row, so exactly one
+        // held row now means the media prompt the page just raised; its
+        // heading text goes into the marker as evidence for the observer.
+        const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
+        ready(view, &format!("document.querySelectorAll('{ROW}').length===1")).await?;
+        let label = eval(
+            view,
+            &format!("document.querySelector('{ROW} h3')?.textContent ?? ''"),
+        )
+        .await?;
+        let seen = serde_json::to_vec(&serde_json::json!({ "held": true, "label": label }))
+            .map_err(|error| error.to_string())?;
+        std::fs::write(case.join("media-held-seen.json"), seen)
+            .map_err(|error| error.to_string())?;
+        checkpoint(view, case, "media-navigated").await?;
+        // The same-site reload killed the document's held request: the
+        // App's row must be gone, proving retirement reached the held map
+        // rather than merely the browser.
+        ready(view, "!document.querySelector('#permissions-heading')").await?;
+        println!("first: the held media prompt retired with its document");
+    }
     // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
     checkpoint_within(view, case, "request-final-exit", Duration::from_secs(60)).await?;
     std::fs::write(

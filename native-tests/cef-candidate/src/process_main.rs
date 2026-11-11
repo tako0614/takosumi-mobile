@@ -1256,20 +1256,29 @@ wrap_browser_process_handler! {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 wrap_app! {
     struct Application;
-    impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
-}
-#[cfg(windows)]
-wrap_app! {
-    struct Application;
     impl App {
         fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
             // The browser process's own command line; its helpers inherit
             // the feature switches from it.
             if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
-            if let Some(command_line) = command_line { disable_native_occlusion(command_line); }
+            if let Some(command_line) = command_line {
+                #[cfg(windows)]
+                disable_native_occlusion(command_line);
+                #[cfg(feature = "fixture-inspection")]
+                fake_media_device(command_line);
+            }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) }
     }
+}
+/// Fixture browsers only: one synthetic capture device, so a real
+/// getUserMedia call reaches the permission handler on hardware-free
+/// CI/Xvfb hosts instead of failing device enumeration before any prompt.
+/// A staged or packaged browser is built without the feature and never
+/// gets this switch.
+#[cfg(feature = "fixture-inspection")]
+fn fake_media_device(command_line: &mut CommandLine) {
+    command_line.append_switch(Some(&CefString::from("use-fake-device-for-media-stream")));
 }
 
 /// Windows: Chromium's native window occlusion tracking is off, as Electron

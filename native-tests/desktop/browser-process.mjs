@@ -901,6 +901,18 @@ async function firstLaunch() {
     proof.permissionAnswered=answered;
     assert.equal(answered?.result,'granted',"The App's answer did not reach the held callback: "+JSON.stringify(answered));
   }
+  // The same opted-in browser also holds media requests the runtime cannot
+  // dismiss itself: the App's row must appear, then die with the document —
+  // retirement is proven by the row's disappearance, not the promise.
+  step('Media permission held for the App then retired with its document',personal);
+  const mediaRequested=await personal.evaluate('(()=>{const g=globalThis.__sumiMediaProbe={stream:null,error:null,settled:false};g.promise=navigator.mediaDevices.getUserMedia({audio:true}).then(s=>{g.stream=s;g.settled=true;return s},e=>{g.error=String(e);g.settled=true});return {devices:typeof navigator.mediaDevices!=="undefined",secure:isSecureContext}})()',true);
+  assert.equal(mediaRequested?.devices,true,'A held media request needs navigator.mediaDevices: '+JSON.stringify(mediaRequested));
+  await writeFile(path.join(data,'media-requested'),'ready',{flag:'wx'});
+  // The App driver confirms the held media row before the document dies.
+  const heldSeen=await marker('media-held-seen.json');
+  await personal.evaluate("(()=>{location.reload();return true})()");
+  await writeFile(path.join(data,'media-navigated'),'ready',{flag:'wx'});
+  proof.mediaRetired={requested:true,secure:mediaRequested.secure,heldLabel:heldSeen.label};
   step('Personal popup open at the final quit',personal);
   proof.finalPopup=await openPopupForQuit(personal);
   step('Personal final exit',personal);

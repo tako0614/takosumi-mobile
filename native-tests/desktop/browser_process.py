@@ -355,6 +355,9 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_SNAPSHOT_PROGRAM=str(args.browser),
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
+               # The mjs observer drives the media hold/retire choreography;
+               # Windows/macOS observer flows never write its checkpoints.
+               TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1",
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
     # A recording stand-in for the desktop's opener, first on PATH: the App hands
     # links the person chose to open outside to xdg-open. Nothing real opens.
