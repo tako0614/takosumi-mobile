@@ -58,6 +58,9 @@ SETTLE_WAIT = 10
 # One pure read's bound through a starved DevTools channel; the same order
 # of storm the driver's 60s cancel-inspected bound already waits out.
 STARVED_READ_WAIT = 60
+# The same bound for the dialog-cancel send loop: each timed-out send is
+# re-asked while the profile lives, until the shared storm bound.
+STARVED_SEND_WAIT = 60
 # The fixture site's documents: a navigation within a profile, or the boot
 # load of a new browser (the cef-candidate popup probe's 25 s load bound).
 LOAD_WAIT = 25
@@ -1218,25 +1221,46 @@ class Observer:
         (dialog_failure) before it goes on."""
         attempt = time.monotonic()
         try:
-            for send_retry in range(3):
+            send_deadline = attempt + STARVED_SEND_WAIT
+            send_retry = 0
+            while True:
                 try:
                     page.send("Page.handleJavaScriptDialog", {"accept": False})
                     break
                 except CdpError as error:
-                    if not (self.real and opened is not None and error.error.get("message") == NO_DIALOG):
-                        raise
-                    return self.cancelled_by_browser(page, what, opened, attempt, error)
+                    no_dialog = error.error.get("message") == NO_DIALOG
+                    if self.real and opened is not None and no_dialog:
+                        return self.cancelled_by_browser(page, what, opened, attempt, error)
+                    # Only after a starved send may "no dialog" mean that send
+                    # landed late; before any send it means the browser closed
+                    # the dialog itself, which the fixture run must refuse.
+                    if no_dialog and send_retry and self.dialog_cancelled_close(page, mark) is not None:
+                        return "observer"
+                    raise
                 except Failure as error:
                     # A busy renderer can starve one DevTools reply while the
                     # dialog stays open (run 42953633716: Photopea kept
-                    # spawning renderers through Work's whole cancel window).
-                    # Asking again is the same cancel — the close event below
-                    # still proves it actually happened; a dead browser fails
-                    # there instead.
-                    if send_retry == 2 or "CDP timeout" not in str(error):
+                    # spawning renderers through Work's whole cancel window;
+                    # run 42971293681 exhausted all three blind sends). A
+                    # timed-out send may still land: the dialog's own close,
+                    # not another blind send, decides what happened — and a
+                    # dead profile cannot be answered at all.
+                    if "CDP timeout" not in str(error) or time.monotonic() >= send_deadline:
                         raise
+                    send_retry += 1
                     self.proof.setdefault("dialogSendRetries", []).append(
-                        {"attempt": send_retry + 1, "error": str(error)[:200]})
+                        {"attempt": send_retry, "error": str(error)[:200]})
+                    page.cdp.drain(0.5)
+                    if self.dialog_cancelled_close(page, mark) is not None:
+                        # The timed-out send landed: on a real site record
+                        # through the browser-cancel path (which send or actor
+                        # delivered it is unknowable); on the fixture it is
+                        # the observer's own cancel.
+                        if self.real and opened is not None:
+                            return self.cancelled_by_browser(page, what, opened, attempt, error)
+                        return "observer"
+                    require(not self.guard_ended(page.process["guardReceipt"]),
+                            f"{what}: the profile ended while its cancel starved")
             page.cdp.wait_event(
                 lambda event: event["method"] == "Page.javascriptDialogClosed"
                 and event.get("sessionId") == page.session and event["params"].get("result") is False,
@@ -1267,6 +1291,15 @@ class Observer:
             if RECEIVED_AT in closed and RECEIVED_AT in opened else None,
             "cancelAfterOpening": round(attempt - opened[RECEIVED_AT], 3) if RECEIVED_AT in opened else None})
         return "browser"
+
+    def dialog_cancelled_close(self, page, mark):
+        """The page session's javascriptDialogClosed with result false among
+        the events since `mark` — the only proof a held dialog was cancelled,
+        whichever send or actor delivered it."""
+        return next((event for event in page.cdp.since(mark)
+                     if event["method"] == "Page.javascriptDialogClosed"
+                     and event.get("sessionId") == page.session
+                     and event["params"].get("result") is False), None)
 
     def dialog_failure(self, what, watched, error, opened=None, attempt=None):
         """Diagnostics only, after a failed dialog step: for each watched
