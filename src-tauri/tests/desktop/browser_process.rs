@@ -65,15 +65,24 @@ async fn eval(view: &impl Shell, script: &str) -> Result<Value> {
     view.eval(script).await
 }
 async fn ready(view: &impl Shell, condition: &str) -> Result<()> {
-    let end = Instant::now() + Duration::from_secs(20);
+    ready_within(view, condition, Duration::from_secs(20)).await
+}
+/// Polls a page condition up to the given bound, keeping the last poll
+/// outcome so an expiry reports whether the condition stayed false or the
+/// eval itself stalled, not merely that the deadline passed.
+async fn ready_within(view: &impl Shell, condition: &str, bound: Duration) -> Result<()> {
+    let end = Instant::now() + bound;
+    let mut last = String::from("no poll completed");
     while Instant::now() < end {
-        if eval(view, &format!("Boolean({condition})")).await == Ok(Value::Bool(true)) {
-            return Ok(());
+        match eval(view, &format!("Boolean({condition})")).await {
+            Ok(Value::Bool(true)) => return Ok(()),
+            Ok(value) => last = format!("poll saw {value}"),
+            Err(error) => last = format!("poll eval failed: {error}"),
         }
         view.pause(Duration::from_millis(75)).await;
     }
     Err(format!(
-        "Shell readiness expired: {}",
+        "Shell readiness expired ({last}): {}",
         eval(view, "document.body?.innerText")
             .await
             .unwrap_or(Value::Null)
@@ -869,7 +878,18 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         // held row now means the media prompt the page just raised; its
         // heading text goes into the marker as evidence for the observer.
         const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
-        ready(view, &format!("document.querySelectorAll('{ROW}').length===1")).await?;
+        // A held prompt on macOS can outlive the shared 20 s floor before
+        // its row paints even though the hold worked, so this wait gets the
+        // same 30 s class as the driver's other page waits; an expiry also
+        // reports the live row count so a recurrence names 0 / 2+ / an eval
+        // stall rather than only the deadline.
+        let row_count = format!("document.querySelectorAll('{ROW}').length");
+        if let Err(error) =
+            ready_within(view, &format!("{row_count}===1"), Duration::from_secs(30)).await
+        {
+            let count = eval(view, &row_count).await.unwrap_or(Value::Null);
+            return Err(format!("{error}; held-row count at expiry: {count}"));
+        }
         let label = eval(
             view,
             &format!("document.querySelector('{ROW} h3')?.textContent ?? ''"),
