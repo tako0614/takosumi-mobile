@@ -122,12 +122,38 @@ public final class ResponseCapabilityTest {
 
     private ResponseProbeActivity.Transfer response(String link) throws Exception {
         assertTrue("Unexpected extra original response", activity.responses.isEmpty());
-        tap(link);
+        tapExpectingNavigation(link);
         ResponseProbeActivity.Transfer transfer = activity.responses.poll(20, TimeUnit.SECONDS);
         if (transfer == null) fail("No actual external response from Gecko for " + link + "\n"
             + activity.diagnostics() + "\n" + visibleTree());
         assertEquals(activity.work, transfer.context);
         return transfer;
+    }
+
+    private void tapExpectingNavigation(String text) throws Exception {
+        // A settled a11y rect is still not proof of a hit: run 42966638207
+        // showed the tap after a session re-attach dropped before any load
+        // request — its trace ends on the programmatic reopen load. The tap's
+        // real effect is a navigation, so one silent miss earns exactly one
+        // fresh-bounds retry (the Save-for-web rule). A navigation without a
+        // response, or two silent misses, stay real failures. Every tap whose
+        // expected effect is a navigation shares this rule — the denied-path
+        // link carries the same drop signature as run 42961067390.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (!activity.responses.isEmpty()) return;
+            int before = activity.loadRequests();
+            tap(text);
+            try {
+                await("Tap on " + text + " produced no navigation or response",
+                    () -> !activity.responses.isEmpty() || activity.loadRequests() > before, 15);
+                return;
+            } catch (AssertionError silent) {
+                // The await's own message carries the visible tree but not
+                // the owned-event deque that classifies the drop.
+                if (attempt == 1) throw new AssertionError(silent.getMessage() + "\n" + activity.diagnostics());
+                activity.trace("tap on " + text + " produced no navigation; retrying on fresh bounds");
+            }
+        }
     }
 
     private void exact(ResponseProbeActivity.Transfer transfer, byte[] expected) throws Exception {
@@ -159,19 +185,19 @@ public final class ResponseCapabilityTest {
         // Exercise the native control labels before any engine result can obscure them.
         for (String button : new String[] {"Work", "Personal", "Reopen Work", "Cancel transfer", "Close Work"}) visible(button);
         visible("Fixture signed out");
-        tap("Fixture sign in");
+        tapExpectingNavigation("Fixture sign in");
         visible("Fixture signed in");
         exact(response("Cookie attachment"), FixtureServer.COOKIE);
         assertEquals(1, activity.server.authenticatedDownloads.get());
 
-        tap("Personal");
+        tapExpectingNavigation("Personal");
         visible("Fixture signed out");
-        tap("Cookie attachment");
+        tapExpectingNavigation("Cookie attachment");
         visible("Cookie denied");
         assertEquals(1, activity.server.deniedDownloads.get());
         assertTrue("A denied page must not become a saved response", activity.responses.isEmpty());
 
-        tap("Reopen Work");
+        tapExpectingNavigation("Reopen Work");
         visible("Fixture signed in");
         exact(response("Cookie attachment"), FixtureServer.COOKIE);
         assertEquals("No URL replay or substitute HTTP client", 2, activity.server.authenticatedDownloads.get());
@@ -180,7 +206,7 @@ public final class ResponseCapabilityTest {
         interrupt("Cancel transfer");
         interrupt("Close Work");
         await("The server still sends the canceled responses", () -> activity.server.interruptedSlowResponses.get() == 2, 10);
-        tap("Personal");
+        tapExpectingNavigation("Personal");
         visible("Fixture signed out");
         assertTrue(activity.responses.isEmpty());
         assertArrayEquals(new byte[] {11, 5}, Files.readAllBytes(new File(activity.directory, "keep.txt").toPath()));

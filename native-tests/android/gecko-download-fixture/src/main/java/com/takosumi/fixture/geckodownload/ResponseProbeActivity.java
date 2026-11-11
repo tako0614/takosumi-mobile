@@ -27,9 +27,18 @@ public final class ResponseProbeActivity extends Activity {
     boolean destroyed;
     private final ArrayDeque<String> events = new ArrayDeque<>();
 
-    private synchronized void trace(String event) {
+    private int loadRequests;
+
+    synchronized void trace(String event) {
+        // The bounded deque evicts; this count never does. A tap that
+        // produced no new 'load ' record never reached navigation.
+        if (event.startsWith("load ")) loadRequests++;
         if (events.size() == 32) events.removeFirst();
         events.addLast(event);
+    }
+
+    synchronized int loadRequests() {
+        return loadRequests;
     }
 
     synchronized String diagnostics() {
