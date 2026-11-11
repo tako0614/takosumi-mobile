@@ -109,6 +109,12 @@ enum HeldPermission {
     Media {
         callback: MediaAccessCallback,
         permissions: u32,
+        /// Media requests carry no CEF prompt id, so no dismissal reaches
+        /// `on_dismiss_permission_prompt`: a held media request is retired
+        /// only through its browser's own lifetime — the browser closing or
+        /// the main frame committing a new load, after which every pending
+        /// request of the old document tree is dead.
+        browser_id: i32,
     },
 }
 /// Held permission prompts the App has not answered yet: past this bound a
@@ -805,6 +811,9 @@ wrap_life_span_handler! {
                 }
                 state.live-=1;
             });
+            // Media holds in this browser die with it; the map keeps the
+            // retirement single-shot if CEF also dismissed anything first.
+            retire_media_permissions_for_browser(id);
             #[cfg(windows)]
             children_windows::mark(children_windows::Mark::BrowserClosed);
             // A cancel clears the shutdown, so the remaining windows stay open.
@@ -889,6 +898,14 @@ wrap_context_menu_handler! {
 wrap_load_handler! {
     struct Loads;
     impl LoadHandler {
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            let (Some(browser),Some(frame))=(browser,frame) else {return;};
+            if frame.is_main()==0{return;}
+            // The old document tree is dead once a new main-frame load
+            // commits; media requests it still held need this dismissal —
+            // requests of the new document only exist after this point.
+            retire_media_permissions_for_browser(browser.identifier());
+        }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code:i32) {
             let (Some(browser),Some(frame))=(browser,frame) else {return;};
             if frame.is_main()==0{return;}
@@ -934,6 +951,35 @@ fn hold_permission(
     })
 }
 
+/// Media requests have no CEF dismissal of their own: they die with their
+/// document, so the held entry is retired on the two events after which no
+/// request of that browser can still be live — `on_before_close` and a
+/// committed main-frame load. Removal from the map keeps each retirement
+/// single-shot whichever event lands first; a never-matched id (-1, no
+/// browser) simply stays held until its answer or process drop as before.
+fn retire_media_permissions_for_browser(browser_id: i32) {
+    let (gone, profile) = with_state(|state| {
+        let gone: Vec<u64> = state
+            .pending_permissions
+            .iter()
+            .filter_map(|(seq, held)| {
+                matches!(held, HeldPermission::Media { browser_id: id, .. } if *id == browser_id)
+                    .then_some(*seq)
+            })
+            .collect();
+        for seq in &gone {
+            state.pending_permissions.remove(seq);
+        }
+        (gone, state.profile.clone())
+    });
+    for seq in gone {
+        reply(Reply::PermissionDismissed {
+            profile: profile.clone(),
+            prompt_id: seq,
+        });
+    }
+}
+
 wrap_permission_handler! {
     // The browser never decides a permission itself: each request is recorded
     // in the profile's own browser.log (stderr). Without the App's opt-in the
@@ -943,11 +989,12 @@ wrap_permission_handler! {
     // prompts the runtime itself ended; an App-resolved one is already gone.
     struct Permissions;
     impl PermissionHandler {
-        fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
+        fn on_request_media_access_permission(&self, browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
             let origin=requesting_origin.map(ToString::to_string).unwrap_or_default();
             eprintln!("permission: media origin={origin} permissions={requested_permissions:#x}");
             if let Some(callback)=callback {
-                if hold_permission(HeldPermission::Media{callback:callback.clone(),permissions:requested_permissions},origin,PermissionKind::Media,requested_permissions).is_some() { return 1; }
+                let browser_id=browser.map(|browser|browser.identifier()).unwrap_or(-1);
+                if hold_permission(HeldPermission::Media{callback:callback.clone(),permissions:requested_permissions,browser_id},origin,PermissionKind::Media,requested_permissions).is_some() { return 1; }
             }
             0
         }
@@ -1150,7 +1197,7 @@ fn dispatch(bytes: Option<&[u8]>) {
                     });
                     reply(Reply::PermissionResolved { id });
                 }
-                Some(HeldPermission::Media { callback, permissions }) => {
+                Some(HeldPermission::Media { callback, permissions, .. }) => {
                     match decision {
                         PermissionDecision::Allow => callback.cont(permissions),
                         PermissionDecision::Deny => callback.cancel(),
