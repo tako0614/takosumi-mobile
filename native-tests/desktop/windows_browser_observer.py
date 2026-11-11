@@ -1171,6 +1171,35 @@ class Observer:
         self.case("permission-answered-by-app", entry)
         return entry
 
+    def media_dismissal(self, page):
+        """A held media request has no runtime dismissal of its own: it
+        retires with its document. The page raises a real getUserMedia; the
+        driver confirms the App's held row and records its label, then the
+        page reloads — the row's disappearance (asserted by the driver) is
+        the retirement evidence, never the request's own promise. Runs only
+        where the driver also opted in via the shared flag."""
+        if os.environ.get("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL") != "1":
+            return
+        self.step("media permission held for the App then retired with its document", page)
+        key = json.dumps("__sumiMediaProbe")
+        state = page.evaluate(
+            f"(()=>{{const g=globalThis[{key}]={{stream:null,error:null,settled:false}};"
+            f"g.promise=navigator.mediaDevices.getUserMedia({{audio:true}})"
+            f".then(s=>{{g.stream=s;g.settled=true;return s}},e=>{{g.error=String(e);g.settled=true}});"
+            f"return {{devices:typeof navigator.mediaDevices!=='undefined',secure:isSecureContext}};}})()", True)
+        require(state and state["devices"] is True,
+                f"A held media request needs navigator.mediaDevices: {state}")
+        self.checkpoint("media-requested")
+        held = self.marker("media-held-seen.json")
+        page.evaluate("(()=>{location.reload();return true})()", True)
+        self.checkpoint("media-navigated")
+        # The reload replaces the document; let it arrive before the next
+        # evaluation (a page between documents fails Runtime.evaluate).
+        self.settled(lambda: page.evaluate("document.readyState") == "complete",
+                     "The reloaded document did not come back", MARKER_WAIT, tolerate=True)
+        self.proof["mediaRetired"] = {"requested": True, "secure": state.get("secure"),
+                                      "heldLabel": held.get("label")}
+
     def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
         return page.cdp.wait_event(
             lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
@@ -1679,6 +1708,7 @@ class Observer:
         # App's own answer: this run's checkpoint hands it to the driver,
         # whose click on the home row grants it before the final quit.
         self.answer_permission(personal)
+        self.media_dismissal(personal)
         self.step("Personal final exit", personal)
         if not self.real:
             # Personal's own popup stays open for the final quit: its native

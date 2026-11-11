@@ -497,6 +497,10 @@ def run_phase(args, env, files, before, head, suffix):
     proof = {"passed": False, "phase": phase or "first", "sourceHead": head, "artifactsBefore": before}
     execution = {"passed": False}
     observer_env = {key: value for key, value in os.environ.items() if not key.upper().startswith("TAKOSUMI_")}
+    if not args.packaged:
+        # The same opt-in the App env carries: a fixture browser, not an
+        # installed one, runs the media hold/retire choreography.
+        observer_env["TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL"] = "1"
     with create_exclusive(session / f"app{suffix}.log", "wb") as log:
         job = WindowsJob()
         try:
@@ -732,7 +736,12 @@ def browser_env(base, args, session, log):
     if not args.packaged:
         env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
                    TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard),
-                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(session / "r"))
+                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(session / "r"),
+                   # The fixture browser carries the synthetic media
+                   # device: the App driver runs its media hold/retire
+                   # block and the observer drives the page side. A
+                   # packaged run leaves the choreography off.
+                   TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1")
     if args.real_site:
         env["TAKOSUMI_BROWSER_PROCESS_REAL_SITE"] = args.real_site
     return env

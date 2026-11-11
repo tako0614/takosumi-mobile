@@ -333,6 +333,7 @@ class MacObserver(Observer):
         # App's own answer: the driver clicks the home's row before the final
         # quit, and the page's resolved grant is the round-trip evidence.
         self.answer_permission(personal)
+        self.media_dismissal(personal)
         with watch_shutdowns(self, [personal]):
             self.checkpoint("request-final-exit")
             self.finish_final_quit([personal])
@@ -444,7 +445,13 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
                        TAKOSUMI_BROWSER_PROCESS_REAL_SITE="1", TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(browser),
                        TAKOSUMI_BROWSER_PROCESS_GUARD=str(guard), TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime),
                        TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
-                       TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(case / "external-open.log"))
+                       TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(case / "external-open.log"),
+                       # The fixture browser carries the synthetic media
+                       # device: the App driver runs its media hold/retire
+                       # block; the in-process observer reads the same flag
+                       # from os.environ below.
+                       TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1")
+            os.environ["TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL"] = "1"
             if phase:
                 env["TAKOSUMI_BROWSER_PROCESS_PHASE"] = phase
             entry = {"name": name}
