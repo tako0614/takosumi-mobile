@@ -773,10 +773,22 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     )
     .map_err(|error| error.to_string())?;
     // Resume, download, the popup (load up to 25 s) and the external link
-    // (15 s) run before the observer asks to quit. The App watchdog (90 s)
-    // remains the overall bound; the observer's stage names a slow step.
+    // (15 s) run before the observer asks to quit. The App watchdog (90 s
+    // fixture, 540 s real site) remains the overall bound; the observer's
+    // stage names a slow step.
+    // A real site adds the observer's own starved reads before the request
+    // (two samples plus the beforeunload arming, each bounded read up to
+    // 60 s), so the wait carries the real-site inspect bound while keeping
+    // the 60 s floor the fixture's popup/link choreography was calibrated
+    // on.
     println!("first: Work reused; waiting for the quit request");
-    checkpoint_within(view, case, "request-exit", Duration::from_secs(60)).await?;
+    checkpoint_within(
+        view,
+        case,
+        "request-exit",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
     println!("first: quitting (Work's beforeunload expected)");
