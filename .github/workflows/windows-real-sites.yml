@@ -240,7 +240,7 @@ jobs:
             'excalidraw/reuse-raises-window',
             'excalidraw/quit-cancel-stops',
             'excalidraw/quit-partial-order',
-            'excalidraw/permission-probe',
+            'excalidraw/permission-answered-by-app',
             'excalidraw/quit-completes',
             'excalidraw/no-process-left',
             'excalidraw/no-opener-request'
@@ -284,7 +284,7 @@ jobs:
             'photopea/reuse-raises-window',
             'photopea/quit-cancel-stops',
             'photopea/quit-partial-order',
-            'photopea/permission-probe',
+            'photopea/permission-answered-by-app',
             'photopea/quit-completes',
             'photopea/no-process-left',
             'photopea/no-opener-request'

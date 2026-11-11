@@ -109,7 +109,7 @@ IDENTIFIER = "com.takosumi.fixture.browserprocess"
 POPUP_CASE = "work-same-origin-popup"
 OBSERVED_CASES = {
     "": ("separate-profiles", "home-by-window-switch", "reuse-raises-window", POPUP_CASE,
-         "quit-cancel-stops", "quit-partial-order", "permission-probe"),
+         "quit-cancel-stops", "quit-partial-order", "permission-answered-by-app"),
     "restart": ("restart-keeps-separation",),
     "reset": ("clear-only-one-profile",),
 }
