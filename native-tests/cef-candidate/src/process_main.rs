@@ -141,7 +141,13 @@ fn reply(value: Reply) {
         || out.write_all(b"\n").is_err()
         || out.flush().is_err()
     {
-        eprintln!("A browser reply could not be written to the control pipe.");
+        // Keep reply() panic-free like the ignored write errors it reports:
+        // eprintln! panics on a broken stderr while this runs on the CEF UI
+        // thread, where an unwind would abort the process.
+        let _ = writeln!(
+            io::stderr().lock(),
+            "A browser reply could not be written to the control pipe."
+        );
     }
 }
 fn error(id: u64, message: &str) {
