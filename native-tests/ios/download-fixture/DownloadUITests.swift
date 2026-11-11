@@ -66,7 +66,16 @@ final class DownloadUITests: XCTestCase {
 
     private func closeScreen() {
         let close = app.buttons["閉じる"].firstMatch
-        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        // An OS export surface can still be dismissing when the element
+        // already exists: its tap then computes hit point {-1,-1} and lands
+        // nowhere (run 42971293681: the Files save kept the sheet up for
+        // several more seconds). Wait until the real control is hittable —
+        // same bound, and still an actual tap on the actual button.
+        let deadline = Date().addingTimeInterval(10)
+        while !close.isHittable && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        XCTAssertTrue(close.isHittable, "閉じる stayed covered; the close tap could not land")
         close.tap()
         XCTAssertTrue(app.buttons["Inspect files"].waitForExistence(timeout: 10))
         lastClosedAt = Date()
