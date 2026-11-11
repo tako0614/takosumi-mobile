@@ -106,8 +106,17 @@ def migration_progress(path):
             # the status==2 plugin gate cannot see post-migration progress.
             stage = waiting[1]
             transitions.append({"plugin": "stage:" + stage, "elapsed": elapsed})
+    # No minimum-elapsed floor: this only runs once the fixed deadline already
+    # passed, which is itself the abnormality the floor meant to prove. The
+    # parsed tail can also lag tens of seconds behind a boot that is still
+    # moving — simctl block-buffers its non-tty output (run 42739950403: the
+    # deadline read saw Elapsed=02:22 while the boot had already reached
+    # Waiting on System App at 02:57 with migrators still completing — the
+    # floor refused the extension and a near-ready boot was sent to erase). The
+    # <=60-second transition gap stays the honest recency test; a boot that
+    # stops transitioning keeps failing at the same 300-second ceiling.
     recent = (len(transitions) >= 2 and status is not None and terminal == "NO" and
-              elapsed >= 150 and 0 <= elapsed - transitions[-1]["elapsed"] <= 60)
+              0 <= elapsed - transitions[-1]["elapsed"] <= 60)
     # A migrator the OS still reports running is in flight, not stalled: run
     # 42834538144 lost both created boots inside 00LaunchServicesMigrator at
     # 137s+ (a healthy boot spent ~121s on it). The last Running-plugin line
@@ -116,7 +125,7 @@ def migration_progress(path):
     # boot still fails, just at the existing cap.
     in_flight = (running is not None and transitions and
                  transitions[-1]["plugin"] == running and status == 2 and
-                 terminal == "NO" and elapsed >= 150)
+                 terminal == "NO")
     return {"transitions": transitions, "lastElapsed": elapsed, "recentMigrationProgress": recent,
             "activeMigration": in_flight,
             "extensionSeconds": 120 if (recent or in_flight) else 0, "maximumBootSeconds": 300,

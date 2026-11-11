@@ -317,6 +317,12 @@ class HarnessTests(unittest.TestCase):
                                  (entry(5, "launch") + entry(175, "launch"), False, True),
                                  (entry(5, "launch") + entry(20, "keys") + entry(175, "keys"), False, True),
                                  (entry(5, "launch") + entry(165, "safari") + entry(175, "safari"), True, True),
+                                 # Run 42739950403: a deadline read behind
+                                 # simctl's buffered output still shows a
+                                 # running migrator seconds old — the floor
+                                 # must not refuse the bounded continuation.
+                                 (entry(33, "launch") + entry(117, "keys") + entry(129, "safari") +
+                                  entry(142, "safari"), True, True),
                                  # Run 42672706585: migration ended and the boot
                                  # reached Waiting on System App; that stage
                                  # transition is the same forward motion.
