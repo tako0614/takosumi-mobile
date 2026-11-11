@@ -313,18 +313,30 @@ public final class WebAppOperationTest {
 
     // Interactive windows from other uids containing the point: a
     // self-targeted event is refused while one sits on top. Naming the
-    // surface (2 = input method, system bars, sheets) lets the next refusal
-    // classify itself instead of guessing at a transient.
+    // surface and its owner lets the next refusal classify itself instead of
+    // guessing at a transient. A foreign TYPE_APPLICATION window counts too:
+    // another app's dialog (2 = input method, system bars, sheets, or a
+    // system permission prompt) intercepts the same tap while reporting a
+    // type this check once skipped — an empty list then explained nothing.
     private String coveringWindows(MotionEvent event) {
+        String own = instrumentation.getTargetContext().getPackageName();
         StringBuilder names = new StringBuilder();
         try {
             for (AccessibilityWindowInfo window : instrumentation.getUiAutomation().getWindows()) {
-                if (window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) continue;
                 Rect area = new Rect();
                 window.getBoundsInScreen(area);
-                if (area.contains((int) event.getX(), (int) event.getY()))
-                    names.append(names.length() == 0 ? "" : ", ").append("type=")
-                        .append(window.getType()).append('@').append(area.toShortString());
+                if (!area.contains((int) event.getX(), (int) event.getY())) continue;
+                String owner = null;
+                AccessibilityNodeInfo root = window.getRoot();
+                if (root != null) {
+                    try { owner = String.valueOf(root.getPackageName()); }
+                    finally { root.recycle(); }
+                }
+                if (own.equals(owner)) continue;
+                names.append(names.length() == 0 ? "" : ", ")
+                    .append("type=").append(window.getType())
+                    .append('@').append(area.toShortString())
+                    .append(' ').append(owner);
             }
         } catch (RuntimeException unavailable) { /* evidence only */ }
         return names.toString();
