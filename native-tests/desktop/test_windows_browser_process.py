@@ -1277,12 +1277,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(f"'^test result: ok\\. {tests} passed; 0 failed'", job)
 
     def test_the_macos_job_bundles_and_smokes_the_browser(self):
-        """M1: cef-macos builds the browser and its helper, bundles them with
-        CEF's framework, runs both smokes with the seatbelt check and uploads
-        text only."""
+        """M1/M4: cef-macos runs standalone and packaged browser smokes
+        with the seatbelt check and uploads text evidence only."""
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = workflow[workflow.index("\n  cef-macos:\n"):]
-        self.assertIn("    runs-on: macos-latest\n    timeout-minutes: 75\n", job)
+        self.assertRegex(job, r"(?m)^    runs-on: macos-latest$")
+        # M4 adds a third serial App flow. Comments between the fields must
+        # not change which runner/bounded job this contract checks.
+        self.assertRegex(job, r"(?m)^    timeout-minutes: 100$")
         self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper "
                       "--bin takosumi-browser-guard\n", job)
         self.assertIn('node scripts/bundle-macos-cef.mjs --cef "$cef" --bin "$CARGO_TARGET_DIR/debug" '
@@ -1295,6 +1297,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(smokes, [
             f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-product/{app}" '
             '--work "$RUNNER_TEMP" --expect-sandbox',
+            f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser '
+            f'"$CARGO_TARGET_DIR/debug/bundle/macos/Takosumi.app/Contents/Resources/cef/{app}" '
+            '--work "$RUNNER_TEMP" --expect-sandbox',
             f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-fixture/{app}" '
             '--work "$RUNNER_TEMP" --expect-load --reuse --expect-sandbox',
         ])
@@ -1303,7 +1308,17 @@ class RunnerTests(unittest.TestCase):
                      "m1-fixture/bundle.json"):
             self.assertIn(f"${{{{ runner.temp }}}}/{path}\n", upload)
         self.assertNotIn(".app\n", upload)
-        self.assertNotIn("target-cef", upload)
+        paths = re.search(r"(?m)^          path: \|\n((?:            .+\n)+)", upload)
+        self.assertIsNotNone(paths)
+        entries = [entry.strip() for entry in paths.group(1).splitlines()]
+        self.assertEqual([entry for entry in entries if entry.startswith("target-cef/")], [
+            f"target-cef/debug/bundle/macos/{name}.app/Contents/Info.plist"
+            for name in ("Takosumi", "TakosumiFixture")
+        ])
+        for entry in entries:
+            # Packaged Info.plist is text; do not permit its containing app
+            # or arbitrary target files when accepting these new paths.
+            self.assertRegex(entry, r"\.(json|log|plist)$")
         self.assertNotIn("codesign", job)
         # The window wait's decisions run, every test of them.
         source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
