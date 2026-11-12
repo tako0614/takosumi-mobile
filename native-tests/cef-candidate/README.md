@@ -2528,6 +2528,19 @@ three portable rejection tests exercise listener/process ownership and abnormal
 receipts; Linux cross-Clippy with C/library stubs checks Rust only, not linking
 or native behavior.
 
+Mac lifecycle records also mark the existing control-packet read, UI-task post
+return value and UI-task entry, without parsing or logging packet contents.
+Run43297320017 cancelled quit successfully, then Work's reuse-focus began
+25.176 seconds after the App's successful send; its reply arrived after the
+App had already failed its wait. The new boundaries distinguish reader/post
+delay from UI-task delivery, with the existing command/focus markers covering
+dispatch and focus. Post return and task entry run on different threads and
+may be recorded in either order; FIFO packet order and positive command
+records must be correlated. A missing best-effort line proves no stop point.
+The synchronous diagnostic write retains the existing control-lock scope
+and can affect timing. No protocol, scheduling or timeout rule changes, and
+native collection of these boundaries remains unqualified.
+
 M3 uses CDP `Page.close` on relaunch. OS window switching, keyboard focus,
 real login/popup return, native files/downloads, site permissions, notifications,
 OS-managed WKWebView services outside the App's guarded tree, macOS packaging,

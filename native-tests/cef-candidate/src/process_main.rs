@@ -1244,7 +1244,11 @@ fn dispatch(bytes: Option<&[u8]>) {
 }
 wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
-    impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
+    impl Task { fn execute(&self) {
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("control-task-enter", mac_lifecycle::BROWSER, None);
+        dispatch(self.bytes.as_deref());
+    } }
 }
 // macOS: the next look for a new browser's NSWindow (`await_window`).
 #[cfg(target_os = "macos")]
@@ -1619,13 +1623,26 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         let mut reader = BufReader::new(io::stdin());
         loop {
             let bytes = read_packet(&mut reader).ok().flatten();
+            #[cfg(target_os = "macos")]
+            mac_lifecycle::record(
+                "control-packet-read",
+                mac_lifecycle::BROWSER,
+                Some(i32::from(bytes.is_some())),
+            );
             let stop = bytes.is_none();
             let open = CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
             if !*open {
                 break;
             }
             let mut task = PipeTask::new(bytes);
-            if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+            let posted = post_task(ThreadId::UI, Some(&mut task));
+            #[cfg(target_os = "macos")]
+            mac_lifecycle::record(
+                "control-task-post-return",
+                mac_lifecycle::BROWSER,
+                Some(posted),
+            );
+            if posted != 1 {
                 // A command the parent believes sent would otherwise vanish
                 // without a reply and no trace (run 43076506208's reopened
                 // Work Open is exactly this shape: sent, never answered).
