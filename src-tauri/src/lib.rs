@@ -86,7 +86,19 @@ pub fn run() {
         feature = "native-web-home-fixture",
         feature = "native-browser-process-fixture"
     )))]
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running Takosumi mobile");
+    {
+        let app = builder
+            .build(tauri::generate_context!())
+            .expect("error while running Takosumi mobile");
+        #[cfg(windows)]
+        {
+            // Tao's Windows run exits inside the loop, before the runtime's
+            // remaining WebView2 controllers can drop. Like the actual-App
+            // fixture, return through the runtime before ending the process.
+            let code = app.run_return(|_, _| {});
+            std::process::exit(code);
+        }
+        #[cfg(not(windows))]
+        app.run(|_, _| {});
+    }
 }

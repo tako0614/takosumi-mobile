@@ -116,6 +116,13 @@ advertise this command. The synthetic-site Windows same-App browser-fault
 case passed in [CI43218039839](https://github.com/tako0614/takosumi-mobile/actions/runs/43218039839/job/131182189815).
 Installed-package recovery and interrupted-write integrity remain unqualified.
 
+The ordinary Windows product entry now returns through the event loop before
+exiting, as the actual-App fixture already does, allowing remaining shell
+WebView2 controllers to drop. This is a shutdown repair candidate: the prior
+installed-product smoke exited the App normally but left four WebView2 processes
+in its job. The same ten-second empty-job check must pass before this can be
+called a native repair; forced job cleanup cannot satisfy it.
+
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
 Excalidraw/Photopea file checks and remaining platform limits are described in
