@@ -244,7 +244,12 @@ has a 60-second wait and the same direct-child retirement rules. An absent
 bundle or interrupted xcodebuild is not exported; neither missing attachments
 nor export failure changes the original test failure. No test is retried.
 If the test reaches the Save to Files tap, it keeps an immediate post-tap
-screenshot. Independently, it keeps up to 32 observations of the original input file and
+screenshot. The second existing five-second action wait requires the resolved
+cell to exist, be enabled and be hittable. Its resolved state is attached after
+that wait and immediately before the single real tap; teardown preserves both
+the host and DocumentsApp hierarchies. This diagnoses a share sheet that stays
+open after a tap; it does not establish the cause or repair of that OS handoff.
+Independently, it keeps up to 32 observations of the original input file and
 the same activity's presentation after session removal: one immediately, then
 on a one-second timer whose cadence is not a hard wall-time guarantee. The observer
 holds the activity weakly and records only timestamps and boolean observations;

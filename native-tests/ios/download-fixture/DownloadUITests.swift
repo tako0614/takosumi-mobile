@@ -30,8 +30,14 @@ final class DownloadUITests: XCTestCase {
         screenshot.lifetime = .keepAlways
         add(screenshot)
         let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "Download host hierarchy at teardown"
         hierarchy.lifetime = .keepAlways
         add(hierarchy)
+        let filesHierarchy = XCTAttachment(string: filesApp.state == .notRunning
+            ? "DocumentsApp is not running" : filesApp.debugDescription)
+        filesHierarchy.name = "DocumentsApp hierarchy at teardown"
+        filesHierarchy.lifetime = .keepAlways
+        add(filesHierarchy)
         app.terminate()
     }
 
@@ -174,7 +180,21 @@ final class DownloadUITests: XCTestCase {
             .firstMatch
         // Standard English iOS fixture. Missing actions fail; no fake export.
         if !saveToFiles.waitForExistence(timeout: 5) { app.swipeUp() }
-        XCTAssertTrue(saveToFiles.waitForExistence(timeout: 5))
+        // Run 43218039839 tapped the real action cell, but its share sheet
+        // stayed up with unresolved activity icons. Existence alone does
+        // not establish an actionable control. Reuse the second five-second
+        // wait for readiness and keep the resolved state as evidence; this
+        // does not establish why the OS activity failed to open.
+        let actionable = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            saveToFiles.exists && saveToFiles.isEnabled && saveToFiles.isHittable
+        }, object: nil)
+        let ready = XCTWaiter.wait(for: [actionable], timeout: 5)
+        let verdict = XCTAttachment(string: "Readiness wait result: \(ready)")
+        verdict.name = "Save to Files readiness verdict"
+        verdict.lifetime = .keepAlways
+        add(verdict)
+        XCTAssertEqual(ready, .completed, "Save to Files did not become enabled and hittable")
+        attachExportAction(saveToFiles, stage: "after readiness wait")
         if afterSessionClose {
             // Keep the real activity pending while the host removes the
             // session and observes the input file. Final receipt also requires
@@ -186,6 +206,9 @@ final class DownloadUITests: XCTestCase {
             XCTAssertEqual(XCTWaiter.wait(for: [retained], timeout: 3), .completed)
             XCTAssertTrue(saveToFiles.exists, "Session removal dismissed the OS export")
         }
+        XCTAssertTrue(saveToFiles.exists && saveToFiles.isEnabled && saveToFiles.isHittable,
+                      "Save to Files lost readiness before its tap")
+        attachExportAction(saveToFiles, stage: "immediately before the real tap")
         saveToFiles.tap()
         XCTContext.runActivity(named: "Immediately after the real Save to Files action") { _ in
             let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
@@ -225,6 +248,16 @@ final class DownloadUITests: XCTestCase {
         filesElement("Download Fixture folder did not appear", timeout: 5) { $0.staticTexts["Download Fixture"].firstMatch }.tap()
         filesElement("OS Files export Save did not remain", timeout: 5) { $0.buttons["Save"].firstMatch }.tap()
         waitForFilesDismissal()
+    }
+
+    private func attachExportAction(_ action: XCUIElement, stage: String) {
+        let state = action.exists
+            ? "enabled=\(action.isEnabled) hittable=\(action.isHittable) frame=\(action.frame)\n\(action.debugDescription)"
+            : "Save to Files is unresolved"
+        let attachment = XCTAttachment(string: state)
+        attachment.name = "Save to Files \(stage)"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     private func waitForFilesDismissal() {
