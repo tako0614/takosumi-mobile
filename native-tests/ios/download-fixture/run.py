@@ -303,7 +303,7 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
     return path.read_text(errors="replace")
 
 
-def certificate(directory):
+def certificate(directory, *, localhost=False):
     """Private key files stay outside uploaded evidence and source."""
     ca, cert, key = directory / "ca.pem", directory / "server.pem", directory / "server.key"
     command(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -313,7 +313,8 @@ def certificate(directory):
     command(["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
              "-keyout", str(key), "-out", str(directory / "server.csr")], directory / "request.log")
     extensions = directory / "server.ext"
-    extensions.write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"
+    alternate = ",DNS:localhost" if localhost else ""
+    extensions.write_text(f"subjectAltName=IP:127.0.0.1{alternate}\nextendedKeyUsage=serverAuth\n"
                           "keyUsage=critical,digitalSignature,keyEncipherment\nbasicConstraints=critical,CA:FALSE\n")
     command(["openssl", "x509", "-req", "-days", "1", "-in", str(directory / "server.csr"),
              "-CA", str(ca), "-CAkey", str(directory / "ca.key"), "-CAcreateserial",

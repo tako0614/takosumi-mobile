@@ -66,6 +66,14 @@ jobs:
             grep -Eq "^# $verdict 0$" "$RUNNER_TEMP/browser-startup-controls.log"
           done
         working-directory: takosumi-mobile
+      - name: Whole iOS App Web-home harness controls (not native qualification)
+        run: |
+          python3 -B native-tests/ios/web-home-fixture/test_run.py 2>&1 | tee "$RUNNER_TEMP/ios-web-home-controls.log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Whole-App iOS harness controls failed'; exit 1; }
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/ios-web-home-controls.log"
+        working-directory: takosumi-mobile
+        env:
+          TMPDIR: ${{ runner.temp }}
 
   # The native plugin tests `bun run check` does not run: the takosumi-push
   # plugin's RFC 8291 decryption and Declarative Web Push parsing (Kotlin on
@@ -730,6 +738,7 @@ jobs:
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features desktop-cef
         working-directory: takosumi-mobile
       - name: Whole App iOS Simulator SDK build (unsigned)
+        id: ios-sdk
         if: runner.os == 'macOS'
         timeout-minutes: 25
         env:
@@ -747,6 +756,19 @@ jobs:
         with:
           name: ios-download-runtime
           path: ${{ runner.temp }}/ios-download-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Actual whole iOS App connection, Web home, resume and reset
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.ios-sdk.outcome == 'success' }}
+        timeout-minutes: 20
+        run: python3 -B native-tests/ios/web-home-fixture/run.py --out "$RUNNER_TEMP/ios-web-home-evidence"
+        working-directory: takosumi-mobile
+      - name: Keep whole iOS App Web-home evidence (no App bundle or fixture keys)
+        if: ${{ always() && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios-whole-app-web-home
+          path: ${{ runner.temp }}/ios-web-home-evidence
           if-no-files-found: warn
           retention-days: 14
       - name: Actual GTK profile, navigation and popup fixture

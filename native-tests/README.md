@@ -144,6 +144,13 @@ Compiler caches are saved after non-cancelled SDK failures as well as success,
 so a source repair can reuse completed compilation. Failed checks stay failed;
 cached compiler files are not accepted App artifacts or runtime evidence.
 
+The separate [whole-App Web-home fixture](ios/web-home-fixture/README.md) is
+a source candidate that installs this exact Simulator App and drives its
+connection form, synthetic Web authentication/home/apps, native navigation,
+profile separation, warm/cold resume and explicit profile reset. Its native
+result remains pending; SDK compilation and the standalone download host do
+not qualify that whole-App flow.
+
 ### Android original-response comparison
 
 The standalone [Gecko download fixture](android/gecko-download-fixture/README.md)
