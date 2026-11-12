@@ -68,10 +68,10 @@ the native title bar. Windows/Linux keep profile directories separate from the
 trusted shell; macOS uses dedicated UUID data stores. Popups inherit their
 opener's native environment/store. The shell and mobile/desktop adapters share
 `WebHome`, connection persistence, profile identity and validated `OpenRequest`.
-CEF across every desktop OS would require a separate Tauri 3 alpha migration;
-this candidate keeps the existing Tauri 2 mobile plugins. On Linux, the
-explicit `desktop-cef` feature opens each connection in its own guarded CEF
-browser process packaged under the bundle's `cef/` resources; see
+The explicit `desktop-cef` feature keeps the Tauri 2 shell and mobile plugins
+while opening each connection in its own guarded CEF browser process on Linux,
+Windows and macOS. On Linux, the browser is packaged under the bundle's `cef/`
+resources; see
 [Linux packaging](native-tests/cef-candidate/README.md#linux-packaging-desktop-cef).
 On Windows the same adapter and a Job Object guard compile and are tested in
 CI, with the browser in Chromium's sandbox (CEF's bootstrap with the browser
@@ -118,10 +118,11 @@ Installed-package recovery and interrupted-write integrity remain unqualified.
 
 The ordinary Windows product entry now returns through the event loop before
 exiting, as the actual-App fixture already does, allowing remaining shell
-WebView2 controllers to drop. This is a shutdown repair candidate: the prior
-installed-product smoke exited the App normally but left four WebView2 processes
-in its job. The same ten-second empty-job check must pass before this can be
-called a native repair; forced job cleanup cannot satisfy it.
+WebView2 controllers to drop. The unsigned installed-product smoke passed in
+[CI43272033643](https://github.com/tako0614/takosumi-mobile/actions/runs/43272033643/job/131370792374):
+eight seconds up, normal App exit and an empty job within the original ten-second
+bound. The prior four-process remainder is absent in this run. This is a bounded
+first-launch/close check; distribution and updates remain release work.
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
