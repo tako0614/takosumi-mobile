@@ -48,6 +48,10 @@ class Controls(unittest.TestCase):
         self.assertIn("name: ios-app-swift-runtime", body)
         self.assertIn("name: ios-whole-app-web-home", body)
         self.assertNotIn("actions/download-artifact@", body, "Keep SDK input and installed-App readback on one host")
+        standalone = jobs[owners[2][0]]
+        for setup in ("brew install xcodegen", "xcodegen --version"):
+            self.assertTrue(setup in standalone, "The standalone host must prepare XcodeGen without the SDK init: " + setup)
+            self.assertLess(standalone.index(setup), standalone.index(download))
 
     def app(self, root=None):
         root = root or self.root / "build"

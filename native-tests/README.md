@@ -229,6 +229,9 @@ Its small host compiles the product coordinator, navigator, policy and download
 owner directly; only the unused Tauri shell signal is replaced with a refusal.
 The desktop macOS CI job runs this case independently of the SDK/whole-App
 job. Each case creates and retires its own Simulator on its own CI host.
+CI explicitly prepares XcodeGen before the standalone case; this dependency
+previously came from the SDK's Tauri init. The runtime runner still requires
+its tools to exist and does not install an SDK or generate the whole App.
 
 The disposable host supplies an explicit `Info.plist` with Boolean file-sharing
 and opening-in-place keys, merged with Xcode's generated bundle fields. XCTest
