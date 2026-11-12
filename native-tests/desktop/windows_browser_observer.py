@@ -58,6 +58,14 @@ SETTLE_WAIT = 10
 # One pure read's bound through a starved DevTools channel; the same order
 # of storm the driver's 60s cancel-inspected bound already waits out.
 STARVED_READ_WAIT = 60
+# A live storm can outlast the base bound while the event stream keeps
+# arriving (run 43173821786: DOMStorage.enable starved the full 60 s under
+# ~90 s of observed renderer churn on the real site). A stream that is
+# still receiving events names a STARVED channel, not a dead one, so the
+# bound then extends in quiet-window steps while events keep landing, up to
+# the absolute cap; a channel that goes quiet fails at its own bound.
+STARVED_QUIET_WAIT = 15
+STARVED_MAX_WAIT = 240
 # The same bound for the dialog-cancel send loop: each timed-out send is
 # re-asked while the profile lives, until the shared storm bound.
 STARVED_SEND_WAIT = 60
@@ -926,19 +934,30 @@ class Observer:
         # and re-sent only while the bound lasts, then raised on its own
         # name — never masked by the storage-domain fallback below.
         deadline = time.monotonic() + STARVED_READ_WAIT
+        hard_deadline = time.monotonic() + STARVED_MAX_WAIT
         def starved(method, params=None):
+            nonlocal deadline
             while True:
                 try:
                     return page.send(method, params,
                                      max(5.0, deadline - time.monotonic()))
                 except Failure as error:
-                    if "CDP timeout" in str(error):
-                        self.proof.setdefault("starvedBrowserReadRetries", []).append(
-                            {"profile": page.process["profile"], "method": method,
-                             "error": str(error)[:200]})
-                        if time.monotonic() < deadline:
-                            time.sleep(0.05)
-                            continue
+                    if "CDP timeout" not in str(error):
+                        raise
+                    now = time.monotonic()
+                    events = getattr(page.cdp, "events", ()) or ()
+                    quiet_for = now - events[-1].get(RECEIVED_AT, 0.0) if events else None
+                    storm_live = quiet_for is not None and quiet_for < STARVED_QUIET_WAIT
+                    self.proof.setdefault("starvedBrowserReadRetries", []).append(
+                        {"profile": page.process["profile"], "method": method,
+                         "error": str(error)[:200],
+                         "channelQuietSeconds": round(quiet_for, 1) if quiet_for is not None else None})
+                    if storm_live and now < hard_deadline:
+                        deadline = min(now + STARVED_QUIET_WAIT, hard_deadline)
+                        continue
+                    if now < deadline:
+                        time.sleep(0.05)
+                        continue
                     raise
         # getFrameTree itself has no storage-domain fallback: without the root
         # frame's id the navigation scan below cannot run at all, so a missing

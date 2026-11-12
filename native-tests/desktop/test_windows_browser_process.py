@@ -595,6 +595,75 @@ class CdpTests(unittest.TestCase):
         self.assertEqual(watch.proof["starvedBrowserReadRetries"][0]["method"],
                          "Page.getFrameTree")
 
+    def contended_page_with_events(self, sends, events):
+        page = self.contended_page(sends, events)
+        page.cdp.events = events
+        return page
+
+    def test_a_starved_read_extends_only_while_the_storm_stays_live(self):
+        # Run 43173821786: DOMStorage.enable starved the full base bound
+        # while renderer churn kept the event stream alive. A stream still
+        # receiving events names a starved channel, so the bound extends in
+        # quiet-window steps and the late answer still lands.
+        key = "sumi_app_process_no-such-case"
+        attempts = {"n": 0}
+
+        def flaky(method):
+            attempts["n"] += 1
+            if attempts["n"] <= 3:
+                return Failure("CDP timeout DOMStorage.enable (P)")
+            return {}
+
+        class Sends(dict):
+            def __missing__(self, method):
+                return flaky(method) if method == "DOMStorage.enable" else {}
+
+        sends = Sends({"DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
+                       "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
+        events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
+        page = self.contended_page_with_events(sends, events)
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.multiple(observer, STARVED_READ_WAIT=0.01,
+                                 STARVED_QUIET_WAIT=0.05, STARVED_MAX_WAIT=5.0):
+            self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertEqual(attempts["n"], 4)
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertEqual(len(retries), 3)
+        self.assertTrue(all(retry["method"] == "DOMStorage.enable" for retry in retries))
+        self.assertTrue(all(retry["channelQuietSeconds"] == 0.0 for retry in retries))
+
+    def test_a_starved_read_still_names_the_method_past_the_hard_cap(self):
+        # Storm liveness extends only up to STARVED_MAX_WAIT: a channel that
+        # never quietens and never answers raises on the method's own name
+        # rather than waiting forever.
+        events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
+
+        class Cdp:
+            base = 0
+
+            def since(self, mark):
+                return events[mark:]
+
+        class Page:
+            def __init__(self):
+                self.cdp = Cdp()
+                self.cdp.events = [{"method": "Target.targetCreated",
+                                    observer.RECEIVED_AT: time.monotonic()}]
+                self.session = "S1"
+                self.process = {"profile": "P"}
+
+            def send(self, method, params=None, timeout=5.0):
+                raise Failure(f"CDP timeout {method} (P)")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.multiple(observer, STARVED_READ_WAIT=0.01,
+                                 STARVED_QUIET_WAIT=0.01, STARVED_MAX_WAIT=0.05):
+            with self.assertRaisesRegex(Failure, "CDP timeout Page.getFrameTree"):
+                watch.contended_sample(Page(), 0)
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertTrue(retries)
+        self.assertTrue(all(retry["method"] == "Page.getFrameTree" for retry in retries))
+
 
 class TcpTableTests(unittest.TestCase):
     def row(self, state, address, port, pid):
