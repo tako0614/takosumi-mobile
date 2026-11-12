@@ -1051,7 +1051,11 @@ fn open(id: u64, payload: OpenRequest) {
                 .load_url(Some(&CefString::from(payload.url.as_str())));
         }
         let host = browser.host().unwrap();
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-focus-begin", mac_lifecycle::BROWSER, None);
         host.set_focus(1);
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-focus-return", mac_lifecycle::BROWSER, None);
         // set_focus only moves keyboard focus inside the browser. A window
         // covered by another profile stays hidden unless it is raised.
         match raise(&host) {
@@ -1072,7 +1076,11 @@ fn open(id: u64, payload: OpenRequest) {
             #[cfg(not(windows))]
             Ok(()) => {}
         }
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-raise-return", mac_lifecycle::BROWSER, None);
         opened(id, payload.key, &browser);
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-reply-return", mac_lifecycle::BROWSER, None);
         return;
     }
     let context = with_state(|state| {

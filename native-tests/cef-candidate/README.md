@@ -2222,6 +2222,11 @@ This adds no work inside the guard's stop-to-kill interval and changes no
 shutdown bound or receipt acceptance. Abnormal closes have a distinct request
 label; the before-exit record is not proof of OS exit, and a missing best-effort
 line does not prove that a helper was absent. The main RED remains unresolved.
+The existing-browser reuse path also records focus begin/return, window-raise
+return and reply return with the same closed metadata. These stages distinguish
+a resume that stops inside focus, AppKit window raising or reply construction;
+they do not prove foreground activation or successful delivery of a reply.
+Missing lines can still be diagnostic loss. No operation or timeout is changed.
 The first diagnostic run (`d32f18a`, 42491760278) passed its macOS component
 job, but concurrent helpers interleaved the JSON formatter's separate writes.
 Records are now formatted fully before one best-effort write. A failed or short
