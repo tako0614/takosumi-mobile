@@ -670,6 +670,13 @@ def main():
                      "--project-root", str(scratch), "--project", str(scratch)],
                     out / "project.log", env=env)
             shutil.copyfile(scratch / "DownloadFixture.xcodeproj/project.pbxproj", out / "project.pbxproj")
+            # Destination evidence BEFORE xcodebuild: run 43100058856's
+            # "Unable to find a device matching id=<just-booted udid>" could
+            # not discriminate a vanished device from an xcodebuild-side
+            # matching failure on the degraded host. The pre-test inventory
+            # names which of the two it was.
+            command(["xcrun", "simctl", "list", "devices", "--json"],
+                    out / "before-test.log")
             log = command(["xcodebuild", "test", "-project", str(scratch / "DownloadFixture.xcodeproj"),
                            "-scheme", "DownloadFixture", "-destination", f"id={udid}",
                            "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),
