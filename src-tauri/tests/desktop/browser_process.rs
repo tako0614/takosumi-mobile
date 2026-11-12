@@ -235,19 +235,30 @@ async fn open_saved(view: &impl Shell, app: &AppHandle, name: &str, count: usize
 /// fake click can never read as a grant.
 async fn answer_permission(view: &impl Shell) -> Result<()> {
     const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
-    let enabled_allow = format!("(()=>{{const allow=[...document.querySelectorAll('{ROW} button')].filter(b=>b.textContent.trim()==='許可する'&&!b.disabled);return allow.length===1}})()");
+    // A second held prompt can land while this leg waits — the observer
+    // issues the media request as soon as the page records this answer, and
+    // run 43173821786 failed here because the media row kept the whole
+    // section alive: waiting for #permissions-heading to vanish asserts on
+    // every prompt, not just the answered one. Identify the row being
+    // answered by its heading and wait for THAT row to retire; other held
+    // prompts may coexist (the media leg then owns the remaining row).
+    let enabled_allow = format!("(()=>{{return [...document.querySelectorAll('{ROW}')].some(row=>[...row.querySelectorAll('button')].some(b=>b.textContent.trim()==='許可する'&&!b.disabled))}})()");
     ready(view, &enabled_allow).await?;
-    eval(
+    let heading = eval(
         view,
-        &format!("(()=>{{const allow=[...document.querySelectorAll('{ROW} button')].find(b=>b.textContent.trim()==='許可する'&&!b.disabled);if(!allow)throw Error('One enabled allow button required');allow.click();return true}})()"),
+        &format!("(()=>{{const row=[...document.querySelectorAll('{ROW}')].find(r=>[...r.querySelectorAll('button')].some(b=>b.textContent.trim()==='許可する'&&!b.disabled));if(!row)throw Error('An enabled allow row required');const heading=row.querySelector('h3')?.textContent??'';[...row.querySelectorAll('button')].find(b=>b.textContent.trim()==='許可する'&&!b.disabled).click();return heading}})()"),
     )
     .await?;
+    let gone = format!(
+        "![...document.querySelectorAll('{ROW} h3')].some(h=>h.textContent==={})",
+        serde_json::to_string(&heading).unwrap_or_else(|_| "null".into())
+    );
     ready(
         view,
-        "!document.querySelector('#permissions-heading') || document.querySelector('.web-error')",
+        &format!("{gone} || document.querySelector('.web-error')"),
     )
     .await?;
-    if eval(view, "Boolean(!document.querySelector('#permissions-heading'))").await? != Value::Bool(true) {
+    if eval(view, &format!("Boolean({gone})")).await? != Value::Bool(true) {
         return Err(format!(
             "The held prompt was not answered: {}",
             eval(view, "document.querySelector('.web-error')?.textContent")
