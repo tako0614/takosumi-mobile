@@ -25,6 +25,7 @@ final class FixtureHome: UIViewController {
     private let personal = UUID().uuidString.lowercased()
     private let receipt = UILabel()
     private var closeTimer: Timer?
+    private var closeOnBytesKey: String?
     private var inspectionTimer: Timer?
     private var exportObservationTimer: Timer?
     private var exportObservations: [[String: Any]] = []
@@ -45,6 +46,10 @@ final class FixtureHome: UIViewController {
         super.viewDidLoad()
         AppScreenDownload.lifecycleObserver = { [weak self] event, state in
             guard let self = self else { return }
+            if event == "state", state == "receiving", let key = self.closeOnBytesKey {
+                self.closeOnBytesKey = nil
+                self.closeDuringTransfer(key: key)
+            }
             if self.downloadLifecycle.count < 64 {
                 self.downloadLifecycle.append([
                     "unixSeconds": Date().timeIntervalSince1970,
@@ -107,27 +112,34 @@ final class FixtureHome: UIViewController {
         var request = AppScreenRequest(key: key, url: url, title: "Download Fixture")
         request.webHome = true
         request.profile = profile
+        closeOnBytesKey = closeOnBytes ? key : nil
         do { try AppScreenCoordinator.shared.open(request, from: self) }
         catch { fatalError("Actual AppScreen open failed: \(error)") }
         if closeOnExport { closeDuringExport(key: key) }
-        if closeOnBytes {
-            let deadline = Date().addingTimeInterval(25)
-            closeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
-                guard let self = self else { timer.invalidate(); return }
-                let partial = self.temporaryDownloads().contains { directory in
-                    ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
-                        .contains { ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 }
-                }
-                if partial {
-                    timer.invalidate()
-                    self.closedDuringTransfer = true
-                    // Exercise the real owner removal while WebKit is writing.
-                    AppScreenCoordinator.shared.remove(key)
-                    self.dismiss(animated: false)
-                } else if Date() >= deadline {
-                    timer.invalidate()
-                    self.closeTimedOut = true
-                }
+    }
+
+    private func closeDuringTransfer(key: String) {
+        // The 25-second transfer bound starts at the real WKDownload's
+        // receiving transition, after the user's Save confirmation. Starting
+        // it at screen open expired it during the page's reload recovery in
+        // run 43179155497, before Save was tapped; no removal was attempted.
+        // Keep requiring actual partial bytes and the real coordinator remove.
+        let deadline = Date().addingTimeInterval(25)
+        closeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            let partial = self.temporaryDownloads().contains { directory in
+                ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+                    .contains { ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 }
+            }
+            if partial {
+                timer.invalidate()
+                self.closedDuringTransfer = true
+                // Exercise the real owner removal while WebKit is writing.
+                AppScreenCoordinator.shared.remove(key)
+                self.dismiss(animated: false)
+            } else if Date() >= deadline {
+                timer.invalidate()
+                self.closeTimedOut = true
             }
         }
     }
