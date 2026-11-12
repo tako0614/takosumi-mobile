@@ -2,7 +2,8 @@
 
 This is an external UI Automator driver for the actual Tauri Android App,
 not an Activity hosting a substitute WebView. Source/local harness controls
-pass; native compilation and the first whole-App UI execution are pending.
+and actual APK/driver compilation pass; the full whole-App UI flow remains
+unqualified.
 
 Run `bash native-tests/android/build-app.sh` first in a fresh CI checkout.
 With the official API36 Google APIs x86_64 image, emulator/platform-tools,
@@ -30,7 +31,23 @@ wait. A setText return does not confirm the field value. Click wrapper times
 do not prove actual input down/up delivery or JavaScript submit receipt.
 This is a source candidate following run43279856761: the final image showed
 text selection on Save, but could not establish why the first Web page was
-not reached. Actual Java SDK compilation and trace collection remain pending.
+not reached. Driver Java compilation has passed; native collection of this
+connection-add trace remains pending because the next run stopped in setup.
+
+Run43297320017 installed and launched the actual App, but failed the initial
+form check before connection-add. Its final screenshot/hierarchy show the
+OS's `System UI isn't responding` dialog over the form, as an earlier run
+also did. The ANR onset and cause are unknown; no Save gesture ran in this
+attempt. On failure only, the runner now rechecks the exact owned guest
+before each `dumpsys activity lastanr` / `lastanr-traces` read. Each query has
+one 10-second command allowance with the existing CLI retirement handling.
+Raw output stays in private scratch; evidence keeps only the first 128KiB of
+the summary and 512KiB of traces, with truncation/size/hash or closed error metadata.
+An interrupted diagnostic retains scratch under the existing policy. Missing
+or failed diagnostics preserve the original failure and cannot pass the UI.
+The saved summary and newest trace file may concern different ANRs; their
+process identities and timestamps must match before attributing a cause.
+No dialog is dismissed, test retried, oracle relaxed or UI wait extended.
 
 The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's

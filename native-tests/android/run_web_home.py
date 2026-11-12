@@ -281,6 +281,40 @@ class Emulator:
                 self.fd = None
 
 
+def preserve_guest_anr(emulator, scratch, out):
+    """Failure-only reads; an absent/late diagnostic never qualifies the UI."""
+    result = {"diagnosticOnly": True, "scope": "Exact owned disposable Android guest", "queries": {}}
+    for label, query, limit in (("guest-last-anr", "lastanr", 128 * 1024),
+                                ("guest-last-anr-traces", "lastanr-traces", 512 * 1024)):
+        entry = result["queries"][label] = {}
+        raw = scratch / (label + "-raw.log")
+        try:
+            require(not raw.exists() and not raw.is_symlink(), "Existing diagnostic input refused")
+            emulator.owned()
+        except Exception as error:
+            entry["errorType"] = type(error).__name__
+            break  # A foreign/dead guest authorizes no further reads.
+        try:
+            runtime.command([str(emulator.adb), "-s", SERIAL, "shell", "dumpsys", "activity", query],
+                            raw, timeout=10, read_output=False)
+            entry["queryReturned"] = True
+        except Exception as error:
+            entry["errorType"] = type(error).__name__
+        try:
+            if raw.exists():
+                require(raw.is_file() and not raw.is_symlink(), "Plain diagnostic output required")
+                size = raw.stat().st_size
+                with raw.open("rb") as source:
+                    data = source.read(limit)
+                with (out / (label + ".log")).open("xb") as target:
+                    target.write(data)
+                entry.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
+                             sha256=hashlib.sha256(data).hexdigest())
+        except Exception as error:
+            entry["collectionErrorType"] = type(error).__name__
+    return result
+
+
 def installed(emulator, expected):
     paths = emulator.run("shell", "pm", "path", PACKAGE).strip().splitlines()
     require(len(paths) == 1 and paths[0].startswith("package:"), "One installed base APK required")
@@ -406,6 +440,8 @@ def main():
         failure = error
         proof["errorType"] = type(error).__name__
         proof["error"] = str(error)
+        if isinstance(error, Exception) and emulator is not None:
+            proof["guestANR"] = preserve_guest_anr(emulator, scratch, out)
     finally:
         cleanup_errors = []
         if emulator is not None:

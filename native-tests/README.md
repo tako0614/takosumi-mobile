@@ -5,6 +5,13 @@ They do not sign in to real accounts, use provider/DB/SSO credentials, or qualif
 
 ## Portable desktop runner controls
 
+CI keeps the isolated Chromium case's top-level `browser.log` and `guard.json`
+after startup failure, plus `receipt.json` when the case succeeds.
+Run43297320017 timed out during CDP discovery before opening the
+shared UI; retaining stderr and the guard receipt makes that boundary
+inspectable. Profiles, Vite scratch and recursive browser data are excluded.
+Collection does not retry startup, extend its 20-second budget or pass the UI.
+
 When changing the desktop runners or their CI workflow, run the shared
 runner/protocol/workflow controls with Python 3's standard library:
 

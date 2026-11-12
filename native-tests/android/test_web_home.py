@@ -94,6 +94,66 @@ class Controls(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 runner.receipt(dict(value, **{key: changed}), normal=True)
 
+    def test_failed_guest_anr_reads_are_owned_bounded_and_keep_raw_output_outside_evidence(self):
+        scratch, out = self.root / "scratch", self.root / "evidence"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        calls = []
+        def command(argv, path, **options):
+            calls.append((argv, path, options))
+            path.write_bytes(b"ANR in com.android.systemui\n" + b"x" * (1024 * 1024))
+            return ""
+        with patch.object(runner.runtime, "command", side_effect=command):
+            result = runner.preserve_guest_anr(emulator, scratch, out)
+        self.assertTrue(result["diagnosticOnly"])
+        self.assertEqual(emulator.owned.call_count, 2)
+        self.assertEqual([argv for argv, _, _ in calls], [
+            [str(emulator.adb), "-s", runner.SERIAL, "shell", "dumpsys", "activity", name]
+            for name in ("lastanr", "lastanr-traces")])
+        for _, raw, options in calls:
+            self.assertEqual(raw.parent, scratch)
+            self.assertEqual(options, {"timeout": 10, "read_output": False})
+        for name, entry in result["queries"].items():
+            saved = out / (name + ".log")
+            self.assertTrue(entry["truncated"])
+            self.assertGreater(entry["sourceBytes"], entry["keptBytes"])
+            self.assertEqual(saved.stat().st_size, entry["keptBytes"])
+            self.assertEqual(entry["keptBytes"],
+                             (128 if name == "guest-last-anr" else 512) * 1024)
+            self.assertEqual(hashlib.sha256(saved.read_bytes()).hexdigest(), entry["sha256"])
+        self.assertFalse(any(out.glob("*-raw.log")))
+        self.assertNotIn("passed", result)
+
+    def test_guest_anr_read_refuses_foreign_ownership_and_preserves_query_failure(self):
+        scratch, out = self.root / "scratch", self.root / "evidence"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        emulator.owned.side_effect = RuntimeError("foreign guest")
+        with patch.object(runner.runtime, "command") as command:
+            result = runner.preserve_guest_anr(emulator, scratch, out)
+        command.assert_not_called()
+        self.assertEqual(result["queries"]["guest-last-anr"]["errorType"], "RuntimeError")
+        emulator.owned.side_effect = None
+        with patch.object(runner.runtime, "command", side_effect=TimeoutError):
+            result = runner.preserve_guest_anr(emulator, scratch, out)
+        self.assertEqual(result["queries"]["guest-last-anr"]["errorType"], "TimeoutError")
+        self.assertNotIn("passed", result)
+
+    def test_interrupted_guest_anr_read_keeps_partial_bytes_without_reporting_completion(self):
+        scratch, out = self.root / "scratch", self.root / "evidence"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        def interrupted(argv, path, **options):
+            path.write_bytes(b"partial guest diagnostic")
+            raise TimeoutError("private exception detail")
+        with patch.object(runner.runtime, "command", side_effect=interrupted):
+            result = runner.preserve_guest_anr(emulator, scratch, out)
+        for name, entry in result["queries"].items():
+            self.assertEqual(entry["errorType"], "TimeoutError")
+            self.assertNotIn("queryReturned", entry)
+            self.assertEqual((out / (name + ".log")).read_bytes(), b"partial guest diagnostic")
+        self.assertNotIn("private exception detail", str(result))
+
     def emulator_process_fixture(self):
         emulator = runner.Emulator.__new__(runner.Emulator)
         emulator.sdk = self.root / "sdk"
