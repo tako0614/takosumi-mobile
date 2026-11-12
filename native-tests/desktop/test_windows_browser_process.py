@@ -12,6 +12,7 @@ import re
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -206,6 +207,36 @@ class CdpTests(unittest.TestCase):
                          {"profile": "P", "type": "alert", "origin": "https://excalidraw.com"})
         self.assertNotIn("secret", json.dumps(watch.proof), "only the origin of a real site's URL is kept")
         self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
+
+    def test_the_final_quit_requires_normal_cleanup_before_reporting_success(self):
+        normal = {"rootExit": 0, "complete": True, "kernelNoChildren": True,
+                  "remaining": [], "forcedCleanup": 0, "cleanupErrors": [], "error": None}
+        # Run 43179155497: Personal's browser exited 0, but its guard had to
+        # kill ten descendants. Any JSON receipt used to end this loop and
+        # mark the observer passed, hiding the reason for the App's refusal
+        # behind the outer guard's subsequent 45-second timeout.
+        for changed in ({"forcedCleanup": 10}, {"rootExit": 2},
+                        {"remaining": [17]}, {"complete": False},
+                        {"kernelNoChildren": False}, {"cleanupErrors": ["failed"]},
+                        {"error": "failed"}, {}):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "guard.json"
+                receipt = dict(normal, **changed)
+                path.write_text(json.dumps(receipt))
+                cdp = observer.Cdp(FakeSocket([]), "personal")
+                page = observer.Page(cdp, "S", {
+                    "opened": {"windowId": 1, "nativePid": 2}, "profile": "Personal",
+                    "guardReceipt": str(path)}, {"targetId": "T"})
+                watch = observer.Observer(Path(directory), "https://127.0.0.1:1", 1, "",
+                                          real_site="photopea")
+                if changed:
+                    with self.assertRaisesRegex(Failure, "Final quit.*Personal.*abnormal receipt"):
+                        watch.finish_final_quit([page])
+                else:
+                    watch.finish_final_quit([page])
+                self.assertEqual(watch.proof["finalQuitReceipts"],
+                                 [{"profile": "Personal", "receipt": receipt}])
+                self.assertEqual(cdp.websocket.sent, [], "an ended profile needs no CDP commands")
 
     def test_photopea_is_entered_from_its_landing_and_excalidraw_directly(self):
         class FakePage:

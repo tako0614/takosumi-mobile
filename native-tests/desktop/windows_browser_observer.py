@@ -858,10 +858,14 @@ class Observer:
         self.settled(lambda: self.guard_ended(receipt), message, bound)
         with open(receipt, "rb") as source:
             value = json.loads(source.read())
+        self.check_normal_receipt(value, message)
+        return value
+
+    @staticmethod
+    def check_normal_receipt(value, message):
         require(value["rootExit"] == 0 and value["complete"] is True and value["kernelNoChildren"] is True
                 and value["forcedCleanup"] == 0 and value["remaining"] == [] and value["cleanupErrors"] == []
                 and value["error"] is None, f"{message}: abnormal receipt {json.dumps(value)[:500]}")
-        return value
 
     def cookie_of(self):
         key = self.key
@@ -1205,8 +1209,10 @@ class Observer:
         """W4: after the final quit request, a real site may ask its own
         beforeunload (the quit then waits for an answer). Accept only that
         (final_quit_dialog; recorded, as is a refused one) until every
-        remaining profile's guard has ended."""
+        remaining profile's guard has ended normally. Forced descendant
+        cleanup ends a guard too, but the App refuses that quit."""
         accepted = self.proof["finalQuitDialogsAccepted"] = []
+        receipts = self.proof["finalQuitReceipts"] = []
         marks = {id(page): page.cdp.mark() for page in pages}
         deadline = time.monotonic() + FINAL_QUIT_WAIT
         remaining = list(pages)
@@ -1214,6 +1220,13 @@ class Observer:
             require(time.monotonic() < deadline, "The final quit did not end every remaining profile")
             for page in list(remaining):
                 if self.guard_ended(page.process["guardReceipt"]):
+                    with open(page.process["guardReceipt"], "rb") as source:
+                        value = json.loads(source.read())
+                    receipts.append({"profile": page.process["profile"], "receipt": value})
+                    # Preserve the exact refusal before failing: otherwise
+                    # M3 marks this observer passed, then only reports the
+                    # outer App timeout because the App retained the profile.
+                    self.check_normal_receipt(value, f"Final quit for {page.process['profile']}")
                     remaining.remove(page)
                     continue
                 try:
