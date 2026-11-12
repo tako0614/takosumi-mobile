@@ -88,6 +88,18 @@ not at socket acceptance or TLS handshake. A returned write does not prove WebKi
 paint or accessibility readiness. This diagnostic adds no request, UI read,
 tap, retry or wait, and does not alter the functional or cleanup verdicts.
 
+Run43297320017 passed the Work flow through Notes navigation, draft and warm
+return, then failed after attempting Personal. Its recording shows the URL
+field still empty, followed by the browser's `Fill out this field` validation
+and then the completed URL. Personal was not saved and no new server request
+arrived. Returning from `typeText` did not prove that the requested input had
+landed. Before its single Save tap, the driver now adds a ten-second exact
+value-readiness condition for each actual field. Missing input fails before
+Save. The keyboard remains present; there is no replacement input,
+keyboard-dismiss tap or Save retry. The separate fifteen-second Web-page
+deadline is unchanged. Native execution of this input-readiness repair
+remains pending.
+
 Current iOS retains only one non-popup App screen. Warm document-memory
 retention is checked before opening Personal; cross-profile reopening checks
 persistent state and restored URL. This fixture does not claim simultaneous

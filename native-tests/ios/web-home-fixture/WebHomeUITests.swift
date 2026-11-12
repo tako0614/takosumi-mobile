@@ -55,15 +55,23 @@ final class WebHomeUITests: XCTestCase {
         app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", name, origin)).firstMatch
     }
 
+    private func entered(_ field: XCUIElement, _ value: String) {
+        let delivered = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", value), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [delivered], timeout: 10), .completed,
+                       "The connection field did not receive the requested input")
+    }
+
     private func addConnection(_ name: String) {
         let nameInput = app.webViews.textFields.matching(NSPredicate(format: "placeholderValue == %@", "自分のTakosumi")).firstMatch
         let urlInput = app.webViews.textFields.matching(NSPredicate(format: "placeholderValue == %@", "https://app.takosumi.com")).firstMatch
         XCTAssertTrue(nameInput.waitForExistence(timeout: 10))
         nameInput.tap()
         nameInput.typeText(name)
+        entered(nameInput, name)
         XCTAssertTrue(urlInput.exists)
         urlInput.tap()
         urlInput.typeText(origin)
+        entered(urlInput, origin)
         app.buttons["保存して開く"].tap()
         expect("Fixture signed out")
         expect("Remote has no App IPC")
