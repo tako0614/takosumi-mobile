@@ -25,7 +25,13 @@ The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's
 public CA for the exact hosts `127.0.0.1` and `localhost`, without cleartext,
 subdomains, global/user CA installation or SSL-error bypass. Both actual
-compiled XML and packaged CA bytes are checked. The rebuild must retain the
+compiled XML and packaged CA bytes are checked. The first native setup found
+that apkanalyzer's decoded domain elements had no text; whether the original
+compiled text was absent remained unproven. A separate aapt2 XML-tree decoder
+now binds actual text to the same two domain leaves. Missing, conflicting,
+foreign, duplicate or misplaced text is refused; expected hosts are never
+used to fill omitted data. Structure/attribute/resource/CA checks remain.
+This repair still requires native SDK execution. The rebuild must retain the
 normal Cargo App library bytes. APK hash, installed base-APK hash, source
 head/tree and Kit head bind the actual UI to the build; the normal SDK APK
 is backed up privately and restored only after safe shutdown and unchanged

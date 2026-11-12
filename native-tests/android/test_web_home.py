@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 import run_web_home as runner
-from fixture_network import ANDROID, CONFIG, Overlay, certificate_bytes, verify_network
+from fixture_network import ANDROID, CONFIG, Overlay, certificate_bytes, verify_network, domain_text_from_xmltree
 
 CERT = b"-----BEGIN CERTIFICATE-----\nc3ludGhldGljLXB1YmxpYy1maXh0dXJl\n-----END CERTIFICATE-----\n"
 TABLE = """Package name=com.takosumi.fixture.android id=7f
@@ -18,6 +18,19 @@ TABLE = """Package name=com.takosumi.fixture.android id=7f
    () (file) res/xml/sumi_fixture_network_security.xml type=XML
  resource 0x7f130001 raw/sumi_fixture_ca
    () (file) res/raw/sumi_fixture_ca.pem
+"""
+XMLTREE = """E: network-security-config (line=2)
+    E: domain-config (line=3)
+      A: cleartextTrafficPermitted="false" (Raw: "false")
+        E: domain (line=4)
+          A: includeSubdomains="false" (Raw: "false")
+            T: '127.0.0.1'
+        E: domain (line=5)
+          A: includeSubdomains="false" (Raw: "false")
+            T: 'localhost'
+        E: trust-anchors (line=6)
+            E: certificates (line=6)
+              A: src=@0x7f130001
 """
 
 
@@ -81,13 +94,57 @@ class Controls(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 runner.receipt(dict(value, **{key: changed}), normal=True)
 
-    def network(self, config=CONFIG, table=TABLE, cert=CERT):
+    def network(self, config=CONFIG, table=TABLE, cert=CERT, tree=XMLTREE):
         app = ET.Element("application", {ANDROID + "networkSecurityConfig": "@ref/0x7f120003"})
         archive_bytes = io.BytesIO()
         with zipfile.ZipFile(archive_bytes, "w") as archive:
             archive.writestr("res/raw/sumi_fixture_ca.pem", cert)
         with zipfile.ZipFile(archive_bytes) as archive:
-            return verify_network(app, table, lambda _: ET.fromstring(config), archive, self.cert)
+            return verify_network(app, table, lambda _: ET.fromstring(config), archive, self.cert, lambda _: tree)
+
+    def test_actual_xmltree_text_restores_only_omitted_decoded_domain_leaves(self):
+        root = ET.fromstring(CONFIG)
+        for domain in root.findall("domain-config/domain"):
+            domain.text = None
+        result = domain_text_from_xmltree(root, XMLTREE)
+        self.assertEqual([n.text for n in result.findall("domain-config/domain")], ["127.0.0.1", "localhost"])
+        self.assertEqual([n.text for n in root.findall("domain-config/domain")], [None, None])
+        missing = CONFIG.replace(">127.0.0.1<", "><").replace(">localhost<", "><")
+        self.network(missing)
+
+    def test_domain_text_cannot_be_fabricated_from_absence_or_another_node(self):
+        root = ET.fromstring(CONFIG)
+        for domain in root.findall("domain-config/domain"): domain.text = None
+        for tree in (XMLTREE.replace("            T: '127.0.0.1'\n", ""),
+                     XMLTREE.replace("T: 'localhost'", "T: ''"),
+                     XMLTREE.replace("T: 'localhost'", "T: 'localhost'\n            T: 'localhost'"),
+                     XMLTREE.replace("            T: 'localhost'", "        T: 'localhost'"),
+                     XMLTREE + "    T: '127.0.0.1'\n",
+                     XMLTREE.replace("    E: domain-config", "  E: domain-config"),
+                     XMLTREE.replace("E: domain-config", "E: other"),
+                     "N: prefix=http://foreign\n" + XMLTREE):
+            with self.subTest(tree=tree), self.assertRaises(RuntimeError): domain_text_from_xmltree(root, tree)
+
+    def test_nonempty_decoded_text_must_agree_with_the_independent_packaged_text(self):
+        with self.assertRaises(RuntimeError):
+            domain_text_from_xmltree(ET.fromstring(CONFIG), XMLTREE.replace("T: 'localhost'", "T: 'evil.example'"))
+
+    def test_independent_text_does_not_replace_the_closed_host_policy(self):
+        root = ET.fromstring(CONFIG)
+        for domain in root.findall("domain-config/domain"): domain.text = None
+        changed = domain_text_from_xmltree(root, XMLTREE.replace("T: 'localhost'", "T: 'evil.example'"))
+        self.assertEqual(changed.findall("domain-config/domain")[1].text, "evil.example")
+        self.assertNotEqual(changed.findall("domain-config/domain")[1].text, "localhost")
+        empty = CONFIG.replace(">127.0.0.1<", "><").replace(">localhost<", "><")
+        with self.assertRaisesRegex(RuntimeError, "Fixture trust must be limited"):
+            self.network(empty, tree=XMLTREE.replace("T: 'localhost'", "T: 'evil.example'"))
+
+    def test_independent_tree_cannot_hide_missing_extra_or_duplicate_attributes(self):
+        for tree in (XMLTREE.replace('              A: src=@0x7f130001\n', ''),
+                     XMLTREE + '              A: src=@0x7f130001\n',
+                     XMLTREE + '              A: extra="anything"\n'):
+            with self.subTest(tree=tree), self.assertRaises(RuntimeError):
+                domain_text_from_xmltree(ET.fromstring(CONFIG), tree)
 
     def test_compiled_policy_and_packaged_ca_must_match_this_run(self):
         proof = self.network(CONFIG.replace("@raw/sumi_fixture_ca", "@ref/0x7f130001"))

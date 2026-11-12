@@ -1,6 +1,7 @@
 """Scoped test-CA resources for a private debug App; never device/global trust."""
 import hashlib
 import json
+import copy
 from pathlib import Path
 import re
 import stat
@@ -42,10 +43,67 @@ def policy(node):
     return [node.tag, sorted(node.attrib.items()), (node.text or "").strip(), [policy(c) for c in node]]
 
 
-def verify_network(app, table, xml, archive, certificate):
+def domain_text_from_xmltree(decoded, text):
+    """Bind actual aapt2 CDATA to the same leaves; never supply wanted hosts."""
+    require(len(text) <= 16384, "Oversized network XML tree")
+    result = copy.deepcopy(decoded)
+    elements = []
+    def walk(node, path=()):
+        path = (*path, node.tag)
+        elements.append((path, node))
+        for child in node:
+            walk(child, path)
+    walk(result)
+    current, position, attributes, texts = None, 0, {}, {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        element = re.fullmatch(r"( *)E: ([A-Za-z][A-Za-z0-9_-]*) \(line=[0-9]+\)", line)
+        if element:
+            require(position < len(elements), "Extra element in packaged network XML")
+            path, node = elements[position]
+            require(len(element[1]) == 4 * (len(path) - 1) and element[2] == node.tag,
+                    "Packaged network XML differs from the decoded structure")
+            current, position = position, position + 1
+            attributes[current] = set()
+            continue
+        require(current is not None, "Network XML content precedes its root")
+        path, node = elements[current]
+        attribute = re.fullmatch(r"( *)A: ([A-Za-z][A-Za-z0-9_-]*)=(.+)", line)
+        if attribute:
+            require(len(attribute[1]) == 4 * (len(path) - 1) + 2
+                    and attribute[2] in node.attrib and attribute[2] not in attributes[current],
+                    "Wrong or duplicate packaged network XML attribute")
+            attributes[current].add(attribute[2])
+            continue
+        content = re.fullmatch(r"( *)T: '([^']*)'", line)
+        require(content is not None and path == ("network-security-config", "domain-config", "domain")
+                and len(content[1]) == 4 * len(path) and current not in texts,
+                "Unbound or repeated packaged domain text")
+        value = content[2].strip()
+        require(re.fullmatch(r"[A-Za-z0-9.:-]+", value), "Missing or malformed actual domain text")
+        previous = (node.text or "").strip()
+        require(not previous or previous == value, "Independent network decoders disagree on domain text")
+        node.text = value
+        texts[current] = value
+    require(position == len(elements)
+            and all(attributes.get(i) == set(node.attrib) for i, (_, node) in enumerate(elements)),
+            "Incomplete packaged network XML structure/attributes")
+    domains = [i for i, (path, _) in enumerate(elements)
+               if path == ("network-security-config", "domain-config", "domain")]
+    require(len(domains) == 2 and set(texts) == set(domains), "Exactly two actual domain leaves are required")
+    return result
+
+
+def verify_network(app, table, xml, archive, certificate, xmltree):
     path = resource_file(app.get(ANDROID + "networkSecurityConfig"), table,
                          "xml/sumi_fixture_network_security", "res/xml/sumi_fixture_network_security.xml")
     root = xml(path)
+    actual_tree = xmltree(path)
+    try:
+        root = domain_text_from_xmltree(root, actual_tree)
+    except RuntimeError as error:
+        raise RuntimeError(str(error) + "; aapt2=" + json.dumps(actual_tree[:16384])) from error
     expected = ET.fromstring(CONFIG)
     anchors = root.findall("domain-config/trust-anchors/certificates")
     require(len(anchors) == 1, "The fixture must have exactly one scoped trust anchor")
@@ -56,7 +114,7 @@ def verify_network(app, table, xml, archive, certificate):
     actual, wanted = policy(root), policy(expected)
     require(actual == wanted, "Fixture trust must be limited to the two exact HTTPS hosts: "
             + json.dumps({"actual": actual, "expected": wanted}, separators=(",", ":")))
-    return {"domains": ["127.0.0.1", "localhost"],
+    return {"domains": ["127.0.0.1", "localhost"], "domainTextSource": "same packaged XML via aapt2 xmltree",
             "certificateSHA256": hashlib.sha256(archive.read(raw)).hexdigest()}
 
 

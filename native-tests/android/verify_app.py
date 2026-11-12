@@ -52,6 +52,10 @@ def verify_app(root, fixture_ca=None):
             [str(sdk / "cmdline-tools/latest/bin/apkanalyzer"), "resources", "xml", "--file",
              "/" + path, str(apk)], text=True, timeout=30)
         return ET.fromstring(text)
+    def xmltree(path):
+        return subprocess.check_output(
+            [str(sdk / "build-tools/36.0.0/aapt2"), "dump", "xmltree", str(apk), "--file", path],
+            text=True, timeout=30)
     rules = xml(rules_file)
     expected_rules = ET.parse(generated / "app/src/main/res/xml/data_extraction_rules.xml").getroot()
     def policy(node):
@@ -112,7 +116,7 @@ def verify_app(root, fixture_ca=None):
             require(app.get(android + "networkSecurityConfig") is None, "Unexpected fixture trust in normal SDK APK")
             network = None
         else:
-            network = verify_network(app, resource_table, xml, archive, fixture_ca)
+            network = verify_network(app, resource_table, xml, archive, fixture_ca, xmltree)
     with apk.open("rb") as stream:
         apk_hash = digest(stream)
     def git(directory, *args):
