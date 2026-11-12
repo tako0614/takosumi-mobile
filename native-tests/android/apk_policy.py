@@ -2,7 +2,7 @@
 import re
 
 
-def extraction_resource(reference, table, package="com.takosumi.fixture.android"):
+def resource_file(reference, table, name, path, package="com.takosumi.fixture.android", kind="XML"):
     current_package, current = None, None
     resources = []
     for line in table.splitlines():
@@ -18,21 +18,28 @@ def extraction_resource(reference, table, package="com.takosumi.fixture.android"
         elif current is not None:
             value = re.fullmatch(r"\s*\([^)]*\) (.+)", line)
             if value:
-                file = re.fullmatch(r"\(file\) (res/\S+) type=XML", value[1])
-                current["files"].append(file[1] if file else None)
-    expected = "xml/data_extraction_rules"
+                # aapt2 omits the suffix for raw/unknown FileReferences.
+                # XML callers still require the explicit XML type.
+                file = re.fullmatch(r"\(file\) (res/\S+?)(?: type=([A-Z_]+))?", value[1])
+                current["files"].append(file[1] if file and (kind is None or file[2] == kind) else None)
+    expected = name
     candidates = [r for r in resources if r["package"] == package
                   and r["name"] in (expected, f"{package}:{expected}")]
     if len(candidates) != 1:
-        raise ValueError("Missing or ambiguous packaged extraction-rules resource")
+        raise ValueError("Missing or ambiguous packaged resource: " + name)
     resource = candidates[0]
     same_id = [r for r in resources if r["id"] == resource["id"]]
     if len(same_id) != 1 or same_id[0] is not resource:
-        raise ValueError("Ambiguous packaged extraction-rules resource ID")
+        raise ValueError("Ambiguous packaged resource ID: " + name)
     numeric = re.fullmatch(r"@ref/(0x[0-9a-fA-F]+)", reference or "")
-    if not (reference == "@xml/data_extraction_rules"
+    if not (reference == "@" + name
             or numeric and int(numeric[1], 16) == resource["id"]):
-        raise ValueError("Manifest does not reference the packaged extraction-rules resource")
-    if resource["files"] != ["res/xml/data_extraction_rules.xml"]:
-        raise ValueError("Unexpected or ambiguous extraction-rules file mapping")
+        raise ValueError("Wrong packaged resource reference: " + name)
+    if resource["files"] != [path]:
+        raise ValueError("Unexpected or ambiguous file mapping: " + name)
     return resource["files"][0]
+
+
+def extraction_resource(reference, table, package="com.takosumi.fixture.android"):
+    return resource_file(reference, table, "xml/data_extraction_rules",
+                         "res/xml/data_extraction_rules.xml", package)

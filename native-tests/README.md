@@ -608,6 +608,16 @@ describe the SDK/NDK setup; the builder itself does not install an Android SDK.
 binding controls, including a different valid resource, wrong package and
 ambiguous/missing file mappings. These controls do not compile an APK.
 
+The [whole-App Android UI candidate](android/web-home-fixture/README.md) adds a
+separate UI Automator driver after that build, using two owned HTTPS origins.
+It is source/local harness evidence only until its first native CI result.
+Its per-App, two-host test CA rebuild is recorded separately from the normal
+SDK APK, and the Cargo App library must remain byte-identical. It checks the
+installed APK bytes before and after actual UI operations, and restores the
+normal APK after confirmed emulator shutdown. Neither APK nor fixture keys
+enter the artifacts. The pinned Kit/contract and product native runtime are
+unchanged; this does not qualify real credentials, SSO, Push or distribution.
+
 `AppScreenMediaConsentTest` checks the camera/microphone consent state machine,
 including OS denial, stale results and document/profile changes. The actual
 `MediaPermissionActivityTest` uses an intercepted HTTPS fixture in the production

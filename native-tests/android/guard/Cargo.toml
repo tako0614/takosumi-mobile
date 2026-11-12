@@ -1,0 +1,16 @@
+[package]
+name = "sumi-android-emulator-guard"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Compile the existing product supervisor without bringing in CEF/Tauri.
+# The source and its ECHILD/receipt contract have one owner.
+[[bin]]
+name = "sumi-android-emulator-guard"
+path = "../../cef-candidate/src/guard_entry.rs"
+harness = false
+
+[dependencies]
+libc = "=0.2.186"
+serde_json = "=1.0.151"

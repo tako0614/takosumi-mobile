@@ -80,9 +80,18 @@ jobs:
           test "${PIPESTATUS[0]}" = 0 || { echo 'Android APK policy controls failed'; exit 1; }
           grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/android-apk-policy-controls.log"
         working-directory: takosumi-mobile
+      - name: Whole Android App UI harness controls (not native qualification)
+        run: |
+          python3 -B native-tests/android/test_web_home.py 2>&1 | tee "$RUNNER_TEMP/android-web-home-controls.log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Android Web-home controls failed'; exit 1; }
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/android-web-home-controls.log"
+        working-directory: takosumi-mobile
+        env:
+          TMPDIR: ${{ runner.temp }}
 
   # Build the normal Rust/Tauri Android App, separately from the library hosts.
-  # The APK stays on the disposable runner; only its compile proof is retained.
+  # Its separate external driver operates that App with synthetic Web sites.
+  # APKs/keys stay private; compile and runtime evidence have separate artifacts.
   android-app:
     needs: quality
     runs-on: ubuntu-24.04
@@ -142,6 +151,24 @@ jobs:
         with:
           name: android-whole-app-build
           path: takosumi-mobile/src-tauri/gen/android/whole-app-proof.json
+          if-no-files-found: warn
+      - name: SDK image and existing-source emulator supervisor
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "emulator" "platform-tools" "system-images;android-36;google_apis;x86_64"
+          cargo build --locked --manifest-path native-tests/android/guard/Cargo.toml --target-dir src-tauri/target
+      - name: Actual whole Android App connection, Web home, resume and reset
+        timeout-minutes: 20
+        shell: bash
+        run: python3 -B native-tests/android/run_web_home.py --out "$RUNNER_TEMP/android-web-home-evidence"
+      - name: Keep whole Android App UI evidence (no APK or fixture keys)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-whole-app-web-home
+          path: ${{ runner.temp }}/android-web-home-evidence
           if-no-files-found: warn
 
   # The native plugin tests `bun run check` does not run: the takosumi-push
