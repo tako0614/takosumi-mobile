@@ -118,6 +118,8 @@ final class DownloadUITests: XCTestCase {
     }
 
     private func closeScreen() {
+        XCTAssertFalse(filesExists({ $0.otherElements["Browse View (Picker)"].firstMatch }),
+                       "Cannot close the App screen while the real Files picker still owns the UI")
         let close = app.buttons["閉じる"].firstMatch
         XCTAssertTrue(close.waitForExistence(timeout: 10), "The screen's own close control is missing")
         // An OS export surface can still be dismissing when the element
@@ -133,10 +135,9 @@ final class DownloadUITests: XCTestCase {
         // the accessibility tree after it visibly closes: the control then
         // reports covered while nothing is on top (run 43017266783: the
         // button existed on a clean screen yet stayed non-hittable >10 s).
-        // That stale entry poisons only isHittable - the real touch path is
-        // unaffected, so the actual tap is still sent to the real button;
-        // if a genuine surface still intercepts, "Inspect files" below
-        // stays absent and fails with its name.
+        // After refusing an actual Files picker above, preserve the ordinary
+        // tap for this stale-host case. "Inspect files" must still appear;
+        // no coordinates or replacement close operation bypass the control.
         let covered = !close.isHittable
         close.tap()
         XCTAssertTrue(app.buttons["Inspect files"].waitForExistence(timeout: 10),
@@ -203,7 +204,7 @@ final class DownloadUITests: XCTestCase {
         // Files remembers the previously selected folder for the next export.
         if filesExists({ $0.navigationBars["Download Fixture"] }) {
             filesElement("OS Files export Save did not open") { $0.buttons["Save"].firstMatch }.tap()
-            XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
+            waitForFilesDismissal()
             return
         }
         let localElement: (XCUIApplication) -> XCUIElement = { host in
@@ -223,7 +224,18 @@ final class DownloadUITests: XCTestCase {
         }
         filesElement("Download Fixture folder did not appear", timeout: 5) { $0.staticTexts["Download Fixture"].firstMatch }.tap()
         filesElement("OS Files export Save did not remain", timeout: 5) { $0.buttons["Save"].firstMatch }.tap()
-        XCTAssertTrue(app.buttons["閉じる"].firstMatch.waitForExistence(timeout: 10))
+        waitForFilesDismissal()
+    }
+
+    private func waitForFilesDismissal() {
+        // The underlying close button exists while Files still covers it
+        // (43202312305). Save must dismiss the actual picker before a later
+        // Close tap can exercise the product; keep the same return bound.
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            !filesExists({ $0.otherElements["Browse View (Picker)"].firstMatch })
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed,
+                       "Save did not dismiss the real Files picker")
     }
 
     // The iOS 26 Files export picker is hosted by com.apple.DocumentsApp. Its
