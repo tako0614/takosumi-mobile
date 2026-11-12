@@ -294,8 +294,11 @@ outcome, transfer failure, activity completion, state changes and cleanup. The
 first 64 events and an explicit truncation flag accompany the samples, without
 owners, controllers, URLs, errors or response data. Ordinary App builds have no
 observer. It neither intercepts callbacks nor changes transitions or verdicts.
-Events only append in memory; the existing sample timer persists them. Events
-after the last sample remain unknown. The trace covers this first cookie flow,
+Each existing lifecycle callback also persists the bounded trace after sampling
+has begun, including events after the 32-sample timer stops. This fixes a
+diagnostic gap in run43272033643, where sampling ended before the real Files
+Save; actual completion and cleanup still need native evidence. It adds no
+sample, UI query, retry or longer wait. The trace covers this first cookie flow,
 has no owner identifiers, and cannot establish attribution for concurrent
 downloads. Callback/check events are not proof of completed cleanup or final UI
 state; `remove-succeeded` separately records the actual removal return.

@@ -57,6 +57,10 @@ final class FixtureHome: UIViewController {
                     "state": state,
                 ])
             } else { self.lifecycleTruncated = true }
+            // OS export can finish after the 32-sample timer has ended.
+            // Keep those existing completion/cleanup events without retaining
+            // the download owner or extending any UI wait.
+            self.saveExportObservations()
         }
         view.backgroundColor = .systemBackground
         do {
