@@ -275,8 +275,10 @@ temporary cleanup remain required; this fixture correction does not establish
 product export reliability or the cause of other failures.
 If the test reaches the Save to Files tap, it keeps an immediate post-tap
 screenshot. The second existing five-second action wait requires the resolved
-cell to exist, be enabled and be hittable. Its resolved state is attached after
-that wait and immediately before the single real tap; teardown preserves both
+cell to exist, be enabled and be hittable. Its verdict records the last predicate's
+existing scalar reads and their timestamps before asserting, without another AX
+query on the failure path. Its full resolved state is attached after a successful
+wait and immediately before the single real tap; teardown preserves both
 the host and DocumentsApp hierarchies. This diagnoses a share sheet that stays
 open after a tap; it does not establish the cause or repair of that OS handoff.
 Independently, it keeps up to 32 observations of the original input file and

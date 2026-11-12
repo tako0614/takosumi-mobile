@@ -185,11 +185,28 @@ final class DownloadUITests: XCTestCase {
         // not establish an actionable control. Reuse the second five-second
         // wait for readiness and keep the resolved state as evidence; this
         // does not establish why the OS activity failed to open.
+        var lastReadiness = "No completed readiness evaluation"
         let actionable = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            saveToFiles.exists && saveToFiles.isEnabled && saveToFiles.isHittable
+            let startedAt = Date().timeIntervalSince1970
+            let exists = saveToFiles.exists
+            let existsAt = Date().timeIntervalSince1970
+            guard exists else {
+                lastReadiness = "startedAt=\(startedAt) exists=false existsAt=\(existsAt) enabled=unread hittable=unread"
+                return false
+            }
+            let enabled = saveToFiles.isEnabled
+            let enabledAt = Date().timeIntervalSince1970
+            guard enabled else {
+                lastReadiness = "startedAt=\(startedAt) exists=true existsAt=\(existsAt) enabled=false enabledAt=\(enabledAt) hittable=unread"
+                return false
+            }
+            let hittable = saveToFiles.isHittable
+            let hittableAt = Date().timeIntervalSince1970
+            lastReadiness = "startedAt=\(startedAt) exists=true existsAt=\(existsAt) enabled=true enabledAt=\(enabledAt) hittable=\(hittable) hittableAt=\(hittableAt)"
+            return hittable
         }, object: nil)
         let ready = XCTWaiter.wait(for: [actionable], timeout: 5)
-        let verdict = XCTAttachment(string: "Readiness wait result: \(ready)")
+        let verdict = XCTAttachment(string: "Readiness wait result: \(ready)\nLast existing predicate reads: \(lastReadiness)")
         verdict.name = "Save to Files readiness verdict"
         verdict.lifetime = .keepAlways
         add(verdict)
