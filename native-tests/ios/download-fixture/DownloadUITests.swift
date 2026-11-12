@@ -151,13 +151,17 @@ final class DownloadUITests: XCTestCase {
     }
 
     private func exportToFixtureDocuments(afterSessionClose: Bool = false) {
-        // The iOS 26 share sheet exposes this action as a Cell, as captured in
-        // the original failed XCTest hierarchy. Retain the older Button form;
-        // do not select the nested title text or substitute an export result.
+        // The share sheet action is a cell/button that owns the labelled title.
+        // Older iOS put "Save to Files" on actionGroupCell itself; the observed
+        // iOS 26 hierarchy (run 43141585764) keeps it only on the nested
+        // cellTitleLabel and leaves the cell unlabelled, so resolve the real
+        // control through its labelled descendant. Do not substitute the bare
+        // title text or an export result.
         let actionTypes = [XCUIElement.ElementType.cell.rawValue, XCUIElement.ElementType.button.rawValue] as NSArray
-        let saveToFiles = app.descendants(matching: .any).matching(
-            NSPredicate(format: "label == %@ AND elementType IN %@", "Save to Files", actionTypes)
-        ).firstMatch
+        let saveToFiles = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "elementType IN %@", actionTypes))
+            .containing(NSPredicate(format: "label == %@", "Save to Files"))
+            .firstMatch
         // Standard English iOS fixture. Missing actions fail; no fake export.
         if !saveToFiles.waitForExistence(timeout: 5) { app.swipeUp() }
         XCTAssertTrue(saveToFiles.waitForExistence(timeout: 5))
