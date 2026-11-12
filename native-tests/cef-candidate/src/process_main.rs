@@ -142,8 +142,9 @@ fn reply(value: Reply) {
         || out.flush().is_err()
     {
         // Keep reply() panic-free like the ignored write errors it reports:
-        // eprintln! panics on a broken stderr while this runs on the CEF UI
-        // thread, where an unwind would abort the process.
+        // an explicit writeln! discards the result on this CEF UI thread,
+        // where an unwind would abort the process, however a toolchain
+        // happens to treat eprintln! on a broken stderr.
         let _ = writeln!(
             io::stderr().lock(),
             "A browser reply could not be written to the control pipe."
