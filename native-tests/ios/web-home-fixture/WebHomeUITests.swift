@@ -1,8 +1,10 @@
 import XCTest
 
+private let fixtureBundleIdentifier = "com.takosumi.fixture.simulator"
+
 final class WebHomeUITests: XCTestCase {
     // A preinstalled, attested whole Tauri App, not the tiny driver target.
-    private let app = XCUIApplication(bundleIdentifier: "com.takosumi.fixture.simulator")
+    private let app = XCUIApplication(bundleIdentifier: fixtureBundleIdentifier)
     private var origin = ""
     private var editor = ""
 
@@ -21,7 +23,7 @@ final class WebHomeUITests: XCTestCase {
         // Read once before an element query can wait for automation startup.
         // This records an already-stopped App separately from missing Web UI.
         let state = app.state
-        let attachment = XCTAttachment(string: "bundle=\(app.bundleIdentifier) state=\(state.rawValue)")
+        let attachment = XCTAttachment(string: "bundle=\(fixtureBundleIdentifier) state=\(state.rawValue)")
         attachment.name = "Whole App launch state (\(stage))"
         attachment.lifetime = .keepAlways
         add(attachment)
