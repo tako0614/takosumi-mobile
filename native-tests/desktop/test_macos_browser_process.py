@@ -97,7 +97,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_sampler_thread_failure_still_runs_the_normal_close_body(self):
         with tempfile.TemporaryDirectory(prefix="m3-sample-start-") as directory:
-            observer = mock.Mock(identities=[], phase="restart", data=Path(directory), proof={})
+            observer = mock.Mock(identities=[], phase="restart", data=Path(directory), proof={}, sample_shutdowns=True)
             with mock.patch.object(sampler.threading, "Thread") as thread:
                 thread.return_value.start.side_effect = RuntimeError("cannot start new thread")
                 entered = False
@@ -114,9 +114,50 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(len(saved), 2)
             self.assertEqual(saved, observer.proof["shutdownSamples"])
 
-    def failed_observer(self):
+    def test_normal_close_does_not_start_a_sampler_without_explicit_opt_in(self):
+        observer = self.failed_observer()
+        self.assertIs(observer.proof["shutdownSampling"], False)
+        with mock.patch.object(sampler.threading, "Thread") as thread, \
+                mock.patch.object(sampler, "sample_owned") as sample:
+            with sampler.watch_shutdowns(observer, []):
+                observer.proof["normalCloseRan"] = True
+        self.assertTrue(observer.proof["normalCloseRan"])
+        thread.assert_not_called()
+        sample.assert_not_called()
+
+    def test_opt_in_shutdown_watch_still_samples_the_registered_browser_once(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        self.assertIs(observer.proof["shutdownSampling"], True)
+        ready = sampler.threading.Event()
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        def capture(*args):
+            ready.set()
+            return {"pid": 12, "diagnosticOnly": True, "status": "captured"}
+        with mock.patch.object(sampler, "shutdown_pending", return_value=True), \
+                mock.patch.object(sampler.time, "monotonic", side_effect=[0, 0, 3, 3]), \
+                mock.patch.object(sampler, "sample_owned", side_effect=capture) as sample:
+            with sampler.watch_shutdowns(observer, [page]):
+                self.assertTrue(ready.wait(2), "Opt-in watcher did not reach its registered target")
+        sample.assert_called_once()
+        self.assertEqual(sample.call_args.args[1:3], tuple(observer.identities[:2][::-1]))
+        self.assertEqual(observer.proof["shutdownSamples"], [{"pid": 12, "diagnosticOnly": True, "status": "captured"}])
+
+    def test_normal_close_preserves_its_body_failure_without_starting_a_sampler(self):
+        observer = self.failed_observer()
+        failure = runner.Failure("original close failure")
+        with mock.patch.object(sampler.threading, "Thread") as thread:
+            try:
+                with sampler.watch_shutdowns(observer, []):
+                    raise failure
+            except runner.Failure as caught:
+                self.assertIs(caught, failure)
+            else:
+                self.fail("Original close failure was hidden")
+        thread.assert_not_called()
+
+    def failed_observer(self, sample_shutdowns=False):
         observer = runner.MacObserver(self.root, "photopea", "", mock.Mock(),
-                                      self.browser_image, self.guard_image)
+                                      self.browser_image, self.guard_image, sample_shutdowns=sample_shutdowns)
         observer.identities = [
             {"pid": 11, "parent": 10, "start": 100}, {"pid": 12, "parent": 11, "start": 101},
             {"pid": 21, "parent": 10, "start": 102}, {"pid": 22, "parent": 21, "start": 103}]

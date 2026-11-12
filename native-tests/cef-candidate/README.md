@@ -2585,8 +2585,14 @@ open despite the completed Excalidraw flow.
 
 The next diagnostic records only admission predicate booleans on a rejected
 Mac creation reply, including the exact libproc reads used for admission.
-It neither retries nor relaxes identity/path checks. In the Mac fixture,
-an owned browser still inside `CefShutdown` after two seconds is sampled
+It neither retries nor relaxes identity/path checks. Normal M3/M4 runs do not
+attach a sampler while the flow is in progress: the installed sample manual
+says it suspends the target at each interval. The explicit diagnostic option
+`--sample-shutdowns` retains the old in-flow watcher; summary and observation
+JSON record `shutdownSampling: true`, and its passing flow remains timing-
+perturbed evidence. CI's existing invocations omit the option. The actual UI
+operations, wait bounds and strict exit/receipt predicates remain unchanged.
+In this opt-in mode, an owned browser still inside `CefShutdown` after two seconds is sampled
 once for one second at 100 ms intervals, before Chromium's ten-second
 [teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
 PID/birth, guard ancestry and both executable paths are checked before and

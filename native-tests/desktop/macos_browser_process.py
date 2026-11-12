@@ -108,11 +108,13 @@ def normal_receipt(receipt):
 
 
 class MacObserver(Observer):
-    def __init__(self, data, site, phase, processes, browser, guard, quit_helper=None):
+    def __init__(self, data, site, phase, processes, browser, guard, quit_helper=None, sample_shutdowns=False):
         super().__init__(data, REAL_SITES[site]["origin"], 0, phase, real_site=site)
         self.processes, self.browser, self.guard = processes, browser, guard
         self.identities = []
         self.quit_helper = quit_helper
+        self.sample_shutdowns = sample_shutdowns
+        self.proof["shutdownSampling"] = sample_shutdowns
         self.proof["scope"] = f"macOS actual App {phase or 'first'}; anonymous {site}, synthetic markers, no login"
 
     def system_quit(self, page):
@@ -549,7 +551,7 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
     runtime = case / "rt"
     runtime.mkdir(mode=0o700)
     proof = {"passed": False, "scope": __doc__, "site": args.site, "case": str(case), "phases": [],
-             "packaged": args.packaged,
+             "packaged": args.packaged, "shutdownSampling": args.sample_shutdowns,
              "source": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip(),
              "executables": {str(path): digest(path) for path in (binary, browser, guard)}}
     print(f"M3 case: {case}", flush=True)
@@ -571,7 +573,8 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
             entry = {"name": name}
             proof["phases"].append(entry)
             outer_receipt = case / f"app-guard-{name}.json"
-            observer = MacObserver(case, args.site, phase, processes, browser_image, guard_image, quit_helper)
+            observer = MacObserver(case, args.site, phase, processes, browser_image, guard_image, quit_helper,
+                                   sample_shutdowns=args.sample_shutdowns)
             with open(case / f"app-{name}.log", "xb") as log:
                 app_guard = subprocess.Popen([str(guard), str(outer_receipt), str(binary)], env=env,
                                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -642,6 +645,8 @@ def main():
                         help="Resolve browser, guard and runtime from the App; pass no executable/runtime overrides")
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--site", required=True, choices=sorted(REAL_SITES))
+    parser.add_argument("--sample-shutdowns", action="store_true",
+                        help="Diagnostic only: sample pending shutdowns during the flow; timing is perturbed")
     args = parser.parse_args()
     if args.packaged and (args.browser or args.guard):
         parser.error("--packaged cannot be combined with --browser or --guard")

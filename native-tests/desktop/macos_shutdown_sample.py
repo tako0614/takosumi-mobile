@@ -112,13 +112,11 @@ def sample_owned(processes, child, parent, browser, guard, output):
             with diagnostic.open("wb") as stderr:
                 try:
                     # -mayDie grabs symbol locations first: the teardown watchdog
-                    # can kill the sampled browser mid-run. The bound stays
-                    # under that watchdog's window (pending detection plus this
-                    # limit ends before the kill) but lets symbol grab, the one
-                    # second sample and the report write finish on a CEF-sized
-                    # binary. Three and five seconds both expired before the
-                    # report; seven keeps detection (~+2 s) plus this limit
-                    # inside the watchdog's ~ten seconds.
+                    # can kill the sampled browser mid-run. Three- and five-
+                    # second attempts expired before producing a report. This
+                    # seven-second command allowance excludes the preceding
+                    # state reads, ownership checks and filesystem work; it
+                    # cannot guarantee completion before the teardown watchdog.
                     completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100",
                                                 "-mayDie", "-file", str(raw)],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -146,7 +144,13 @@ def sample_owned(processes, child, parent, browser, guard, output):
 
 @contextmanager
 def watch_shutdowns(observer, pages):
-    """Watch during the existing close/wait, including a blocking Page.close reply."""
+    """Opt-in diagnostic: sample during close/wait, including a blocked Page.close."""
+    # sample suspends its target at each interval. Keep normal flow verdicts
+    # separate from that probe's scheduling effects; failure_capture remains
+    # available after the original flow has already failed.
+    if getattr(observer, "sample_shutdowns", False) is not True:
+        yield
+        return
     identities = {item["pid"]: item for item in observer.identities}
     targets = [(identities[page.native["nativePid"]], identities[page.process["pid"]],
                 Path(page.process["directory"]) / "browser.log") for page in pages]
