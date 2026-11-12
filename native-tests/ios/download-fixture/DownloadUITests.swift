@@ -265,7 +265,7 @@ final class DownloadUITests: XCTestCase {
         // (43202312305). Save must return control to the native host before
         // a later Close tap exercises the product; keep the same bound.
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            !exportSurfaceBlocksHost()
+            !exportSurfaceBlocksHost(requiringHostReturn: true)
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed,
                        "Save did not return control from the OS export surface")
@@ -278,7 +278,12 @@ final class DownloadUITests: XCTestCase {
             names, names, XCUIElement.ElementType.popover.rawValue))
     }
 
-    private func exportSurfaceBlocksHost() -> Bool {
+    private func nativeHostReady() -> Bool {
+        let close = app.buttons["閉じる"].firstMatch
+        return app.state == .runningForeground && close.exists && close.isEnabled && close.isHittable
+    }
+
+    private func exportSurfaceBlocksHost(requiringHostReturn: Bool = false) -> Bool {
         // 43224385576: the Blob picker visibly dismissed inside this wait,
         // yet the absence gate still matched. Provider AX retention is an
         // inference; that run did not record its teardown hierarchy. Host
@@ -287,12 +292,23 @@ final class DownloadUITests: XCTestCase {
         // can stop blocking only with a positive native-host return and no
         // interactive provider surface. Non-hittable alone proves nothing.
         if exportSurfaces(app).firstMatch.exists { return true }
-        let provider = exportSurfaces(filesApp).allElementsBoundByIndex
-        if provider.isEmpty { return false }
-        let close = app.buttons["閉じる"].firstMatch
-        guard app.state == .runningForeground && close.exists && close.isEnabled && close.isHittable else {
-            return true
+        // The post-Save wait must positively return to the host. Ordinary
+        // Close keeps its separate existing readiness wait when Files is absent.
+        if requiringHostReturn && !nativeHostReady() { return true }
+        // 43248197436: Files exited after OS Save. Enumerating its AX roots
+        // then fails the test itself. The post-Save wait requires the positive
+        // host return above; ordinary Close retains its own readiness wait.
+        // Neither caller should resolve the ended provider's dead AX tree.
+        switch filesApp.state {
+        case .notRunning: return false
+        case .unknown: return true
+        default: break
         }
+        let surfaces = exportSurfaces(filesApp)
+        guard surfaces.firstMatch.exists else { return false }
+        let provider = surfaces.allElementsBoundByIndex
+        if provider.isEmpty { return false }
+        guard nativeHostReady() else { return true }
         return provider.contains { surface in
             surface.isHittable || surface.descendants(matching: .any)
                 .allElementsBoundByIndex.contains { $0.isHittable }

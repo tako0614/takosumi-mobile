@@ -244,11 +244,13 @@ has a 60-second wait and the same direct-child retirement rules. An absent
 bundle or interrupted xcodebuild is not exported; neither missing attachments
 nor export failure changes the original test failure. No test is retried.
 After Save, the existing ten-second return check refuses any host-side Files
-picker, activity sheet or popover. A hierarchy retained only by DocumentsApp
+picker, activity sheet or popover and requires the foreground native Close to
+be ready. A provider that is already not running is not enumerated; an unknown
+state remains blocking. Ordinary Close preserves its separate existing readiness
+wait when no export surface exists. A hierarchy retained only by DocumentsApp
 may count as no longer blocking only when the real native Close is enabled/hittable
 in the foreground host and neither those provider surfaces nor any of their
-descendants is hittable. In
-43224385576, the Blob picker visibly disappeared within the bound while the
+descendants is hittable. In 43224385576, the Blob picker visibly disappeared within the bound while the
 absence gate still matched; retained provider AX is an inference because that
 run did not capture its teardown hierarchy. Host absence or a non-hittable
 provider alone cannot pass. The later real Close, Inspect files, exact exported bytes and
