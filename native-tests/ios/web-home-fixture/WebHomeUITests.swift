@@ -12,8 +12,20 @@ final class WebHomeUITests: XCTestCase {
         editor = try XCTUnwrap(ProcessInfo.processInfo.environment["SUMI_WEB_EDITOR_URL"])
         XCTAssertTrue(origin.hasPrefix("https://127.0.0.1:"))
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
-        app.launch()
+        launchApp("initial")
         XCTAssertTrue(app.buttons["保存して開く"].waitForExistence(timeout: 20), "The whole App did not render WebHome")
+    }
+
+    private func launchApp(_ stage: String) {
+        app.launch()
+        // Read once before an element query can wait for automation startup.
+        // This records an already-stopped App separately from missing Web UI.
+        let state = app.state
+        let attachment = XCTAttachment(string: "bundle=\(app.bundleIdentifier) state=\(state.rawValue)")
+        attachment.name = "Whole App launch state (\(stage))"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertEqual(state, .runningForeground, "The whole App stopped or lost foreground during \(stage) launch")
     }
 
     override func tearDownWithError() throws {
@@ -163,7 +175,7 @@ final class WebHomeUITests: XCTestCase {
         // server stays alive; no connection/profile or page is pre-seeded.
         app.terminate()
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10), "The original App process did not terminate")
-        app.launch()
+        launchApp("cold-resume")
         XCTAssertTrue(connection("Work").waitForExistence(timeout: 20))
         XCTAssertTrue(connection("Personal").exists)
         reopen("Work")

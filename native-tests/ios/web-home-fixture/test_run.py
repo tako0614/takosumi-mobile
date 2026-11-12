@@ -135,6 +135,56 @@ class Controls(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 runner.retire_device(self.root, "owned", "expected", "runtime")
 
+    def test_target_log_read_is_scoped_to_the_owned_booted_simulator_and_private_app(self):
+        out, scratch = self.root / "evidence", self.root / "scratch"
+        out.mkdir(); scratch.mkdir()
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        calls = []
+        def command(argv, path, **kwargs):
+            calls.append((argv, kwargs))
+            if argv == ["xcrun", "simctl", "list", "devices", "--json"]:
+                return json.dumps({"devices": {"runtime": [device]}})
+            path.write_bytes(b"native target event\n")
+            return "native target event\n"
+        with patch.object(runtime, "command", side_effect=command):
+            result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+        self.assertNotIn("errorType", result)
+        self.assertEqual((out / "target-app-exit.log").read_bytes(), b"native target event\n")
+        argv, options = calls[1]
+        self.assertEqual(argv[:5], ["xcrun", "simctl", "spawn", "owned", "log"])
+        self.assertEqual(argv[-1], '(process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")')
+        self.assertEqual(options["timeout"], 15)
+        self.assertIs(options["read_output"], False)
+
+    def test_target_log_read_refuses_foreign_changed_or_stopped_device_before_spawn(self):
+        original = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        for key, value in (("udid", "foreign"), ("name", "foreign"), ("state", "Shutdown"),
+                           ("dataPath", "/foreign/data"), ("logPath", "/foreign/logs")):
+            device = dict(original, **{key: value})
+            with self.subTest(key=key), patch.object(runtime, "command", return_value=json.dumps({"devices": {"runtime": [device]}})) as command:
+                result = runner.preserve_app_exit(self.root, self.root, "owned", original, "expected", "runtime")
+                self.assertIn("errorType", result)
+                self.assertEqual(command.call_count, 1)
+
+    def test_target_log_evidence_is_bounded_and_diagnostic_failure_is_not_a_pass(self):
+        out, scratch = self.root / "evidence", self.root / "scratch"
+        out.mkdir(); scratch.mkdir()
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        def command(argv, path, **kwargs):
+            if "spawn" not in argv:
+                return json.dumps({"devices": {"runtime": [device]}})
+            path.write_bytes(b"x" * (1024 * 1024) + b"last event")
+            return ""
+        with patch.object(runtime, "command", side_effect=command):
+            result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+        self.assertTrue(result["diagnosticOnly"] and result["truncated"])
+        self.assertEqual(result["keptBytes"], 512 * 1024)
+        self.assertTrue((out / "target-app-exit.log").read_bytes().endswith(b"last event"))
+        with patch.object(runtime, "command", side_effect=TimeoutError):
+            result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+        self.assertEqual(result["errorType"], "TimeoutError")
+        self.assertNotIn("passed", result)
+
     def test_existing_harness_server_import_is_not_poisoned_or_left_in_global_namespace(self):
         poison = types.ModuleType("server")
         path = Path(__file__).parent / "harness.py"

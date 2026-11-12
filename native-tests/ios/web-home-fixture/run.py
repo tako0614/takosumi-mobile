@@ -99,6 +99,38 @@ def installed_app(out, udid, device, expected, suffix):
     return actual
 
 
+def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
+    """Optional, bounded target logs from this exact newly created Simulator."""
+    result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
+              "scope": "Owned Simulator only; Takosumi process or private fixture bundle events"}
+    try:
+        # Recheck inventory before spawn. Never query a host-wide log store or
+        # a Simulator selected by its display name alone.
+        inventory = json.loads(runtime.command(["xcrun", "simctl", "list", "devices", "--json"],
+                                               out / "before-target-logs.log", timeout=20))
+        current = runtime.owned_device(inventory, udid, name, selected_runtime)
+        require(current.get("state") == "Booted" and current.get("dataPath") == device.get("dataPath")
+                and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
+        # No custom/remote process name or predicate input. The bundle is the
+        # preinstalled private Tauri App, not the minimal XCTest driver.
+        predicate = '(process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")'
+        raw = scratch / "target-app-exit-raw.log"
+        runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                         "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
+        with raw.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            source.seek(max(0, size - 512 * 1024))
+            data = source.read(512 * 1024)
+        with (out / "target-app-exit.log").open("xb") as target:
+            target.write(data)
+        result.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
+                      sha256=hashlib.sha256(data).hexdigest())
+    except Exception as error:
+        # Missing/failed diagnostics never replace the original test failure.
+        result["errorType"] = type(error).__name__
+    return result
+
+
 def require_ui_pass(log):
     identity = f"-[WebHomeUITests.WebHomeUITests {METHOD}]"
     case = re.escape(identity)
@@ -223,6 +255,7 @@ def main():
             if created is not None:
                 result["deviceLogs"] = runtime.preserve_device_logs(
                     created, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
+                result["targetAppExit"] = preserve_app_exit(out, scratch, udid, created, name, selected_runtime)
         finally:
             result["testAttachments"] = runtime.export_test_attachments(out)
             for server in servers:

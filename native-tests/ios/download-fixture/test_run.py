@@ -26,6 +26,17 @@ class HarnessTests(unittest.TestCase):
             reset.start()
             self.addCleanup(reset.stop)
 
+    def test_command_can_preserve_large_raw_output_without_decoding_it(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            path = Path(raw) / "target-raw.log"
+            argv = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024))"]
+            with patch.object(Path, "read_text", side_effect=AssertionError("Raw output must not be decoded")):
+                self.assertEqual(fixture_runner.command(argv, path, timeout=5, read_output=False), "")
+            self.assertEqual(path.stat().st_size, 1024 * 1024)
+            path = Path(raw) / "normal.log"
+            self.assertEqual(fixture_runner.command([sys.executable, "-c", "print('normal stdout')"], path, timeout=5),
+                             "normal stdout\n")
+
     def test_attachment_export_preserves_missing_or_interrupted_bundle(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
             out = Path(raw)

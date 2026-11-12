@@ -182,7 +182,7 @@ def owned_scratch(parent):
                 state["cleanupError"] = type(error).__name__
 
 
-def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=False):
+def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=False, read_output=True):
     """Preserve the original failure even if retiring our own CLI also fails."""
     if boot_status and (len(argv) != 5 or argv[:3] != ["xcrun", "simctl", "bootstatus"] or
                         argv[4] != "-b" or timeout != 180):
@@ -300,7 +300,7 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
                         failure.add_note(f"Trust stage evidence unavailable: {type(error).__name__}")
     if code:
         raise RuntimeError(f"{argv[0]} exit {code}; see {path.name}")
-    return path.read_text(errors="replace")
+    return path.read_text(errors="replace") if read_output else ""
 
 
 def certificate(directory, *, localhost=False):

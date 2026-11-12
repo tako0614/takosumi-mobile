@@ -26,6 +26,16 @@ same full-bundle readback remain required; the original cause is unknown and
 native UI qualification is still pending. The 600-second XCTest budget and
 20-minute CI case cap are unchanged.
 
+The next native attempt installed and byte-checked the whole App, then the
+correct App process stopped before its automation session became ready. Its
+exit cause remains unknown. Each intended launch now records the App state
+before querying UI and requires foreground state; the existing form/navigation
+checks remain. On failure, the runner rechecks the exact owned, booted Simulator
+and queries only its Takosumi-process/private-bundle log events, keeping at most
+512KiB. Host-wide logs, relaunches and extra UI waits are not used. These are
+diagnostic candidates until native execution; an absent exit reason is not a
+successful launch or a causal diagnosis.
+
 [Apple's bundle-ID initializer](https://developer.apple.com/documentation/xcuiautomation/xcuiapplication/init(bundleidentifier:))
 can launch an installed app when the scheme/dependencies/build-products
 contain no matching build. This driver uses a different identity and its own
