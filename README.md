@@ -89,10 +89,15 @@ and runs on its own in CI; see
 Its guard/adapter are covered by M2 component tests. The explicit
 [macOS actual App fixture (M3)](native-tests/cef-candidate/README.md#macos-actual-app-fixture-m3)
 adds the shared home/profile flow on macOS 14+; its native qualification is
-pending, and the intermittent ordinary-shutdown failure remains unresolved.
+limited to anonymous Excalidraw/Photopea fixtures. Both passed all three
+launches in [CI43195505965](https://github.com/tako0614/takosumi-mobile/actions/runs/43195505965).
+The earlier intermittent ordinary-shutdown failure remains unresolved.
 The [macOS packaging candidate (M4)](native-tests/cef-candidate/README.md#macos-packaging-m4)
-places that browser and guard in the Tauri App's own resources. Its packaged
-native flow and local `.app` builds are pending CI qualification.
+places that browser and guard in the Tauri App's own resources. That run built
+both local debug `.app` bundles and passed the embedded product-browser
+sandbox smoke and packaged Excalidraw's three-launch home/profile flow.
+Packaged Photopea is a follow-up check; signing and distribution remain
+separate release work.
 
 On Linux/Windows with `desktop-cef`, opening a saved connection after its browser
 crashes can offer **保存データを保持して開き直す** on the home. This explicit action
@@ -114,10 +119,13 @@ Excalidraw/Photopea file checks and remaining platform limits are described in
 The iOS Web-home adapter now hands download actions and attachment responses
 to the original WKDownload, with native confirmation, transfer cancellation
 and OS export. It keeps the originating profile and does not reopen the URL
-in Safari or copy cookies. This candidate still needs actual Simulator download
-and export qualification; the SDK build alone cannot establish cookie/Blob
-transfer or temporary-file cleanup. See the
-[download contract](src-tauri/plugins/app-screen/README.md#ios-web-home-downloads).
+in Safari or copy cookies. The standalone native host compiling these product
+sources passed on an iOS 26.5 / iPhone 11 Simulator: original Cookie/Blob
+exports, profile isolation, close during transfer/export, and owned temporary
+file cleanup. Whole-App UI, real IdP, physical-device and background/crash
+behavior remain unqualified. See the
+[download contract](src-tauri/plugins/app-screen/README.md#ios-web-home-downloads)
+and [runtime fixture](native-tests/README.md#ios-download-runtime-qualification).
 
 Web homes remember an eligible last page separately for each connection and
 profile, including another app's https origin. Native document outcomes gate
