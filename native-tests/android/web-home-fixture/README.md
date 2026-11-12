@@ -21,6 +21,17 @@ product callback, JS injection, cookie injection or native test UI opens a
 connection. The ordinary App launcher returns to the connection picker after
 Close removes a profile's Android Recents task.
 
+The latest connection-add attempt also keeps a short diagnostic receipt: the
+setText return time, the existing IME-presence/Back operation result, the same
+readiness query's Save bounds, and click entry/return times. It records only
+an attempt count, monotonic milliseconds, pixel bounds and booleans, without
+input values or selectors. It adds no UI read, tap, retry, fallback or longer
+wait. A setText return does not confirm the field value. Click wrapper times
+do not prove actual input down/up delivery or JavaScript submit receipt.
+This is a source candidate following run43279856761: the final image showed
+text selection on Save, but could not establish why the first Web page was
+not reached. Actual Java SDK compilation and trace collection remain pending.
+
 The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's
 public CA for the exact hosts `127.0.0.1` and `localhost`, without cleartext,

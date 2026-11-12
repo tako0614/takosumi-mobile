@@ -3,6 +3,7 @@ package com.takosumi.fixture.webhome;
 import static org.junit.Assert.*;
 
 import android.content.Context;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -36,6 +37,7 @@ public final class WebHomeOperationTest {
     private String origin, editor, launcher;
     private final JSONObject result = new JSONObject();
     private final JSONArray cases = new JSONArray();
+    private int connectionAttempts;
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
@@ -57,11 +59,25 @@ public final class WebHomeOperationTest {
     }
 
     private UiObject2 one(BySelector selector) {
+        return one(selector, null);
+    }
+
+    private UiObject2 one(BySelector selector, JSONObject trace) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
         do {
             UiObject2 value = device.findObject(inApp);
-            if (value != null && value.isEnabled() && !value.getVisibleBounds().isEmpty()) return value;
+            if (value != null && value.isEnabled()) {
+                Rect bounds = value.getVisibleBounds();
+                if (!bounds.isEmpty()) {
+                    if (trace != null) {
+                        diagnostic(trace, "saveReadyAtMs", SystemClock.elapsedRealtime());
+                        diagnostic(trace, "saveBounds", new JSONArray().put(bounds.left).put(bounds.top)
+                            .put(bounds.right).put(bounds.bottom));
+                    }
+                    return value;
+                }
+            }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
         throw new AssertionError("Actual App control did not become ready: " + selector);
@@ -74,21 +90,59 @@ public final class WebHomeOperationTest {
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }
 
     private void hideKeyboardIfShown() {
+        hideKeyboardIfShown(null);
+    }
+
+    private void hideKeyboardIfShown(JSONObject trace) {
+        if (trace != null) diagnostic(trace, "keyboardStartedAtMs", SystemClock.elapsedRealtime());
         String ime = Settings.Secure.getString(context.getContentResolver(), Settings.Secure.DEFAULT_INPUT_METHOD);
+        boolean queried = false, shown = false, requested = false, returned = false;
         if (ime != null && ime.contains("/")) {
             String owner = ime.substring(0, ime.indexOf('/'));
-            if (device.hasObject(By.pkg(owner))) device.pressBack();
+            queried = true;
+            shown = device.hasObject(By.pkg(owner));
+            if (shown) {
+                requested = true;
+                returned = device.pressBack();
+            }
+        }
+        if (trace != null) {
+            diagnostic(trace, "imeQueried", queried);
+            diagnostic(trace, "imePresent", shown);
+            diagnostic(trace, "backRequested", requested);
+            diagnostic(trace, "backReturned", returned);
+            diagnostic(trace, "keyboardReturnedAtMs", SystemClock.elapsedRealtime());
         }
     }
 
+    private static void diagnostic(JSONObject target, String key, Object value) {
+        // Closed scalar metadata only; loss must not replace the UI failure.
+        try { target.put(key, value); } catch (org.json.JSONException ignored) { }
+    }
+
     private void add(String name) {
+        JSONObject trace = new JSONObject();
+        diagnostic(trace, "diagnosticOnly", true);
+        diagnostic(trace, "attempt", ++connectionAttempts);
+        // Only the latest add is retained; no input text, URL or selector.
+        diagnostic(result, "connectionAdd", trace);
         expect("保存して開く");
         List<UiObject2> fields = device.findObjects(By.clazz("android.widget.EditText").pkg(TARGET));
         assertEquals("The real connection form must contain URL and name", 2, fields.size());
         fields.get(0).click(); fields.get(0).setText(origin);
         fields.get(1).click(); fields.get(1).setText(name);
-        hideKeyboardIfShown();
-        click("保存して開く");
+        diagnostic(trace, "setTextReturnedAtMs", SystemClock.elapsedRealtime());
+        hideKeyboardIfShown(trace);
+        UiObject2 save = one(By.text("保存して開く"), trace);
+        boolean returned = false;
+        diagnostic(trace, "clickStartedAtMs", SystemClock.elapsedRealtime());
+        try {
+            save.click();
+            returned = true;
+        } finally {
+            diagnostic(trace, "clickReturned", returned);
+            diagnostic(trace, "clickFinishedAtMs", SystemClock.elapsedRealtime());
+        }
         expect("Fixture signed out");
         expect("Remote has no App IPC");
     }
