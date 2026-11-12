@@ -65,7 +65,13 @@ public final class WebHomeOperationTest {
     private UiObject2 one(BySelector selector, JSONObject trace) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
+        boolean keyboardDismissalRequested = false;
         do {
+            // A keyboard can appear after setText's first AX snapshot. Only
+            // the connection Save wait may dismiss it, at most once.
+            if (trace != null && !keyboardDismissalRequested) {
+                keyboardDismissalRequested = hideKeyboardIfShown(trace);
+            }
             UiObject2 value = device.findObject(inApp);
             if (value != null && value.isEnabled()) {
                 Rect bounds = value.getVisibleBounds();
@@ -93,7 +99,7 @@ public final class WebHomeOperationTest {
         hideKeyboardIfShown(null);
     }
 
-    private void hideKeyboardIfShown(JSONObject trace) {
+    private boolean hideKeyboardIfShown(JSONObject trace) {
         if (trace != null) diagnostic(trace, "keyboardStartedAtMs", SystemClock.elapsedRealtime());
         String ime = Settings.Secure.getString(context.getContentResolver(), Settings.Secure.DEFAULT_INPUT_METHOD);
         boolean queried = false, shown = false, requested = false, returned = false;
@@ -113,6 +119,9 @@ public final class WebHomeOperationTest {
             diagnostic(trace, "backReturned", returned);
             diagnostic(trace, "keyboardReturnedAtMs", SystemClock.elapsedRealtime());
         }
+        // Consume the request even when pressBack returned false. A second
+        // Back could navigate away from the form after the keyboard closes.
+        return requested;
     }
 
     private static void diagnostic(JSONObject target, String key, Object value) {
@@ -132,7 +141,6 @@ public final class WebHomeOperationTest {
         fields.get(0).click(); fields.get(0).setText(origin);
         fields.get(1).click(); fields.get(1).setText(name);
         diagnostic(trace, "setTextReturnedAtMs", SystemClock.elapsedRealtime());
-        hideKeyboardIfShown(trace);
         UiObject2 save = one(By.text("保存して開く"), trace);
         boolean returned = false;
         diagnostic(trace, "clickStartedAtMs", SystemClock.elapsedRealtime());

@@ -36,12 +36,25 @@ other origins, URL suffixes, deletion buttons and unknown trailing labels
 fail. Quality explicitly prepares JDK17. This does not qualify the Android
 driver's new selector until its native run.
 
+Run43311887068 compiled the new driver and installed the actual App, but
+stopped earlier at the first connection Save. Its one IME query reported no
+keyboard; the final screenshot and accessibility tree showed Gboard with
+Save outside the viewport. No Save click ran. Late keyboard visibility is
+consistent with this sequence, while a configured-IME/AX-owner mismatch is
+not excluded. The connection Save wait now rechecks the same configured IME
+package within its existing 15-second readiness loop. It requests Back only
+on a positive match and at most once, including when Back returns false;
+then it continues requiring the actual Save control and clicks once. Other
+control waits retain their existing behavior. The new IME handling and saved
+connection selector remain unqualified by this run.
+
 The latest connection-add attempt also keeps a short diagnostic receipt: the
 setText return time, the existing IME-presence/Back operation result, the same
 readiness query's Save bounds, and click entry/return times. It records only
 an attempt count, monotonic milliseconds, pixel bounds and booleans, without
-input values or selectors. It adds no UI read, tap, retry, fallback or longer
-wait. A setText return does not confirm the field value. Click wrapper times
+input values or selectors. The trace itself adds no UI read, tap, retry,
+fallback or longer wait; the bounded Save wait's last IME query is retained.
+A setText return does not confirm the field value. Click wrapper times
 do not prove actual input down/up delivery or JavaScript submit receipt.
 The trace follows run43279856761, whose final image showed text selection
 on Save without establishing why the first Web page was not reached.
