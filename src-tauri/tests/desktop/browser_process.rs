@@ -228,8 +228,8 @@ async fn open_saved(view: &impl Shell, app: &AppHandle, name: &str, count: usize
         ))
     }
 }
-/// Answer the one held site-permission prompt through the home's own row, as
-/// the person does: the enabled 許可する click resolves the browser's held
+/// Answer a held site-permission prompt through the home's own row, as the
+/// person does: the enabled 許可する click resolves the browser's held
 /// callback and the answered prompt leaves the section. A wrong or
 /// unresolved answer keeps the row (and .web-error on a failed invoke), so a
 /// fake click can never read as a grant.

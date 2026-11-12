@@ -635,7 +635,9 @@ class CdpTests(unittest.TestCase):
     def test_a_starved_read_still_names_the_method_past_the_hard_cap(self):
         # Storm liveness extends only up to STARVED_MAX_WAIT: a channel that
         # never quietens and never answers raises on the method's own name
-        # rather than waiting forever.
+        # rather than waiting forever. send keeps the event stream fresh, so
+        # the extension path is what must give up — a dead-stream run would
+        # end on the soft deadline and never exercise the cap at all.
         events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
 
         class Cdp:
@@ -646,6 +648,7 @@ class CdpTests(unittest.TestCase):
 
         class Page:
             def __init__(self):
+                self.attempts = 0
                 self.cdp = Cdp()
                 self.cdp.events = [{"method": "Target.targetCreated",
                                     observer.RECEIVED_AT: time.monotonic()}]
@@ -653,6 +656,14 @@ class CdpTests(unittest.TestCase):
                 self.process = {"profile": "P"}
 
             def send(self, method, params=None, timeout=5.0):
+                self.attempts += 1
+                # A broken bound without the hard cap would retry forever;
+                # fail the test on a distinct name instead of hanging.
+                if self.attempts > 100000:
+                    raise Failure("starved read ignored the hard cap")
+                self.cdp.events.append(
+                    {"method": "Target.targetCreated",
+                     observer.RECEIVED_AT: time.monotonic()})
                 raise Failure(f"CDP timeout {method} (P)")
 
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
