@@ -594,7 +594,12 @@ input. Every native library must be x86_64 ELF, and the packaged App library
 must match the actual Cargo output byte for byte. SDK signature/manifest tools,
 ZIP CRC and tracked-source preservation are required. Only `whole-app-proof.json`
 is uploaded; the APK, generated debug key and Firebase configuration are not.
-The first CI build is pending. This is a prerequisite for actual whole-App
+The first whole-App debug APK build passed in
+[CI43236148268](https://github.com/tako0614/takosumi-mobile/actions/runs/43236148268/job/131244314392).
+Its private fixture package had actual min/target SDK 28/36 and four x86_64 ELF
+libraries; SDK signature/manifest/resource checks and Cargo byte identity passed.
+Only the proof JSON was retained, so the APK cannot be independently downloaded
+and rechecked from that artifact. This is a prerequisite for actual whole-App
 connection/login/home/resume qualification; the library tests below and an APK
 compile cannot establish that UI behavior, real IdP, physical-device or update
 qualification. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#android)
