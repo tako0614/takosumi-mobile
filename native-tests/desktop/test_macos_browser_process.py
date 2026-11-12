@@ -114,6 +114,64 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(len(saved), 2)
             self.assertEqual(saved, observer.proof["shutdownSamples"])
 
+    def failed_observer(self):
+        observer = runner.MacObserver(self.root, "photopea", "", mock.Mock(),
+                                      self.browser_image, self.guard_image)
+        observer.identities = [
+            {"pid": 11, "parent": 10, "start": 100}, {"pid": 12, "parent": 11, "start": 101},
+            {"pid": 21, "parent": 10, "start": 102}, {"pid": 22, "parent": 21, "start": 103}]
+        observer.proof["opened"] = {"processes": [
+            {"pid": 11, "opened": {"nativePid": 12}}, {"pid": 21, "opened": {"nativePid": 22}}]}
+        observer.first_launch = mock.Mock(side_effect=runner.Failure("original flow failed"))
+        return observer
+
+    def test_failed_flow_collects_owned_stacks_without_replacing_the_error(self):
+        observer = self.failed_observer()
+        observer.identities.extend([
+            {"pid": 31, "parent": 10, "start": 104}, {"pid": 32, "parent": 31, "start": 105}])
+        observer.proof["opened"]["processes"].append({"pid": 31, "opened": {"nativePid": 32}})
+        def collect(processes, child, parent, browser, guard, output):
+            self.assertEqual(observer.proof["error"], "Failure: original flow failed")
+            self.assertEqual(child["parent"], parent["pid"])
+            self.assertEqual((browser, guard), (self.browser_image, self.guard_image))
+            self.assertEqual(output, self.root / "evidence/failure-first" / f"sample-{child['pid']}.log")
+            return {"pid": child["pid"], "diagnosticOnly": True, "status": "captured"}
+        with mock.patch.object(runner, "sample_owned", side_effect=collect) as capture, \
+                self.assertRaisesRegex(runner.Failure, "original flow failed"):
+            observer.run()
+        self.assertEqual(capture.call_count, 2)
+        saved = json.loads((self.root / "browser-observation.json").read_text())
+        self.assertEqual([x["pid"] for x in saved["failureSamples"]], [12, 22])
+        self.assertFalse(saved["passed"])
+        self.assertEqual(saved["error"], "Failure: original flow failed")
+
+    def test_failure_stack_capture_requires_identity_and_does_not_repeat_shutdown_sample(self):
+        observer = self.failed_observer()
+        observer.proof["shutdownSamples"] = [{"pid": 12, "status": "sample-error"}]
+        observer.identities = observer.identities[:2]
+        with mock.patch.object(runner, "sample_owned") as capture, \
+                self.assertRaisesRegex(runner.Failure, "original flow failed"):
+            observer.run()
+        capture.assert_not_called()
+        self.assertEqual(observer.proof["failureSamples"], [])
+
+    def test_failure_stack_error_cannot_mask_the_original_flow_failure(self):
+        observer = self.failed_observer()
+        with mock.patch.object(runner, "sample_owned", side_effect=OSError("private diagnostic detail")), \
+                self.assertRaisesRegex(runner.Failure, "original flow failed"):
+            observer.run()
+        saved = json.loads((self.root / "browser-observation.json").read_text())
+        self.assertEqual([x["errorType"] for x in saved["failureSamples"]], ["OSError", "OSError"])
+        self.assertNotIn("private diagnostic detail", json.dumps(saved))
+
+    def test_successful_flow_does_not_collect_failure_stacks(self):
+        observer = self.failed_observer()
+        observer.first_launch.side_effect = None
+        with mock.patch.object(runner, "sample_owned") as capture:
+            observer.run()
+        capture.assert_not_called()
+        self.assertNotIn("failureSamples", observer.proof)
+
     def test_system_quit_requires_same_owned_identity_and_exact_request_receipt(self):
         child = {"pid": 12, "parent": 11, "group": 11, "start": 101}
         parent = {"pid": 11, "parent": 10, "group": 11, "start": 100}

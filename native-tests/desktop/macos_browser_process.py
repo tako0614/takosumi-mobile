@@ -37,7 +37,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, require, seatbelt_evidence  # noqa: E402
 from windows_browser_observer import Cdp, FRAME_EVENTS, Observer, Page, REAL_SITES, SETTLE_WAIT, WebSocket  # noqa: E402
-from macos_shutdown_sample import same_owner, watch_shutdowns  # noqa: E402
+from macos_shutdown_sample import same_owner, sample_owned, watch_shutdowns  # noqa: E402
 from macos_process_image import PinnedImage  # noqa: E402
 
 
@@ -443,8 +443,31 @@ class MacObserver(Observer):
         self.proof["passed"] = True
 
     def failure_capture(self):
-        # No foreign process/window inspection or screenshot. Keep only our identities.
+        # Called only after the original flow has failed, before owned cleanup.
+        # A failed Open can leave the UI thread wedged without entering shutdown,
+        # so the shutdown watcher alone cannot collect its stack.
         self.proof["identities"] = self.identities
+        records = self.proof["failureSamples"] = []
+        try:
+            identities = {item["pid"]: item for item in self.identities}
+            attempted = {item.get("pid") for item in self.proof.get("shutdownSamples", [])}
+            # The fixture opens two profiles. Never discover or sample by name,
+            # and do not repeat a shutdown watcher's already attempted sample.
+            for process in self.proof.get("opened", {}).get("processes", [])[:2]:
+                try:
+                    pid = process["opened"]["nativePid"]
+                    if pid in attempted:
+                        continue
+                    attempted.add(pid)
+                    child, parent = identities.get(pid), identities.get(process["pid"])
+                    if child is None or parent is None:
+                        continue
+                    output = self.data / "evidence" / f"failure-{self.phase or 'first'}" / f"sample-{pid}.log"
+                    records.append(sample_owned(self.processes, child, parent, self.browser, self.guard, output))
+                except Exception as error:
+                    records.append({"status": "failure-sample-error", "errorType": type(error).__name__})
+        except Exception as error:
+            records.append({"status": "failure-sample-error", "errorType": type(error).__name__})
 
 
 def digest(path):

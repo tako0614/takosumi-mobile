@@ -2591,12 +2591,12 @@ once for one second at 100 ms intervals, before Chromium's ten-second
 [teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
 PID/birth, guard ancestry and both executable paths are checked before and
 after; changed identity discards the output. The sample subprocess has a
-five-second limit and passes `-mayDie`, so symbol locations are grabbed
-before the sampled browser can be watchdog-killed mid-run; the recorded tool
-support was kept for exactly this after a bare run timed out without a
-stack, and the bound stays under the watchdog while letting symbol grab,
-the sample and the report write finish on a CEF-sized binary, which three
-seconds did not. Its retained stack text is capped at 4 MiB and stderr at
+seven-second limit and passes `-mayDie` to collect symbol locations before a
+target exits during sampling. Earlier three- and five-second attempts expired
+before producing a report. Kernel-state collection runs first with separate
+tool bounds, so seven seconds is not a total diagnostic bound and does not
+guarantee completion before the teardown watchdog. Its retained stack text is
+capped at 4 MiB and stderr at
 8 KiB. A timeout retains any partial stack and stderr only after the same
 identity readback, and remains a failed diagnostic, never a native pass.
 The subprocess is reaped and the watcher joined before fixture cleanup.
@@ -2607,6 +2607,18 @@ can perturb scheduling: a sampled pass is diagnostic, not an unsampled
 qualification. No heap, environment, page contents or binary crash dump is
 requested. Existing first-launch/restart/reset and zero-forced-cleanup
 requirements remain unchanged.
+
+After an M3/M4 observer flow has already failed, its failure callback also
+attempts the same owned sampler before cleanup for at most the two opened
+profiles. It uses only the registered PID/birth and guard identities, skips
+any PID already attempted by the shutdown watcher, and retains results under
+`evidence/failure-<phase>/` with closed `failureSamples` metadata. A missing
+identity, sampling error or unavailable stack cannot replace the original
+failure. A successful flow does not enter this path. Tool bounds and output
+caps are unchanged; collection can delay failure cleanup, and filesystem or
+libproc reads still have no hard IO deadline. This extends diagnosis to a
+failed Open whose browser never entered shutdown; native collection of that
+path remains unqualified.
 
 The CI also records the installed `/usr/bin/sample` usage (with no process
 argument) and its installed manual, each capped at 16 KiB, in
