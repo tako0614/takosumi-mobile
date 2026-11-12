@@ -57,6 +57,11 @@ jobs:
         working-directory: takosumi-mobile
         env:
           TMPDIR: ${{ runner.temp }}
+      - name: Windows browser evidence privacy controls
+        run: python3 -B native-tests/desktop/test_windows_package_evidence.py
+        working-directory: takosumi-mobile
+        env:
+          TMPDIR: ${{ runner.temp }}
       - name: Private browser startup controls
         run: |
           node --experimental-strip-types --test --test-reporter=tap native-tests/browser/startup.test.ts | tee "$RUNNER_TEMP/browser-startup-controls.log"
@@ -1803,6 +1808,10 @@ jobs:
           # the rest go on.
           function Copy-Evidence([System.IO.FileInfo]$file, [string]$target, [string[]]$allowed) {
             try {
+              if (($file.FullName -split '[\\/]') -icontains 'cef-profiles') {
+                $skipped.Add($file.FullName)
+                return
+              }
               $extension = $file.Extension.ToLowerInvariant()
               if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) -or (Test-Binary $file.FullName)) {
                 $skipped.Add($file.FullName)
@@ -1832,6 +1841,13 @@ jobs:
             $tree = $trees[$name]
             if (-not $tree -or -not (Test-Path -LiteralPath $tree -PathType Container)) { continue }
             $tree = (Get-Item -LiteralPath $tree).FullName.TrimEnd('\')
+            if ($name -eq 'browser-smoke') {
+              # A .log beneath cef-profiles may be a private LevelDB file.
+              # The copier accepts only four named, bounded text diagnostics.
+              python -B takosumi-mobile/native-tests/desktop/windows_package_evidence.py --source $tree --destination (Join-Path $out $name)
+              if ($LASTEXITCODE -ne 0) { throw 'Browser evidence selection failed' }
+              continue
+            }
             foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -File)) {
               Copy-Evidence $file (Join-Path (Join-Path $out $name) $file.FullName.Substring($tree.Length + 1)) $text
             }
@@ -1839,8 +1855,11 @@ jobs:
           $profiles = if ($env:W6_APP_DATA) { Join-Path $env:W6_APP_DATA 'browser-process-experiment' } else { '' }
           if ($profiles -and (Test-Path -LiteralPath $profiles -PathType Container)) {
             foreach ($profile in @(Get-ChildItem -LiteralPath $profiles -Directory)) {
-              foreach ($file in @(Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log')) {
-                Copy-Evidence $file (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $file.Name) $text
+              foreach ($name in @('browser.log', 'cef-native.log')) {
+                $path = Join-Path $profile.FullName $name
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  Copy-Evidence (Get-Item -LiteralPath $path) (Join-Path (Join-Path (Join-Path $out 'profiles') $profile.Name) $name) $text
+                }
               }
             }
           }

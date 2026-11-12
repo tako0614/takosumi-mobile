@@ -138,6 +138,7 @@ WINDOWS_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
     "native-tests/desktop/windows_browser_fault.py",
+    "native-tests/desktop/windows_package_evidence.py",
     "native-tests/desktop/windows_fixture_tls.ps1", "native-tests/cef-candidate/windows_smoke.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/.cargo/config.toml",

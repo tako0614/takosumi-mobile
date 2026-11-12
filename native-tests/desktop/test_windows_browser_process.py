@@ -1366,15 +1366,19 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(re.fullmatch(re.escape(product["productName"]) + r"_.*_x64-setup\.exe",
                                       "TakosumiFixture_0.1.0_x64-setup.exe"))
         # The upload takes one gathered directory; the gathering copies only
-        # the named evidence, through one copier that never takes an
-        # executable, a library or an installer.
+        # named reports through Copy-Evidence and standalone browser text
+        # through the SDK-free, tested allowlist copier.
         upload = job[job.index("name: cef-windows-package-evidence"):]
         self.assertIn("path: ${{ runner.temp }}/w6-evidence\n          if-no-files-found", upload)
         gather = job[job.index("- name: Gather the W6 evidence"):job.index("- name: Keep the W6 evidence")]
         self.assertIn("if: ${{ always() }}", gather)
         self.assertIn("$never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')", gather)
         self.assertIn("$text = @('.json', '.log', '.txt', '.html', '.md')", gather)
-        self.assertEqual(gather.count("Copy-Item"), 1, "every copy goes through Copy-Evidence")
+        self.assertEqual(gather.count("Copy-Item"), 1, "report copies go through Copy-Evidence")
+        self.assertIn("python -B takosumi-mobile/native-tests/desktop/windows_package_evidence.py "
+                      "--source $tree --destination (Join-Path $out $name)", gather)
+        self.assertIn("'cef-profiles'", gather)
+        self.assertIn("native-tests/desktop/windows_package_evidence.py", runner.WINDOWS_SOURCES)
         self.assertIn("if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) "
                       "-or (Test-Binary $file.FullName)) {", gather)
         # MZ, ELF and ZIP by content; a failed copy is logged, not fatal.
@@ -1392,10 +1396,10 @@ class RunnerTests(unittest.TestCase):
                    "'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'",
                    "$trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }",
                    "Get-ChildItem -LiteralPath $tree -Recurse -File",
-                   "Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log'"]
+                   "foreach ($name in @('browser.log', 'cef-native.log'))"]
         for source in sources:
             self.assertIn(source, gather)
-        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 5, "no other source is gathered")
+        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 4, "no other source is gathered")
         for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
             self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
 

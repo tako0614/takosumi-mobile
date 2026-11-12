@@ -1638,12 +1638,16 @@ removed them; the check now waits for all three). What remains is reported, not 
 directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime
 root and browser profiles, and the fixture's per-case
 `com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any). The
-artifact keeps only reports, logs, the stage manifests, the packaged case
-and the installed browser's smoke case, gathered into one directory: text
-files only (`.json`, `.log`, `.txt`, `.html`, `.md`), never anything that is
-an executable, a library or an archive by its name or its first bytes (MZ,
-ELF, ZIP); each skipped file and failed copy is logged, and one failure does
-not stop the rest.
+artifact keeps reports, logs, stage manifests and packaged-case metadata in
+one directory. Browser profile directories are excluded, including database
+files named `.log`. The standalone smoke copier accepts only `boot.json`,
+`browser.log`, `cef-native.log` and `summary.json` directly under an owned
+smoke case: plain, single-link files, at most 8 MiB each, valid UTF-8 and no
+NUL bytes. It copies the inspected bytes and refuses links and a reused output
+directory. The general report copier permits `.json`, `.log`, `.txt`, `.html`
+and `.md`, rejects executables, libraries and archives by name or first bytes
+(MZ, ELF, ZIP), and logs its rejected files and copy errors. Profile-level logs
+are limited to the two native diagnostic names, without descending into site data.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows
