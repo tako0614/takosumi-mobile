@@ -284,8 +284,15 @@ class Emulator:
 def preserve_guest_anr(emulator, scratch, out):
     """Failure-only reads; an absent/late diagnostic never qualifies the UI."""
     result = {"diagnosticOnly": True, "scope": "Exact owned disposable Android guest", "queries": {}}
-    for label, query, limit in (("guest-last-anr", "lastanr", 128 * 1024),
-                                ("guest-last-anr-traces", "lastanr-traces", 512 * 1024)):
+    for label, query, limit in (
+        ("guest-last-anr", ("dumpsys", "activity", "lastanr"), 128 * 1024),
+        ("guest-last-anr-traces", ("dumpsys", "activity", "lastanr-traces"), 512 * 1024),
+        # The newest activity trace may belong to a different boot service.
+        # Retain timestamped ANR identities and only the system-app ANR tag.
+        ("guest-anr-events", ("logcat", "-b", "events", "-d", "-v",
+                              "threadtime,epoch,usec", "-s", "am_anr"), 128 * 1024),
+        ("guest-system-app-anr", ("dumpsys", "dropbox", "--print", "system_app_anr"), 512 * 1024),
+    ):
         entry = result["queries"][label] = {}
         raw = scratch / (label + "-raw.log")
         try:
@@ -295,7 +302,7 @@ def preserve_guest_anr(emulator, scratch, out):
             entry["errorType"] = type(error).__name__
             break  # A foreign/dead guest authorizes no further reads.
         try:
-            runtime.command([str(emulator.adb), "-s", SERIAL, "shell", "dumpsys", "activity", query],
+            runtime.command([str(emulator.adb), "-s", SERIAL, "shell", *query],
                             raw, timeout=10, read_output=False)
             entry["queryReturned"] = True
         except Exception as error:

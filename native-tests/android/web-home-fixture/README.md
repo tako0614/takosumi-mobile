@@ -95,6 +95,29 @@ Run43305494368 collected both bounded queries without truncation; each said
 that no ANR had occurred since boot. This does not establish the earlier ANR's
 cause or prove it repaired.
 
+Run43324346638 again stopped in initial setup with the System UI dialog,
+before the new native form scroll or any connection-add input. Its activity
+summary reported no ANR. Its newest trace's main subject/stack concerned
+Google Play startup, while the embedded CriticalEventLog identified System UI
+PID1058 at Unix milliseconds1794524643642, waiting20,024ms while executing
+`SystemUIService`. System UI's own stack and the cause remain unknown.
+Failure-only collection now also
+reads `logcat -b events -d -v threadtime,epoch,usec -s am_anr` and
+`dumpsys dropbox --print system_app_anr`, retaining at most 128KiB and 512KiB
+respectively under the same private-raw/size/hash/error policy. Ownership is
+rechecked before each query; each additional command has one 10-second
+allowance. The event record can name the ANR process and time; the DropBox tag
+can contain multiple system apps, so identities/timestamps still require
+matching. The allowances exclude ownership checks and CLI retirement; they
+are not a total collection deadline. Missing, denied or truncated records
+remain inconclusive. No logs
+are cleared, permission changed or dialog dismissed. These queries have
+SDK-free controls; collection on the actual guest remains unverified.
+The command/filter behavior follows the Android 16
+[DropBox service](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/services/core/java/com/android/server/DropBoxManagerService.java),
+[logcat](https://android.googlesource.com/platform/system/logging/+/refs/heads/android16-release/logcat/logcat.cpp)
+and [ANR event fields](https://android.googlesource.com/platform/frameworks/base/+/master/services/core/java/com/android/server/am/EventLogTags.logtags).
+
 The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's
 public CA for the exact hosts `127.0.0.1` and `localhost`, without cleartext,
