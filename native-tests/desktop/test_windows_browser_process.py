@@ -1282,7 +1282,7 @@ class RunnerTests(unittest.TestCase):
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = workflow[workflow.index("\n  cef-macos:\n"):]
         self.assertRegex(job, r"(?m)^    runs-on: macos-latest$")
-        # M4 adds a third serial App flow. Comments between the fields must
+        # M4 adds packaged site flows. Comments between the fields must
         # not change which runner/bounded job this contract checks.
         self.assertRegex(job, r"(?m)^    timeout-minutes: 100$")
         self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper "
@@ -1324,6 +1324,21 @@ class RunnerTests(unittest.TestCase):
         source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
         self.assertIn('rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"\n', job)
         self.assertIn(f"grep -q '^test result: ok\\. {source.count('#[test]')} passed; 0 failed'", job)
+
+    def test_the_macos_job_runs_both_sites_with_and_without_packaged_resources(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-macos:\n"):]
+        flows = [line.strip() for line in job.splitlines()
+                 if line.strip().startswith("run: python3 -B native-tests/desktop/macos_browser_process.py ")]
+        unbundled = ('run: python3 -B native-tests/desktop/macos_browser_process.py '
+                     '--binary "$CARGO_TARGET_DIR/debug/takosumi-mobile" '
+                     '--browser "$RUNNER_TEMP/m1-fixture/takosumi-cef-browser-process.app/Contents/MacOS/'
+                     'takosumi-cef-browser-process" --guard "$CARGO_TARGET_DIR/debug/takosumi-browser-guard" '
+                     '--work "$RUNNER_TEMP" --site ')
+        packaged = ('run: python3 -B native-tests/desktop/macos_browser_process.py --packaged '
+                    '--binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site ')
+        self.assertEqual(flows, [prefix + site for prefix in (unbundled, packaged)
+                                 for site in ("excalidraw", "photopea")])
 
     def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
         """M2: cef-macos runs every macOS guard self-test, then the adapter's

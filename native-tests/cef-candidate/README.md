@@ -2740,10 +2740,11 @@ to the product's stage directory or its descendants, including through existing 
 The CI builds both `.app` artifacts, requires the same product guard in both
 stages, and runs the product browser from inside its packaged resources with
 the existing sandbox smoke. It then runs the packaged fixture's shared
-home/profile flow on anonymous Excalidraw:
+home/profile flow separately on anonymous Excalidraw and Photopea:
 
 ```bash
 python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary <TakosumiFixture.app>/Contents/MacOS/<CFBundleExecutable> --work <owned evidence directory> --site excalidraw
+python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary <TakosumiFixture.app>/Contents/MacOS/<CFBundleExecutable> --work <owned evidence directory> --site photopea
 ```
 
 This mode accepts no `--browser` or `--guard`. It removes inherited browser

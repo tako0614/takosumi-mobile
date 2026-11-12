@@ -1696,7 +1696,7 @@ jobs:
   # is uploaded. Independent of the other jobs.
   cef-macos:
     runs-on: macos-latest
-    # M1/M2, two M3 site flows and the additional packaged M4 flow run serially.
+    # M1/M2, two M3 site flows and two packaged M4 site flows run serially.
     timeout-minutes: 100
     defaults:
       run:
@@ -1988,6 +1988,10 @@ jobs:
         if: ${{ !cancelled() && steps.packaged-app-build.outcome == 'success' }}
         timeout-minutes: 25
         run: python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site excalidraw
+      - name: Packaged App resolves its own browser, guard and runtime (anonymous Photopea)
+        if: ${{ !cancelled() && steps.packaged-app-build.outcome == 'success' }}
+        timeout-minutes: 25
+        run: python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site photopea
       # Each smoke's summary (with its `sandbox` and `descendants` records),
       # its top-level logs and the bundle manifests: text only, no binary.
       - name: Keep the smoke summaries

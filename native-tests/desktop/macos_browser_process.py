@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""M3: actual WKWebView home -> guarded CEF profiles on macOS 14+.
+"""M3/M4: actual WKWebView home -> guarded CEF profiles on macOS 14+.
 
 Reuses the Linux/Windows App flow and the Windows observer's platform-neutral
 CDP, dialog and checkpoint helpers. Anonymous Excalidraw or Photopea only;
 synthetic storage markers, no login, credential, Keychain change or TLS bypass.
 The three launches exercise reuse, OS quit intent/cancellation, restart and
 one-profile clear. Page.close drives a browser close on relaunch; OS window
-switching, native dialogs/files, notifications and packaging are not qualified.
+switching, native dialogs/files and notifications are not qualified.
+
+M3 uses explicit browser/guard paths. M4 (--packaged) checks a local debug
+App's own embedded resources, with no executable/runtime overrides. Signing,
+notarization, distribution and updates are outside both modes.
 
 Each App launch is itself under the existing macOS guard, in addition to the
 App's per-profile guards. Only these owned guards receive a stop on failure.
