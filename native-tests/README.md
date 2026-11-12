@@ -1,7 +1,21 @@
 # App-screen native tests
 
-These tests exercise the product's plain WebViews. They do not sign in to any
-real service, use provider/DB/SSO credentials, or qualify distribution.
+This directory contains native Web-app fixtures and SDK-free runner controls.
+They do not sign in to real accounts, use provider/DB/SSO credentials, or qualify distribution.
+
+## Portable desktop runner controls
+
+When changing the desktop runners or their CI workflow, run the shared
+runner/protocol/workflow controls with Python 3's standard library:
+
+```bash
+python3 -B native-tests/desktop/test_windows_browser_process.py
+```
+
+These controls start no App, SDK, browser or external service. CI runs them
+in Quality as well as the native Windows jobs, so a stale workflow contract
+cannot hide behind a successful portable Web build. Native build, OS input,
+packaged startup and process-cleanup qualification remain separate.
 
 ## Public Web-app operation probe (experimental)
 
