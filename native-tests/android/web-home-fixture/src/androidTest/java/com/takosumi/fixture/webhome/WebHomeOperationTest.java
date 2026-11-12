@@ -11,6 +11,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.uiautomator.By;
 import androidx.test.uiautomator.BySelector;
+import androidx.test.uiautomator.Direction;
 import androidx.test.uiautomator.UiDevice;
 import androidx.test.uiautomator.UiObject2;
 import java.io.File;
@@ -63,9 +64,14 @@ public final class WebHomeOperationTest {
     }
 
     private UiObject2 one(BySelector selector, JSONObject trace) {
+        return one(selector, trace, false);
+    }
+
+    private UiObject2 one(BySelector selector, JSONObject trace, boolean scrollConnectionForm) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
         boolean keyboardDismissalRequested = false;
+        boolean formScrollRequested = false;
         do {
             // A keyboard can appear after setText's first AX snapshot. Only
             // the connection Save wait may dismiss it, at most once.
@@ -82,6 +88,19 @@ public final class WebHomeOperationTest {
                             .put(bounds.right).put(bounds.bottom));
                     }
                     return value;
+                }
+            }
+            if (scrollConnectionForm && !formScrollRequested
+                    && (value == null || value.getVisibleBounds().isEmpty())) {
+                UiObject2 heading = device.findObject(By.text("接続先を追加").pkg(TARGET));
+                List<UiObject2> views = device.findObjects(
+                    By.clazz("android.webkit.WebView").pkg(TARGET).scrollable(true));
+                if (heading != null && !heading.getVisibleBounds().isEmpty() && views.size() == 1
+                        && views.get(0).isEnabled() && !views.get(0).getVisibleBounds().isEmpty()) {
+                    formScrollRequested = true;
+                    // One real gesture. The return value says whether more
+                    // scrolling is possible, not whether Save is ready.
+                    views.get(0).scroll(Direction.DOWN, 0.5f);
                 }
             }
             SystemClock.sleep(100);
@@ -135,7 +154,7 @@ public final class WebHomeOperationTest {
         diagnostic(trace, "attempt", ++connectionAttempts);
         // Only the latest add is retained; no input text, URL or selector.
         diagnostic(result, "connectionAdd", trace);
-        expect("保存して開く");
+        one(By.text("保存して開く"), null, true);
         List<UiObject2> fields = device.findObjects(By.clazz("android.widget.EditText").pkg(TARGET));
         assertEquals("The real connection form must contain URL and name", 2, fields.size());
         fields.get(0).click(); fields.get(0).setText(origin);

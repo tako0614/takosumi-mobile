@@ -48,6 +48,20 @@ then it continues requiring the actual Save control and clicks once. Other
 control waits retain their existing behavior. The new IME handling and saved
 connection selector remain unqualified by this run.
 
+Run43317859224 passed Work Web login/management, Notes/draft, saved-Work
+selection and background return with the same App PID/document. It then
+stopped before Personal input: the saved Work row pushed the form below the
+viewport, with no keyboard shown and Save outside the accessibility tree.
+Only the initial form wait may now scroll once, when Save is absent or has
+empty bounds, the add heading is visible and exactly one owned scrollable
+WebView is enabled/visible. A half-viewport `scroll(Direction.DOWN, 0.5f)`
+uses the real gesture API within the same 15-second readiness bound. Its
+return value is not an acceptance result; the actual enabled/visible Save
+must still appear. Other waits, input and Save counts are unchanged. The
+scroll path and Personal/cold/reset stages remain natively unqualified.
+The pinned UI Automator2.3.0 API is described in the
+[UiObject2 reference](https://developer.android.com/reference/androidx/test/uiautomator/UiObject2#scroll(androidx.test.uiautomator.Direction,float)).
+
 The latest connection-add attempt also keeps a short diagnostic receipt: the
 setText return time, the existing IME-presence/Back operation result, the same
 readiness query's Save bounds, and click entry/return times. It records only
