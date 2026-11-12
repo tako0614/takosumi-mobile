@@ -1122,10 +1122,12 @@ class WindowsFaultTests(unittest.TestCase):
     def test_persistent_profile_is_in_app_data_while_guard_state_is_in_runtime(self):
         process, app_data, runtime = self.recovery_layout()
         paths = fault.recovery_paths(process, app_data, runtime)
-        self.assertEqual(paths["cache"], Path(process["opened"]["nativeCache"]))
-        self.assertTrue(paths["cache"].is_relative_to(app_data))
-        self.assertFalse(paths["cache"].is_relative_to(runtime))
-        self.assertTrue(paths["receipt"].is_relative_to(runtime))
+        # On Windows, the runner's Temp path can use RUNNER~1 while strict
+        # resolution returns runneradmin. Compare the same canonical paths.
+        self.assertEqual(paths["cache"], Path(process["opened"]["nativeCache"]).resolve(strict=True))
+        self.assertTrue(paths["cache"].is_relative_to(app_data.resolve(strict=True)))
+        self.assertFalse(paths["cache"].is_relative_to(runtime.resolve(strict=True)))
+        self.assertTrue(paths["receipt"].resolve(strict=True).is_relative_to(runtime.resolve(strict=True)))
 
     def test_runtime_or_another_app_is_not_a_persistent_profile_owner(self):
         process, app_data, runtime = self.recovery_layout()
