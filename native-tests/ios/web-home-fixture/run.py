@@ -20,6 +20,10 @@ ROOT = HERE.parents[2]
 BUILD = ROOT / "src-tauri/gen/apple/build"
 BUNDLE = "com.takosumi.fixture.simulator"
 METHOD = "testWholeAppConnectionsWebHomeAndResumeStayProfileBound"
+# The first actual 128 MB Tauri App install outlived the initial 30 s
+# allowance. One bounded setup attempt; functional XCTest still gets 600 s
+# and installation must finish normally before exact bundle readback.
+INSTALL_WAIT = 120
 SOURCES = runtime.FROZEN_SOURCES + [HERE / name for name in (
     "run.py", "test_run.py", "harness.py", "web_site.py", "Driver.swift", "WebHomeUITests.swift", "project.yml")]
 SOURCES += [ROOT / name for name in (
@@ -159,7 +163,8 @@ def main():
     require(not scratch_parent.resolve().is_relative_to(ROOT), "Private scratch must stay outside the repository")
     require(shutil.disk_usage(scratch_parent).free >= 8 * 1024**3, "Need 8 GiB free; no broad cleanup")
     result = {"passed": False, "scope": "Whole installed Tauri App, synthetic Web UI only",
-              "source": source_hashes(), "app": app_proof, "cleanup": False, "functionalPassed": False}
+              "source": source_hashes(), "app": app_proof, "installBudgetSeconds": INSTALL_WAIT,
+              "cleanup": False, "functionalPassed": False}
     udid, created, servers, failure = None, None, [], None
     with runtime.owned_scratch(scratch_parent) as (scratch, scratch_state):
         try:
@@ -185,7 +190,7 @@ def main():
             runtime.command(["xcrun", "simctl", "boot", udid], out / "boot.log", timeout=30)
             runtime.command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
             runtime.command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log", trust_trace=True)
-            runtime.command(["xcrun", "simctl", "install", udid, str(app)], out / "install.log", timeout=30)
+            runtime.command(["xcrun", "simctl", "install", udid, str(app)], out / "install.log", timeout=INSTALL_WAIT)
             result["installedBefore"] = installed_app(out, udid, created, app_proof, "before")
             for kind in ("instance", "editor"):
                 server = Site(cert, key, kind)

@@ -19,6 +19,12 @@ App bundle, generated CA/key and containers outside uploaded evidence. It
 uses the existing CLI retirement/scratch custody and creates, reads back,
 trusts and deletes only its fresh Simulator UUID. A failed cleanup or
 interrupted command prevents its final PASS. It installs no SDK or tool.
+The first native attempt stopped before XCTest when installation of the
+127,665,411-byte App exceeded the initial 30-second setup allowance. Installation
+now has one 120-second wait, without a retry. Normal command completion and the
+same full-bundle readback remain required; the original cause is unknown and
+native UI qualification is still pending. The 600-second XCTest budget and
+20-minute CI case cap are unchanged.
 
 [Apple's bundle-ID initializer](https://developer.apple.com/documentation/xcuiautomation/xcuiapplication/init(bundleidentifier:))
 can launch an installed app when the scheme/dependencies/build-products
