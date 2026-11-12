@@ -2227,6 +2227,15 @@ return and reply return with the same closed metadata. These stages distinguish
 a resume that stops inside focus, AppKit window raising or reply construction;
 they do not prove foreground activation or successful delivery of a reply.
 Missing lines can still be diagnostic loss. No operation or timeout is changed.
+The App adapter's opted-in Mac inspection also records dispatch/blocking/lock,
+send completion, reader enqueue, matching receive, native/cache confirmation
+and IPC return boundaries. Reader quit/permission callback begin/return stages
+distinguish an in-flight event callback from an unreceived open reply. Only
+stage names, App/guard PIDs, assigned request IDs, success flags and wall-clock
+microseconds are recorded; an unassigned guard or request has ID0. No key, profile URL,
+reply body, path, environment or page data enters these lines. The record is
+formatted before one best-effort stderr write. These are diagnostic candidates:
+none proves delivery beyond its own boundary or changes ownership/timeout rules.
 The first diagnostic run (`d32f18a`, 42491760278) passed its macOS component
 job, but concurrent helpers interleaved the JSON formatter's separate writes.
 Records are now formatted fully before one best-effort write. A failed or short

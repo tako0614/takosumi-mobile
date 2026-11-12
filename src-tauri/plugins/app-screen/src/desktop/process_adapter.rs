@@ -36,6 +36,24 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 
+/// Closed diagnostic fields for the opted-in Mac fixture, never page data.
+/// A returned stage observes only this boundary; it is not delivery proof.
+fn mac_open_trace(stage: &'static str, guard: u32, request: u64, ok: Option<bool>) {
+    if !cfg!(target_os = "macos") || !setup::inspection(&setup::environment) {
+        return;
+    }
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let record = format!(
+        "takosumi-mac-open-stage: {}\n",
+        serde_json::json!({"stage":stage,"appPid":std::process::id(),"guardPid":guard,
+            "requestId":request,"ok":ok,"unixMicros":micros})
+    );
+    let _ = std::io::stderr().lock().write_all(record.as_bytes());
+}
+
 #[derive(Clone)]
 pub(super) struct Backend(Arc<Mutex<State>>, Arc<ExitPhase>);
 #[derive(Default)]
@@ -515,12 +533,16 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
 }
 
 pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
+    mac_open_trace("ipc-dispatch", 0, 0, None);
     let backend = app.state::<Backend>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        mac_open_trace("blocking-enter", 0, 0, None);
         if backend.1.state.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidRequest("The browser is closing."));
         }
+        mac_open_trace("backend-lock-begin", 0, 0, None);
         let mut state = backend.0.lock().map_err(failure)?;
+        mac_open_trace("backend-lock-return", 0, 0, None);
         if backend.1.state.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidRequest("The browser is closing."));
         }
@@ -571,10 +593,14 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
                 state.processes.remove(&profile);
             }
         }
-        open_in_state(&app, &mut state, payload)
+        let result = open_in_state(&app, &mut state, payload);
+        mac_open_trace("backend-open-return", 0, 0, Some(result.is_ok()));
+        result
     })
     .await
-    .map_err(failure)?
+    .map_err(failure)?;
+    mac_open_trace("ipc-return", 0, 0, Some(result.is_ok()));
+    result
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -1393,6 +1419,7 @@ impl Process {
             process
         };
         let owner = process.profile.clone();
+        let guard_pid = process.child.id();
         std::thread::Builder::new()
             .name("browser-process-replies".into())
             .spawn(move || {
@@ -1405,6 +1432,13 @@ impl Process {
                         Ok(None) => break,
                         Err(error) => Err(error.to_string()),
                     };
+                    let opened_id = match &reply {
+                        Ok(Reply::Opened { id, .. }) => Some(*id),
+                        _ => None,
+                    };
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-opened", guard_pid, id, None);
+                    }
                     // The person chose to open a link outside the App. The browser
                     // runs with its profile's HOME and XDG directories, so the App
                     // opens it with the person's own desktop; never a command reply.
@@ -1426,7 +1460,9 @@ impl Process {
                         }
                         Ok(Reply::QuitRequested { .. }) => {
                             if let Some(on_quit) = &on_quit {
+                                mac_open_trace("reader-quit-callback-begin", guard_pid, 0, None);
                                 on_quit();
+                                mac_open_trace("reader-quit-callback-return", guard_pid, 0, None);
                                 continue;
                             }
                             Err("Browser quit request has no App owner".to_string())
@@ -1446,12 +1482,24 @@ impl Process {
                             ..
                         }) => {
                             if let Some(on_event) = &on_permission_event {
+                                mac_open_trace(
+                                    "reader-permission-callback-begin",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
                                 on_event(PermissionEvent::Requested {
                                     prompt_id,
                                     origin,
                                     kind,
                                     permissions,
                                 });
+                                mac_open_trace(
+                                    "reader-permission-callback-return",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
                                 continue;
                             }
                             Err("Browser permission request has no App owner".to_string())
@@ -1461,7 +1509,19 @@ impl Process {
                         }
                         Ok(Reply::PermissionDismissed { prompt_id, .. }) => {
                             if let Some(on_event) = &on_permission_event {
+                                mac_open_trace(
+                                    "reader-permission-callback-begin",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
                                 on_event(PermissionEvent::Dismissed { prompt_id });
+                                mac_open_trace(
+                                    "reader-permission-callback-return",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
                                 continue;
                             }
                             Err("Browser permission dismissal has no App owner".to_string())
@@ -1469,7 +1529,14 @@ impl Process {
                         other => other,
                     };
                     let failed = reply.is_err();
-                    if send.send(reply).is_err() || failed {
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-enqueue-begin", guard_pid, id, None);
+                    }
+                    let sent = send.send(reply);
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-enqueue-return", guard_pid, id, Some(sent.is_ok()));
+                    }
+                    if sent.is_err() || failed {
                         break;
                     }
                 }
@@ -1568,6 +1635,9 @@ impl Process {
             if let Reply::Error { message, .. } = reply {
                 return Err(Wait::Rejected(message));
             }
+            if matches!(&reply, Reply::Opened { .. }) {
+                mac_open_trace("receive-opened-return", self.child.id(), id, Some(true));
+            }
             return Ok(reply);
         }
     }
@@ -1611,14 +1681,23 @@ impl Process {
                     && browser_id > 0
                     && window_id > 0
                     && native_pid > 0;
+                mac_open_trace("identity-begin", self.child.id(), self.next, None);
                 #[cfg(not(target_os = "macos"))]
                 let owned = fields_match && native_owned(native_pid, &self.child, &self.program);
                 #[cfg(target_os = "macos")]
                 let owned = fields_match
                     && native_owned(native_pid, &self.child, &self.program, &self.executable);
+                mac_open_trace("identity-return", self.child.id(), self.next, Some(owned));
+                mac_open_trace("cache-path-begin", self.child.id(), self.next, None);
                 let cache_matches = same_path(
                     &cache_path,
                     &self.directory.join("cef-profiles").join(&self.profile),
+                );
+                mac_open_trace(
+                    "cache-path-return",
+                    self.child.id(),
+                    self.next,
+                    Some(cache_matches),
                 );
                 if !owned || !cache_matches {
                     #[cfg(target_os = "macos")]
@@ -1638,6 +1717,12 @@ impl Process {
                 }
                 self.opened = serde_json::json!({"key":actual,"profile":profile,"browserId":browser_id,"nativeCache":cache_path,"windowId":window_id,"nativePid":native_pid});
                 self.opening = None;
+                mac_open_trace(
+                    "confirm-opened-return",
+                    self.child.id(),
+                    self.next,
+                    Some(true),
+                );
                 Ok(())
             }
             _ => Err(Error::InvalidRequest(
@@ -1646,6 +1731,7 @@ impl Process {
         }
     }
     fn open(&mut self, payload: OpenRequest) -> Result<()> {
+        mac_open_trace("process-open-enter", self.child.id(), 0, None);
         if self.uncertain {
             // A command whose deadline passed may already have its reply
             // queued: settle it once before refusing, without sending
@@ -1678,10 +1764,13 @@ impl Process {
         {
             self.foreground_grant = Some(windows::allow_foreground(pid));
         }
+        mac_open_trace("send-open-begin", self.child.id(), id, None);
         if let Err(error) = self.send(Request::Open { id, payload }, deadline) {
+            mac_open_trace("send-open-return", self.child.id(), id, Some(false));
             self.uncertain = true;
             return Err(error);
         }
+        mac_open_trace("send-open-return", self.child.id(), id, Some(true));
         self.expect_open_until(id, &key, deadline)
     }
     /// The App's answer to one held permission prompt (an `Requested`
