@@ -81,8 +81,17 @@ live documents across profiles, whole-App/OS-crash recovery or unsaved writes
 surviving eviction. Real IdP, physical devices, files/notifications, signing,
 distribution and updates remain separate.
 
-CI runs the case independently of the download fixture after the SDK step
-succeeds. It retains the Mac job's 60-minute cap and adds a 20-minute case;
-the preceding observed Mac job took 25m18s. That measurement is capacity
-planning, not a guarantee or permission to widen deadlines. The harness
-controls are SDK-free and cannot qualify native behavior.
+CI now moves the SDK build and this case into their own `macos-26-intel` job.
+The standalone download case remains in the desktop Mac job. GitHub-hosted
+[jobs use separate VMs](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners),
+so a preceding download case's interrupted CLI or CoreSimulator service state
+is not this case's setup. It builds the SDK once on the same host as its
+installed-byte checks; no App bundle or Simulator state crosses jobs. Existing
+compiler cache is restored read-only, with no additional cache writer.
+
+The 60-minute job, 25-minute SDK and 20-minute case caps remain unchanged, as
+do the boot/trust limits, ownership checks and strict UI/cleanup verdicts.
+This is a source candidate after run43279856761's whole-App boot failed
+following a download case that passed but retained interrupted-setup scratch.
+The cause of that boot failure remains unknown. Separate hosts do not guarantee
+boot success. The SDK-free harness controls cannot qualify native behavior.

@@ -147,19 +147,19 @@ The normal kit Apple push writer runs again after regeneration; the development
 entitlement must survive before compilation. This is wiring evidence, not push delivery.
 It requires one nonempty Simulator `.app` with the exact fixture identifier
 and Simulator platform, rejects a device IPA, and prints the executable digest.
-CI runs this after the macOS desktop compile, serialized with the other desktop
-SDK checks. The desktop matrix waits for the native job to finish but still
-runs if that independent job fails; a native failure keeps the workflow red.
-Quality failure or workflow cancellation prevents the matrix from running.
+CI builds this SDK in the whole-App job, separate from the desktop matrix and
+its standalone download case. Both jobs wait for `native-plugins` and still
+run if that job fails, provided Quality passed; the native failure stays red.
+Quality failure or workflow cancellation prevents these jobs from running.
 The SDK lane uses the standard `macos-26-intel` runner after hosted arm64
 capacity prevented job acquisition. It compiles the host's x86_64 Simulator
 target; Apple Silicon/iOS device runtime remains separate qualification.
 This is an SDK compile check: it does not install or launch the App,
 test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
 Simulator/device runtime checks remain separate from the portable Swift policy tests.
-Compiler caches are saved after non-cancelled SDK failures as well as success,
-so a source repair can reuse completed compilation. Failed checks stay failed;
-cached compiler files are not accepted App artifacts or runtime evidence.
+The SDK/whole-App job restores the existing desktop compiler cache read-only,
+without another cache writer. Failed checks stay failed; cached compiler
+files are not accepted App artifacts or runtime evidence.
 
 The separate [whole-App Web-home fixture](ios/web-home-fixture/README.md) is
 a source candidate that installs this exact Simulator App and drives its
@@ -227,7 +227,8 @@ are gone. Unreaped commands also force failure; neither case authorizes group
 signals or deleting a potentially live build directory.
 Its small host compiles the product coordinator, navigator, policy and download
 owner directly; only the unused Tauri shell signal is replaced with a refusal.
-The existing desktop macOS CI job runs it after the whole App SDK build.
+The desktop macOS CI job runs this case independently of the SDK/whole-App
+job. Each case creates and retires its own Simulator on its own CI host.
 
 The disposable host supplies an explicit `Info.plist` with Boolean file-sharing
 and opening-in-place keys, merged with Xcode's generated bundle fields. XCTest

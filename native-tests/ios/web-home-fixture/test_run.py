@@ -26,6 +26,29 @@ class Controls(unittest.TestCase):
         self.assertFalse(parent.is_relative_to(runner.ROOT), "Private mock material belongs outside the repository")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=parent)))
 
+    def test_whole_app_build_and_ui_use_one_ci_host_independent_of_download(self):
+        workflow = (runner.ROOT / ".github/workflows/ci.yml").read_text().split("\njobs:\n", 1)[1]
+        starts = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", workflow))
+        jobs = {start[1]: workflow[start.end():starts[i + 1].start() if i + 1 < len(starts) else len(workflow)]
+                for i, start in enumerate(starts)}
+        sdk = "run: bash native-tests/ios/build-simulator.sh"
+        ui = "run: python3 -B native-tests/ios/web-home-fixture/run.py"
+        download = "run: python3 -B native-tests/ios/download-fixture/run.py"
+        self.assertEqual([workflow.count(command) for command in (sdk, ui, download)], [1, 1, 1],
+                         "Build and each native case must execute exactly once")
+        owners = [[name for name, body in jobs.items() if command in body] for command in (sdk, ui, download)]
+        self.assertEqual([len(names) for names in owners], [1, 1, 1], "Each native command needs one owning job")
+        self.assertEqual(owners[0], owners[1], "The UI must bind the SDK built in its own job")
+        self.assertNotEqual(owners[1], owners[2], "Whole App and download must not share a host/CoreSimulator service")
+        body = jobs[owners[1][0]]
+        self.assertIn("runs-on: macos-26-intel", body)
+        self.assertNotRegex(body, r"(?m)^    strategy:", "A matrix must not repeat the whole-App case")
+        self.assertLess(body.index(sdk), body.index(ui))
+        self.assertIn("steps.ios-sdk.outcome == 'success'", body)
+        self.assertIn("name: ios-app-swift-runtime", body)
+        self.assertIn("name: ios-whole-app-web-home", body)
+        self.assertNotIn("actions/download-artifact@", body, "Keep SDK input and installed-App readback on one host")
+
     def app(self, root=None):
         root = root or self.root / "build"
         app = root / "Takosumi.app"
