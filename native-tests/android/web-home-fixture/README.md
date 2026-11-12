@@ -43,10 +43,12 @@ an attempt count, monotonic milliseconds, pixel bounds and booleans, without
 input values or selectors. It adds no UI read, tap, retry, fallback or longer
 wait. A setText return does not confirm the field value. Click wrapper times
 do not prove actual input down/up delivery or JavaScript submit receipt.
-This is a source candidate following run43279856761: the final image showed
-text selection on Save, but could not establish why the first Web page was
-not reached. Driver Java compilation has passed; native collection of this
-connection-add trace remains pending because the next run stopped in setup.
+The trace follows run43279856761, whose final image showed text selection
+on Save without establishing why the first Web page was not reached.
+Run43305494368 collected the trace in the installed App, then reached Work
+Web login, home, Notes/draft and native Back/Home before the saved-row lookup
+failure described above. Its Save click wrapper returned in 64ms; the later
+Web/UI assertions establish that run's progress, not the wrapper timing alone.
 
 Run43297320017 installed and launched the actual App, but failed the initial
 form check before connection-add. Its final screenshot/hierarchy show the
@@ -62,6 +64,9 @@ or failed diagnostics preserve the original failure and cannot pass the UI.
 The saved summary and newest trace file may concern different ANRs; their
 process identities and timestamps must match before attributing a cause.
 No dialog is dismissed, test retried, oracle relaxed or UI wait extended.
+Run43305494368 collected both bounded queries without truncation; each said
+that no ANR had occurred since boot. This does not establish the earlier ANR's
+cause or prove it repaired.
 
 The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's
