@@ -91,13 +91,16 @@ Its guard/adapter are covered by M2 component tests. The explicit
 adds the shared home/profile flow on macOS 14+; its native qualification is
 limited to anonymous Excalidraw/Photopea fixtures. Both passed all three
 launches in [CI43195505965](https://github.com/tako0614/takosumi-mobile/actions/runs/43195505965).
-The earlier intermittent ordinary-shutdown failure remains unresolved.
+The intermittent ordinary-shutdown failure remains unresolved: a later
+unbundled Photopea run returned normally from the browser root but left
+helpers requiring forced cleanup.
 The [macOS packaging candidate (M4)](native-tests/cef-candidate/README.md#macos-packaging-m4)
-places that browser and guard in the Tauri App's own resources. That run built
-both local debug `.app` bundles and passed the embedded product-browser
-sandbox smoke and packaged Excalidraw's three-launch home/profile flow.
-Packaged Photopea is a follow-up check; signing and distribution remain
-separate release work.
+places that browser and guard in the Tauri App's own resources. The local
+debug `.app` builds and embedded product-browser sandbox smoke passed.
+Packaged Excalidraw and Photopea each passed the three-launch home/profile
+flow with normal inner/outer receipts in
+[CI43202312305](https://github.com/tako0614/takosumi-mobile/actions/runs/43202312305).
+Signing and distribution remain separate release work.
 
 On Linux/Windows with `desktop-cef`, opening a saved connection after its browser
 crashes can offer **保存データを保持して開き直す** on the home. This explicit action
@@ -122,8 +125,10 @@ and OS export. It keeps the originating profile and does not reopen the URL
 in Safari or copy cookies. The standalone native host compiling these product
 sources passed on an iOS 26.5 / iPhone 11 Simulator: original Cookie/Blob
 exports, profile isolation, close during transfer/export, and owned temporary
-file cleanup. Whole-App UI, real IdP, physical-device and background/crash
-behavior remain unqualified. See the
+file cleanup. A later run failed after Save to Files while the real Files
+picker remained visible; export reliability is still open. Whole-App UI,
+real IdP, physical-device and background/crash behavior remain unqualified.
+See the
 [download contract](src-tauri/plugins/app-screen/README.md#ios-web-home-downloads)
 and [runtime fixture](native-tests/README.md#ios-download-runtime-qualification).
 

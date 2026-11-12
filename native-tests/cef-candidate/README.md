@@ -2701,8 +2701,14 @@ accepted the site's own uniform Loading backdrop, corrected by 03b33c3.
 
 ## macOS packaging (M4)
 
-Source candidate; packaged native qualification is pending. On a prepared Mac
-with at least 8 GiB free, use the same CEF SDK and target as the M1 build:
+The embedded product-browser sandbox smoke passed. The packaged fixture's
+anonymous Excalidraw and Photopea home/profile flows each passed all three
+launches with normal inner/outer receipts in
+[CI43202312305](https://github.com/tako0614/takosumi-mobile/actions/runs/43202312305).
+This is local debug bundle evidence. Intermittent unbundled Photopea helper
+retirement failures remain unresolved; these passes do not establish their
+repair or qualify signing/distribution. On a prepared Mac with at least
+8 GiB free, use the same CEF SDK and target as the M1 build:
 
 ```bash
 CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper --bin takosumi-browser-guard
@@ -2753,8 +2759,8 @@ per-user runtime directory, and attests the opened browser and guard against
 those exact packaged executables. The same isolation, reuse, sequential quit,
 restart, clear and normal inner/outer receipt assertions still apply. The
 original unbundled M3 flows remain separate, so a packaging failure cannot
-replace their results. Packaged Photopea, ordinary product home rendering,
-OS focus, physical-device use and release signing remain unqualified.
+replace their results. Ordinary product home rendering, OS focus,
+physical-device use and release signing remain unqualified.
 
 ## Observations and limits
 
