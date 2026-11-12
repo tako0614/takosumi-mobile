@@ -2718,6 +2718,15 @@ The minimum macOS version is 14, as required by the shared home data stores.
 The `.app` is a local debug artifact; Developer ID signing, notarization,
 distribution and updates remain separate release work.
 
+The browser sets CEF's `main_bundle_path` to its own enclosing
+`Contents/MacOS` bundle. In this CEF version the empty default uses Chromium's
+outermost `.app`, which would select the Tauri App and search for the browser's
+framework and helpers there. CEF passes the explicit bundle path to its
+helpers. See [CEF's bundle lookup](https://github.com/chromiumembedded/cef/blob/14c5a08/libcef/common/util_mac.mm#L116)
+and [Chromium's outermost lookup](https://github.com/chromium/chromium/blob/154.0.8037.98/base/apple/foundation_util.mm#L154).
+The SDK-free `mac_bundle.rs` controls cover both standalone and nested paths;
+the embedded sandbox smoke and packaged App flow remain the native oracles.
+
 `--with-guard` checks the guard's thin Mach-O architecture against the browser
 before any copy, refuses a missing or linked guard, and never overwrites the
 output. `bundle.json` records the guard's own bytes/mode/hash separately from

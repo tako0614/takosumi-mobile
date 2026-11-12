@@ -48,6 +48,10 @@ pub(crate) mod mac_front;
 #[path = "mac_lifecycle.rs"]
 mod mac_lifecycle;
 
+#[cfg(target_os = "macos")]
+#[path = "mac_bundle.rs"]
+mod mac_bundle;
+
 #[cfg(feature = "fixture-inspection")]
 #[path = "download_observation.rs"]
 mod download_observation;
@@ -1577,8 +1581,17 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         }))
     });
     let port = inspection_port(&directory);
+    #[cfg(target_os = "macos")]
+    let executable = std::env::current_exe().expect("The browser executable's path");
+    #[cfg(target_os = "macos")]
+    let main_bundle = mac_bundle::browser_bundle(&executable)
+        .expect("The browser must run from its own app bundle's Contents/MacOS");
     let settings = Settings {
         no_sandbox: i32::from(without_sandbox(std::env::args_os().skip(1))),
+        // CEF propagates this setting to every helper. Its default searches
+        // the outermost .app, which is the Tauri App in a packaged build.
+        #[cfg(target_os = "macos")]
+        main_bundle_path: CefString::from(main_bundle.to_str().expect("UTF-8 browser bundle")),
         root_cache_path: CefString::from(cache.to_str().unwrap()),
         log_file: CefString::from(directory.join("cef-native.log").to_str().unwrap()),
         remote_debugging_port: port,

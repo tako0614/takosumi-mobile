@@ -183,6 +183,12 @@ jobs:
             target-plugins
           key: native-plugins-cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/plugins/*/Cargo.toml') }}
           restore-keys: native-plugins-cargo-${{ runner.os }}-
+      - name: macOS browser bundle path controls (no Mac SDK)
+        shell: bash
+        run: |
+          rustc --edition=2021 --test native-tests/cef-candidate/src/mac_bundle.rs -o "$RUNNER_TEMP/mac-bundle-tests"
+          "$RUNNER_TEMP/mac-bundle-tests" | tee "$RUNNER_TEMP/mac-bundle-tests.log"
+          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/mac-bundle-tests.log"
       - name: cargo test (takosumi-push, app-screen)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target-plugins
