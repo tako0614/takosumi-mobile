@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -93,6 +93,76 @@ class Controls(unittest.TestCase):
                              ("rootExit", -15), ("forcedCleanup", 1)):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 runner.receipt(dict(value, **{key: changed}), normal=True)
+
+    def emulator_process_fixture(self):
+        emulator = runner.Emulator.__new__(runner.Emulator)
+        emulator.sdk = self.root / "sdk"
+        emulator.name = "sumi-whole-app-synthetic"
+        emulator.birth = 100
+        emulator.process = Mock(pid=100, poll=Mock(return_value=None))
+        image = emulator.sdk / "emulator/qemu/linux-x86_64/qemu-system-x86_64"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"synthetic SDK image")
+        guard = self.root / "sumi-android-emulator-guard"
+        guard.write_bytes(b"synthetic guard")
+        proc = self.root / "proc"
+        argv = [b"-avd", emulator.name.encode(), b"-port", b"5582"]
+        for pid, executable, arguments in (
+                (100, guard, [str(guard).encode(), b"guard.json", str(image).encode(), *argv]),
+                (200, image, [str(image).encode(), *argv])):
+            entry = proc / str(pid)
+            entry.mkdir(parents=True)
+            (entry / "exe").symlink_to(executable)
+            (entry / "cmdline").write_bytes(b"\0".join(arguments) + b"\0")
+        identities = {100: (os.getpid(), 100), 200: (100, 200)}
+        return emulator, proc, identities
+
+    def test_emulator_guard_forwarded_argv_is_not_an_sdk_child(self):
+        emulator, proc, identities = self.emulator_process_fixture()
+        with patch.object(runner, "Path", return_value=proc), \
+                patch.object(runner, "identity", side_effect=identities.__getitem__):
+            emulator.owned_process()
+
+    def test_guard_argv_alone_cannot_establish_emulator_ownership(self):
+        emulator, proc, identities = self.emulator_process_fixture()
+        (proc / "200").rename(proc / "not-a-process")
+        with patch.object(runner, "Path", return_value=proc), \
+                patch.object(runner, "identity", side_effect=identities.__getitem__), \
+                self.assertRaisesRegex(RuntimeError, "No SDK emulator"):
+            emulator.owned_process()
+
+    def test_matching_emulator_still_requires_sdk_image_and_guard_ancestry(self):
+        emulator, proc, identities = self.emulator_process_fixture()
+        image = proc / "200/exe"
+        original = image.resolve(strict=True)
+        foreign = self.root / "foreign-image"
+        foreign.write_bytes(b"foreign")
+        with patch.object(runner, "Path", return_value=proc), \
+                patch.object(runner, "identity", side_effect=identities.__getitem__):
+            image.unlink()
+            image.symlink_to(foreign)
+            with self.assertRaisesRegex(RuntimeError, "outside the SDK emulator"):
+                emulator.owned_process()
+            image.unlink()
+            image.symlink_to(original)
+            identities[200] = (1, 200)
+            with self.assertRaisesRegex(RuntimeError, "Foreign emulator ancestry"):
+                emulator.owned_process()
+
+    def test_recycled_emulator_birth_cannot_pass_ownership_readback(self):
+        emulator, proc, identities = self.emulator_process_fixture()
+        reads = 0
+        def identity(pid):
+            nonlocal reads
+            if pid == 200:
+                reads += 1
+                if reads > 1:
+                    return 100, 201
+            return identities[pid]
+        with patch.object(runner, "Path", return_value=proc), \
+                patch.object(runner, "identity", side_effect=identity), \
+                self.assertRaisesRegex(RuntimeError, "Unstable emulator ancestry"):
+            emulator.owned_process()
 
     def network(self, config=CONFIG, table=TABLE, cert=CERT, tree=XMLTREE):
         app = ET.Element("application", {ANDROID + "networkSecurityConfig": "@ref/0x7f120003"})

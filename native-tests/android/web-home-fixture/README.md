@@ -31,8 +31,10 @@ compiled text was absent remained unproven. A separate aapt2 XML-tree decoder
 now binds actual text to the same two domain leaves. Missing, conflicting,
 foreign, duplicate or misplaced text is refused; expected hosts are never
 used to fill omitted data. Structure/attribute/resource/CA checks remain.
-This repair still requires native SDK execution. The rebuild must retain the
-normal Cargo App library bytes. APK hash, installed base-APK hash, source
+The actual XML/CA checks and unchanged Cargo App bytes passed in
+[CI43265225919](https://github.com/tako0614/takosumi-mobile/actions/runs/43265225919).
+That run stopped during emulator ownership setup before App installation or UI.
+The rebuild must retain the normal Cargo App library bytes. APK hash, installed base-APK hash, source
 head/tree and Kit head bind the actual UI to the build; the normal SDK APK
 is backed up privately and restored only after safe shutdown and unchanged
 manifest/resource custody. Interrupted CLI descendants are not assumed idle:
@@ -53,6 +55,9 @@ compiling CEF/Tauri a second time. A fresh private AVD home, unique AVD name,
 explicit serial/ports, stable process birth/SDK executable/guard ancestry and
 ADB AVD-name readback are required before device operations. Success requires
 normal emulator exit, no forced cleanup and the guard's kernel ECHILD proof.
+The known guard PID remains the ancestry root even though its command line
+forwards the same AVD arguments; it cannot stand in for an SDK child. The
+ownership repair is covered by SDK-free controls and still needs native execution.
 The existing shared adb service is outside that scope and is never killed.
 The host must have no preexisting Android device; no foreign emulator is
 stopped. A failed/incomplete drain retains scratch and cannot pass.

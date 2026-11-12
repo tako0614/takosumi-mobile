@@ -217,6 +217,11 @@ class Emulator:
                 continue
             try:
                 pid = int(entry.name)
+                # The owned guard forwards these same -avd/-port arguments.
+                # Its live birth was checked above; it is the ancestry root,
+                # never a candidate SDK emulator process.
+                if pid == self.process.pid:
+                    continue
                 before = identity(pid)
                 words = (entry / "cmdline").read_bytes().split(b"\0")
                 if b"-avd" not in words or self.name.encode() not in words:
