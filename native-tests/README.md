@@ -772,6 +772,11 @@ or iOS data-store isolation. WKWebView/device qualification remains necessary.
 ## Profile data reset candidate
 
 The shared WebHome confirmation has a separate actual-browser component test.
+It also controls deferred permission-list and answer replies around live events
+in the real shared UI: a late snapshot must not hide the next held prompt,
+transport failure keeps the prompt available for an explicit retry, and retired
+listeners/snapshots cannot restore the permission panel. The permission adapter
+is synthetic; these cases do not grant a native permission or qualify OS prompts.
 From the product root on Linux, with modern Node (22.12+), Python with pidfd
 support, the existing dependencies and an installed Chrome:
 

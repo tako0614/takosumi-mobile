@@ -165,11 +165,50 @@ try {
   const final = await evaluate("resetFixture.snapshot()");
   assert.equal(final.clears.length, 3, "Removing settings started another deletion");
   assert.deepEqual(final.saved, initial.slice(1), "Removing one setting changed another profile");
+
+  const firstPrompt = { profile: initial[1].profile, promptId: 71, origin: "https://permission-first.example", kind: "prompt", permissions: 1 << 15 };
+  const nextPrompt = { ...firstPrompt, promptId: 72, origin: "https://permission-next.example" };
+  const permissionPanel = "document.querySelector('section[aria-labelledby=permissions-heading]')";
+  await evaluate("resetFixture.permissions.begin()");
+  await check("resetFixture.permissions.snapshot().listing", "Initial permission snapshot was not requested");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(firstPrompt)}])`);
+  await check(`${permissionPanel}?.textContent.includes('permission-first.example')`, "Live permission prompt did not render");
+  await evaluate("resetFixture.permissions.finishList([])");
+  await check(`${permissionPanel}?.textContent.includes('permission-first.example')`, "Late initial snapshot hid a newer permission prompt");
+
+  await evaluate(`${permissionPanel}.querySelectorAll('button')[1].click()`);
+  await check("resetFixture.permissions.snapshot().answering", "Permission answer did not reach its adapter");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(nextPrompt)}])`);
+  await evaluate("resetFixture.permissions.finishAnswer([])");
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example')`, "Late answer snapshot hid the next permission prompt");
+  await evaluate(`${permissionPanel}.querySelector('button').click()`);
+  await evaluate("resetFixture.permissions.failAnswer()");
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example') && document.querySelector('[role=alert]').textContent === 'Synthetic permission transport refusal'`, "Answer failure hid the held prompt or its cause");
+  await evaluate(`${permissionPanel}.querySelector('button').click()`);
+  await evaluate("resetFixture.permissions.finishAnswer([])");
+  await check(`!${permissionPanel}`, "Successful answer did not retire its prompt");
+  assert.deepEqual(await evaluate("resetFixture.permissions.snapshot().answers"), [
+    { prompt: firstPrompt, decision: "allow" }, { prompt: nextPrompt, decision: "deny" }, { prompt: nextPrompt, decision: "deny" },
+  ], "The shared UI answered the wrong held prompt or retried automatically");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(firstPrompt)}])`);
+  await check(`!${permissionPanel}`, "An already queued callback revived a retired permission surface");
+
+  await evaluate("resetFixture.permissions.begin()");
+  await evaluate(`resetFixture.permissions.finishList([${JSON.stringify(nextPrompt)}])`);
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example')`, "Initial snapshot without a competing event was ignored");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate("resetFixture.permissions.begin()");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate(`resetFixture.permissions.finishList([${JSON.stringify(firstPrompt)}])`);
+  await check(`!${permissionPanel}`, "A late snapshot revived a retired permission surface");
+  await check("resetFixture.permissions.snapshot().unlistened === 3", "Permission registrations were not released exactly once");
   assert.equal(errors.length, 0, JSON.stringify(errors));
   assert.deepEqual(await sourceHashes(), before, "Fixture or shared source changed during the run");
-  finalReceipt = { result: "pass", component: "shared WebHome + clear request adapter",
-    native: "synthetic, no engine deletion", node: process.version, browser: version, sourceHashes: before,
-    cases: ["shared clear hidden", "confirmation lock", "cancel", "pending", "false receipt", "completed receipt", "native refusal", "preference removal"], final };
+  finalReceipt = { result: "pass", component: "shared WebHome + clear and permission adapters",
+    native: "synthetic, no engine deletion or native permission", node: process.version, browser: version, sourceHashes: before,
+    cases: ["shared clear hidden", "confirmation lock", "cancel", "pending", "false receipt", "completed receipt", "native refusal", "preference removal",
+      "permission initial snapshot ordering", "permission answer ordering", "permission failure and explicit retry", "retired permission callbacks and snapshots"], final };
  } catch (error) {
   testError = error;
   throw error;
@@ -202,4 +241,4 @@ try {
 }
 assert(finalReceipt && lifecycle, "No completed UI and browser lifecycle receipt");
 await writeFile(`${output}/receipt.json`, JSON.stringify({ ...finalReceipt, lifecycle, privateProfileRemoved: true }, null, 2));
-console.log("PASS: real shared WebHome confirmation/cancel/pending/failure/completion; native deletion is simulated");
+console.log("PASS: real shared WebHome clear and permission ordering/error/retirement; native adapters are simulated");

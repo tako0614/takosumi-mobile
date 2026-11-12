@@ -30,6 +30,7 @@ export function WebHome(props: {
   const [recovery, setRecovery] = createSignal<{ connection: WebConnection; ticket: BrowserRecoveryRequired }>();
   const [pendingPermissions, setPendingPermissions] = createSignal<readonly PendingPermission[]>([]);
   const [answering, setAnswering] = createSignal<string>();
+  let permissionRevision = 0;
   createEffect(() => {
     const prompts = props.permissionPrompts;
     if (!prompts) {
@@ -39,11 +40,14 @@ export function WebHome(props: {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void (async () => {
-      // Subscribe before the snapshot: an emit during the first list() call
-      // reaches the live listener, and the later snapshot overwrites with
-      // state at least as new. A failed subscription still gets the snapshot.
+      // Subscribe before the snapshot, but do not let a delayed reply replace
+      // an event received since that request. A failed watch still gets a list.
       try {
-        const release = await prompts.watch(setPendingPermissions);
+        const release = await prompts.watch((list) => {
+          if (disposed) return;
+          permissionRevision += 1;
+          setPendingPermissions(list);
+        });
         if (disposed) {
           release();
           return;
@@ -51,12 +55,14 @@ export function WebHome(props: {
         unlisten = release;
       } catch { /* Live updates are unavailable; the snapshot still applies. */ }
       try {
+        const revision = permissionRevision;
         const list = await prompts.list();
-        if (!disposed) setPendingPermissions(list);
+        if (!disposed && revision === permissionRevision) setPendingPermissions(list);
       } catch { /* An unavailable surface shows no prompts. */ }
     })();
     onCleanup(() => {
       disposed = true;
+      permissionRevision += 1;
       unlisten?.();
     });
   });
@@ -161,10 +167,12 @@ export function WebHome(props: {
   async function answer(prompt: PendingPermission, decision: PermissionAnswer) {
     const prompts = props.permissionPrompts;
     if (!prompts || answering() !== undefined) return;
+    const revision = ++permissionRevision;
     setAnswering(`${prompt.profile}:${prompt.promptId}`);
     setError("");
     try {
-      setPendingPermissions(await prompts.answer(prompt, decision));
+      const list = await prompts.answer(prompt, decision);
+      if (revision === permissionRevision) setPendingPermissions(list);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "許可設定を登録できませんでした。");
     } finally {
