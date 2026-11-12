@@ -124,8 +124,8 @@ final class DownloadUITests: XCTestCase {
     }
 
     private func closeScreen() {
-        XCTAssertFalse(filesExists({ $0.otherElements["Browse View (Picker)"].firstMatch }),
-                       "Cannot close the App screen while the real Files picker still owns the UI")
+        XCTAssertFalse(exportSurfaceBlocksHost(),
+                       "Cannot close the App screen while the OS export surface still blocks the host")
         let close = app.buttons["閉じる"].firstMatch
         XCTAssertTrue(close.waitForExistence(timeout: 10), "The screen's own close control is missing")
         // An OS export surface can still be dismissing when the element
@@ -262,13 +262,41 @@ final class DownloadUITests: XCTestCase {
 
     private func waitForFilesDismissal() {
         // The underlying close button exists while Files still covers it
-        // (43202312305). Save must dismiss the actual picker before a later
-        // Close tap can exercise the product; keep the same return bound.
+        // (43202312305). Save must return control to the native host before
+        // a later Close tap exercises the product; keep the same bound.
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            !filesExists({ $0.otherElements["Browse View (Picker)"].firstMatch })
+            !exportSurfaceBlocksHost()
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed,
-                       "Save did not dismiss the real Files picker")
+                       "Save did not return control from the OS export surface")
+    }
+
+    private func exportSurfaces(_ host: XCUIApplication) -> XCUIElementQuery {
+        let names = ["Browse View (Picker)", "ActivityListView"] as NSArray
+        return host.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier IN %@ OR label IN %@ OR elementType == %d",
+            names, names, XCUIElement.ElementType.popover.rawValue))
+    }
+
+    private func exportSurfaceBlocksHost() -> Bool {
+        // 43224385576: the Blob picker visibly dismissed inside this wait,
+        // yet the absence gate still matched. Provider AX retention is an
+        // inference; that run did not record its teardown hierarchy. Host
+        // absence alone is insufficient: that remote picker was absent there even
+        // while visible. Keep any host surface blocking; provider-only AX
+        // can stop blocking only with a positive native-host return and no
+        // interactive provider surface. Non-hittable alone proves nothing.
+        if exportSurfaces(app).firstMatch.exists { return true }
+        let provider = exportSurfaces(filesApp).allElementsBoundByIndex
+        if provider.isEmpty { return false }
+        let close = app.buttons["閉じる"].firstMatch
+        guard app.state == .runningForeground && close.exists && close.isEnabled && close.isHittable else {
+            return true
+        }
+        return provider.contains { surface in
+            surface.isHittable || surface.descendants(matching: .any)
+                .allElementsBoundByIndex.contains { $0.isHittable }
+        }
     }
 
     // The iOS 26 Files export picker is hosted by com.apple.DocumentsApp. Its
