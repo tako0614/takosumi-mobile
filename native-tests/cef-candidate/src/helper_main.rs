@@ -32,7 +32,12 @@ fn main() {
         eprintln!("takosumi-cef-browser-helper: the CEF framework did not load");
         std::process::exit(1);
     }
+    // A surviving helper-enter alone does not prove that CEF was entered:
+    // framework loading and API setup happen first. Keep these boundaries
+    // distinct when the root returns while an owned renderer remains.
+    mac_lifecycle::record("helper-framework-loaded", role, None);
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+    mac_lifecycle::record("helper-cef-enter", role, None);
     let code = cef::execute_process(
         Some(args.as_main_args()),
         None::<&mut cef::App>,
