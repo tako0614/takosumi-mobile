@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -24,6 +25,36 @@ class EvidenceTests(unittest.TestCase):
         self.guard.write_bytes(b"guard")
         self.browser_image = self.enterContext(runner.PinnedImage(self.browser))
         self.guard_image = self.enterContext(runner.PinnedImage(self.guard))
+
+    def test_packaged_executables_must_be_inside_the_apps_own_resources(self):
+        binary = Path("/Applications/Takosumi.app/Contents/MacOS/takosumi-mobile")
+        browser, guard = runner.packaged_files(binary)
+        cef = binary.parent.parent / "Resources/cef"
+        self.assertEqual(browser, cef / "takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process")
+        self.assertEqual(guard, cef / "takosumi-browser-guard")
+        for invalid in (Path("/tmp/takosumi-mobile"), Path("/tmp/package/Contents/MacOS/app"),
+                        Path("/Applications/Takosumi.app/MacOS/app")):
+            with self.assertRaises(runner.Failure):
+                runner.packaged_files(invalid)
+
+    def test_packaged_environment_cannot_use_inherited_executable_or_runtime_overrides(self):
+        args = SimpleNamespace(site="photopea", packaged=True, browser=Path("/explicit/browser"),
+                               guard=Path("/explicit/guard"))
+        base = {"PATH": "/usr/bin", "TAKOSUMI_BROWSER_PROCESS_PROGRAM": "/foreign/browser",
+                "TAKOSUMI_BROWSER_PROCESS_GUARD": "/foreign/guard",
+                "TAKOSUMI_BROWSER_PROCESS_RUNTIME": "/foreign/runtime",
+                "TAKOSUMI_BROWSER_PROCESS_PHASE": "foreign"}
+        env = runner.browser_env(base, args, self.root, self.root / "rt", "restart")
+        for key in ("PROGRAM", "GUARD", "RUNTIME"):
+            self.assertNotIn("TAKOSUMI_BROWSER_PROCESS_" + key, env)
+        self.assertEqual(env["PATH"], base["PATH"])
+        self.assertEqual(env["TAKOSUMI_BROWSER_PROCESS_PHASE"], "restart")
+        args.packaged = False
+        env = runner.browser_env(base, args, self.root, self.root / "rt", "")
+        self.assertEqual(env["TAKOSUMI_BROWSER_PROCESS_PROGRAM"], str(args.browser))
+        self.assertEqual(env["TAKOSUMI_BROWSER_PROCESS_GUARD"], str(args.guard))
+        self.assertEqual(env["TAKOSUMI_BROWSER_PROCESS_RUNTIME"], str(self.root / "rt"))
+        self.assertNotIn("TAKOSUMI_BROWSER_PROCESS_PHASE", env)
 
     def test_image_alias_accepts_hardlink_but_not_copy_replacement_or_missing(self):
         alias = self.root / "clone" / "browser"

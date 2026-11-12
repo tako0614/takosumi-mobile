@@ -14,7 +14,7 @@
 //     Frameworks/takosumi-cef-browser-process Helper (Plugin).app/...
 //     Frameworks/takosumi-cef-browser-process Helper (Alerts).app/...
 //
-//   node scripts/bundle-macos-cef.mjs --cef <dir with Chromium Embedded Framework.framework> --bin <build dir> --out <dir> [--fixture]
+//   node scripts/bundle-macos-cef.mjs --cef <dir with Chromium Embedded Framework.framework> --bin <build dir> --out <dir> [--fixture] [--with-guard]
 //
 // `--cef` is the distribution cef-dll-sys unpacks into CEF_PATH
 // (`<version>/cef_macos_aarch64`: the Release directory, where the framework
@@ -26,6 +26,10 @@
 // Info.plist files among them, each symbolic link's target, the
 // architecture) must not exist yet: nothing is replaced or removed, and
 // every check runs before anything is written.
+// `--with-guard` also copies the same-architecture takosumi-browser-guard
+// beside the app bundle, recording its own size/mode/hash. For Tauri's
+// product resources use --out src-tauri/target/macos-cef/cef, mapped by
+// tauri.macos-cef.conf.json; fixture stages use macos-cef-fixture instead.
 //
 // Every helper app holds a copy of the same helper executable under its
 // own name; CEF finds them by the browser executable's name. The framework
@@ -72,6 +76,7 @@ import { fileURLToPath } from "node:url";
 
 export const BROWSER = "takosumi-cef-browser-process";
 export const HELPER = "takosumi-cef-browser-helper";
+export const GUARD = "takosumi-browser-guard";
 export const FRAMEWORK = "Chromium Embedded Framework.framework";
 export const FRAMEWORK_BINARY = "Chromium Embedded Framework";
 export const SANDBOX_LIBRARY = "Libraries/libcef_sandbox.dylib";
@@ -85,6 +90,7 @@ export const HELPERS = [
 ];
 export const IDENTIFIER = "com.takosumi.cef-browser";
 const INSPECTION_SEAM = Buffer.from("TAKOSUMI_BROWSER_PROCESS_INSPECT");
+const PRODUCT_STAGE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src-tauri/target/macos-cef/cef");
 /** Mach-O CPU types (with CPU_ARCH_ABI64). */
 export const CPU = { 0x0100000c: "arm64", 0x01000007: "x86_64" };
 
@@ -92,17 +98,19 @@ function usage(message) {
   console.error(`bundle-macos-cef: ${message}`);
   console.error(
     `usage: bundle-macos-cef.mjs --cef <dir with ${FRAMEWORK}> --bin <dir with ${BROWSER} and ${HELPER}> ` +
-      "--out <dir> [--fixture]",
+      "--out <dir> [--fixture] [--with-guard]",
   );
   process.exit(2);
 }
 
 function parse(argv) {
-  const options = { fixture: false };
+  const options = { fixture: false, withGuard: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--fixture") {
       options.fixture = true;
+    } else if (flag === "--with-guard") {
+      options.withGuard = true;
     } else if (flag === "--cef" || flag === "--bin" || flag === "--out") {
       const value = argv[index + 1];
       if (!value) usage(`${flag} needs a directory`);
@@ -292,16 +300,24 @@ function copyExecutable(source, target, relative, entries) {
 
 function main() {
   const options = parse(process.argv.slice(2));
+  if (options.fixture) {
+    const output = destination(options.out);
+    const product = destination(PRODUCT_STAGE);
+    if (output === product || output.startsWith(product + path.sep)) {
+      usage("a fixture bundle is never written to the product stage path or beneath it; use target/macos-cef-fixture/cef instead");
+    }
+  }
   const cef = realpathSync(options.cef);
   const bin = realpathSync(options.bin);
   const app = path.join(options.out, `${BROWSER}.app`);
   const manifestPath = path.join(options.out, "bundle.json");
-  for (const existing of [app, manifestPath]) {
+  for (const existing of [app, manifestPath, ...(options.withGuard ? [path.join(options.out, GUARD)] : [])]) {
     if (existsSync(existing) || isLink(existing)) usage(`${existing} already exists; remove it yourself or choose another --out`);
   }
 
   const browser = requireFile(path.join(bin, BROWSER), `built ${BROWSER}`);
   const helper = requireFile(path.join(bin, HELPER), `built ${HELPER}`);
+  const guard = options.withGuard ? requireFile(path.join(bin, GUARD), `built ${GUARD}`) : null;
   const framework = path.join(cef, FRAMEWORK);
   if (!existsSync(framework) || isLink(framework) || !statSync(framework).isDirectory()) {
     usage(`${FRAMEWORK} not found in ${cef}`);
@@ -321,6 +337,12 @@ function main() {
   const arch = architectures.browser[0];
   if (architectures.helper[0] !== arch || !architectures.framework.includes(arch)) {
     usage(`one architecture is needed: browser ${arch}, helper ${architectures.helper}, framework ${architectures.framework}`);
+  }
+  if (guard) {
+    const found = architecturesOf(guard);
+    if (!found || found.length !== 1 || found[0] !== arch) {
+      usage(`the guard must be a thin ${arch} Mach-O executable: ${guard}`);
+    }
   }
 
   const inspectionSeam = readFileSync(browser).includes(INSPECTION_SEAM);
@@ -354,6 +376,8 @@ function main() {
     );
     copyExecutable(helper, path.join(helperContents, "MacOS", name), `Contents/Frameworks/${name}.app/Contents/MacOS/${name}`, entries);
   }
+  const guardEntries = [];
+  if (guard) copyExecutable(guard, path.join(options.out, GUARD), GUARD, guardEntries);
 
   let distribution = null;
   try {
@@ -371,9 +395,25 @@ function main() {
     helpers: HELPERS.map(({ suffix }) => `${BROWSER} Helper${suffix}.app`),
     cefDistribution: distribution,
     files: entries,
+    ...(guard ? { guard: guardEntries[0] } : {}),
   };
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
   console.log(`bundled ${app} (${arch}, ${entries.length} entries${options.fixture ? ", fixture" : ""})`);
+}
+
+/** Resolve existing parent links even when the output leaf does not exist. */
+function destination(file) {
+  let prefix = path.resolve(file);
+  const suffix = [];
+  for (;;) {
+    try {
+      return path.join(realpathSync(prefix), ...suffix);
+    } catch (error) {
+      if (error.code !== "ENOENT" || path.dirname(prefix) === prefix) throw error;
+      suffix.unshift(path.basename(prefix));
+      prefix = path.dirname(prefix);
+    }
+  }
 }
 
 // Run when started as a script (also through a symbolic link), not when a

@@ -479,11 +479,40 @@ def preserve_browser_logs(case, phase):
 
 def run(args):
     processes = Processes()
+    if args.packaged:
+        args.browser, args.guard = packaged_files(args.binary.resolve(strict=True))
     binary, browser, guard = (path.resolve(strict=True) for path in (args.binary, args.browser, args.guard))
+    args.browser, args.guard = browser, guard
     # Keep these open across all launches and sampling threads, before any
     # owned process starts. A later replacement cannot redefine the identity.
     with PinnedImage(binary) as app_image, PinnedImage(browser) as browser_image, PinnedImage(guard) as guard_image:
         return run_pinned(args, processes, binary, browser, guard, app_image, browser_image, guard_image)
+
+
+def packaged_files(binary):
+    """The paths the App resolves inside its own Tauri .app resources."""
+    contents = binary.parent.parent
+    require(binary.parent.name == "MacOS" and contents.name == "Contents"
+            and contents.parent.suffix == ".app", "A packaged App executable must be inside .app/Contents/MacOS")
+    cef = contents / "Resources" / "cef"
+    return (cef / "takosumi-cef-browser-process.app" / "Contents" / "MacOS" / "takosumi-cef-browser-process",
+            cef / "takosumi-browser-guard")
+
+
+def browser_env(base, args, case, runtime, phase):
+    env = {key: value for key, value in base.items()
+           if not key.upper().startswith("TAKOSUMI_BROWSER_PROCESS_")}
+    env.update(TAKOSUMI_BROWSER_PROCESS_CASE=str(case), TAKOSUMI_BROWSER_PROCESS_APP=args.site,
+               TAKOSUMI_BROWSER_PROCESS_REAL_SITE="1", TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
+               TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(case / "external-open.log"),
+               TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1")
+    if not args.packaged:
+        env.update(TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(args.browser),
+                   TAKOSUMI_BROWSER_PROCESS_GUARD=str(args.guard),
+                   TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime))
+    if phase:
+        env["TAKOSUMI_BROWSER_PROCESS_PHASE"] = phase
+    return env
 
 
 def run_pinned(args, processes, binary, browser, guard, app_image, browser_image, guard_image):
@@ -493,6 +522,7 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
     runtime = case / "rt"
     runtime.mkdir(mode=0o700)
     proof = {"passed": False, "scope": __doc__, "site": args.site, "case": str(case), "phases": [],
+             "packaged": args.packaged,
              "source": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip(),
              "executables": {str(path): digest(path) for path in (binary, browser, guard)}}
     print(f"M3 case: {case}", flush=True)
@@ -507,23 +537,10 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
         proof["systemQuitHelper"] = {"sourceSHA256": digest(quit_source), "binarySHA256": digest(quit_helper)}
         for phase in ("", "restart", "reset"):
             name = phase or "first"
-            env = dict(os.environ)
-            for key in tuple(env):
-                if key.startswith("TAKOSUMI_BROWSER_PROCESS_"):
-                    del env[key]
-            env.update(TAKOSUMI_BROWSER_PROCESS_CASE=str(case), TAKOSUMI_BROWSER_PROCESS_APP=args.site,
-                       TAKOSUMI_BROWSER_PROCESS_REAL_SITE="1", TAKOSUMI_BROWSER_PROCESS_PROGRAM=str(browser),
-                       TAKOSUMI_BROWSER_PROCESS_GUARD=str(guard), TAKOSUMI_BROWSER_PROCESS_RUNTIME=str(runtime),
-                       TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
-                       TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG=str(case / "external-open.log"),
-                       # The fixture browser carries the synthetic media
-                       # device: the App driver runs its media hold/retire
-                       # block; the in-process observer reads the same flag
-                       # from os.environ below.
-                       TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1")
+            env = browser_env(os.environ, args, case, runtime, phase)
+            # The fixture browser carries the synthetic media device. The
+            # in-process observer reads the same flag as the App driver.
             os.environ["TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL"] = "1"
-            if phase:
-                env["TAKOSUMI_BROWSER_PROCESS_PHASE"] = phase
             entry = {"name": name}
             proof["phases"].append(entry)
             outer_receipt = case / f"app-guard-{name}.json"
@@ -592,11 +609,17 @@ def run_pinned(args, processes, binary, browser, guard, app_image, browser_image
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--browser", required=True, type=Path)
-    parser.add_argument("--guard", required=True, type=Path)
+    parser.add_argument("--browser", type=Path)
+    parser.add_argument("--guard", type=Path)
+    parser.add_argument("--packaged", action="store_true",
+                        help="Resolve browser, guard and runtime from the App; pass no executable/runtime overrides")
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--site", required=True, choices=sorted(REAL_SITES))
     args = parser.parse_args()
+    if args.packaged and (args.browser or args.guard):
+        parser.error("--packaged cannot be combined with --browser or --guard")
+    if not args.packaged and (not args.browser or not args.guard):
+        parser.error("--browser and --guard are required without --packaged")
     require(sys.platform == "darwin", "The M3 native runner requires macOS")
     require(int(subprocess.check_output(["/usr/bin/sw_vers", "-productVersion"], text=True).split('.')[0]) >= 14,
             "The M3 isolated home store requires macOS 14+")

@@ -2699,6 +2699,53 @@ cause unresolved. The same run's Android job still failed at the Open tap
 stage (filePrompts=0); its retained screenshot proved the first paint gate
 accepted the site's own uniform Loading backdrop, corrected by 03b33c3.
 
+## macOS packaging (M4)
+
+Source candidate; packaged native qualification is pending. On a prepared Mac
+with at least 8 GiB free, use the same CEF SDK and target as the M1 build:
+
+```bash
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper --bin takosumi-browser-guard
+node scripts/bundle-macos-cef.mjs --with-guard --cef /absolute/owned/cef_macos_aarch64 --bin /absolute/owned/target/debug --out src-tauri/target/macos-cef/cef
+CARGO_TARGET_DIR=/absolute/owned/target bunx tauri build --ci --debug --bundles app --features desktop-cef --config src-tauri/tauri.macos-cef.conf.json
+```
+
+The overlay maps this stage to `Takosumi.app/Contents/Resources/cef/`. The
+existing adapter resolves the browser at
+`cef/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process`
+and the adjacent `cef/takosumi-browser-guard` without executable overrides.
+The minimum macOS version is 14, as required by the shared home data stores.
+The `.app` is a local debug artifact; Developer ID signing, notarization,
+distribution and updates remain separate release work.
+
+`--with-guard` checks the guard's thin Mach-O architecture against the browser
+before any copy, refuses a missing or linked guard, and never overwrites the
+output. `bundle.json` records the guard's own bytes/mode/hash separately from
+the nested browser app's entries. The existing framework link checks and
+fixture-inspection rejection still apply. These checks do not qualify a
+Mach-O's full linkability or native execution on a Linux test host.
+
+The explicit fixture overlay `tauri.macos-cef-fixture.conf.json` uses
+`src-tauri/target/macos-cef-fixture/cef`. A `--fixture` stage cannot be written
+to the product's stage directory or its descendants, including through existing parent links.
+The CI builds both `.app` artifacts, requires the same product guard in both
+stages, and runs the product browser from inside its packaged resources with
+the existing sandbox smoke. It then runs the packaged fixture's shared
+home/profile flow on anonymous Excalidraw:
+
+```bash
+python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary <TakosumiFixture.app>/Contents/MacOS/<CFBundleExecutable> --work <owned evidence directory> --site excalidraw
+```
+
+This mode accepts no `--browser` or `--guard`. It removes inherited browser
+executable/runtime overrides, lets the App choose its bundled resources and
+per-user runtime directory, and attests the opened browser and guard against
+those exact packaged executables. The same isolation, reuse, sequential quit,
+restart, clear and normal inner/outer receipt assertions still apply. The
+original unbundled M3 flows remain separate, so a packaging failure cannot
+replace their results. Packaged Photopea, ordinary product home rendering,
+OS focus, physical-device use and release signing remain unqualified.
+
 ## Observations and limits
 
 On 2026-11-05 the native candidate loaded Photopea, imported its generated SVG,

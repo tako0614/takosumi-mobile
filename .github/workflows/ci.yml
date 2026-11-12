@@ -1684,7 +1684,8 @@ jobs:
   # is uploaded. Independent of the other jobs.
   cef-macos:
     runs-on: macos-latest
-    timeout-minutes: 75
+    # M1/M2, two M3 site flows and the additional packaged M4 flow run serially.
+    timeout-minutes: 100
     defaults:
       run:
         working-directory: takosumi-mobile
@@ -1721,7 +1722,7 @@ jobs:
         run: |
           python3 -B native-tests/desktop/test_macos_browser_process.py -v 2>&1 | tee "$RUNNER_TEMP/m3-runner-tests.log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'M3 runner tests failed'; exit 1; }
-          grep -q '^Ran 14 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all fourteen M3 runner tests ran'; exit 1; }
+          grep -q '^Ran 16 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all sixteen M3 runner tests ran'; exit 1; }
       - name: Locked CEF version
         id: cef
         run: |
@@ -1904,6 +1905,24 @@ jobs:
         run: |
           cargo check --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features desktop-process-experiment --lib
           cargo check --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml --features fixture-overrides --lib
+      # M4: create a local .app with the browser runtime and guard inside
+      # its own resources. No signing credentials, notarization or upload.
+      - name: Bundle the macOS product App with its browser and guard
+        id: product-app-bundle
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          df -h "$CARGO_TARGET_DIR"
+          free_kib=$(df -Pk "$CARGO_TARGET_DIR" | awk 'NR == 2 { print $4 }')
+          if [ -z "$free_kib" ] || [ "$free_kib" -lt 8388608 ]; then echo 'Mac App packaging needs at least 8 GiB free'; exit 1; fi
+          node scripts/bundle-macos-cef.mjs --with-guard --cef "$M1_CEF" --bin "$CARGO_TARGET_DIR/debug" --out src-tauri/target/macos-cef/cef
+          bunx tauri build --ci --debug --bundles app --features desktop-cef --config src-tauri/tauri.macos-cef.conf.json
+          test -d "$CARGO_TARGET_DIR/debug/bundle/macos/Takosumi.app/Contents/Resources/cef"
+      - name: Browser smoke from inside the product App resources
+        if: ${{ !cancelled() && steps.product-app-bundle.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$CARGO_TARGET_DIR/debug/bundle/macos/Takosumi.app/Contents/Resources/cef/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process" --work "$RUNNER_TEMP" --expect-sandbox
       # The fixture-inspection build adds the main-frame load marker, which
       # shows a renderer ran; --reuse reopens the screen and requires the
       # Cocoa raise to report no refusal. Only the browser is rebuilt; the
@@ -1940,6 +1959,23 @@ jobs:
         if: ${{ !cancelled() && steps.app-build.outcome == 'success' }}
         timeout-minutes: 25
         run: python3 -B native-tests/desktop/macos_browser_process.py --binary "$CARGO_TARGET_DIR/debug/takosumi-mobile" --browser "$RUNNER_TEMP/m1-fixture/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process" --guard "$CARGO_TARGET_DIR/debug/takosumi-browser-guard" --work "$RUNNER_TEMP" --site photopea
+      - name: Build the packaged macOS App fixture
+        id: packaged-app-build
+        if: ${{ !cancelled() && steps.app-build.outcome == 'success' && steps.product-app-bundle.outcome == 'success' }}
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          node scripts/bundle-macos-cef.mjs --fixture --with-guard --cef "$M1_CEF" --bin "$CARGO_TARGET_DIR/debug" --out src-tauri/target/macos-cef-fixture/cef
+          node --input-type=module -e 'import{readFileSync}from"node:fs";const read=p=>JSON.parse(readFileSync(p,"utf8"));const product=read("src-tauri/target/macos-cef/cef/bundle.json"),fixture=read("src-tauri/target/macos-cef-fixture/cef/bundle.json");if(product.guard.sha256!==fixture.guard.sha256)throw Error("Product and fixture guards differ");'
+          bunx tauri build --ci --debug --bundles app --features native-browser-process-fixture --config src-tauri/tauri.macos-cef-fixture.conf.json
+          app="$CARGO_TARGET_DIR/debug/bundle/macos/TakosumiFixture.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          test -x "$app/Contents/MacOS/$executable"
+          echo "M4_APP_BINARY=$app/Contents/MacOS/$executable" >> "$GITHUB_ENV"
+      - name: Packaged App resolves its own browser, guard and runtime (anonymous Excalidraw)
+        if: ${{ !cancelled() && steps.packaged-app-build.outcome == 'success' }}
+        timeout-minutes: 25
+        run: python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site excalidraw
       # Each smoke's summary (with its `sandbox` and `descendants` records),
       # its top-level logs and the bundle manifests: text only, no binary.
       - name: Keep the smoke summaries
@@ -1953,6 +1989,10 @@ jobs:
             ${{ runner.temp }}/sumi-cef-smoke-*/*.log
             ${{ runner.temp }}/m1-product/bundle.json
             ${{ runner.temp }}/m1-fixture/bundle.json
+            takosumi-mobile/src-tauri/target/macos-cef/cef/bundle.json
+            takosumi-mobile/src-tauri/target/macos-cef-fixture/cef/bundle.json
+            target-cef/debug/bundle/macos/Takosumi.app/Contents/Info.plist
+            target-cef/debug/bundle/macos/TakosumiFixture.app/Contents/Info.plist
             ${{ runner.temp }}/m2-*-tests.log
             ${{ runner.temp }}/m3-runner-tests.log
             ${{ runner.temp }}/sumi-m2-*/profiles/*/browser.log

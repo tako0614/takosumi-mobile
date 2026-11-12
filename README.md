@@ -90,6 +90,9 @@ Its guard/adapter are covered by M2 component tests. The explicit
 [macOS actual App fixture (M3)](native-tests/cef-candidate/README.md#macos-actual-app-fixture-m3)
 adds the shared home/profile flow on macOS 14+; its native qualification is
 pending, and the intermittent ordinary-shutdown failure remains unresolved.
+The [macOS packaging candidate (M4)](native-tests/cef-candidate/README.md#macos-packaging-m4)
+places that browser and guard in the Tauri App's own resources. Its packaged
+native flow and local `.app` builds are pending CI qualification.
 
 On Linux/Windows with `desktop-cef`, opening a saved connection after its browser
 crashes can offer **保存データを保持して開き直す** on the home. This explicit action
