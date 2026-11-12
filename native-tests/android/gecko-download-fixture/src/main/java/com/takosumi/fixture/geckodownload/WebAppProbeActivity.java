@@ -307,7 +307,13 @@ public final class WebAppProbeActivity extends Activity {
                     out.write(buffer, 0, count);
                     bytes += count;
                 }
-            } catch (IOException | RuntimeException e) { error = e.getClass().getSimpleName() + ": " + e.getMessage(); }
+            } catch (IOException | RuntimeException e) {
+                // Carry the stall position: run 43173821786 hit "Timed out"
+                // inside this copy loop once, and whether bytes was 0 or
+                // mid-export decides between a never-started stream and a
+                // contended mid-copy gap without widening the 1 s bound.
+                error = e.getClass().getSimpleName() + ": " + e.getMessage() + " after " + bytes + "B";
+            }
             finally {
                 // Verify original closure independently of output close failure.
                 try { if (response.body != null) { response.body.close(); closed = true; } }
