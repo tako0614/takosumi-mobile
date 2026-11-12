@@ -1,5 +1,6 @@
 """Scoped test-CA resources for a private debug App; never device/global trust."""
 import hashlib
+import json
 from pathlib import Path
 import re
 import stat
@@ -52,7 +53,9 @@ def verify_network(app, table, xml, archive, certificate):
                         "res/raw/sumi_fixture_ca.pem", kind=None)
     require(archive.read(raw) == certificate_bytes(certificate), "Packaged test CA differs from this owned run")
     anchors[0].set("src", "@raw/sumi_fixture_ca")
-    require(policy(root) == policy(expected), "Fixture trust must be limited to the two exact HTTPS hosts")
+    actual, wanted = policy(root), policy(expected)
+    require(actual == wanted, "Fixture trust must be limited to the two exact HTTPS hosts: "
+            + json.dumps({"actual": actual, "expected": wanted}, separators=(",", ":")))
     return {"domains": ["127.0.0.1", "localhost"],
             "certificateSHA256": hashlib.sha256(archive.read(raw)).hexdigest()}
 

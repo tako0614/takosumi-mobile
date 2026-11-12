@@ -400,6 +400,7 @@ def main():
     except BaseException as error:
         failure = error
         proof["errorType"] = type(error).__name__
+        proof["error"] = str(error)
     finally:
         cleanup_errors = []
         if emulator is not None:

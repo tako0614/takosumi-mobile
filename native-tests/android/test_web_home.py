@@ -106,6 +106,15 @@ class Controls(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises((RuntimeError, ValueError)):
                 self.network(config)
 
+    def test_mismatched_decoded_policy_is_preserved_without_certificate_contents(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.network(CONFIG.replace('includeSubdomains="false"', 'includeSubdomains="true"'))
+        message = str(caught.exception)
+        self.assertIn('"actual"', message)
+        self.assertIn('"expected"', message)
+        self.assertIn('"includeSubdomains","true"', message)
+        self.assertNotIn(CERT.decode(), message)
+
     def test_only_a_plain_single_public_cert_can_be_packaged(self):
         self.assertEqual(certificate_bytes(self.cert), CERT)
         for value in (CERT + CERT, CERT.replace(b"CERTIFICATE", b"PRIVATE KEY"), b"", CERT + b"garbage"):
