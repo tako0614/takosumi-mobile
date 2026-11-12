@@ -1633,17 +1633,20 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     // sequential quit wedged behind it and the sibling profile's
     // beforeunload was never asked). Every screen is already closed and
     // the stopped reply was reported, so bound the teardown wait; past it,
-    // record and leave with the real outcome code. _exit skips atexit
-    // handlers that could re-enter the wedged runtime, and the guard still
-    // accounts for any helper left running.
+    // record and leave with the hung-process failure code (2, as Chromium's
+    // own teardown watchdog). The earlier command outcome cannot make an
+    // incomplete CefShutdown successful. _exit skips atexit handlers that
+    // could re-enter the wedged runtime; the guard still accounts for any
+    // helper left running and the App retains the abnormal profile.
     #[cfg(target_os = "macos")]
     let _ = std::thread::Builder::new()
         .name("cef-shutdown-bound".into())
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(15));
-            mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, None);
-            // SAFETY: immediate process exit; no user state remains unflushed.
-            unsafe { libc::_exit(i32::from(failed)) };
+            mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, Some(2));
+            // SAFETY: immediate process exit cannot unwind into the blocked
+            // runtime. An incomplete shutdown makes no flush guarantee.
+            unsafe { libc::_exit(2) };
         });
     shutdown();
     #[cfg(target_os = "macos")]
