@@ -564,6 +564,34 @@ an App acceptance result.
 
 ## Android
 
+`bash native-tests/android/build-app.sh` is the separate whole Tauri App SDK
+compile check. It requires a fresh checkout without `src-tauri/gen/android`,
+Linux x86_64, JDK 17, Android SDK/platform 36, Build-Tools 36.0.0 and an installed
+NDK. It refuses signing inputs and a foreign Cargo target. CI uses NDK
+29.0.14206865 and the same pinned Kit/contract as the desktop/iOS lanes.
+Normal Kit init generates the complete App with the private package ID
+`com.takosumi.fixture.android`; normal plugins, manifest hardening and embedded
+shared UI remain present. The debug APK has Gradle's disposable debug signature;
+it is not a release or an unsigned distribution artifact.
+
+The check requires one APK, actual min/target SDK 28/36, nonexported product FCM
+service with opt-in initialization, the product deep-link scheme and backup
+policy. The manifest must reference the actual packaged extraction-rules XML;
+its compiled resource ID is bound through the APK resource table to that file.
+Its cloud-backup/device-transfer exclusions must match the normal Kit-generated
+input. Every native library must be x86_64 ELF, and the packaged App library
+must match the actual Cargo output byte for byte. SDK signature/manifest tools,
+ZIP CRC and tracked-source preservation are required. Only `whole-app-proof.json`
+is uploaded; the APK, generated debug key and Firebase configuration are not.
+The first CI build is pending. This is a prerequisite for actual whole-App
+connection/login/home/resume qualification; the library tests below and an APK
+compile cannot establish that UI behavior, real IdP, physical-device or update
+qualification. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#android)
+describe the SDK/NDK setup; the builder itself does not install an Android SDK.
+`python3 -B native-tests/android/test_apk_policy.py` exercises SDK-free reference
+binding controls, including a different valid resource, wrong package and
+ambiguous/missing file mappings. These controls do not compile an APK.
+
 `AppScreenMediaConsentTest` checks the camera/microphone consent state machine,
 including OS denial, stale results and document/profile changes. The actual
 `MediaPermissionActivityTest` uses an intercepted HTTPS fixture in the production
