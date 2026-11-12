@@ -2786,9 +2786,10 @@ configuration or an engine-selection decision.
 
 ## Windows same-App recovery fixture
 
-Source candidate; Windows native recovery remains unqualified until this
-scenario runs. The W3 job adds a separate fresh case with `--recover`, using
-the same sandboxed browser and the existing fixture TLS setup. It accepts no
+The synthetic-site, same-running-App Windows recovery case passed all six
+required cases in [CI43218039839](https://github.com/tako0614/takosumi-mobile/actions/runs/43218039839/job/131182189815).
+The W3 job runs a separate fresh case with `--recover`, the same sandboxed
+browser and the existing fixture TLS setup. It accepts no
 restart/reset, real-site, installed-package or unsandboxed mode combination.
 
 The actual home creates Work and Personal. The observer seeds both, normally
@@ -2809,6 +2810,7 @@ satisfy a final cleanup check. Six named cases and a nonempty passed summary
 are required.
 
 The SDK-free controls exercise fault refusal, PID reuse and case wiring.
-Actual Win32 handle calls, the Windows App UI and the recovery result still
-need native execution. This does not qualify whole-App/OS-crash recovery,
+The held Win32 fault, actual Windows App recovery confirmation and final
+normal cleanup ran in that native case. This does not qualify whole-App/OS-crash
+recovery,
 unsaved writes, actual authentication or installed-package recovery.

@@ -112,7 +112,9 @@ the profile's `recoveries/` directory. Unsaved changes and writes interrupted by
 the crash may be lost. Ordinary open, clear and quit keep their stricter normal
 exit checks. This recovery applies to a browser tracked by the still-running
 App; it does not qualify recovery after an App/OS crash. macOS and mobile do not
-advertise this command. Windows native recovery is not yet qualified.
+advertise this command. The synthetic-site Windows same-App browser-fault
+case passed in [CI43218039839](https://github.com/tako0614/takosumi-mobile/actions/runs/43218039839/job/131182189815).
+Installed-package recovery and interrupted-write integrity remain unqualified.
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
