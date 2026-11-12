@@ -151,22 +151,18 @@ public final class WebHomeOperationTest {
         long end = SystemClock.elapsedRealtime() + 15000;
         do {
             List<UiObject2> matches = new ArrayList<>();
-            for (UiObject2 label : device.findObjects(By.text(name).pkg(TARGET))) {
-                UiObject2 row = label;
-                for (int depth = 0; row != null && depth < 4; depth++, row = row.getParent()) {
-                    if ("android.widget.Button".equals(row.getClassName()) && row.isEnabled()
-                            && (String.valueOf(row.getText()).contains(origin)
-                                || String.valueOf(row.getContentDescription()).contains(origin)
-                                || row.findObject(By.textContains(origin)) != null)) {
-                        matches.add(row); break;
-                    }
+            for (UiObject2 row : device.findObjects(By.clazz("android.widget.Button").pkg(TARGET))) {
+                if (row.isEnabled() && row.isClickable() && !row.getVisibleBounds().isEmpty()
+                        && (ConnectionLabel.matches(row.getText(), name, origin)
+                            || ConnectionLabel.matches(row.getContentDescription(), name, origin))) {
+                    matches.add(row);
                 }
             }
             if (matches.size() == 1) { matches.get(0).click(); return; }
             assertTrue("Ambiguous saved connection " + name, matches.size() <= 1);
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
-        throw new AssertionError("Saved App connection missing: " + name);
+        throw new AssertionError("Saved App connection button did not become ready: " + name);
     }
 
     private void host(String address) {

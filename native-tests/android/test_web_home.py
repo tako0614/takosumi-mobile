@@ -1,8 +1,10 @@
-"""SDK-free controls; none of these qualify the actual Android UI."""
+"""Android-SDK-free controls; label matching uses an existing JDK, never the App."""
 import hashlib
 import io
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -70,6 +72,22 @@ class Controls(unittest.TestCase):
                         log.replace("numtests=1", "numtests=2"), log + "INSTRUMENTATION_FAILED: aborted\n"):
             with self.subTest(log=changed), self.assertRaises(RuntimeError):
                 runner.require_ui_pass(changed, result)
+
+    def test_actual_driver_connection_label_matcher_rejects_foreign_rows(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the driver label control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the driver label control")
+        classes = self.root / "label-classes"
+        classes.mkdir()
+        helper = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/ConnectionLabel.java"
+        control = runner.HERE / "label-controls/ConnectionLabelTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.webhome.ConnectionLabelTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: saved connection label checks=[1-9][0-9]*")
 
     def test_ui_result_requires_all_operations_and_actual_cold_replacement(self):
         for defect in ("no-pass", "missing-operation", "same-pid", "invalid-pid", "same-document", "no-diagnostics"):

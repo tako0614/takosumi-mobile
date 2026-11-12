@@ -85,6 +85,10 @@ jobs:
           test "${PIPESTATUS[0]}" = 0 || { echo 'Android APK policy controls failed'; exit 1; }
           grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/android-apk-policy-controls.log"
         working-directory: takosumi-mobile
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Whole Android App UI harness controls (not native qualification)
         run: |
           python3 -B native-tests/android/test_web_home.py 2>&1 | tee "$RUNNER_TEMP/android-web-home-controls.log"

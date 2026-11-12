@@ -22,6 +22,20 @@ product callback, JS injection, cookie injection or native test UI opens a
 connection. The ordinary App launcher returns to the connection picker after
 Close removes a profile's Android Recents task.
 
+Run43305494368 reached Work sign-in, management, Notes/draft and native Back/Home,
+then the first saved-Work lookup failed. Its screenshot and accessibility tree
+retain the enabled, visible connection button; WebView combines its name,
+origin and hint into one label, with no separate `Work` node. The driver now
+finds package-scoped, enabled/clickable visible buttons and matches the exact
+name and complete origin in text or description. Only the known `開く →` or
+`前の画面へ戻る →` hint may follow. One unique button is clicked once; multiple
+matches fail and the existing 15-second lookup deadline remains.
+The actual matcher also runs in the Android-SDK-free Python controls using
+an existing JDK17+: merged/newline labels pass, while name/port prefixes,
+other origins, URL suffixes, deletion buttons and unknown trailing labels
+fail. Quality explicitly prepares JDK17. This does not qualify the Android
+driver's new selector until its native run.
+
 The latest connection-add attempt also keeps a short diagnostic receipt: the
 setText return time, the existing IME-presence/Back operation result, the same
 readiness query's Save bounds, and click entry/return times. It records only
