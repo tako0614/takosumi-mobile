@@ -11,6 +11,7 @@ import { createServer as reservePort } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { confirmBrowserCleanup } from "./lifecycle.ts";
+import { guardRunning, initialPage } from "./startup.ts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const output = process.argv[2];
@@ -19,7 +20,8 @@ await mkdir(output, { mode: 0o700 });
 const temporary = await mkdtemp(join(process.env.RUNNER_TEMP || process.env.TMPDIR || tmpdir(), "sumi-webhome-ui-"));
 const sourceFiles = ["src/web-home.tsx", "src/web-home.css", "src/web-connections.ts", "src/web-profile-data.ts",
   "native-tests/browser/web-home.html", "native-tests/browser/web-home.fixture.tsx", "native-tests/browser/run.ts",
-  "native-tests/browser/tsconfig.json", "native-tests/browser/guard.py", "native-tests/browser/lifecycle.ts", "native-tests/desktop/web_home.py", "vite.config.ts", "bun.lock"];
+  "native-tests/browser/tsconfig.json", "native-tests/browser/guard.py", "native-tests/browser/lifecycle.ts",
+  "native-tests/browser/startup.ts", "native-tests/desktop/web_home.py", "vite.config.ts", "bun.lock"];
 async function sourceHashes() {
   return Object.fromEntries(await Promise.all(sourceFiles.map(async (path) => [path,
     createHash("sha256").update(await readFile(`${root}${path}`)).digest("hex")])));
@@ -96,22 +98,8 @@ try {
     browser!.once("error", (error) => { startupError = error; resolve(); });
   });
   await log.close();
-  const deadline = Date.now() + 20_000;
-  let port = 0;
-  while (!port && Date.now() < deadline) {
-    assert(!startupError && browser.exitCode === null, "Owned Chrome exited during startup");
-    try { port = Number((await readFile(`${temporary}/profile/DevToolsActivePort`, "utf8")).split("\n")[0]); } catch { }
-    if (!port) await delay(25);
-  }
-  assert(port, "Owned Chrome did not expose its private CDP endpoint");
-  const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(5_000) });
-  assert(response.ok);
-  const pages = (await response.json() as { type: string; url: string; webSocketDebuggerUrl: string }[])
-    .filter((target) => target.type === "page");
-  assert.equal(pages.length, 1, "Fresh owned browser must have exactly its initial page");
-  const target = pages[0]!;
-  assert.equal(target.url, "about:blank", "Unexpected page in fresh owned browser");
-  assert(target.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${port}/`));
+  const target = await initialPage(`${temporary}/profile/DevToolsActivePort`,
+    () => guardRunning(browser!, startupError));
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Owned CDP handshake timed out")), 10_000);

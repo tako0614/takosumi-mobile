@@ -57,6 +57,15 @@ jobs:
         working-directory: takosumi-mobile
         env:
           TMPDIR: ${{ runner.temp }}
+      - name: Private browser startup controls
+        run: |
+          node --experimental-strip-types --test --test-reporter=tap native-tests/browser/startup.test.ts | tee "$RUNNER_TEMP/browser-startup-controls.log"
+          test "${PIPESTATUS[0]}" = 0 || { echo 'Browser startup controls failed'; exit 1; }
+          grep -Eq '^# tests [1-9][0-9]*$' "$RUNNER_TEMP/browser-startup-controls.log"
+          for verdict in fail cancelled skipped; do
+            grep -Eq "^# $verdict 0$" "$RUNNER_TEMP/browser-startup-controls.log"
+          done
+        working-directory: takosumi-mobile
 
   # The native plugin tests `bun run check` does not run: the takosumi-push
   # plugin's RFC 8291 decryption and Declarative Web Push parsing (Kotlin on
