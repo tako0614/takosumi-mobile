@@ -48,7 +48,16 @@ final class DownloadUITests: XCTestCase {
         // but never painted" (43026070035: served, still 10%) and "loaded
         // but a11y-empty" (42729892985: page painted and served).
         let state = { [app] in
-            "windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count) progress=\((app.progressIndicators["Progress"].firstMatch.value as? String) ?? "absent")"
+            // Run 43173821786: the link wait timed out while the Progress bar
+            // was absent entirely, and firstMatch.value threw the diagnostic
+            // away before the designed reload/reopen could run. A value read
+            // still requires a resolved element, so absence must be checked
+            // first — "absent" then names a fourth variant (page painted, no
+            // progress ever reported) rather than masking the wait's verdict.
+            let progress = app.progressIndicators["Progress"].firstMatch
+            let progressText = progress.exists
+                ? ((progress.value as? String) ?? "unreadable") : "absent"
+            return "windows=\(app.windows.count) webViews=\(app.webViews.count) links=\(app.webViews.links.count) staticTexts=\(app.webViews.staticTexts.count) progress=\(progressText)"
         }
         if !link.waitForExistence(timeout: 15) {
             // A page still empty past the bound is the one a user reloads;
