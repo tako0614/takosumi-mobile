@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import windows_browser_observer as observer  # noqa: E402
 import windows_browser_process as runner  # noqa: E402
+import windows_browser_fault as fault  # noqa: E402
 from windows_smoke import Failure  # noqa: E402
 
 
@@ -1061,6 +1062,161 @@ def main_source():
     return (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
 
 
+class FakeProcessApi:
+    """Handle objects keep their generation even when a PID is reused."""
+    def __init__(self):
+        self.images = {role: rf"C:\fixture\{role}.exe" for role in ("app", "guard", "browser")}
+        self.pids = {"app": 10, "guard": 20, "browser": 30}
+        self.objects = {pid: {"pid": pid, "created": pid * 100, "image": fault.image_key(self.images[role]),
+                              "live": True, "exit": None} for role, pid in self.pids.items()}
+        self.parent_ids = {30: 20, 20: 10}
+        self.opened, self.closed, self.signals = [], [], []
+        self.fail_open = None
+
+    def open(self, pid, terminate=False):
+        if pid == self.fail_open:
+            raise Failure("synthetic process access refusal")
+        handle = self.objects[pid]
+        self.opened.append((pid, terminate))
+        return handle
+
+    def identity(self, handle):
+        return {key: handle[key] for key in ("pid", "created", "image")}
+
+    def live(self, handle):
+        return handle["live"]
+
+    def parents(self):
+        return dict(self.parent_ids)
+
+    def terminate(self, handle):
+        self.signals.append(handle)
+        handle.update(live=False, exit=fault.FAULT_EXIT)
+
+    def wait(self, handle, milliseconds):
+        if handle["live"]:
+            raise Failure("synthetic process is still live")
+
+    def exit_code(self, handle):
+        return handle["exit"]
+
+    def close(self, handle):
+        self.closed.append(handle)
+
+
+class WindowsFaultTests(unittest.TestCase):
+    def recovery_layout(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        app_data, runtime = root / "local-app-data" / "fixture-case", root / "case" / "r"
+        profile = "11111111-1111-4111-8111-111111111111"
+        directory = app_data / "browser-process-experiment" / profile
+        cache = directory / "cef-profiles" / profile
+        cache.mkdir(parents=True)
+        receipt = runtime / "owned-guard" / "guard.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("")
+        process = {"profile": profile, "directory": str(directory), "guardReceipt": str(receipt),
+                   "opened": {"nativeCache": str(cache)}}
+        return process, app_data, runtime
+
+    def test_persistent_profile_is_in_app_data_while_guard_state_is_in_runtime(self):
+        process, app_data, runtime = self.recovery_layout()
+        paths = fault.recovery_paths(process, app_data, runtime)
+        self.assertEqual(paths["cache"], Path(process["opened"]["nativeCache"]))
+        self.assertTrue(paths["cache"].is_relative_to(app_data))
+        self.assertFalse(paths["cache"].is_relative_to(runtime))
+        self.assertTrue(paths["receipt"].is_relative_to(runtime))
+
+    def test_runtime_or_another_app_is_not_a_persistent_profile_owner(self):
+        process, app_data, runtime = self.recovery_layout()
+        for wrong in (runtime, app_data.parent):
+            with self.assertRaises(Failure):
+                fault.recovery_paths(process, wrong, runtime)
+
+    def test_foreign_guard_receipt_and_mismatched_native_cache_are_refused(self):
+        process, app_data, runtime = self.recovery_layout()
+        foreign = app_data / "foreign.json"
+        foreign.write_text("{}")
+        wrong = dict(process, guardReceipt=str(foreign))
+        with self.assertRaises(Failure):
+            fault.recovery_paths(wrong, app_data, runtime)
+        wrong = dict(process, opened={"nativeCache": str(app_data)})
+        with self.assertRaises(Failure):
+            fault.recovery_paths(wrong, app_data, runtime)
+
+    def test_only_the_held_browser_can_receive_the_explicit_fixture_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            proof = owned.fault()
+            self.assertEqual(proof["exit"], 73)
+            self.assertEqual(api.opened, [(10, False), (20, False), (30, True)])
+            self.assertEqual(api.signals, [owned.handles["browser"]])
+            self.assertTrue(api.objects[10]["live"])
+            self.assertTrue(api.objects[20]["live"])
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(len(api.signals), 1)
+        self.assertEqual(len(api.closed), 3)
+
+    def test_observation_only_lineages_never_acquire_termination_access(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images) as owned:
+            with self.assertRaises(Failure):
+                owned.fault()
+        self.assertEqual(api.signals, [])
+        self.assertFalse(any(terminate for _, terminate in api.opened))
+
+    def test_wrong_parent_image_birth_or_dead_owner_refuses_before_fault(self):
+        for defect in ("parent", "image", "birth", "dead", "missing-parent"):
+            with self.subTest(defect=defect):
+                api = FakeProcessApi()
+                with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+                    if defect == "parent":
+                        api.parent_ids[30] = 999
+                    elif defect == "image":
+                        api.objects[20]["image"] = fault.image_key(r"C:\foreign\guard.exe")
+                    elif defect == "birth":
+                        api.objects[30]["created"] = 1
+                    elif defect == "dead":
+                        api.objects[10]["live"] = False
+                    else:
+                        del api.parent_ids[20]
+                    with self.assertRaises(Failure):
+                        owned.fault()
+                    self.assertEqual(api.signals, [])
+
+    def test_pid_reuse_cannot_redirect_a_held_browser_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            original = api.objects[30]
+            original["live"] = False
+            api.objects[30] = dict(original, created=9999, live=True)
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(api.signals, [])
+            self.assertTrue(api.objects[30]["live"])
+
+    def test_partial_capture_refusal_closes_existing_handles(self):
+        api = FakeProcessApi()
+        api.fail_open = 30
+        with self.assertRaises(Failure):
+            fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True)
+        self.assertEqual(api.opened, [(10, False), (20, False)])
+        self.assertEqual(len(api.closed), 2)
+        self.assertEqual(api.signals, [])
+
+    def test_owner_ending_during_ancestry_inspection_refuses_the_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            def owner_ends():
+                api.objects[10]["live"] = False
+                return dict(api.parent_ids)
+            api.parents = owner_ends
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(api.signals, [])
+
+
 class RunnerTests(unittest.TestCase):
     def test_case_names_also_fit_the_app_identifier(self):
         for name in ("sumi-w3", "a", "x" * 24):
@@ -1446,7 +1602,7 @@ class RunnerTests(unittest.TestCase):
         workflow = (root / "ci.yml").read_text(encoding="utf-8")
         w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
         w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
-        for job, stage, runs in ((w3, "w3-stage", 1), (w4, "w4-stage", 2)):
+        for job, stage, runs in ((w3, "w3-stage", 2), (w4, "w4-stage", 2)):
             self.assertNotIn("unsandboxed-candidate", job)
             self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
                           "--bin takosumi-browser-guard\n", job)
@@ -1459,6 +1615,50 @@ class RunnerTests(unittest.TestCase):
                               '--guard "$stage\\takosumi-browser-guard.exe" ', line)
             self.assertEqual(job.count(f"$stage = Join-Path $env:RUNNER_TEMP '{stage}\\cef'\n"), runs)
             self.assertIn("key: cef-windows-app-cargo-w7-", job)
+
+    def test_recovery_is_a_fresh_case_with_six_required_cases_and_its_fault_source_pinned(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
+        start = job.index("      - name: Actual home recovery after an owned browser fault\n")
+        step = job[start:job.index("      - name: Remove the fixture CA\n", start)]
+        self.assertIn("steps.w3-tls.outcome == 'success'", step)
+        self.assertIn("'sumi-w3-recover'", step)
+        command = next(line for line in step.splitlines() if line.strip().startswith("python -B "))
+        self.assertIn(" --recover | Tee-Object", command)
+        for other_mode in ("--packaged", "--real-site", "--restart", "--reset", "--unsandboxed-candidate"):
+            self.assertNotIn(other_mode, command)
+        cases = re.search(r"\$recoveryCases = @\((.*?)\n          \)", step, re.S)
+        self.assertIsNotNone(cases)
+        self.assertEqual(re.findall(r"'([a-z-]+)'", cases.group(1)),
+                         list(runner.OBSERVED_CASES["recover"]) + list(runner.FINAL_CASES))
+        self.assertIn(".Count -ne 6", step)
+        self.assertIn("$summary.phases[0].phase -ne 'recover'", step)
+        self.assertIn("native-tests/desktop/windows_browser_fault.py", runner.WINDOWS_SOURCES)
+
+    def test_recovery_final_sandbox_evidence_must_name_the_replacement_pid(self):
+        opened = {"processes": [{"profile": "work", "opened": {"nativePid": 30}}]}
+        record = {"profile": "work", "stage": "recovery-final", "browser": {"pid": 29},
+                  "renderers": [], "problems": []}
+        with self.assertRaises(Failure):
+            runner.sandbox_summary({"sandbox": [record]}, opened, True, ("recovery-final",))
+        record["browser"]["pid"] = 30
+        self.assertEqual(len(runner.sandbox_summary({"sandbox": [record]}, opened, True,
+                                                   ("recovery-final",))), 1)
+
+    def test_recovery_rejects_combined_or_unsandboxed_modes_before_creating_the_case(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as root:
+            case = Path(root) / "not-created"
+            command = [sys.executable, "-B", str(HERE / "windows_browser_process.py"),
+                       "--binary", "unused.exe", "--browser", "unused-browser.exe", "--guard", "unused-guard.exe",
+                       "--data", str(case), "--tls-cert", "unused.cert", "--tls-key", "unused.key",
+                       "--tls-ca", "unused.ca", "--recover"]
+            for mode in (["--restart"], ["--reset"], ["--packaged"], ["--real-site", "photopea"],
+                         ["--unsandboxed-candidate"]):
+                result = subprocess.run(command + mode, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("standalone sandboxed synthetic-site scenario", result.stderr)
+                self.assertFalse(case.exists())
 
     def test_the_sandboxed_browsers_dll_is_hashed_with_it(self):
         import tempfile

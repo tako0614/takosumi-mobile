@@ -112,6 +112,8 @@ OBSERVED_CASES = {
          "quit-cancel-stops", "quit-partial-order", "permission-answered-by-app"),
     "restart": ("restart-keeps-separation",),
     "reset": ("clear-only-one-profile",),
+    "recover": ("recovery-requires-consent", "recovery-keeps-settled-data",
+                "recovery-preserves-other-profile", "recovery-retains-abnormal-receipt"),
 }
 # Verified by the runner: the first launch's final quit closed every
 # connection normally; after all launches nothing was left in a job and no
@@ -135,6 +137,7 @@ EVIDENCE_KEYS = ("stage", "error", "failureForeground", "visibility", "zOrder", 
 WINDOWS_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
     "native-tests/desktop/windows_browser_process.py", "native-tests/desktop/windows_browser_observer.py",
+    "native-tests/desktop/windows_browser_fault.py",
     "native-tests/desktop/windows_fixture_tls.ps1", "native-tests/cef-candidate/windows_smoke.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs", "native-tests/cef-candidate/.cargo/config.toml",
@@ -396,7 +399,10 @@ def sandbox_summary(observation, opened, required, stages=("attach",)):
         mine = [record for record in records if record.get("profile") == process["profile"]]
         if required:
             for stage in stages:
-                require(any(record.get("stage", "attach") == stage for record in mine),
+                require(any(record.get("stage", "attach") == stage
+                            and (stage != "recovery-final" or
+                                 (record.get("browser") or {}).get("pid") == process["opened"]["nativePid"])
+                            for record in mine),
                         f"No {stage} sandbox evidence for the browser of {process['profile']}")
         for record in mine:
             if required:
@@ -526,6 +532,10 @@ def run_phase(args, env, files, before, head, suffix):
             # W7: the observer requires each profile's browser to show
             # Chromium's sandbox, unless this is the unsandboxed candidate.
             real += ["--unsandboxed-candidate"] if args.unsandboxed_candidate else []
+            if phase == "recover":
+                for role, image in (("app", args.binary), ("guard", args.guard), ("browser", args.browser)):
+                    real += [f"--recovery-{role}", str(image)]
+                real += ["--recovery-app-data", str(app_data(session.name)[0])]
             with create_exclusive(session / f"observer{suffix}.log") as observer:
                 subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
                                 "--app-pid", str(app.pid), "--phase", phase, *real],
@@ -541,13 +551,24 @@ def run_phase(args, env, files, before, head, suffix):
             opened = read_json(session / (f"app-browser-process{suffix}-open.json" if suffix
                                           else "app-browser-process-open.json"))
             # A real-site run (first launch only) checks again on the real site.
-            stages = ("attach", "real-site") if args.real_site else ("attach",)
+            stages = (("recovery-final",) if phase == "recover" else
+                      ("attach", "real-site") if args.real_site else ("attach",))
             proof["sandbox"] = sandbox_summary(observation, opened, not args.unsandboxed_candidate, stages)
+            if phase == "recover":
+                # Intentional fault evidence has its own slot. It must not
+                # satisfy any final guard's strict normal receipt below.
+                normal(observation["seedNormal"], "The normally saved recovery seed")
+                require(observation["injectedAbnormal"]["rootExit"] == 73,
+                        "Recovery must retain the explicitly injected abnormal exit")
+                proof["recovery"] = {key: observation[key] for key in
+                                     ("seedNormal", "fault", "injectedAbnormal", "incident", "cacheIdentity")}
             execution["browserGuards"] = []
             for process in opened["processes"]:
                 receipt = read_json(Path(process["guardReceipt"]))
                 normal(receipt)
                 execution["browserGuards"].append(receipt)
+            if phase == "recover":
+                proof["recovery"]["finalNormal"] = execution["browserGuards"]
             proof["sessionJob"] = session_receipt(job, execution["appExit"])
             normal(proof["sessionJob"], "The App's job")
             execution["passed"] = True
@@ -630,12 +651,16 @@ def main():
                         help="relaunch the App on the same data and verify per-profile state after restart")
     parser.add_argument("--reset", action="store_true",
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
+    parser.add_argument("--recover", action="store_true",
+                        help="standalone fresh-case same-App recovery after an explicitly owned browser fault")
     parser.add_argument("--real-site", choices=sorted(REAL_SITES),
                         help="W4: the app home links to this real site; first launch only, cases named <site>/<case>")
     parser.add_argument("--unsandboxed-candidate", action="store_true",
                         help="diagnostics only: the browser is the windows-unsandboxed-candidate executable; its "
                              "sandbox evidence is recorded, not required (W7)")
     args = parser.parse_args()
+    if args.recover and (args.restart or args.reset or args.real_site or args.packaged or args.unsandboxed_candidate):
+        parser.error("--recover is a standalone sandboxed synthetic-site scenario, without --packaged")
     if args.real_site and (args.restart or args.reset):
         parser.error("--real-site runs the first launch only")
     if args.packaged and (args.browser or args.guard):
@@ -775,14 +800,16 @@ def run(args, summary):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(file, target)
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
-        phases = [""] + (["-restart"] if args.restart else []) + (["-reset"] if args.reset else [])
+        phases = (["-recover"] if getattr(args, "recover", False) else
+                  [""] + (["-restart"] if args.restart else []) + (["-reset"] if args.reset else []))
         for suffix in phases:
             phase_env = dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE=suffix[1:]) if suffix else env
             proof = run_phase(args, phase_env, files, before, head, suffix)
             shutdown = shutdown_summary(proof.get("guardRecords"))
             summary["phases"].append({"phase": proof["phase"], "passed": proof["passed"],
                                       "sessionJob": proof.get("sessionJob"), "sandbox": proof.get("sandbox"),
-                                      "shutdown": shutdown})
+                                      "shutdown": shutdown,
+                                      **({"recovery": proof["recovery"]} if "recovery" in proof else {})})
             print(f"shutdown{suffix or '-first'} {json.dumps(shutdown, separators=(',', ':'))}", flush=True)
             require(proof["passed"] is True, f"The {proof['phase']} App launch did not pass")
             expected = [name for name in OBSERVED_CASES[suffix[1:]]

@@ -32,7 +32,9 @@ type Result<T> = std::result::Result<T, String>;
 /// chooser are inspected on Linux only.
 #[cfg(target_os = "linux")]
 const PHASES: &[&str] = &["restart", "reset", "notify", "files", "recover"];
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
+const PHASES: &[&str] = &["restart", "reset", "recover"];
+#[cfg(target_os = "macos")]
 const PHASES: &[&str] = &["restart", "reset"];
 
 /// The home view the flow drives. `eval` returns the script's value as JSON
@@ -618,7 +620,7 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
 }
 /// Actual home controls: normal open must offer recovery without reopening;
 /// only a subsequent explicit action may create a new native generation.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     add(view, "Work", 1).await?;
     add(view, "Personal", 2).await?;
@@ -699,7 +701,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
         println!("{kind}: shell ready");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if kind == "recover" {
             return recovery_flow(app, case, view).await;
         }

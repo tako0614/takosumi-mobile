@@ -50,6 +50,7 @@ from urllib.parse import urlsplit
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, ProcessTree, require, sandbox_evidence  # noqa: E402
+from windows_browser_fault import FAULT_EXIT, OwnedBrowser, WindowsProcesses, recovery_paths  # noqa: E402
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -770,7 +771,7 @@ class Page:
 
 class Observer:
     def __init__(self, data, site, app_pid, phase, win32=None, real_site=None, installed=None,
-                 expect_sandbox=True):
+                 expect_sandbox=True, recovery_images=None, recovery_app_data=None):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
         # W7: each profile's browser must show Chromium's sandbox (False:
         # the unsandboxed candidate, recorded only).
@@ -778,6 +779,8 @@ class Observer:
         # W6 (--packaged): the installed App's directory; each guard and
         # browser must run from its cef\ (installed_from).
         self.installed = installed
+        self.recovery_images = recovery_images
+        self.recovery_app_data = recovery_app_data
         # W4: the app link leads to this real site (None: the fixture's /app/).
         self.real = REAL_SITES[real_site] if real_site else None
         self.real_name = real_site
@@ -1929,9 +1932,127 @@ class Observer:
         except Exception as error:  # diagnostics only
             self.proof["failureForeground"] = {"error": str(error)}
 
+    def recovery(self):
+        """Fresh-case, same-running-App recovery, with one explicit owned fault."""
+        require(not self.real and self.installed is None and self.recovery_images and self.recovery_app_data,
+                "Recovery requires the standalone synthetic-site fixture and exact process images")
+        api = WindowsProcesses(self.win.kernel32)
+        initial = self.proof["opened"] = self.marker("app-browser-process-recover-initial.json")
+        work, personal = [self.attach(self.process_of(initial, name)) for name in ("Work", "Personal")]
+
+        def held(process, allow_fault=False):
+            return OwnedBrowser(api, {"app": self.app_pid, "guard": process["pid"],
+                                     "browser": process["opened"]["nativePid"]},
+                                self.recovery_images, allow_fault)
+
+        def data(page):
+            value = self.sample(page)
+            return {name: value.get(name) for name in ("document", "storage", "cookie", "user")}
+
+        def cache_identity(process):
+            paths = recovery_paths(process, self.recovery_app_data, self.data / "r")
+            result = {}
+            for name in ("root", "cache"):
+                path = paths[name]
+                info = path.lstat()
+                require(path.is_dir() and not path.is_symlink() and info.st_ino > 0
+                        and not (getattr(info, "st_file_attributes", 0) & 0x400),
+                        "Plain identifiable cache directory required")
+                result[name] = {"device": info.st_dev, "inode": info.st_ino}
+            return result
+
+        with held(personal.process) as other:
+            for index, page in enumerate((work, personal)):
+                self.sign_in(page, ("work", "personal")[index])
+                key, value = json.dumps(self.key), json.dumps(f"{index}:{self.nonce}")
+                cookie = json.dumps(f"{self.key}={index}:{self.nonce}; Max-Age=86400; Path=/; Secure; SameSite=Lax")
+                page.evaluate(f"(()=>{{globalThis[{key}]={value};localStorage.setItem({key},{value});"
+                              f"document.cookie={cookie};return true}})()")
+            expected = [data(page) for page in (work, personal)]
+            require([value["cookie"] for value in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"],
+                    "Both recovery seeds must exist in their separate profiles")
+            self.win.close(work.native["windowId"])
+            seed_receipt = self.normal_receipt(work.process["guardReceipt"], "Work seed must close normally")
+            self.proof["seedNormal"] = seed_receipt
+            self.checkpoint("recover-seeded")
+
+            before = self.marker("app-browser-process-recover-before.json")
+            crashed = self.attach(self.process_of(before, "Work"))
+            saved = dict(expected[0], document=None)
+            require(data(crashed) == saved, "Recovery input must be durable before the induced crash")
+            require(data(personal) == expected[1], "Personal changed before the induced crash")
+            cache_before = cache_identity(crashed.process)
+            with held(crashed.process, allow_fault=True) as target:
+                self.proof["fault"] = target.fault()
+                self.settled(lambda: self.guard_ended(crashed.process["guardReceipt"]),
+                             "The exact crash guard must finish", 30)
+                target.guard_ended()
+                receipt = json.loads(Path(crashed.process["guardReceipt"]).read_bytes())
+                require(type(receipt.get("rootExit")) is int and receipt["rootExit"] == FAULT_EXIT
+                        and receipt.get("complete") is True and receipt.get("kernelNoChildren") is True
+                        and receipt.get("remaining") == [] and receipt.get("cleanupErrors") == []
+                        and receipt.get("nonFatalErrors") == [] and receipt.get("error") is None
+                        and type(receipt.get("forcedCleanup")) is int and receipt["forcedCleanup"] >= 0,
+                        "The injected failure must have an exact, conclusive abnormal receipt")
+                self.proof["injectedAbnormal"] = receipt
+                other.validate()
+                self.checkpoint("recover-crashed")
+
+                offered = self.marker("app-browser-process-recover-offered.json")
+                require(offered == before["processes"], "Ordinary open must only offer recovery")
+                require(data(personal) == expected[1], "Offering recovery changed Personal")
+                self.case("recovery-requires-consent")
+                self.checkpoint("recover-consent")
+                reopened = self.marker("app-browser-process-recover-open.json")
+                require(reopened.get("explicitRecovery") is True and reopened["connections"] == before["connections"],
+                        "Explicit recovery must retain the exact saved connections")
+                fresh = self.process_of(reopened, "Work")
+                require(self.process_of(reopened, "Personal") == self.process_of(before, "Personal"),
+                        "Personal's native ownership changed during recovery")
+                require(fresh["profile"] == crashed.process["profile"]
+                        and fresh["directory"] == crashed.process["directory"]
+                        and fresh["pid"] != crashed.process["pid"]
+                        and fresh["opened"]["nativePid"] != crashed.native["nativePid"],
+                        "Recovery must reuse the profile/directory with new native processes")
+                recovered = self.attach(fresh)
+                with held(fresh) as replacement:
+                    require(all(replacement.identities[role]["created"] >= target.identities[role]["created"]
+                                for role in ("guard", "browser")), "Replacement generation predates the crash")
+                    require(data(recovered) == saved and cache_identity(fresh) == cache_before,
+                            "Recovery replaced the saved data or cache directories")
+                    self.case("recovery-keeps-settled-data")
+                    other.validate()
+                    require(data(personal) == expected[1], "Recovery changed Personal's document or data")
+                    self.case("recovery-preserves-other-profile")
+                    incidents = list((Path(fresh["directory"]) / "recoveries").iterdir())
+                    require(len(incidents) == 1, "One recovery incident must retain the abnormal generation")
+                    incident_file = incidents[0]
+                    info = incident_file.lstat()
+                    require(incident_file.is_file() and not incident_file.is_symlink()
+                            and not (getattr(info, "st_file_attributes", 0) & 0x400)
+                            and info.st_nlink == 1 and 0 < info.st_size <= 1024 * 1024,
+                            "A bounded plain recovery incident is required")
+                    incident = json.loads(incident_file.read_bytes())
+                    require(incident.get("schema") == 1 and incident.get("profile") == fresh["profile"]
+                            and incident.get("guardPid") == crashed.process["pid"]
+                            and incident.get("nativePid") == crashed.native["nativePid"]
+                            and incident.get("receipt") == receipt,
+                            "The original abnormal receipt must survive unchanged in the incident")
+                    self.proof["incident"] = incident
+                    self.case("recovery-retains-abnormal-receipt")
+                    for page in (recovered, personal):
+                        self.sandbox(page.process, "recovery-final")
+                    replacement.validate()
+                    self.proof["reopened"] = reopened
+                    self.proof["cacheIdentity"] = cache_before
+                    self.checkpoint("recover-inspected")
+        self.proof["passed"] = True
+
     def run(self):
         try:
-            if self.phase:
+            if self.phase == "recover":
+                self.recovery()
+            elif self.phase:
                 self.relaunch(self.phase)
             else:
                 self.first_launch()
@@ -1957,7 +2078,10 @@ def main():
     parser.add_argument("--data", type=Path, required=True, help="the runner's session directory")
     parser.add_argument("--site", required=True, help="the fixture site origin")
     parser.add_argument("--app-pid", type=int, required=True)
-    parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
+    parser.add_argument("--phase", default="", choices=["", "restart", "reset", "recover"])
+    for role in ("app", "guard", "browser"):
+        parser.add_argument(f"--recovery-{role}", type=Path)
+    parser.add_argument("--recovery-app-data", type=Path)
     parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
     parser.add_argument("--installed", type=Path,
                         help="W6: the installed App's directory; its guards and browsers must run from its cef")
@@ -1966,12 +2090,22 @@ def main():
     args = parser.parse_args()
     if args.real_site and args.phase:
         parser.error("--real-site runs the first launch only")
+    recovery_images = {role: str(getattr(args, f"recovery_{role}")) for role in ("app", "guard", "browser")}
+    if args.phase == "recover" and (args.installed or args.real_site or args.recovery_app_data is None or
+                                    any(getattr(args, f"recovery_{role}") is None for role in recovery_images)):
+        parser.error("--phase recover needs exact App/guard/browser paths and a standalone synthetic site")
+    if args.phase != "recover":
+        if args.recovery_app_data is not None or any(getattr(args, f"recovery_{role}") is not None
+                                                   for role in recovery_images):
+            parser.error("Recovery process paths are only accepted with --phase recover")
+        recovery_images = None
     if os.name != "nt":
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
     Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site, args.installed,
-             expect_sandbox=not args.unsandboxed_candidate).run()
+             expect_sandbox=not args.unsandboxed_candidate, recovery_images=recovery_images,
+             recovery_app_data=args.recovery_app_data).run()
 
 
 if __name__ == "__main__":

@@ -2777,3 +2777,32 @@ return, other site permissions/revocation, Web Push delivery, sandboxing, other 
 updates and distribution remain unfinished. The runner
 uses `no_sandbox` in its disposable root test environment; it is not a release
 configuration or an engine-selection decision.
+
+## Windows same-App recovery fixture
+
+Source candidate; Windows native recovery remains unqualified until this
+scenario runs. The W3 job adds a separate fresh case with `--recover`, using
+the same sandboxed browser and the existing fixture TLS setup. It accepts no
+restart/reset, real-site, installed-package or unsandboxed mode combination.
+
+The actual home creates Work and Personal. The observer seeds both, normally
+closes Work and verifies the saved cookie/storage after reopening it, then
+terminates only Work's held native browser handle with a synthetic exit code.
+App/guard/browser image paths, creation times and direct ancestry are checked
+before that fault; the App and guard handles have no termination access. A
+failed identity/liveness check refuses the fault, with no kill-by-PID fallback.
+
+Ordinary open must only offer recovery; the actual confirmation button must
+create the replacement. The observer requires the same UUID/cache directory
+identities and saved connections, new native process generations, unchanged
+Personal document/processes/data, and one incident preserving the original
+abnormal receipt. Seed-normal, injected-abnormal and final-normal evidence
+remain separate. Recovered Work, Personal and the outer App job must all end
+with their original strict normal conditions; the injected failure cannot
+satisfy a final cleanup check. Six named cases and a nonempty passed summary
+are required.
+
+The SDK-free controls exercise fault refusal, PID reuse and case wiring.
+Actual Win32 handle calls, the Windows App UI and the recovery result still
+need native execution. This does not qualify whole-App/OS-crash recovery,
+unsaved writes, actual authentication or installed-package recovery.

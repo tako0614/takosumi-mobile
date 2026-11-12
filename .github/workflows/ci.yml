@@ -1283,6 +1283,33 @@ jobs:
           if ($w3Count -ne 12) { throw "Expected exactly twelve W3 cases, saw $w3Count" }
           $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
           if ($summary.passed -ne $true) { throw 'The W3 summary did not pass' }
+      - name: Actual home recovery after an owned browser fault
+        id: w3-recover
+        if: ${{ !cancelled() && steps.w3-tls.outcome == 'success' }}
+        timeout-minutes: 10
+        working-directory: takosumi-mobile
+        run: |
+          $case = Join-Path ([System.IO.Path]::GetTempPath()) 'sumi-w3-recover'
+          "W3_RECOVERY_CASE=$case" >> $env:GITHUB_ENV
+          $tls = Join-Path $env:RUNNER_TEMP 'w3-tls'
+          $stage = Join-Path $env:RUNNER_TEMP 'w3-stage\cef'
+          $log = Join-Path $env:RUNNER_TEMP 'w3-recovery.log'
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --recover | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "W3 recovery failed (exit $LASTEXITCODE)" }
+          $recoveryCases = @(
+            'recovery-requires-consent',
+            'recovery-keeps-settled-data',
+            'recovery-preserves-other-profile',
+            'recovery-retains-abnormal-receipt',
+            'no-process-left',
+            'no-opener-request'
+          )
+          foreach ($case_name in $recoveryCases) {
+            if (-not (Select-String -Path $log -Pattern "^PASS case $([regex]::Escape($case_name))$" -Quiet)) { throw "Recovery case $case_name did not pass" }
+          }
+          if (@(Select-String -Path $log -Pattern '^PASS case ').Count -ne 6) { throw 'Expected exactly six recovery cases' }
+          $summary = Get-Content -Raw (Join-Path $case 'summary.json') | ConvertFrom-Json
+          if ($summary.passed -ne $true -or $summary.phases.Count -ne 1 -or $summary.phases[0].phase -ne 'recover') { throw 'The standalone recovery summary did not pass' }
       - name: Remove the fixture CA
         if: ${{ always() && steps.w3-tls.outcome != 'skipped' }}
         working-directory: takosumi-mobile
@@ -1298,6 +1325,19 @@ jobs:
           path: |
             ${{ env.W3_CASE }}
             ${{ env.W3_APP_DATA }}/browser-process-experiment/*/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Keep the W3 recovery case
+        if: ${{ !cancelled() && env.W3_RECOVERY_CASE != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cef-windows-recovery
+          path: |
+            ${{ env.W3_RECOVERY_CASE }}/summary.json
+            ${{ env.W3_RECOVERY_CASE }}/**/*.json
+            ${{ env.W3_RECOVERY_CASE }}/**/*.log
+            ${{ env.W3_RECOVERY_CASE }}/source-snapshot/**
           if-no-files-found: warn
           retention-days: 14
 
