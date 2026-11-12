@@ -1,6 +1,7 @@
 """Harness/protocol controls only; these do not execute or qualify the iOS App."""
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from urllib.request import build_opener, HTTPSHandler, HTTPCookieProcessor, Prox
 
 import run as runner
 from harness import runtime
-from web_site import Site
+from web_site import Handler, Site
 
 
 class Controls(unittest.TestCase):
@@ -269,6 +270,64 @@ class Controls(unittest.TestCase):
         checked = subprocess.run(["node", "--input-type=module", "-e", probe],
                                  capture_output=True, text=True, timeout=5)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def handler(self, writer):
+        handler = Handler.__new__(Handler)
+        handler.server = types.SimpleNamespace(kind="editor", tokens={}, events=[])
+        handler.path, handler.headers = "/editor", {}
+        handler.send_response = lambda _: None
+        handler.send_header = lambda *_: None
+        handler.end_headers = lambda: None
+        handler.wfile = writer
+        return handler
+
+    def test_response_write_return_is_separate_from_receipt_and_does_not_claim_a_native_commit(self):
+        writer = io.BytesIO()
+        handler = self.handler(writer)
+        handler.do_GET()
+        self.assertEqual(len(handler.server.events), 1)
+        event = handler.server.events[0]["response"]
+        self.assertEqual(event["state"], "written")
+        self.assertEqual(event["status"], 200)
+        self.assertEqual(event["writtenBytes"], len(writer.getvalue()))
+        self.assertEqual(event["writtenBytes"], event["bodyBytes"])
+        self.assertGreaterEqual(event["writeElapsedMs"], event["responseElapsedMs"])
+        self.assertIsInstance(event["receivedUnixMs"], int)
+        self.assertIsInstance(event["writeReturnedUnixMs"], int)
+        self.assertIn(b"Notes editor", writer.getvalue())
+        self.assertNotIn("passed", event)
+
+    def test_response_transport_failure_updates_the_same_request_without_recording_error_text(self):
+        for error, kind in ((BrokenPipeError("private transport detail"), "broken-pipe"),
+                            (ConnectionResetError("private transport detail"), "connection-reset"),
+                            (ssl.SSLError("private transport detail"), "tls")):
+            with self.subTest(kind=kind):
+                handler = self.handler(types.SimpleNamespace(write=lambda _: (_ for _ in ()).throw(error)))
+                handler.do_GET()
+                self.assertEqual(len(handler.server.events), 1, "Do not inflate the navigation oracle")
+                event = handler.server.events[0]["response"]
+                self.assertEqual(event["state"], "transport-failed")
+                self.assertEqual(event["transportFailure"], kind)
+                self.assertEqual(event["status"], 200)
+                self.assertNotIn("writtenBytes", event)
+                self.assertNotIn("private transport detail", json.dumps(event))
+
+    def test_published_response_snapshot_stays_stable_when_a_write_finishes(self):
+        snapshots = []
+        def write(data):
+            event = handler.server.events[0]
+            snapshots.append((event["response"], json.dumps(handler.server.events), set(event)))
+            return len(data)
+        handler = self.handler(types.SimpleNamespace(write=write))
+        handler.do_GET()
+        during, serialized, keys = snapshots[0]
+        event = handler.server.events[0]
+        self.assertEqual(during["state"], "writing")
+        self.assertNotIn("writtenBytes", during)
+        self.assertEqual(json.loads(serialized)[0]["response"], during)
+        self.assertEqual(set(event), keys, "A request worker must not resize the published request")
+        self.assertEqual(event["response"]["state"], "written")
+        self.assertIsNot(event["response"], during)
 
 
 if __name__ == "__main__":

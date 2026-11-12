@@ -5,6 +5,7 @@ from http.cookies import SimpleCookie
 import secrets
 import ssl
 import threading
+import time
 from urllib.parse import urlsplit
 
 
@@ -52,12 +53,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def reply(self, status, body, **headers):
         data = body.encode()
+        self.record_response(state="writing", status=status, bodyBytes=len(data),
+                             responseElapsedMs=self.elapsed_ms())
         self.send_response(status)
         for key, value in {"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(data)),
                            "Cache-Control": "no-store", "Connection": "close", **headers}.items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(data)
+        written = self.wfile.write(data)
+        # This proves only that the server-side write returned, never that
+        # WebKit committed, painted or exposed the page to accessibility.
+        self.record_response(state="written", writtenBytes=written,
+                             writeElapsedMs=self.elapsed_ms(), writeReturnedUnixMs=time.time_ns() // 1_000_000)
+
+    def record_response(self, **fields):
+        # Request workers may outlive serve_forever's thread. Keep the public
+        # request shape fixed and replace a complete response snapshot so JSON
+        # collection never traverses a dictionary while this worker grows it.
+        self.event["response"] = dict(self.event["response"], **fields)
+
+    def elapsed_ms(self):
+        return (time.monotonic_ns() - self.received_ns) / 1_000_000
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -67,8 +83,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         user = next((name for name, value in self.server.tokens.items()
                      if token is not None and secrets.compare_digest(token.value, value)), None)
         allowed = {"/", "/account", "/sign-in/Work", "/sign-in/Personal", "/editor", "/editor/page-two"}
-        self.server.events.append({"site": self.server.kind, "path": path if path in allowed else "other",
-                                   "user": user, "cookiePresent": token is not None})
+        self.received_ns = time.monotonic_ns()
+        self.event = {"site": self.server.kind, "path": path if path in allowed else "other",
+                      "user": user, "cookiePresent": token is not None,
+                      "response": {"state": "received", "receivedUnixMs": time.time_ns() // 1_000_000}}
+        self.server.events.append(self.event)
         try:
             if self.server.kind == "instance" and path.startswith("/sign-in/"):
                 selected = path.removeprefix("/sign-in/")
@@ -114,5 +133,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(404, "Unknown fixture page")
                 return
             self.reply(200, common + content + isolation)
-        except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError) as error:
+            kind = "broken-pipe" if isinstance(error, BrokenPipeError) else (
+                "connection-reset" if isinstance(error, ConnectionResetError) else "tls")
+            self.record_response(state="transport-failed", transportFailure=kind,
+                                 failureElapsedMs=self.elapsed_ms())

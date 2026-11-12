@@ -74,6 +74,20 @@ Web-home navigation/resume allows B; the shell connection form itself still
 rejects `localhost`. Server evidence requires A's host cookie absent at B.
 This avoids treating two ports on one host as separate cookie scopes.
 
+Run43290145178 installed and launched the actual App, added Work, signed in,
+and reached its home and management page. Notes then missed the unchanged
+15-second element deadline: the failure screenshot still showed Work, while
+the final teardown hierarchy showed the editor on its correct host. The
+request record alone did not prove when the server response finished. Each
+existing request record now includes server receive/write times, status,
+byte counts and a closed transport-failure class. Its response snapshot is
+replaced at each stage without growing the published request or changing a
+response dictionary that collection may already be reading. No headers, response bodies
+or error text are recorded. Receipt is timestamped after request parsing,
+not at socket acceptance or TLS handshake. A returned write does not prove WebKit commit,
+paint or accessibility readiness. This diagnostic adds no request, UI read,
+tap, retry or wait, and does not alter the functional or cleanup verdicts.
+
 Current iOS retains only one non-popup App screen. Warm document-memory
 retention is checked before opening Personal; cross-profile reopening checks
 persistent state and restored URL. This fixture does not claim simultaneous
