@@ -108,6 +108,23 @@ CEF experiments are separate from this GTK repair and Tauri App integration.
 
 ## Whole App iOS Simulator SDK build
 
+Normal iOS init uses the product-owned `src-tauri/ios-project.yml` through the
+supported Tauri config hook. It preserves CLI2.11.4's template and adds only
+an explicit OS Swift runpath before bundled back-deployment frameworks. The
+whole-App Simulator originally aborted in dyld because its embedded Swift
+concurrency library could not resolve `@rpath/libswiftCore.dylib`. Existing
+generated projects need regeneration from the repository root after this
+template change. The candidate has no signing, platform-only SDK override or
+manual runtime-copy step in the product template; native launch qualification
+remains pending.
+
+The SDK script inspects actual App/runtime bytes with the installed `otool`,
+requires the intended main-image runpath order, and keeps load commands,
+dependencies and image hashes in `swift-runtime-proof.json` outside the App.
+That artifact is retained even if the route check fails; the later UI runner
+binds it to the SDK checkout and actual App/runtime hashes. This search-route
+check is not complete loader-closure or launch qualification.
+
 On a disposable macOS checkout with Xcode, CocoaPods, Rust and Bun:
 
 ```bash

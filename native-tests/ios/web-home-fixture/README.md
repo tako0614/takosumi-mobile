@@ -36,6 +36,14 @@ and queries only its Takosumi-process/private-bundle log events, keeping at most
 diagnostic candidates until native execution; an absent exit reason is not a
 successful launch or a causal diagnosis.
 
+The subsequent original crash report identifies a DYLD launch abort: embedded
+`libswift_Concurrency.dylib` cannot resolve `@rpath/libswiftCore.dylib`. A
+product-owned template based on pinned CLI2.11.4 now adds the OS Swift search
+path before bundled frameworks for normal init and this SDK build alike.
+This is a runtime-search repair candidate, not a native launch pass. The SDK
+keeps byte-bound `otool -L/-l` evidence for the App and embedded runtime, and
+the UI runner checks that proof against its actual installed-build input.
+
 [Apple's bundle-ID initializer](https://developer.apple.com/documentation/xcuiautomation/xcuiapplication/init(bundleidentifier:))
 can launch an installed app when the scheme/dependencies/build-products
 contain no matching build. This driver uses a different identity and its own

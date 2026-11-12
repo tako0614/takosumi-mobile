@@ -34,7 +34,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "android": { "minSdkVersion": 28 }
+    "android": { "minSdkVersion": 28 },
+    "iOS": { "template": "src-tauri/ios-project.yml" }
   },
   "plugins": {
     "deep-link": {

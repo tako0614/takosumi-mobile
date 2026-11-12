@@ -30,7 +30,8 @@ SOURCES += [ROOT / name for name in (
     "src/entry.tsx", "src/web-home.tsx", "src/web-home.css", "src/web-connections.ts",
     "src/web-profile-recovery.ts", "src/web-profile-data.ts", "src/web-permissions.ts", "index.html",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json",
-    "src-tauri/Info.ios.plist", "native-tests/ios/build-simulator.sh", "bun.lock")]
+    "src-tauri/Info.ios.plist", "src-tauri/ios-project.yml", "native-tests/ios/build-simulator.sh",
+    "native-tests/ios/swift_runtime.py", "native-tests/ios/test_swift_runtime.py", "bun.lock")]
 
 
 def require(condition, message):
@@ -188,9 +189,23 @@ def main():
     for tool in ("xcrun", "xcodebuild", "xcodegen", "openssl"):
         require(shutil.which(tool), "Missing existing native tool: " + tool)
     app, app_proof = product_app()
+    runtime_file = BUILD / "swift-runtime-proof.json"
+    require(runtime_file.is_file() and not runtime_file.is_symlink() and runtime_file.stat().st_size <= 8 * 1024**2,
+            "Missing bounded SDK Swift runtime proof")
+    swift_runtime = json.loads(runtime_file.read_text())
+    require(swift_runtime.get("passed") is True and swift_runtime.get("bundleIdentifier") == BUNDLE,
+            "SDK Swift search-route inspection did not pass")
+    images = swift_runtime.get("images", [])
+    require(images and images[0].get("path") == app_proof["executable"]
+            and images[0].get("sha256") == app_proof["executableSHA256"], "Swift proof belongs to another App")
+    for image in images:
+        path = Path(image.get("path", ""))
+        require(not path.is_absolute() and path.parts and ".." not in path.parts and digest(app / path) == image.get("sha256"),
+                "Swift runtime image differs from the SDK proof")
     out = args.out.resolve()
     require(not out.is_relative_to(ROOT), "Evidence must stay outside the repository")
     out.mkdir(mode=0o700)
+    shutil.copyfile(runtime_file, out / "swift-runtime-proof.json")
     scratch_parent = Path(os.environ.get("RUNNER_TEMP", os.environ.get("TMPDIR", "/root/dev/tmp")))
     require(not scratch_parent.resolve().is_relative_to(ROOT), "Private scratch must stay outside the repository")
     require(shutil.disk_usage(scratch_parent).free >= 8 * 1024**3, "Need 8 GiB free; no broad cleanup")
@@ -204,6 +219,8 @@ def main():
                                        out / "checkout.log").splitlines()
             require(len(checkout) == 2 and all(re.fullmatch(r"[0-9a-f]{40}", v) for v in checkout), "Invalid checkout")
             result["checkout"] = {"head": checkout[0], "tree": checkout[1]}
+            require(swift_runtime.get("head") == checkout[0] and swift_runtime.get("tree") == checkout[1],
+                    "SDK Swift runtime proof belongs to another source checkout")
             kit = ROOT.parent / "mobile-kit"
             dependency = runtime.command(["git", "-C", str(kit), "rev-parse", "HEAD", "HEAD^{tree}"],
                                          out / "kit-checkout.log").splitlines()

@@ -55,6 +55,7 @@ assert not re.search(r"(?m)^[ \t]*['\"]?(?:SDKROOT|SUPPORTED_PLATFORMS)(?:\[[^\r
 text = text.replace(marker, marker + "        SDKROOT: iphonesimulator\n        SUPPORTED_PLATFORMS: iphonesimulator\n", 1)
 spec.write_text(text)
 PY
+
 xcodegen generate --spec src-tauri/gen/apple/project.yml --project src-tauri/gen/apple
 # XcodeGen rewrites entitlements from its spec. Reapply the same product writer
 # used by init so regeneration cannot silently remove normal plugin wiring.
@@ -97,3 +98,5 @@ print(f"PASS: whole App iOS Simulator SDK build: {bundle}")
 print(f"Executable bytes={binary.stat().st_size}, sha256={hashlib.sha256(binary.read_bytes()).hexdigest()}")
 print("No Simulator runtime, real IdP, push, signing or distribution qualification.")
 PY
+
+python3 -B native-tests/ios/swift_runtime.py
