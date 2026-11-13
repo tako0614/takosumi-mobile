@@ -383,7 +383,10 @@ public final class WebHomeOperationTest {
         cases.put("cold-process-and-profiles-restored");
         closeAndOpenMain(); reopen("Work"); closeAndOpenMain();
         clearConnectionData("Work"); expect("Workの保存データを消去しますか？");
-        click("保存データを消去"); expect("Workのサイトデータを消去しました。");
+        click("保存データを消去");
+        // Completion feedback is below the connection form. Reuse its one
+        // owned-page scroll while still requiring the exact visible receipt.
+        one(By.text("Workのサイトデータを消去しました。"), null, true);
         reopen("Work"); expect("Fixture signed out"); host(origin);
         click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("");
         closeAndOpenMain(); reopen("Personal");
