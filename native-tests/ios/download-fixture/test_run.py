@@ -26,6 +26,109 @@ class HarnessTests(unittest.TestCase):
             reset.start()
             self.addCleanup(reset.stop)
 
+    # stage-checkpoint-controls-begin
+    def test_stage_checkpoint_is_optional_atomic_and_never_a_terminal_verdict(self):
+        old = {"passed": False, "cleanup": False, "simulator": {"udid": "original-id", "name": "original-name"}}
+        result = {"passed": False, "cleanup": False, "source": {"fixture": "held-source-hash"},
+                  "simulator": {"udid": "replacement-id", "name": "replacement-name", "bootRetry": "held-retry"}}
+        device = {"udid": "replacement-id", "name": "replacement-name", "logPath": "private-unselected-path"}
+        unchanged = copy.deepcopy(result)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            receipt = out / "result.json"
+            receipt.write_text(json.dumps(old) + "\n")
+            foreign = out / ".result-checkpoint-unowned.tmp"
+            foreign.write_bytes(b"unrelated sentinel")
+            with patch.object(fixture_runner, "command", side_effect=AssertionError("No new CLI")) as command, \
+                    patch.object(fixture_runner, "save", side_effect=AssertionError("Existing save is unchanged")) as save, \
+                    patch.object(fixture_runner.time, "time", side_effect=AssertionError("No new clock")), \
+                    patch.object(fixture_runner.time, "monotonic", side_effect=AssertionError("No new clock")), \
+                    patch.object(fixture_runner.time, "sleep", side_effect=AssertionError("No new wait")):
+                for stage in ("boot-retry-returned", "trust-returned", "before-test-returned"):
+                    fixture_runner.preserve_stage_checkpoint(out, result, stage, "replacement-id", "replacement-name", device)
+                    value = json.loads(receipt.read_text())
+                    self.assertEqual({key: item for key, item in value.items() if key != "diagnosticCheckpoint"}, result)
+                    checkpoint = value["diagnosticCheckpoint"]
+                    self.assertEqual(checkpoint, {
+                        "schema": "takosumi.ios-download-stage-checkpoint@v1", "diagnosticOnly": True,
+                        "stage": stage, "heldSimulator": {"udid": "replacement-id", "name": "replacement-name"},
+                        "createdDeviceIdentity": {"udid": "replacement-id", "name": "replacement-name"}})
+                    self.assertFalse(value["passed"] or value["cleanup"])
+                command.assert_not_called()
+                save.assert_not_called()
+            self.assertEqual(result, unchanged)
+            valid = receipt.read_bytes()
+            self.assertEqual({path.name for path in out.iterdir()}, {"result.json", foreign.name})
+            original_temp = fixture_runner.tempfile.NamedTemporaryFile
+
+            class PartialWrite:
+                def __init__(self, stream):
+                    self.stream, self.name = stream, stream.name
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+                def write(self, data):
+                    self.stream.write(data[:9])
+                    self.stream.flush()
+                    raise OSError("private partial-write failure")
+
+            for mode in ("serialization", "partial-write", "replace", "missing-held-identity", "unknown-stage"):
+                with self.subTest(failure=mode):
+                    if mode == "serialization":
+                        writer = patch.object(fixture_runner.json, "dumps", side_effect=RuntimeError("private observer failure"))
+                    elif mode == "partial-write":
+                        writer = patch.object(fixture_runner.tempfile, "NamedTemporaryFile",
+                                              side_effect=lambda **kwargs: PartialWrite(original_temp(**kwargs)))
+                    elif mode == "replace":
+                        writer = patch.object(fixture_runner.os, "replace", side_effect=OSError("private replace failure"))
+                    else:
+                        writer = patch.object(fixture_runner.tempfile, "NamedTemporaryFile",
+                                              side_effect=AssertionError("Invalid metadata creates no file"))
+                    with writer:
+                        fixture_runner.preserve_stage_checkpoint(out, result,
+                            "unknown-stage" if mode == "unknown-stage" else "trust-returned",
+                            "replacement-id", "replacement-name", {} if mode == "missing-held-identity" else device)
+                    self.assertEqual(receipt.read_bytes(), valid)
+                    self.assertEqual(result, unchanged)
+                    self.assertEqual({path.name for path in out.iterdir()}, {"result.json", foreign.name})
+                    self.assertEqual(foreign.read_bytes(), b"unrelated sentinel")
+            refused_unlinks = []
+            def refuse_unlink(path):
+                refused_unlinks.append(path)
+                raise PermissionError("private temporary cleanup failure")
+            with patch.object(fixture_runner.os, "replace", side_effect=OSError("private sink failure")), \
+                    patch.object(Path, "unlink", autospec=True, side_effect=refuse_unlink):
+                fixture_runner.preserve_stage_checkpoint(out, result, "trust-returned",
+                    "replacement-id", "replacement-name", device)
+            self.assertEqual(receipt.read_bytes(), valid)
+            self.assertEqual(len(refused_unlinks), 1)
+            temporary = refused_unlinks[0]
+            self.assertEqual(temporary.parent, out)
+            self.assertTrue(temporary.name.startswith(".result-checkpoint-") and temporary.name.endswith(".tmp"))
+            self.assertNotEqual(temporary, foreign)
+            temporary.unlink()  # Only this test's identified owned temporary.
+            original = RuntimeError("original functional failure")
+            raised = None
+            cleanup = Mock()
+            try:
+                try:
+                    raise original
+                finally:
+                    with patch.object(fixture_runner.os, "replace", side_effect=OSError("private sink failure")):
+                        fixture_runner.preserve_stage_checkpoint(out, result, "trust-returned",
+                            "replacement-id", "replacement-name", device)
+                    cleanup()
+            except Exception as error:
+                raised = error
+            self.assertIs(raised, original)
+            cleanup.assert_called_once_with()
+            self.assertEqual(receipt.read_bytes(), valid)
+            self.assertEqual(result, unchanged)
+            self.assertEqual({path.name for path in out.iterdir()}, {"result.json", foreign.name})
+    # stage-checkpoint-controls-end
+
     def test_command_can_preserve_large_raw_output_without_decoding_it(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
             path = Path(raw) / "target-raw.log"

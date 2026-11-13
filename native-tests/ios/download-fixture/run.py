@@ -77,6 +77,38 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+# stage-checkpoint-begin
+def preserve_stage_checkpoint(out, result, stage, udid, name, created_device):
+    temporary = None
+    try:
+        if stage not in ("boot-retry-returned", "trust-returned", "before-test-returned"):
+            return
+        value = dict(result)
+        value["diagnosticCheckpoint"] = {
+            "schema": "takosumi.ios-download-stage-checkpoint@v1", "diagnosticOnly": True,
+            "stage": stage, "heldSimulator": {"udid": udid, "name": name},
+            "createdDeviceIdentity": {"udid": created_device["udid"], "name": created_device["name"]}}
+        data = json.dumps(value, indent=2) + "\n"
+        # A failed/partial write must not truncate the last complete receipt.
+        # The exclusive temporary is owned by this call in the same private out.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=out,
+                prefix=".result-checkpoint-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+        os.replace(temporary, out / "result.json")
+        temporary = None
+    except Exception:
+        pass  # Optional evidence never replaces the original work/error/cleanup.
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except Exception:
+                pass  # Only this call's exclusive temporary is eligible here.
+# stage-checkpoint-end
+
+
 def migration_progress(path):
     """Read native migration progress and explicit terminal success from this CLI."""
     with path.open("rb") as source:
@@ -641,6 +673,7 @@ def main():
                 # readiness ceiling per attempt is unchanged, no third try.
                 udid, name, created_device = retry_boot_after_stall(
                     out, stalled, udid, name, device_type, runtime, result, created_device)
+                preserve_stage_checkpoint(out, result, "boot-retry-returned", udid, name, created_device)  # stage-checkpoint:retry
             # Trust only on this exact disposable Simulator, never host trust.
             try:
                 command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
@@ -660,6 +693,7 @@ def main():
                 command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
                         out / "trust-retry.log", trust_trace=True)
                 result["simulator"]["trustRetry"] = "stalled-retried"
+            preserve_stage_checkpoint(out, result, "trust-returned", udid, name, created_device)  # stage-checkpoint:trust
             server = FixtureServer(cert, key)
             server.start()
             env = dict(os.environ, SUMI_DOWNLOAD_URL=server.url, SUMI_DOWNLOAD_SOURCE=str(HERE),
@@ -678,6 +712,7 @@ def main():
             # names which of the two it was.
             command(["xcrun", "simctl", "list", "devices", "--json"],
                     out / "before-test.log")
+            preserve_stage_checkpoint(out, result, "before-test-returned", udid, name, created_device)  # stage-checkpoint:before-test
             log = command(["xcodebuild", "test", "-project", str(scratch / "DownloadFixture.xcodeproj"),
                            "-scheme", "DownloadFixture", "-destination", f"id={udid}",
                            "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),

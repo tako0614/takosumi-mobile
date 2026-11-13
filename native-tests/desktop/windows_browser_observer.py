@@ -637,7 +637,8 @@ def command_observation(record, stage, **values):
                 "commandId": ident if 0 <= ident <= 2**53 - 1 else None,
                 "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
                 "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending",
-                "lastReceive": None, "lastOtherReplyRelation": None}
+                "lastReceive": None, "lastOtherReplyRelation": None,
+                "firstEventReceivedAt": None, "lastEventReceivedAt": None}
     if record is None:
         return None
     result = dict(record)
@@ -650,6 +651,14 @@ def command_observation(record, stage, **values):
             if increment:
                 result["countsCapped"] |= result[name] == 2**31 - 1
                 result[name] = min(result[name] + 1, 2**31 - 1)
+        if values["event"]:
+            # Already stamped after JSON classification; no clock read or raw event is retained.
+            received_at = values["message"][RECEIVED_AT]
+            if type(received_at) is not float or not 0 <= received_at < float("inf"):
+                raise ValueError("Invalid event receipt time")
+            if result["firstEventReceivedAt"] is None:
+                result["firstEventReceivedAt"] = received_at
+            result["lastEventReceivedAt"] = received_at
         if values["other"]:
             relation = command_reply_relation(values["reply_id"], values["ident"])
             if type(relation) is not str or relation not in ("older", "future", "invalid", "unknown"):
@@ -798,7 +807,7 @@ class Cdp:
                     raise Failure(f"CDP timeout {method} ({self.label})")
                 reply_id = message.get("id")
                 if reply_id == ident:
-                    self._observe_command("message", matching=True, other=False, event="method" in message)
+                    self._observe_command("message", matching=True, other=False, event="method" in message, message=message)
                     phase = "reply"
                     if "error" in message:
                         self._observe_command("end", outcome="cdp_error")
@@ -808,7 +817,7 @@ class Cdp:
                     return message.get("result", {})
                 else:
                     self._observe_command("message", matching=False, other="id" in message, event="method" in message,
-                                          reply_id=reply_id, ident=ident)
+                                          reply_id=reply_id, ident=ident, message=message)
         except Exception as error:
             if phase == "receive":  # CDP_RECEIVE_OBSERVATION
                 self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION
