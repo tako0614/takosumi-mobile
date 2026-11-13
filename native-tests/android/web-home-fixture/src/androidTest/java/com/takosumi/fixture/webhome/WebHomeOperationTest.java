@@ -42,6 +42,8 @@ public final class WebHomeOperationTest {
     private final JSONObject result = new JSONObject();
     private final JSONArray cases = new JSONArray();
     private int connectionAttempts;
+    private BackWaitObservation backHomeObservation;
+    private boolean backObservationIncomplete;
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
@@ -111,8 +113,14 @@ public final class WebHomeOperationTest {
                         diagnostic(trace, "saveBounds", new JSONArray().put(bounds.left).put(bounds.top)
                             .put(bounds.right).put(bounds.bottom));
                     }
+                    observeHomeQuery(BackWaitObservation.Outcome.VISIBLE);
                     return value;
+                } else {
+                    observeHomeQuery(BackWaitObservation.Outcome.EMPTY_BOUNDS);
                 }
+            } else {
+                observeHomeQuery(value == null ? BackWaitObservation.Outcome.QUERY_NULL
+                    : BackWaitObservation.Outcome.DISABLED);
             }
             if (scrollConnectionForm && !formScrollRequested
                     && (value == null || value.getVisibleBounds().isEmpty())) {
@@ -247,6 +255,79 @@ public final class WebHomeOperationTest {
         try { target.put(key, value); } catch (org.json.JSONException ignored) { }
     }
 
+    // Observation is separate from one()'s Save/IME trace control input.
+    private void beginAccountBackObservation() {
+        try {
+            backHomeObservation = new BackWaitObservation();
+            backHomeObservation.beginBack(SystemClock.elapsedRealtime());
+        } catch (RuntimeException ignored) { backObservationIncomplete = true; }
+    }
+
+    private void finishAccountBackObservation(boolean returned) {
+        try {
+            if (backHomeObservation != null) backHomeObservation.endBack(SystemClock.elapsedRealtime(), returned);
+        } catch (RuntimeException ignored) { backObservationIncomplete = true; }
+    }
+
+    private void beginHomeWaitObservation() {
+        try {
+            if (backHomeObservation != null) backHomeObservation.beginWait(SystemClock.elapsedRealtime());
+        } catch (RuntimeException ignored) { backObservationIncomplete = true; }
+    }
+
+    private void finishHomeWaitObservation(boolean returned) {
+        try {
+            if (backHomeObservation != null) backHomeObservation.endWait(SystemClock.elapsedRealtime(), returned);
+        } catch (RuntimeException ignored) { backObservationIncomplete = true; }
+        finally { if (backHomeObservation != null) backHomeObservation.waiting = false; }
+    }
+
+    private void observeHomeQuery(BackWaitObservation.Outcome outcome) {
+        if (backHomeObservation == null || !backHomeObservation.waiting) return;
+        try { backHomeObservation.sample(outcome, SystemClock.elapsedRealtime()); }
+        catch (RuntimeException ignored) { backObservationIncomplete = true; }
+    }
+
+    private void captureTime(String key) {
+        try { diagnostic(result, key, SystemClock.elapsedRealtime()); }
+        catch (RuntimeException ignored) { backObservationIncomplete = true; }
+    }
+
+    private void saveBackObservation() {
+        try {
+            BackWaitObservation value = backHomeObservation;
+            if (value == null) {
+                diagnostic(result, "backObservationIncomplete", backObservationIncomplete);
+                return;
+            }
+            JSONObject metadata = new JSONObject();
+            diagnostic(result, "accountBackHome", metadata);
+            diagnostic(metadata, "diagnosticOnly", true);
+            diagnostic(metadata, "phase", "account_back_home");
+            diagnostic(metadata, "clockDomain", "android_elapsed_realtime");
+            diagnostic(metadata, "clockUnit", "ms");
+            diagnostic(metadata, "recordingIncomplete", backObservationIncomplete || value.incomplete);
+            diagnostic(metadata, "sampleLimit", BackWaitObservation.LIMIT);
+            diagnostic(metadata, "backCallStartedAtMs", value.backStartedAtMs);
+            diagnostic(metadata, "backCallFinishedAtMs", value.backFinishedAtMs);
+            diagnostic(metadata, "backCallReturned", value.backReturned);
+            diagnostic(metadata, "waitStartedAtMs", value.waitStartedAtMs);
+            diagnostic(metadata, "waitFinishedAtMs", value.waitFinishedAtMs);
+            diagnostic(metadata, "waitReturned", value.waitReturned);
+            diagnostic(metadata, "samples", value.samples);
+            diagnostic(metadata, "queryNull", value.queryNull);
+            diagnostic(metadata, "disabled", value.disabled);
+            diagnostic(metadata, "emptyBounds", value.emptyBounds);
+            diagnostic(metadata, "visible", value.visible);
+            diagnostic(metadata, "firstOutcome", value.first == null ? "unknown" : value.first.name());
+            diagnostic(metadata, "lastOutcome", value.last == null ? "unknown" : value.last.name());
+            diagnostic(metadata, "firstAtMs", value.firstAtMs);
+            diagnostic(metadata, "lastAtMs", value.lastAtMs);
+            diagnostic(metadata, "capReached", value.capReached);
+            diagnostic(metadata, "droppedCapped", value.dropped);
+        } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
+    }
+
     private void add(String name) {
         JSONObject trace = new JSONObject();
         diagnostic(trace, "diagnosticOnly", true);
@@ -346,7 +427,18 @@ public final class WebHomeOperationTest {
         add("Work"); host(origin);
         click("Sign in Work"); expect("Fixture home Work"); expect("Instance data instance-Work");
         click("Account settings"); expect("Account settings Work");
-        nativeButton("戻る"); expect("Fixture home Work");
+        beginAccountBackObservation();
+        boolean accountBackReturned = false;
+        try {
+            nativeButton("戻る");
+            accountBackReturned = true;
+        } finally { finishAccountBackObservation(accountBackReturned); }
+        beginHomeWaitObservation();
+        boolean accountHomeReturned = false;
+        try {
+            expect("Fixture home Work");
+            accountHomeReturned = true;
+        } finally { finishHomeWaitObservation(accountHomeReturned); }
         click("📝 Notes"); expect("Notes editor"); host(editor);
         writeDraft("work-draft");
         click("Page two"); expect("Notes page two");
@@ -402,13 +494,19 @@ public final class WebHomeOperationTest {
         boolean saved = false;
         try {
             if (device != null) {
-                boolean screenshot = device.takeScreenshot(new File(files, "screen.png"));
-                device.dumpWindowHierarchy(new File(files, "hierarchy.xml"));
+                boolean screenshot;
+                captureTime("screenshotStartedAtMs");
+                try { screenshot = device.takeScreenshot(new File(files, "screen.png")); }
+                finally { captureTime("screenshotFinishedAtMs"); }
+                captureTime("hierarchyStartedAtMs");
+                try { device.dumpWindowHierarchy(new File(files, "hierarchy.xml")); }
+                finally { captureTime("hierarchyFinishedAtMs"); }
                 saved = screenshot;
             }
         } catch (Exception error) {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
+        saveBackObservation();
         result.put("diagnosticsSaved", saved);
         try (FileOutputStream stream = new FileOutputStream(new File(files, "result.json"))) {
             stream.write(result.toString().getBytes(StandardCharsets.UTF_8));

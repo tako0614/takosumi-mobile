@@ -248,6 +248,17 @@ def _read_reply(process):
     return records
 
 
+def _group_kill_observation(outcome, began, failure=None, at_seconds=None):
+    """One existing call's metadata only; unavailable metadata changes no verdict."""
+    try:
+        return {"operation": "group-kill", "outcome": outcome,
+                "errorType": type(failure).__name__ if failure is not None else None,
+                "errno": failure.errno if failure is not None else None,
+                "atSeconds": round(time.monotonic() - began, 6) if at_seconds is None else at_seconds}
+    except Exception:
+        return None
+
+
 def _retire(process):
     """Kill only the new diagnostic group, then reap and verify exhaustion.
 
@@ -263,12 +274,15 @@ def _retire(process):
     operation_errors = []  # At most one failure per existing operation; no exception text.
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    except ProcessLookupError as failure:
+        initial_group_kill = _group_kill_observation("lookup-missing", began, failure)
     except OSError as failure:
         error = type(failure).__name__
         operation_errors.append({"operation": "group-kill", "errorType": error, "errno": failure.errno,
                                  "atSeconds": round(time.monotonic() - began, 6)})
+        initial_group_kill = _group_kill_observation("os-error", began, failure, operation_errors[-1]["atSeconds"])
+    else:
+        initial_group_kill = _group_kill_observation("returned", began)
     reaped = False
     try:
         process.wait(timeout=max(0, end - time.monotonic()))
@@ -298,6 +312,7 @@ def _retire(process):
                      "cleanupComplete": reaped and gone, "leaderReaped": reaped,
                      "groupGone": gone, "exitCode": process.returncode, "errorType": error,
                      "diagnosticGroup": process.pid, "operationErrors": operation_errors,
+                     "initialGroupKill": initial_group_kill,
                      "retirementSeconds": round(time.monotonic() - began, 6),
                      "replyNonblocking": getattr(process, "_diagnostic_nonblocking", None) is True}
 

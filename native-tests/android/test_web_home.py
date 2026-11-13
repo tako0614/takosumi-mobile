@@ -122,6 +122,38 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: connection Save keyboard checks=[1-9][0-9]*")
 
+    def test_actual_driver_back_wait_metadata_is_bounded_and_never_a_ready_oracle(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the back wait metadata control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the back wait metadata control")
+        classes = self.root / "back-wait-classes"
+        classes.mkdir()
+        helper = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/BackWaitObservation.java"
+        control = runner.HERE / "label-controls/BackWaitObservationTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.webhome.BackWaitObservationTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: back wait metadata checks=[1-9][0-9]*")
+
+    def test_app_screen_observation_helper_is_debug_only_bounded_and_failure_neutral(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the native observation helper control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the native observation helper control")
+        classes = self.root / "native-observation-classes"
+        classes.mkdir()
+        helper = runner.ROOT / "src-tauri/plugins/app-screen/android/src/main/java/AppScreenObservation.java"
+        control = runner.HERE / "label-controls/AppScreenObservationTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.appscreen.AppScreenObservationTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: native observation controls checks=[1-9][0-9]*")
+
     def test_ui_result_requires_all_operations_and_actual_cold_replacement(self):
         for defect in ("no-pass", "missing-operation", "same-pid", "invalid-pid", "same-document", "no-diagnostics"):
             result = self.result()
@@ -244,6 +276,129 @@ class Controls(unittest.TestCase):
             self.assertNotIn("queryReturned", entry)
             self.assertEqual((out / (name + ".log")).read_bytes(), b"partial guest diagnostic")
         self.assertNotIn("private exception detail", str(result))
+
+    # native-observation-begin:collector-controls
+    def native_prior(self):
+        names = ("guest-last-anr", "guest-last-anr-traces", "guest-anr-events", "guest-system-app-anr",
+                 "guest-activity-state", "guest-window-state", "guest-crash")
+        return {"queries": {name: {"queryReturned": True} for name in names}}
+
+    def native_line(self, seq=1, stage="BACK_ENTER", cap=0):
+        return (f"v=1 seq={seq} pid=42 t=123 stage={stage} view=77 cur=1 host=1 gen=0 "
+                f"vis=1 res=1 evict=0 logical=UNKNOWN physical=unknown cap={cap}\n").encode()
+
+    def test_native_observation_is_one_closed_tail_query_and_strict_metadata_only(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        def command(argv, path, **options):
+            path.write_bytes(self.native_line() + b"https://private.invalid/user token=private\n"
+                             + self.native_line(64, "CAP_EXHAUSTED", 1))
+        with patch.object(runner.runtime, "command", side_effect=command) as query:
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        emulator.owned.assert_called_once()
+        query.assert_called_once_with([str(emulator.adb), "-s", runner.SERIAL, "shell", "logcat", "-b", "main",
+                                       "-d", "-v", "raw", "-t", "64", "-s", "TakosWebHomeNative:I", "*:S"],
+                                      scratch / "guest-native-observation-raw.log", timeout=10, read_output=False)
+        self.assertTrue(value["diagnosticOnly"])
+        self.assertEqual((value["clockDomain"], value["clockUnit"]), ("android_elapsed_realtime", "ms"))
+        self.assertEqual([row["stage"] for row in value["records"]], ["BACK_ENTER", "CAP_EXHAUSTED"])
+        self.assertTrue(value["nativeCapSeen"])
+        self.assertEqual(value["rejectedPackets"], 1)
+        saved = out / "guest-native-observation.json"
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.assertLessEqual(saved.stat().st_size, 32 * 1024)
+        self.assertNotIn(b"private", saved.read_bytes())
+        self.assertEqual(value["coverage"], "unknown")
+        self.assertNotIn("passed", value)
+        self.assertFalse(any(out.glob("*-raw.log")))
+
+    def test_native_observation_rejects_unknown_stages_extra_fields_and_numeric_overflow(self):
+        line = self.native_line()
+        bad = [line.replace(b"BACK_ENTER", b"OTHER"), line.rstrip() + b" url=https://private.invalid\n",
+               line.replace(b"seq=1", b"seq=65"), line.replace(b"pid=42", b"pid=2147483648"),
+               line.replace(b"t=123", b"t=9223372036854775808"),
+               line.replace(b"view=77", b"view=2147483648"),
+               line.replace(b"gen=0", b"gen=9223372036854775808"),
+               line.replace(b"physical=unknown", b"physical=attached"),
+               self.native_line(64), self.native_line(1, "CAP_EXHAUSTED", 1)]
+        for raw in bad:
+            with self.subTest(raw=raw):
+                records, rejected, cut = runner.parse_native_observation(raw)
+                self.assertEqual(records, [])
+                self.assertEqual(rejected, 1)
+                self.assertFalse(cut)
+
+    def test_native_observation_has_separate_prefix_record_and_saved_byte_caps(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        body = self.native_line() * 65 + b"x" * (128 * 1024)
+        def command(argv, path, **options): path.write_bytes(body)
+        with patch.object(runner.runtime, "command", side_effect=command):
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        self.assertEqual(len(value["records"]), 64)
+        self.assertTrue(value["rawPrefixTruncated"])
+        self.assertTrue(value["recordLimitReached"])
+        self.assertEqual(value["coverage"], "unknown")
+        self.assertLessEqual(value["rawPrefixBytes"], 64 * 1024)
+        self.assertLessEqual((out / "guest-native-observation.json").stat().st_size, 32 * 1024)
+
+    def test_native_observation_never_retries_incomplete_or_foreign_guest_custody(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        prior = self.native_prior(); prior["queries"]["guest-crash"] = {"errorType": "RuntimeError"}
+        with patch.object(runner.runtime, "command") as query:
+            value = runner.preserve_native_observation(emulator, scratch, out, prior)
+        emulator.owned.assert_not_called(); query.assert_not_called()
+        self.assertEqual(value["skipped"], "prior_diagnostic_incomplete")
+        emulator.owned.side_effect = RuntimeError("private identity detail")
+        with patch.object(runner.runtime, "command") as query:
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        query.assert_not_called()
+        self.assertEqual(value["error"], "ownership_or_input_refused")
+        self.assertNotIn("private", str(value))
+
+    def test_native_observation_interruption_preserves_partial_metadata_as_unknown(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        def command(argv, path, **options):
+            path.write_bytes(self.native_line())
+            raise KeyboardInterrupt("private interruption detail")
+        with patch.object(runner.runtime, "command", side_effect=command) as query:
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        self.assertEqual(query.call_count, 1)
+        self.assertFalse(value["queryReturned"])
+        self.assertEqual(value["error"], "interrupted")
+        self.assertEqual(len(value["records"]), 1)
+        self.assertEqual(value["coverage"], "unknown")
+        self.assertNotIn("private", str(value))
+        self.assertNotIn("passed", value)
+
+    def test_native_observation_refuses_symlink_existing_output_and_nonregular_raw(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        secret = self.root / "private-sentinel"; secret.write_bytes(b"never copy this")
+        raw = scratch / "guest-native-observation-raw.log"; raw.symlink_to(secret)
+        with patch.object(runner.runtime, "command") as query:
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        emulator.owned.assert_not_called(); query.assert_not_called(); raw.unlink()
+        saved = out / "guest-native-observation.json"; saved.write_bytes(b"keep original")
+        def command(argv, path, **options): path.write_bytes(self.native_line())
+        with patch.object(runner.runtime, "command", side_effect=command):
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        self.assertEqual(value["collectionError"], "output_refused")
+        self.assertEqual(saved.read_bytes(), b"keep original")
+        raw.unlink(); saved.unlink()
+        def fifo(argv, path, **options): os.mkfifo(path)
+        with patch.object(runner.runtime, "command", side_effect=fifo):
+            value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
+        self.assertEqual(value["collectionError"], "output_refused")
+        self.assertFalse(saved.exists())
+    # native-observation-end:collector-controls
 
     def emulator_process_fixture(self):
         emulator = runner.Emulator.__new__(runner.Emulator)

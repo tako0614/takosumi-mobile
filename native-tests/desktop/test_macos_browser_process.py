@@ -274,25 +274,37 @@ os.open(sys.argv[3],os.O_RDONLY)
 
     def test_retirement_receipt_preserves_each_failed_operation_without_private_messages(self):
         cases = (
-            ("normal", [None, ProcessLookupError()], False, [], True, None),
+            ("normal", [None, ProcessLookupError()], False, [], True, None, False),
+            ("lookup-missing", [ProcessLookupError(errno.ESRCH, "private lookup detail"), ProcessLookupError()],
+             False, [], True, None, False),
+            ("lookup-then-probe", [ProcessLookupError(errno.ESRCH, "private lookup detail"),
+                                   PermissionError(errno.EACCES, "private probe detail")],
+             False, [("group-probe", errno.EACCES)], False, "PermissionError", False),
             ("signal", [PermissionError(errno.EPERM, "private signal detail"), ProcessLookupError()],
-             False, [("group-kill", errno.EPERM)], True, "PermissionError"),
+             False, [("group-kill", errno.EPERM)], True, "PermissionError", False),
             ("probe", [None, PermissionError(errno.EACCES, "private probe detail")],
-             False, [("group-probe", errno.EACCES)], False, "PermissionError"),
+             False, [("group-probe", errno.EACCES)], False, "PermissionError", False),
             ("both", [PermissionError(errno.EPERM, "private signal detail"),
                       PermissionError(errno.EACCES, "private probe detail")],
-             False, [("group-kill", errno.EPERM), ("group-probe", errno.EACCES)], False, "PermissionError"),
+             False, [("group-kill", errno.EPERM), ("group-probe", errno.EACCES)], False, "PermissionError", False),
             ("wait", [PermissionError(errno.EPERM, "private signal detail")], True,
-             [("group-kill", errno.EPERM), ("leader-wait", None)], False, "TimeoutExpired"),
+             [("group-kill", errno.EPERM), ("leader-wait", None)], False, "TimeoutExpired", False),
+            ("metadata-normal", [None, ProcessLookupError()], False, [], True, None, True),
+            ("metadata-probe", [None, PermissionError(errno.EACCES, "private probe detail")],
+             False, [("group-probe", errno.EACCES)], False, "PermissionError", True),
+            ("metadata-wait", [None], True, [("leader-wait", None)], False, "TimeoutExpired", True),
         )
-        for name, signals, timeout, expected, complete, final_error in cases:
+        for name, signals, timeout, expected, complete, final_error, metadata_failure in cases:
             with self.subTest(name=name):
                 process = mock.Mock(pid=246813579, returncode=None if timeout else -9,
                                     _diagnostic_nonblocking=True)
                 if timeout:
                     process.wait.side_effect = subprocess.TimeoutExpired("private wait detail", 2)
+                clock = [100.0, RuntimeError("private metadata detail") if metadata_failure else 100.125]
+                clock += [100.125] * 10
                 with mock.patch.object(sampler, "_active_diagnostic", process), \
                         mock.patch.object(sampler.os, "killpg", side_effect=signals) as send, \
+                        mock.patch.object(sampler.time, "monotonic", side_effect=clock), \
                         mock.patch.object(sampler, "_read_reply", return_value=[]):
                     _, receipt = sampler._retire(process)
                     self.assertEqual(receipt["cleanupComplete"], complete)
@@ -310,8 +322,29 @@ os.open(sys.argv[3],os.O_RDONLY)
                     for event in receipt["operationErrors"]:
                         self.assertGreaterEqual(event["atSeconds"], 0)
                         self.assertLessEqual(event["atSeconds"], receipt["retirementSeconds"])
+                    if metadata_failure:
+                        self.assertIsNone(receipt["initialGroupKill"])
+                    else:
+                        failure = signals[0]
+                        outcome = "lookup-missing" if isinstance(failure, ProcessLookupError) else "os-error" if failure else "returned"
+                        self.assertEqual(receipt["initialGroupKill"], {
+                            "operation": "group-kill", "outcome": outcome,
+                            "errorType": type(failure).__name__ if failure else None,
+                            "errno": failure.errno if failure else None, "atSeconds": 0.125,
+                        })
                     self.assertNotIn("private", json.dumps(receipt))
                     process.stdout.close.assert_called_once()
+        process = mock.Mock(pid=246813579)
+        failure = RuntimeError("private unexpected signal detail")
+        with mock.patch.object(sampler, "_active_diagnostic", process), \
+                mock.patch.object(sampler.os, "killpg", side_effect=failure), \
+                mock.patch.object(sampler, "_read_reply") as reply:
+            with self.assertRaises(RuntimeError) as caught:
+                sampler._retire(process)
+            self.assertIs(caught.exception, failure)
+            self.assertIs(sampler._active_diagnostic, process)
+            process.wait.assert_not_called()
+            reply.assert_not_called()
 
     def test_nonblocking_setup_failure_never_reads_its_blocking_pipe_or_allows_normal_success(self):
         observer = self.failed_observer(sample_shutdowns=True)

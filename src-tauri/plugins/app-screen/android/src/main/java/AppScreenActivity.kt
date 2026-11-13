@@ -71,6 +71,10 @@ class AppScreenActivity : AppCompatActivity() {
     private var lastExternalDeclinedAt = 0L
     private var lastBrowserViewAt = 0L
     private var lastDownloadPromptAt = 0L
+    // native-observation-begin:fields
+    private var nativeObservation: AppScreenObservation? = null
+    private var nativeBoundViewIdentity = 0
+    // native-observation-end:fields
 
     private lateinit var container: FrameLayout
     private lateinit var hostView: TextView
@@ -144,8 +148,41 @@ class AppScreenActivity : AppCompatActivity() {
         return AppScreenFileSelection.Context(current.webView, current.profile, generation, current.resumeState.document, page)
     }
 
+    // native-observation-begin:helpers
+    private fun initializeNativeObservation() {
+        try {
+            val debuggable = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+            if (debuggable) nativeObservation = AppScreenObservation(
+                debuggable, android.os.Process.myPid(),
+                { SystemClock.elapsedRealtime() },
+                { line -> android.util.Log.i(AppScreenObservation.TAG, line) },
+            )
+        } catch (_: Throwable) { /* Observation is optional, never a functional gate. */ }
+    }
+
+    private fun nativeViewIdentity(view: Any): Int = try {
+        if (nativeObservation == null) 0 else System.identityHashCode(view)
+    } catch (_: Throwable) { 0 }
+
+    private fun nativeRecord(
+        stage: AppScreenObservation.Stage,
+        subject: AppScreenRegistry.Entry? = entry,
+        viewIdentity: Int = nativeBoundViewIdentity,
+        logical: AppScreenObservation.Logical = AppScreenObservation.Logical.UNKNOWN,
+    ) {
+        val observer = nativeObservation ?: return
+        try {
+            observer.record(stage, viewIdentity, subject != null && subject === entry,
+                subject?.host === this, profileGeneration, visible, resumed, evicted, logical)
+        } catch (_: Throwable) { /* No view dereference, fallback or retry. */ }
+    }
+
+    // native-observation-end:helpers
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // native-observation-begin:init
+        initializeNativeObservation()
+        // native-observation-end:init
         val parsed = AppScreenLaunch.parse(this, intent)
         if (parsed == null) {
             finishAndRemoveTask()
@@ -218,12 +255,18 @@ class AppScreenActivity : AppCompatActivity() {
         super.onResume()
         resumed = true
         mediaConsent.resumed()
+        // native-observation-begin:resume
+        nativeRecord(AppScreenObservation.Stage.RESUME)
+        // native-observation-end:resume
     }
 
     override fun onPause() {
         resumed = false
         mediaConsent.paused()
         super.onPause()
+        // native-observation-begin:pause
+        nativeRecord(AppScreenObservation.Stage.PAUSE)
+        // native-observation-end:pause
     }
 
     override fun onStop() {
@@ -357,6 +400,10 @@ class AppScreenActivity : AppCompatActivity() {
         entry?.let { if (it.host === this) unbind(it) }
         current.host?.takeIf { it !== this }?.forgetEntry(current)
         val webView = current.webView
+        // native-observation-begin:bind-enter
+        val nativeViewId = nativeViewIdentity(webView)
+        nativeRecord(AppScreenObservation.Stage.BIND_ENTER, current, nativeViewId)
+        // native-observation-end:bind-enter
         (webView.parent as? ViewGroup)?.removeView(webView)
         current.context.baseContext = this
         current.host = this
@@ -377,19 +424,37 @@ class AppScreenActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
+        // native-observation-begin:add-return
+        nativeRecord(AppScreenObservation.Stage.ADD_RETURN, current, nativeViewId, AppScreenObservation.Logical.ADD_RETURN)
+        // native-observation-end:add-return
         entry = current
+        // native-observation-begin:bind-return
+        nativeBoundViewIdentity = nativeViewId
+        nativeRecord(AppScreenObservation.Stage.BIND_RETURN, current, nativeViewId)
+        // native-observation-end:bind-return
     }
 
     private fun unbind(current: AppScreenRegistry.Entry) {
         mediaConsent.cancel()
         fileSelection.cancel()
         val webView = current.webView
+        // native-observation-begin:unbind-enter
+        val nativeViewId = nativeBoundViewIdentity
+        nativeRecord(AppScreenObservation.Stage.UNBIND_ENTER, current, nativeViewId)
+        // native-observation-end:unbind-enter
         container.removeView(webView)
+        // native-observation-begin:remove-return
+        nativeRecord(AppScreenObservation.Stage.REMOVE_RETURN, current, nativeViewId, AppScreenObservation.Logical.REMOVE_RETURN)
+        // native-observation-end:remove-return
         webView.webViewClient = current.detachedClient
         webView.webChromeClient = null
         webView.setDownloadListener(null)
         current.host = null
         current.context.baseContext = applicationContext
+        // native-observation-begin:unbind-return
+        if (current === entry) nativeBoundViewIdentity = 0
+        nativeRecord(AppScreenObservation.Stage.UNBIND_RETURN, current, nativeViewId)
+        // native-observation-end:unbind-return
     }
 
     private fun goBackOrLeave() {
@@ -782,6 +847,9 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
+            // native-observation-begin:page_start
+            nativeRecord(AppScreenObservation.Stage.PAGE_START, bound, nativeViewIdentity(view))
+            // native-observation-end:page_start
             mediaConsent.cancel()
             fileSelection.cancel()
             bound.resumeState.started(url)
@@ -798,6 +866,9 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageFinished(view: WebView, url: String?) {
             if (view !== entry?.webView) return
+            // native-observation-begin:page_finish
+            nativeRecord(AppScreenObservation.Stage.PAGE_FINISH, bound, nativeViewIdentity(view))
+            // native-observation-end:page_finish
             progress.visibility = View.GONE
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 leavePage(view, url, offerOnly = false)
@@ -811,6 +882,9 @@ class AppScreenActivity : AppCompatActivity() {
         }
 
         override fun onPageCommitVisible(view: WebView, url: String?) {
+            // native-observation-begin:page-commit
+            if (view === entry?.webView) nativeRecord(AppScreenObservation.Stage.PAGE_COMMIT, bound, nativeViewIdentity(view))
+            // native-observation-end:page-commit
             if (view === entry?.webView && url == view.url) bound.resumeState.committed(url)
         }
 
@@ -893,6 +967,9 @@ class AppScreenActivity : AppCompatActivity() {
                 return true
             }
             if (current === entry) {
+                // native-observation-begin:render-gone
+                nativeRecord(AppScreenObservation.Stage.RENDER_GONE, current, nativeBoundViewIdentity)
+                // native-observation-end:render-gone
                 unbind(current)
                 entry = null
             }
@@ -986,7 +1063,17 @@ class AppScreenActivity : AppCompatActivity() {
             setPadding(dp(6), 0, dp(6), 0)
         }
         bar.addView(hostView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        backButton = barButton("‹", "戻る") { entry?.webView?.takeIf { it.canGoBack() }?.goBack() }
+        backButton = barButton("‹", "戻る") {
+            // native-observation-begin:back-prefix
+            val nativeSubject = entry
+            val nativeViewId = nativeBoundViewIdentity
+            nativeRecord(AppScreenObservation.Stage.BACK_ENTER, nativeSubject, nativeViewId)
+            // native-observation-end:back-prefix
+            entry?.webView?.takeIf { it.canGoBack() }?.goBack()
+            // native-observation-begin:back-suffix
+            nativeRecord(AppScreenObservation.Stage.BACK_RETURN, nativeSubject, nativeViewId)
+            // native-observation-end:back-suffix
+        }
         bar.addView(backButton)
         bar.addView(barButton("↻", "再読み込み") { entry?.webView?.reload() })
         bar.addView(barButton("⋮", "メニュー") { showMenu(it) })

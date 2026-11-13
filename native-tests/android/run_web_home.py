@@ -343,6 +343,111 @@ def preserve_guest_anr(emulator, scratch, out):
     return result
 
 
+# native-observation-begin:collector
+NATIVE_OBSERVATION_TAG = "TakosWebHomeNative"
+NATIVE_OBSERVATION_STAGES = (
+    "BACK_ENTER", "BACK_RETURN", "BIND_ENTER", "ADD_RETURN", "BIND_RETURN",
+    "UNBIND_ENTER", "REMOVE_RETURN", "UNBIND_RETURN", "RESUME", "PAUSE",
+    "PAGE_START", "PAGE_COMMIT", "PAGE_FINISH", "RENDER_GONE", "CAP_EXHAUSTED",
+)
+NATIVE_OBSERVATION_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-t", "64",
+                            "-s", NATIVE_OBSERVATION_TAG + ":I", "*:S")
+NATIVE_OBSERVATION_READ_BYTES = 64 * 1024
+NATIVE_OBSERVATION_SAVE_BYTES = 32 * 1024
+NATIVE_OBSERVATION_PACKET = re.compile(
+    r"v=1 seq=([0-9]{1,2}) pid=([0-9]{1,10}) t=([0-9]{1,19}) stage=("
+    + "|".join(NATIVE_OBSERVATION_STAGES)
+    + r") view=(-?[0-9]{1,10}) cur=([01]) host=([01]) gen=(-?[0-9]{1,19})"
+      r" vis=([01]) res=([01]) evict=([01]) logical=(UNKNOWN|ADD_RETURN|REMOVE_RETURN)"
+      r" physical=unknown cap=([01])"
+)
+
+
+def parse_native_observation(data):
+    """Only the closed primitive grammar survives; raw log/user strings do not."""
+    records, rejected, cut = [], 0, False
+    for line in data.splitlines():
+        match = NATIVE_OBSERVATION_PACKET.fullmatch(line.decode("ascii", "replace")) if len(line) <= 320 else None
+        if not match:
+            rejected += 1
+            continue
+        seq, pid, elapsed, stage, view, current, host, generation, visible, resumed, evicted, logical, cap = match.groups()
+        seq, pid, elapsed, view, generation = map(int, (seq, pid, elapsed, view, generation))
+        if not (1 <= seq <= 64 and 1 <= pid <= 2**31 - 1 and 0 <= elapsed <= 2**63 - 1
+                and -(2**31) <= view <= 2**31 - 1 and -(2**63) <= generation <= 2**63 - 1
+                and (cap == "1") == (stage == "CAP_EXHAUSTED") == (seq == 64)):
+            rejected += 1
+            continue
+        if len(records) >= 64:
+            cut = True
+            break
+        records.append({"seq": seq, "pid": pid, "elapsedRealtimeMs": elapsed,
+                        "stage": stage, "viewIdentity": view, "currentEntry": current == "1",
+                        "host": host == "1", "generation": generation, "visible": visible == "1",
+                        "resumed": resumed == "1", "evicted": evicted == "1",
+                        "logical": logical, "physical": "unknown", "capExhausted": cap == "1"})
+    return records, rejected, cut
+
+
+def preserve_native_observation(emulator, scratch, out, prior):
+    """One failure-only closed-tag tail; no absolute aggregate/coverage claim."""
+    result = {"diagnosticOnly": True, "clockDomain": "android_elapsed_realtime", "clockUnit": "ms",
+              "captureWindow": "closed_tag_logcat_tail_only", "coverage": "unknown",
+              "queryReturned": False, "records": [], "commandWaitSeconds": 10,
+              "packetTailCount": 64, "rawReadCapBytes": NATIVE_OBSERVATION_READ_BYTES,
+              "saveCapBytes": NATIVE_OBSERVATION_SAVE_BYTES}
+    required = {"guest-last-anr", "guest-last-anr-traces", "guest-anr-events", "guest-system-app-anr",
+                "guest-activity-state", "guest-window-state", "guest-crash"}
+    previous = prior.get("queries", {}) if isinstance(prior, dict) else {}
+    if set(previous) != required or any(not isinstance(entry, dict) or not (entry.get("queryReturned") or "sourceBytes" in entry)
+                                       for entry in previous.values()):
+        result["skipped"] = "prior_diagnostic_incomplete"
+        return result  # Do not recheck a guest after the existing collector lost custody.
+    raw = scratch / "guest-native-observation-raw.log"
+    try:
+        require(not raw.exists() and not raw.is_symlink(), "Existing diagnostic input refused")
+        emulator.owned()
+    except BaseException as error:
+        result["error"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "ownership_or_input_refused"
+        return result
+    try:
+        runtime.command([str(emulator.adb), "-s", SERIAL, "shell", *NATIVE_OBSERVATION_QUERY],
+                        raw, timeout=10, read_output=False)
+        result["queryReturned"] = True
+    except BaseException as error:
+        result["error"] = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
+                           "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else "query_failed")
+    try:
+        if raw.exists():
+            with os.fdopen(os.open(raw, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+                info = os.fstat(source.fileno())
+                require(stat.S_ISREG(info.st_mode), "Plain diagnostic output required")
+                data = source.read(NATIVE_OBSERVATION_READ_BYTES + 1)
+            prefix = data[:NATIVE_OBSERVATION_READ_BYTES]
+            # A cut trailing packet is unknown, never parsed as a whole record.
+            truncated = info.st_size > len(prefix) or len(data) > len(prefix)
+            if truncated and not prefix.endswith(b"\n"):
+                prefix = prefix.rsplit(b"\n", 1)[0] if b"\n" in prefix else b""
+            records, rejected, cut = parse_native_observation(prefix)
+            result.update(records=records, sourceBytes=info.st_size, rawPrefixBytes=len(prefix),
+                          rawPrefixTruncated=truncated, rejectedPackets=rejected, recordLimitReached=cut,
+                          nativeCapSeen=any(record["capExhausted"] for record in records))
+        result["savedRecordsTruncated"] = False
+        payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("ascii")
+        while len(payload) > NATIVE_OBSERVATION_SAVE_BYTES and result["records"]:
+            result["records"].pop()
+            result["savedRecordsTruncated"] = True
+            payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("ascii")
+        require(len(payload) <= NATIVE_OBSERVATION_SAVE_BYTES, "Diagnostic output cap")
+        fd = os.open(out / "guest-native-observation.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            target.write(payload)
+    except BaseException as error:
+        result["collectionError"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "output_refused"
+    return result
+# native-observation-end:collector
+
+
 def installed(emulator, expected):
     paths = emulator.run("shell", "pm", "path", PACKAGE).strip().splitlines()
     require(len(paths) == 1 and paths[0].startswith("package:"), "One installed base APK required")
@@ -470,6 +575,12 @@ def main():
         proof["error"] = str(error)
         if isinstance(error, Exception) and emulator is not None:
             proof["guestANR"] = preserve_guest_anr(emulator, scratch, out)
+            # native-observation-begin:failure-call
+            try:
+                proof["nativeObservation"] = preserve_native_observation(emulator, scratch, out, proof["guestANR"])
+            except BaseException:
+                proof["nativeObservation"] = {"diagnosticOnly": True, "error": "collector_failed", "coverage": "unknown"}
+            # native-observation-end:failure-call
     finally:
         cleanup_errors = []
         if emulator is not None:
