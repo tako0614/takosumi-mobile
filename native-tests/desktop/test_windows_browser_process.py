@@ -1499,8 +1499,9 @@ class RunnerTests(unittest.TestCase):
                      '--work "$RUNNER_TEMP" --site ')
         packaged = ('run: python3 -B native-tests/desktop/macos_browser_process.py --packaged '
                     '--binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site ')
-        self.assertEqual(flows, [prefix + site for prefix in (unbundled, packaged)
-                                 for site in ("excalidraw", "photopea")])
+        # Only packaged Photopea opts into scheduling-perturbing diagnostics.
+        self.assertEqual(flows, [unbundled + "excalidraw", unbundled + "photopea",
+                                 packaged + "excalidraw", packaged + "photopea --sample-shutdowns"])
 
     def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
         """M2: cef-macos runs every macOS guard self-test, then the adapter's
