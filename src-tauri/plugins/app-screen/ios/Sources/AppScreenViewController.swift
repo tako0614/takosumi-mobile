@@ -11,6 +11,7 @@ private enum AppScreenNavigationWitness {
         case opened = "open", request, returned, provisional, commit, finish
         case failedProvisional = "fail_provisional", failed = "fail", cap
         case policyAllow = "policy_allow"
+        case policyAllowReturned = "policy_allow_returned"
         case contentTerminated = "content_terminated"
     }
     enum Target: String {
@@ -490,11 +491,14 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         witnessRecord(.returned, relation: navigation == nil ? 0 : 1, sameView: true)
     }
 
-    private func witnessPolicyAllowed(_ url: URL?, mainFrame: Bool, webView: WKWebView) {
-        guard mainFrame, witnessView > 0, webView === witnessWebView else { return }
+    private func witnessPolicyAllowed(_ url: URL?, mainFrame: Bool, webView: WKWebView)
+        -> (view: Int, target: AppScreenNavigationWitness.Target)? {
+        guard mainFrame, witnessView > 0, webView === witnessWebView else { return nil }
+        let target = AppScreenNavigationWitness.policyTarget(url)
         AppScreenNavigationWitness.record(.policyAllow, view: witnessView, request: 0, relation: 0,
-            target: AppScreenNavigationWitness.policyTarget(url), reused: false, kept: false,
-            resume: false, initial: false, sameView: true)
+            target: target, reused: false, kept: false, resume: false, initial: false, sameView: true)
+        // Capture only the already-validated scalar context, never a URL or WebKit object.
+        return (witnessView, target)
     }
 
     private func witnessContentTerminated(_ webView: WKWebView) {
@@ -545,9 +549,17 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         {
         case .inApp:
 #if DEBUG
-            witnessPolicyAllowed(url, mainFrame: mainFrame, webView: webView)
+            let policyWitness = witnessPolicyAllowed(url, mainFrame: mainFrame, webView: webView)
 #endif
             decisionHandler(.allow)
+#if DEBUG
+            if let policyWitness = policyWitness {
+                // The same handler returned; this is not navigation identity, commit or readiness.
+                AppScreenNavigationWitness.record(.policyAllowReturned, view: policyWitness.view,
+                    request: 0, relation: 0, target: policyWitness.target, reused: false, kept: false,
+                    resume: false, initial: false, sameView: true)
+            }
+#endif
         case .block:
             decisionHandler(.cancel)
         case .browserView:
