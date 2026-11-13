@@ -281,11 +281,88 @@ class Controls(unittest.TestCase):
     def native_prior(self):
         names = ("guest-last-anr", "guest-last-anr-traces", "guest-anr-events", "guest-system-app-anr",
                  "guest-activity-state", "guest-window-state", "guest-crash")
-        return {"queries": {name: {"queryReturned": True} for name in names}}
+        value = {"queries": {name: {"queryReturned": True} for name in names}}
+        value["queries"]["guest-activity-state"]["appProcessPid"] = 42
+        return value
 
     def native_line(self, seq=1, stage="BACK_ENTER", cap=0):
         return (f"v=1 seq={seq} pid=42 t=123 stage={stage} view=77 cur=1 host=1 gen=0 "
                 f"vis=1 res=1 evict=0 logical=UNKNOWN physical=unknown cap={cap}\n").encode()
+
+    def activity_snapshot(self):
+        return (b"  topResumedActivity=ActivityRecord{203787634 u0 com.takosumi.fixture.android/com.takosumi.appscreen.AppScreenActivity t9}\n"
+                b"  * Hist  #0: ActivityRecord{203787634 u0 com.takosumi.fixture.android/com.takosumi.appscreen.AppScreenActivity t9}\n"
+                b"    packageName=com.takosumi.fixture.android processName=com.takosumi.fixture.android\n"
+                b"    app=ProcessRecord{bacc64 3169:com.takosumi.fixture.android/u0a216}\n"
+                b"    mActivityComponent=com.takosumi.fixture.android/com.takosumi.appscreen.AppScreenActivity\n"
+                b"  * Task summary follows\n")
+
+    def test_native_pid_projection_requires_one_complete_matching_activity_process(self):
+        data = self.activity_snapshot()
+        self.assertEqual(runner.native_activity_pid(data), 3169)
+        self.assertIsNone(runner.native_activity_pid(data, truncated=True))
+        invalid = [b"", data[:data.index(b"  * Task")], data + data,
+                   data.replace(b"203787634", b"abc", 1),
+                   data.replace(b"processName=com.takosumi.fixture.android", b"processName=foreign"),
+                   data.replace(b"mActivityComponent=com.takosumi", b"mActivityComponent=foreign"),
+                   data.replace(b"/u0a216", b"/u1a216"),
+                   data.replace(b"3169:", b"0:"), data.replace(b"3169:", b"2147483648:"),
+                   data.replace(b"    app=", b"    app=ProcessRecord{aaaa 3170:com.takosumi.fixture.android/u0a216}\n    app="),
+                   data.replace(b"    app=", b"  * Hist  #1: ActivityRecord{abc u0 other/Activity t1}\n    app="),
+                   data.replace(b"topResumedActivity=", b"topResumedActivity=\xff")]
+        for bad in invalid:
+            with self.subTest(data=bad):
+                self.assertIsNone(runner.native_activity_pid(bad))
+
+    def test_native_pid_scope_reuses_existing_snapshot_and_refuses_unknown_without_lookup(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        calls = []
+        def command(argv, path, **options):
+            calls.append(argv)
+            if "activities" in argv:
+                path.write_bytes(self.activity_snapshot())
+            elif "--pid=3169" in argv:
+                path.write_bytes(self.native_line().replace(b"pid=42", b"pid=3169") + self.native_line())
+            else:
+                path.write_bytes(b"existing diagnostic\n")
+        with patch.object(runner.runtime, "command", side_effect=command):
+            prior = runner.preserve_guest_anr(emulator, scratch, out)
+            value = runner.preserve_native_observation(emulator, scratch, out, prior)
+        self.assertEqual(prior["queries"]["guest-activity-state"].get("appProcessPid"), 3169)
+        self.assertEqual(len(calls), 8, "Existing seven reads plus the one narrowed native query only")
+        self.assertEqual(calls[-1][-4:], ["--pid=3169", "-s", "TakosWebHomeNative:I", "*:S"])
+        self.assertEqual([row["pid"] for row in value["records"]], [3169])
+        self.assertEqual(value["pidMismatchPackets"], 1)
+        self.assertEqual(value["coverage"], "unknown")
+        self.assertEqual(value["captureWindow"], "pid_main_tail_then_closed_tag_filter")
+        owned_before_unknown = emulator.owned.call_count
+        for pid in (None, 0, -1, 2147483648, True, "3169"):
+            with self.subTest(pid=pid):
+                unknown = self.native_prior()
+                unknown["queries"]["guest-activity-state"]["appProcessPid"] = pid
+                with patch.object(runner.runtime, "command") as query:
+                    skipped = runner.preserve_native_observation(emulator, scratch, out, unknown)
+                query.assert_not_called()
+                self.assertEqual(skipped["skipped"], "app_process_unknown")
+                self.assertNotIn("passed", skipped)
+        self.assertEqual(emulator.owned.call_count, owned_before_unknown)
+        for defect in ("interrupted", "truncated"):
+            with self.subTest(defect=defect):
+                local_scratch, local_out = self.root / (defect + "-scratch"), self.root / (defect + "-out")
+                local_scratch.mkdir(); local_out.mkdir()
+                def incomplete(argv, path, **options):
+                    if "activities" in argv:
+                        path.write_bytes(self.activity_snapshot() + (b"x" * (128 * 1024) if defect == "truncated" else b""))
+                        if defect == "interrupted": raise TimeoutError("not a complete snapshot")
+                    else: path.write_bytes(b"existing diagnostic\n")
+                with patch.object(runner.runtime, "command", side_effect=incomplete) as query:
+                    prior = runner.preserve_guest_anr(emulator, local_scratch, local_out)
+                    skipped = runner.preserve_native_observation(emulator, local_scratch, local_out, prior)
+                self.assertEqual(query.call_count, 7)
+                self.assertIsNone(prior["queries"]["guest-activity-state"]["appProcessPid"])
+                self.assertEqual(skipped["skipped"], "app_process_unknown")
 
     def test_native_observation_is_one_closed_tail_query_and_strict_metadata_only(self):
         scratch, out = self.root / "scratch", self.root / "out"
@@ -298,7 +375,7 @@ class Controls(unittest.TestCase):
             value = runner.preserve_native_observation(emulator, scratch, out, self.native_prior())
         emulator.owned.assert_called_once()
         query.assert_called_once_with([str(emulator.adb), "-s", runner.SERIAL, "shell", "logcat", "-b", "main",
-                                       "-d", "-v", "raw", "-t", "64", "-s", "TakosWebHomeNative:I", "*:S"],
+                                       "-d", "-v", "raw", "-t", "64", "--pid=42", "-s", "TakosWebHomeNative:I", "*:S"],
                                       scratch / "guest-native-observation-raw.log", timeout=10, read_output=False)
         self.assertTrue(value["diagnosticOnly"])
         self.assertEqual((value["clockDomain"], value["clockUnit"]), ("android_elapsed_realtime", "ms"))

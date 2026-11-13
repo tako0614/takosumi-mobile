@@ -239,6 +239,93 @@ class Controls(unittest.TestCase):
         self.assertTrue((out / "target-app-exit.log").read_bytes().endswith(b"last partial event"))
         self.assertNotIn("passed", result)
 
+    def test_navigation_witness_has_only_closed_metadata_and_separates_process_view_identity(self):
+        payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=request view=1 request=1 relation=0 "
+                   b"target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123")
+        header = b"2026-11-13 00:00:00.001 Df Takosumi[%d:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+        data = header % 10 + payload + b"\n" + header % 11 + payload + b"\n"
+        result = runner.navigation_witness(data)
+        self.assertEqual([v["pid"] for v in result["records"]], [10, 11])
+        self.assertEqual([v["target"] for v in result["records"]], ["editor", "editor"])
+        self.assertEqual(result["clockDomain"], "ios_system_uptime")
+        self.assertTrue(result["absenceIsUnknown"])
+        for bad in (b"target=https://private.example?token=secret", b"target=Work", b"view=65536", b"relation=3"):
+            key = bad.split(b"=", 1)[0] + b"="
+            poisoned = re.sub(key + rb"[^ ]+", bad, payload)
+            parsed = runner.navigation_witness(header % 10 + poisoned)
+            self.assertEqual(parsed["records"], [])
+            self.assertEqual(parsed["malformed"], 1)
+            self.assertNotIn("secret", json.dumps(parsed))
+        for prefix in (b"", header % 10 + b"page text ", (header % 10).replace(b".simulator.navigation:navigation", b".WebKit:Network")):
+            unknown = runner.navigation_witness(prefix + payload)
+            self.assertEqual(unknown["records"], [], "Do not accept marker-only, spoofed text or a foreign subsystem")
+            self.assertEqual(unknown["malformed"], 1)
+        self.assertNotIn("passed", result)
+
+    def test_navigation_witness_callback_context_requires_matching_view_and_navigation(self):
+        header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+        def packet(event="commit", relation=1, same_view=1, request=4, target="editor", flags="reused=1 kept=0 resume=1 initial=1"):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq=4 event={event} view=2 request={request} "
+                             f"relation={relation} target={target} {flags} sameView={same_view} timeMs=234\n").encode()
+        for relation, same_view in ((1, 0), (0, 1), (2, 1)):
+            with self.subTest(relation=relation, sameView=same_view):
+                value = runner.navigation_witness(packet(relation=relation, same_view=same_view,
+                                                        request=0, target="unknown"))
+                self.assertEqual(value["records"], [])
+                self.assertEqual(value["malformed"], 1)
+        matched = runner.navigation_witness(packet())["records"][0]
+        self.assertTrue(matched["reused"] and matched["resume"] and matched["initial"])
+        unknown = runner.navigation_witness(packet(same_view=0, request=0, target="unknown",
+                                                   flags="reused=0 kept=0 resume=0 initial=0"))["records"][0]
+        self.assertEqual((unknown["request"], unknown["target"]), (0, "unknown"))
+        self.assertFalse(unknown["reused"] or unknown["resume"] or unknown["initial"])
+        opened = runner.navigation_witness(packet(event="open", relation=0, request=0, target="unknown"))
+        self.assertEqual(len(opened["records"]), 1, "Open context does not require a returned navigation")
+        returned = runner.navigation_witness(packet(event="returned", relation=0))
+        self.assertEqual(len(returned["records"]), 1, "A nil return may retain the already-selected request context")
+        self.assertNotIn("passed", unknown)
+
+    def test_navigation_witness_cap_and_absence_never_grant_finish_or_pass(self):
+        line = (b"2026-11-13 00:00:00.001 Df Takosumi[10:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+                b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=provisional view=1 request=1 relation=1 "
+                b"target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123\n")
+        result = runner.navigation_witness(line * 520)
+        self.assertEqual(len(result["records"]), 513)
+        self.assertEqual(result["dropped"], 7)
+        latest = runner.navigation_witness(line * 520 + line.replace(b"Takosumi[10:ab]", b"Takosumi[22:ef]"))
+        self.assertEqual(len(latest["records"]), 513)
+        self.assertEqual(latest["records"][-1]["pid"], 22, "Cold process records must survive older-process overflow")
+        self.assertEqual(latest["dropped"], 8)
+        self.assertEqual(result["capStatus"], "not_observed")
+        marker = line.replace(b"seq=1 event=provisional", b"seq=513 event=cap")
+        self.assertEqual(runner.navigation_witness(marker)["capStatus"], "observed")
+        self.assertEqual(runner.navigation_witness(b"")["records"], [])
+        self.assertEqual(runner.navigation_witness(b"x" * (512 * 1024 + 1))["errorType"], "InputBoundExceeded")
+        self.assertNotIn("finished", result)
+        self.assertNotIn("passed", result)
+
+    def test_navigation_witness_delivery_reuses_one_partial_query_without_replacing_failure(self):
+        out, scratch = self.root / "witness-evidence", self.root / "witness-scratch"
+        out.mkdir(); scratch.mkdir()
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        line = (b"2026-11-13 00:00:00.001 Df Takosumi[11:cd] [com.takosumi.fixture.simulator.navigation:navigation] "
+                b"com.takosumi.fixture.simulator.nav v=1 seq=2 event=provisional view=1 request=1 "
+                b"relation=1 target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=124\n")
+        def command(argv, path, **kwargs):
+            if "spawn" not in argv:
+                return json.dumps({"devices": {"runtime": [device]}})
+            path.write_bytes(line)
+            raise subprocess.TimeoutExpired(argv, 15)
+        with patch.object(runtime, "command", side_effect=command) as query:
+            result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+        self.assertEqual(query.call_count, 2, "Original inventory plus original one query only")
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["queryReturned"])
+        self.assertEqual(result["navigationWitness"]["records"][0]["event"], "provisional")
+        self.assertEqual(result["errorType"], "TimeoutExpired")
+        self.assertNotIn("passed", result)
+
     def test_existing_harness_server_import_is_not_poisoned_or_left_in_global_namespace(self):
         poison = types.ModuleType("server")
         path = Path(__file__).parent / "harness.py"

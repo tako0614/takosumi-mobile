@@ -100,6 +100,53 @@ def installed_app(out, udid, device, expected, suffix):
     return actual
 
 
+def navigation_witness(data):
+    """Closed producer metadata from the already-retained tail, never a navigation verdict."""
+    result = {"diagnosticOnly": True, "clockDomain": "ios_system_uptime", "clockUnit": "ms",
+              "records": [], "recordLimit": 513, "dropped": 0, "malformed": 0,
+              "capStatus": "not_observed", "absenceIsUnknown": True}
+    if len(data) > 512 * 1024:
+        result["errorType"] = "InputBoundExceeded"
+        return result
+    marker = b"com.takosumi.fixture.simulator.nav "
+    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap) "
+                         rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown) "
+                         rb"reused=([01]) kept=([01]) resume=([01]) initial=([01]) sameView=([01]) timeMs=([0-9]{1,15})")
+    for line in data.splitlines():
+        if marker not in line:
+            continue
+        prefix, payload = line.split(marker, 1)
+        # A marker in page/WebKit text is not our native producer. Match the
+        # complete saved compact-log header, including its fixed subsystem.
+        emitter = re.fullmatch(rb"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+\s+Df\s+"
+                               rb"Takosumi\[([1-9][0-9]{0,9}):[0-9a-fA-Fx]+\]\s+"
+                               rb"\[com\.takosumi\.fixture\.simulator\.navigation:navigation\]\s+", prefix)
+        match = pattern.fullmatch(payload)
+        if not emitter or not match or int(match[1]) > 513 or int(match[3]) > 65_535 or int(match[4]) > 65_535:
+            result["malformed"] = min(513, result["malformed"] + 1)
+            continue
+        record = {"pid": int(emitter[1]), "seq": int(match[1]),
+                  "event": match[2].decode("ascii"), "view": int(match[3]), "request": int(match[4]),
+                  "relation": int(match[5]), "target": match[6].decode("ascii"),
+                  "reused": match[7] == b"1", "kept": match[8] == b"1", "resume": match[9] == b"1",
+                  "initial": match[10] == b"1", "sameView": match[11] == b"1", "timeMs": int(match[12])}
+        callback = record["event"] in ("provisional", "commit", "finish", "fail_provisional", "fail")
+        matched = record["relation"] == 1 and record["sameView"]
+        context = (record["request"] != 0 or record["target"] != "unknown"
+                   or any(record[key] for key in ("reused", "kept", "resume", "initial")))
+        if callback and not matched and context:
+            result["malformed"] = min(513, result["malformed"] + 1)
+            continue  # Keep unmatched callback context unknown, including old producer packets.
+        if len(result["records"]) == 513:
+            # Keep the latest process/view window, including a cold relaunch.
+            result["records"].pop(0)
+            result["dropped"] = min(513, result["dropped"] + 1)
+        result["records"].append(record)
+        if record["event"] == "cap":
+            result["capStatus"] = "observed"
+    return result
+
+
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
@@ -143,6 +190,10 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
             target.write(data)
         result.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
                       sha256=hashlib.sha256(data).hexdigest(), partial=not result["queryReturned"])
+        try:
+            result["navigationWitness"] = navigation_witness(data)
+        except Exception as error:
+            result["navigationWitness"] = {"diagnosticOnly": True, "errorType": type(error).__name__}
     except Exception as error:
         # Missing/failed diagnostics never replace the original test failure.
         result["retentionErrorType"] = type(error).__name__

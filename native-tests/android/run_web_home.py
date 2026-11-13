@@ -338,6 +338,10 @@ def preserve_guest_anr(emulator, scratch, out):
                     target.write(data)
                 entry.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
                              sha256=hashlib.sha256(data).hexdigest())
+                if label == "guest-activity-state":
+                    # Reuse this already-read snapshot; no new PID/process query.
+                    entry["appProcessPid"] = (native_activity_pid(data, truncated=size > len(data))
+                                              if entry.get("queryReturned") else None)
         except Exception as error:
             entry["collectionErrorType"] = type(error).__name__
     return result
@@ -350,8 +354,7 @@ NATIVE_OBSERVATION_STAGES = (
     "UNBIND_ENTER", "REMOVE_RETURN", "UNBIND_RETURN", "RESUME", "PAUSE",
     "PAGE_START", "PAGE_COMMIT", "PAGE_FINISH", "RENDER_GONE", "CAP_EXHAUSTED",
 )
-NATIVE_OBSERVATION_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-t", "64",
-                            "-s", NATIVE_OBSERVATION_TAG + ":I", "*:S")
+NATIVE_OBSERVATION_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-t", "64")
 NATIVE_OBSERVATION_READ_BYTES = 64 * 1024
 NATIVE_OBSERVATION_SAVE_BYTES = 32 * 1024
 NATIVE_OBSERVATION_PACKET = re.compile(
@@ -361,6 +364,51 @@ NATIVE_OBSERVATION_PACKET = re.compile(
       r" vis=([01]) res=([01]) evict=([01]) logical=(UNKNOWN|ADD_RETURN|REMOVE_RETURN)"
       r" physical=unknown cap=([01])"
 )
+
+
+def native_activity_pid(data, *, truncated=False):
+    """A scalar from one complete existing Activity snapshot, never PID authority."""
+    if truncated or len(data) > 128 * 1024:
+        return None
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    component = PACKAGE + "/com.takosumi.appscreen.AppScreenActivity"
+    record = r"ActivityRecord\{([0-9a-f]+) u([0-9]+) " + re.escape(component) + r" t([0-9]+)\}"
+    top = [line.strip() for line in lines if "topResumedActivity=" in line]
+    if len(top) != 1:
+        return None
+    resumed = re.fullmatch(r"topResumedActivity=" + record, top[0])
+    if not resumed:
+        return None
+    histories = [(index, re.fullmatch(r"([ ]*)\* Hist +#[0-9]+: " + record, line))
+                 for index, line in enumerate(lines)]
+    matching = [(index, match) for index, match in histories
+                if match and match.groups()[1:] == resumed.groups()]
+    if len(matching) != 1:
+        return None
+    index, header = matching[0]
+    indentation = len(header[1])
+    block = []
+    for line in lines[index + 1:]:
+        if line.strip() and len(line) - len(line.lstrip(" ")) <= indentation:
+            break  # A complete Hist block must end before this snapshot ends.
+        block.append(line.strip())
+    else:
+        return None
+    fields = {key: [line for line in block if line.startswith(key + "=")]
+              for key in ("packageName", "app", "mActivityComponent")}
+    if (fields["packageName"] != ["packageName=" + PACKAGE + " processName=" + PACKAGE]
+            or fields["mActivityComponent"] != ["mActivityComponent=" + component]
+            or len(fields["app"]) != 1):
+        return None
+    process = re.fullmatch(r"app=ProcessRecord\{[0-9a-f]+ ([1-9][0-9]{0,9}):"
+                           + re.escape(PACKAGE) + r"/u([0-9]+)a[0-9]+\}", fields["app"][0])
+    if not process or process[2] != resumed[2]:
+        return None
+    pid = int(process[1])
+    return pid if pid <= 2**31 - 1 else None
 
 
 def parse_native_observation(data):
@@ -392,7 +440,7 @@ def parse_native_observation(data):
 def preserve_native_observation(emulator, scratch, out, prior):
     """One failure-only closed-tag tail; no absolute aggregate/coverage claim."""
     result = {"diagnosticOnly": True, "clockDomain": "android_elapsed_realtime", "clockUnit": "ms",
-              "captureWindow": "closed_tag_logcat_tail_only", "coverage": "unknown",
+              "captureWindow": "pid_main_tail_then_closed_tag_filter", "coverage": "unknown",
               "queryReturned": False, "records": [], "commandWaitSeconds": 10,
               "packetTailCount": 64, "rawReadCapBytes": NATIVE_OBSERVATION_READ_BYTES,
               "saveCapBytes": NATIVE_OBSERVATION_SAVE_BYTES}
@@ -403,6 +451,11 @@ def preserve_native_observation(emulator, scratch, out, prior):
                                        for entry in previous.values()):
         result["skipped"] = "prior_diagnostic_incomplete"
         return result  # Do not recheck a guest after the existing collector lost custody.
+    pid = previous["guest-activity-state"].get("appProcessPid")
+    if type(pid) is not int or not 1 <= pid <= 2**31 - 1:
+        result["skipped"] = "app_process_unknown"
+        return result  # No broad tail, lookup or retry without the existing witness.
+    result["appProcessPid"] = pid
     raw = scratch / "guest-native-observation-raw.log"
     try:
         require(not raw.exists() and not raw.is_symlink(), "Existing diagnostic input refused")
@@ -411,7 +464,8 @@ def preserve_native_observation(emulator, scratch, out, prior):
         result["error"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "ownership_or_input_refused"
         return result
     try:
-        runtime.command([str(emulator.adb), "-s", SERIAL, "shell", *NATIVE_OBSERVATION_QUERY],
+        runtime.command([str(emulator.adb), "-s", SERIAL, "shell", *NATIVE_OBSERVATION_QUERY,
+                         "--pid=" + str(pid), "-s", NATIVE_OBSERVATION_TAG + ":I", "*:S"],
                         raw, timeout=10, read_output=False)
         result["queryReturned"] = True
     except BaseException as error:
@@ -429,7 +483,10 @@ def preserve_native_observation(emulator, scratch, out, prior):
             if truncated and not prefix.endswith(b"\n"):
                 prefix = prefix.rsplit(b"\n", 1)[0] if b"\n" in prefix else b""
             records, rejected, cut = parse_native_observation(prefix)
-            result.update(records=records, sourceBytes=info.st_size, rawPrefixBytes=len(prefix),
+            mismatched = sum(record["pid"] != pid for record in records)
+            records = [record for record in records if record["pid"] == pid]
+            result.update(records=records, pidMismatchPackets=mismatched,
+                          sourceBytes=info.st_size, rawPrefixBytes=len(prefix),
                           rawPrefixTruncated=truncated, rejectedPackets=rejected, recordLimitReached=cut,
                           nativeCapSeen=any(record["capExhausted"] for record in records))
         result["savedRecordsTruncated"] = False
