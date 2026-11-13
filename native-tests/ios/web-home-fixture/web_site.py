@@ -10,7 +10,9 @@ from urllib.parse import urlsplit
 
 
 class Site(http.server.ThreadingHTTPServer):
-    daemon_threads = True
+    # server_close waits for the bounded connection workers before retiring TLS.
+    daemon_threads = False
+    connection_timeout = 5
 
     def __init__(self, certificate, key, kind):
         if kind not in ("instance", "editor"):
@@ -21,13 +23,21 @@ class Site(http.server.ThreadingHTTPServer):
         self.editor = None
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate, key)
+        self.tls_context = context
         super().__init__(("127.0.0.1", 0), Handler)
-        try:
-            self.socket = context.wrap_socket(self.socket, server_side=True)
-        except BaseException:
-            self.server_close()
-            raise
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        try:
+            connection.settimeout(self.connection_timeout)
+            # The first read handshakes in the request worker. An unfinished
+            # TLS connection must not hold the listener's accept/dispatch loop.
+            return self.tls_context.wrap_socket(connection, server_side=True,
+                                                do_handshake_on_connect=False), address
+        except BaseException:
+            connection.close()
+            raise
 
     @property
     def url(self):

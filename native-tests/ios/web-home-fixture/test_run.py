@@ -7,10 +7,12 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import socket
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -352,6 +354,69 @@ class Controls(unittest.TestCase):
         self.assertEqual(set(event), keys, "A request worker must not resize the published request")
         self.assertEqual(event["response"]["state"], "written")
         self.assertIsNot(event["response"], during)
+
+
+class TLSTransportControls(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        parent = Path(os.environ.get("TMPDIR", "/root/dev/tmp")).resolve()
+        if parent.is_relative_to(runner.ROOT):
+            raise RuntimeError("Private mock material belongs outside the repository")
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(dir=parent)))
+        cls.ca, cls.cert, cls.key = runtime.certificate(root, localhost=True)
+
+    def setUp(self):
+        self.server = Site(self.cert, self.key, "editor")
+        self.addCleanup(self.server.stop)
+        self.server.start()
+        self.address = ("127.0.0.1", self.server.server_port)
+
+    def test_unfinished_tls_does_not_hold_two_verified_editor_requests(self):
+        context = ssl.create_default_context(cafile=str(self.ca))
+        opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context))
+        with socket.create_connection(self.address, timeout=1):
+            # Keep the first connection open without TLS while two ordinary
+            # verified requests use at most one additional connection at a time.
+            for _ in range(2):
+                with opener.open(self.server.url + "/editor", timeout=1) as reply:
+                    self.assertEqual(reply.status, 200)
+                    self.assertIn(b"<input id='draft'", reply.read())
+            self.assertEqual(len(self.server.events), 2)
+        # A client read can finish before its worker publishes the write snapshot.
+        self.server.stop()
+        self.assertTrue(all(e["response"]["state"] == "written" for e in self.server.events))
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_idle_tls_is_closed_by_the_connection_deadline_without_a_request_event(self):
+        self.server.connection_timeout = 0.15
+        with socket.create_connection(self.address, timeout=1) as pending:
+            self.assertEqual(pending.recv(1), b"")
+        self.assertEqual(self.server.events, [])
+
+    def test_stop_joins_an_unfinished_tls_worker_and_closes_its_socket(self):
+        self.server.connection_timeout = 1
+        entered = threading.Event()
+        exited = threading.Event()
+        workers = []
+        original = self.server.process_request_thread
+        def observe(*args):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                return original(*args)
+            finally:
+                exited.set()
+        with patch.object(self.server, "process_request_thread", observe):
+            with socket.create_connection(self.address, timeout=1) as pending:
+                self.assertTrue(entered.wait(0.5), "TLS was not dispatched to its own worker")
+                self.server.stop()
+                self.assertTrue(exited.is_set(), "stop returned before the owned TLS worker ended")
+                self.assertTrue(all(not worker.is_alive() for worker in workers))
+                self.assertFalse(self.server.thread.is_alive())
+                self.assertEqual(self.server.socket.fileno(), -1)
+                self.assertEqual(pending.recv(1), b"")
+        self.assertEqual(self.server.events, [])
 
 
 if __name__ == "__main__":

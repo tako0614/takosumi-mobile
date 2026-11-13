@@ -5,7 +5,12 @@ No native process, browser or site is started. Native Mac acceptance is separate
 """
 import copy
 import json
+import os
 from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -95,57 +100,54 @@ class EvidenceTests(unittest.TestCase):
             observer.attach({"pid": 11, "opened": {"nativePid": 12}, "directory": str(self.root)})
         connection.assert_called_once_with("127.0.0.1", 9222, timeout=5)
 
-    def test_sampler_thread_failure_still_runs_the_normal_close_body(self):
-        with tempfile.TemporaryDirectory(prefix="m3-sample-start-") as directory:
-            observer = mock.Mock(identities=[], phase="restart", data=Path(directory), proof={}, sample_shutdowns=True)
-            with mock.patch.object(sampler.threading, "Thread") as thread:
-                thread.return_value.start.side_effect = RuntimeError("cannot start new thread")
-                entered = False
-                with sampler.watch_shutdowns(observer, []):
-                    entered = True
-                # Partial and final quit share a phase: the second watcher
-                # must preserve the first watcher's diagnostics on disk.
-                with sampler.watch_shutdowns(observer, []):
-                    pass
-                self.assertTrue(entered)
-                thread.return_value.join.assert_not_called()
-            self.assertEqual(observer.proof["shutdownSamples"][0]["status"], "thread-start-error")
-            saved = json.loads((Path(directory) / "shutdown-samples-restart.json").read_text())
-            self.assertEqual(len(saved), 2)
-            self.assertEqual(saved, observer.proof["shutdownSamples"])
+    def test_sampler_process_start_failure_still_runs_the_normal_close_body(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        with mock.patch.object(sampler, "_launch", side_effect=RuntimeError("private launch detail")), \
+                mock.patch.object(sampler, "_retire") as retire:
+            entered = False
+            with sampler.watch_shutdowns(observer, [page]):
+                entered = True
+            with sampler.watch_shutdowns(observer, [page]):
+                pass
+            self.assertTrue(entered)
+            retire.assert_not_called()
+        self.assertEqual(len(observer.proof["shutdownSamples"]), 2)
+        self.assertTrue(all(item["status"] == "worker-start-error" for item in observer.proof["shutdownSamples"]))
+        self.assertNotIn("private launch detail", json.dumps(observer.proof))
 
     def test_normal_close_does_not_start_a_sampler_without_explicit_opt_in(self):
         observer = self.failed_observer()
         self.assertIs(observer.proof["shutdownSampling"], False)
-        with mock.patch.object(sampler.threading, "Thread") as thread, \
+        with mock.patch.object(sampler, "_launch") as launch, \
                 mock.patch.object(sampler, "sample_owned") as sample:
             with sampler.watch_shutdowns(observer, []):
                 observer.proof["normalCloseRan"] = True
         self.assertTrue(observer.proof["normalCloseRan"])
-        thread.assert_not_called()
+        launch.assert_not_called()
         sample.assert_not_called()
 
     def test_opt_in_shutdown_watch_still_samples_the_registered_browser_once(self):
         observer = self.failed_observer(sample_shutdowns=True)
         self.assertIs(observer.proof["shutdownSampling"], True)
-        ready = sampler.threading.Event()
         page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
-        def capture(*args):
-            ready.set()
-            return {"pid": 12, "diagnosticOnly": True, "status": "captured"}
-        with mock.patch.object(sampler, "shutdown_pending", return_value=True), \
-                mock.patch.object(sampler.time, "monotonic", side_effect=[0, 0, 3, 3]), \
-                mock.patch.object(sampler, "sample_owned", side_effect=capture) as sample:
+        record = {"pid": 12, "diagnosticOnly": True, "status": "captured"}
+        process = mock.Mock()
+        with mock.patch.object(sampler, "_launch", return_value=process) as launch, \
+                mock.patch.object(sampler, "_retire", return_value=([record], {"cleanupComplete": True})) as retire:
             with sampler.watch_shutdowns(observer, [page]):
-                self.assertTrue(ready.wait(2), "Opt-in watcher did not reach its registered target")
-        sample.assert_called_once()
-        self.assertEqual(sample.call_args.args[1:3], tuple(observer.identities[:2][::-1]))
-        self.assertEqual(observer.proof["shutdownSamples"], [{"pid": 12, "diagnosticOnly": True, "status": "captured"}])
+                self.assertIs(observer._shutdown_diagnostic, process)
+        launch.assert_called_once()
+        target = launch.call_args.args[0]["targets"][0]
+        self.assertEqual((target["child"], target["parent"]), tuple(observer.identities[:2][::-1]))
+        retire.assert_called_once_with(process)
+        self.assertIsNone(observer._shutdown_diagnostic)
+        self.assertEqual(observer.proof["shutdownSamples"], [record])
 
     def test_normal_close_preserves_its_body_failure_without_starting_a_sampler(self):
         observer = self.failed_observer()
         failure = runner.Failure("original close failure")
-        with mock.patch.object(sampler.threading, "Thread") as thread:
+        with mock.patch.object(sampler, "_launch") as launch:
             try:
                 with sampler.watch_shutdowns(observer, []):
                     raise failure
@@ -153,7 +155,209 @@ class EvidenceTests(unittest.TestCase):
                 self.assertIs(caught, failure)
             else:
                 self.fail("Original close failure was hidden")
-        thread.assert_not_called()
+        launch.assert_not_called()
+
+    def blocked_helper(self, budget=10, descendant=False, reply=None):
+        self.helper_number = getattr(self, "helper_number", 0) + 1
+        fifo = self.root / f"blocked-diagnostic-{self.helper_number}"
+        os.mkfifo(fifo)
+        program = """import json,os,subprocess,sys,time
+sys.path.insert(0,sys.argv[1])
+import macos_shutdown_sample as sampler
+os.set_blocking(1,False)
+sampler._arm_group_deadline(float(sys.argv[2]))
+reply=json.loads(sys.argv[4])
+if sys.argv[5]=='yes':
+    child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    reply['descendant']=child.pid
+sampler._emit(reply)
+os.open(sys.argv[3],os.O_RDONLY)
+"""
+        process = sampler._launch_command([sys.executable, "-B", "-c", program,
+                                           str(Path(sampler.__file__).parent), str(budget), str(fifo),
+                                           json.dumps(reply or {"status": "probe-ready"}), "yes" if descendant else "no"])
+        self.addCleanup(lambda: sampler._retire(process) if process.returncode is None else None)
+        return process
+
+    def probe_ready(self, process):
+        readable, _, _ = select.select([process.stdout], [], [], 2)
+        self.assertTrue(readable, "The harmless owned probe did not start")
+        return sampler._read_reply(process)
+
+    def test_blocked_diagnostic_reaches_cleanup_and_reaps_only_its_owned_group(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        process = self.blocked_helper(descendant=True)
+        self.assertIn("descendant", self.probe_ready(process)[0])
+        foreign = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"],
+                                   stdout=subprocess.PIPE, start_new_session=True)
+        def retire_sentinel():
+            if foreign.returncode is None:
+                os.killpg(foreign.pid, signal.SIGKILL)
+                foreign.wait(timeout=2)
+            foreign.stdout.close()
+        self.addCleanup(retire_sentinel)
+        start = time.monotonic()
+        with mock.patch.object(sampler, "_launch", return_value=process):
+            with sampler.watch_shutdowns(observer, [page]):
+                observer.proof["bodyRan"] = True
+            observer.proof["cleanupReached"] = True
+        self.assertLess(time.monotonic() - start, sampler.RETIRE_BUDGET + 1)
+        self.assertTrue(observer.proof["bodyRan"] and observer.proof["cleanupReached"])
+        self.assertTrue(observer.proof["shutdownDiagnosticRetirements"][0]["cleanupComplete"])
+        self.assertIsNotNone(process.returncode)
+        self.assertIsNone(foreign.poll(), "The separate sentinel must not be signalled")
+
+    def test_diagnostic_whole_deadline_includes_blocked_io_and_its_own_descendant(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        process = self.blocked_helper(budget=0.2, descendant=True)
+        self.probe_ready(process)
+        with mock.patch.object(sampler, "_launch", return_value=process):
+            with sampler.watch_shutdowns(observer, [page]):
+                time.sleep(0.35)  # The real harmless IO remains blocked.
+                observer.proof["normalBodyContinued"] = True
+        self.assertTrue(observer.proof["normalBodyContinued"])
+        self.assertIn("diagnostic-deadline", [x["status"] for x in observer.proof["shutdownSamples"]])
+        self.assertTrue(observer.proof["shutdownDiagnosticRetirements"][0]["cleanupComplete"])
+        self.assertNotIn("captured", [x["status"] for x in observer.proof["shutdownSamples"]])
+
+    def test_late_failure_probe_uses_the_same_bounded_owner_and_retains_its_failure(self):
+        reply = {"pid": 12, "start": 101, "diagnosticOnly": True,
+                 "status": "sample-error", "errorType": "TimeoutExpired"}
+        process = self.blocked_helper(reply=reply)
+        with mock.patch.object(sampler, "_launch", return_value=process) as launch:
+            result = sampler.sample_owned(None, {"pid": 12, "start": 101}, {"pid": 11, "start": 100},
+                                         self.browser_image, self.guard_image, self.root / "sample.log")
+        self.assertEqual(result, reply)
+        self.assertEqual(launch.call_args.args[0]["mode"], "sample")
+        self.assertIsNotNone(process.returncode)
+
+    def test_diagnostic_launch_uses_a_fresh_session_and_does_not_forward_credentials(self):
+        process = mock.Mock()
+        with mock.patch.dict(os.environ, {"TAKOSUMI_PRIVATE_TEST_VALUE": "must not forward"}), \
+                mock.patch.object(sampler, "_active_diagnostic", None), \
+                mock.patch.object(sampler.subprocess, "Popen", return_value=process) as launch, \
+                mock.patch.object(sampler.os, "set_blocking"):
+            self.assertIs(sampler._launch({"mode": "watch"}), process)
+        options = launch.call_args.kwargs
+        self.assertIs(options["start_new_session"], True)
+        self.assertNotIn("TAKOSUMI_PRIVATE_TEST_VALUE", options["env"])
+        self.assertEqual(set(options["env"]), {"PATH", "PYTHONDONTWRITEBYTECODE"})
+        self.assertEqual(options["stdin"], subprocess.DEVNULL)
+
+    def test_owner_refuses_foreign_retirement_and_another_worker_until_reaped(self):
+        with mock.patch.object(sampler.os, "killpg") as send:
+            with self.assertRaisesRegex(ValueError, "currently owned"):
+                sampler._retire(mock.Mock())
+            send.assert_not_called()
+        process = self.blocked_helper()
+        self.probe_ready(process)
+        with self.assertRaisesRegex(RuntimeError, "has not retired"), \
+                mock.patch.object(sampler.subprocess, "Popen") as launch:
+            sampler._launch_command([sys.executable, "-c", "pass"])
+        launch.assert_not_called()
+        _, receipt = sampler._retire(process)
+        self.assertTrue(receipt["cleanupComplete"])
+        following = self.blocked_helper()
+        self.probe_ready(following)
+        self.assertTrue(sampler._retire(following)[1]["cleanupComplete"])
+
+    def test_diagnostic_deadline_refuses_a_shared_process_group_before_any_signal(self):
+        program = ("import sys;sys.path.insert(0,sys.argv[1]);import macos_shutdown_sample as s;"
+                   "s._arm_group_deadline(0.1)")
+        result = subprocess.run([sys.executable, "-B", "-c", program, str(Path(sampler.__file__).parent)],
+                                capture_output=True, timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Expected the owned diagnostic session", result.stderr)
+
+    def test_nonblocking_setup_failure_never_reads_its_blocking_pipe_or_allows_normal_success(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        read, write = os.pipe()
+        process = SimpleNamespace(pid=9999999, stdout=os.fdopen(read, "rb"), returncode=None,
+                                  wait=mock.Mock(side_effect=subprocess.TimeoutExpired("owned diagnostic", 0.01)))
+        self.addCleanup(os.close, write)
+        self.addCleanup(process.stdout.close)
+        entered = False
+        with mock.patch.object(sampler, "_active_diagnostic", None), \
+                mock.patch.object(sampler.subprocess, "Popen", return_value=process), \
+                mock.patch.object(sampler.os, "set_blocking", side_effect=OSError("private setup detail")), \
+                mock.patch.object(sampler.os, "killpg"), \
+                mock.patch.object(sampler.os, "read", side_effect=AssertionError("Unsafe blocking read")) as read_pipe, \
+                mock.patch.object(sampler, "RETIRE_BUDGET", 0.01):
+            with self.assertRaises(sampler.DiagnosticRetirementError):
+                with sampler.watch_shutdowns(observer, [page]):
+                    entered = True
+            self.assertIs(sampler._active_diagnostic, process)
+            self.assertIs(observer._shutdown_diagnostic, process)
+            read_pipe.assert_not_called()
+        self.assertFalse(entered)
+        self.assertTrue(process.stdout.closed)
+        receipt = observer.proof["shutdownDiagnosticRetirements"][0]
+        self.assertFalse(receipt["cleanupComplete"])
+        self.assertFalse(receipt["replyNonblocking"])
+        self.assertNotIn("worker-start-error", [x["status"] for x in observer.proof.get("shutdownSamples", [])])
+
+    def test_nonblocking_setup_failure_after_confirmed_retirement_keeps_the_original_body(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"],
+                                   stdout=subprocess.PIPE, start_new_session=True)
+        def cleanup():
+            if process.returncode is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+            process.stdout.close()
+        self.addCleanup(cleanup)
+        with mock.patch.object(sampler.subprocess, "Popen", return_value=process), \
+                mock.patch.object(sampler.os, "set_blocking", side_effect=OSError("private setup detail")):
+            with sampler.watch_shutdowns(observer, [page]):
+                observer.proof["normalBodyRan"] = True
+        self.assertTrue(observer.proof["normalBodyRan"])
+        self.assertIsNotNone(process.returncode)
+        self.assertIsNone(sampler._active_diagnostic)
+        self.assertEqual(observer.proof["shutdownSamples"][0]["status"], "worker-start-error")
+
+    def test_late_failure_probe_retains_the_post_spawn_incomplete_retirement(self):
+        receipt = {"diagnosticOnly": True, "status": "diagnostic-retired", "cleanupComplete": False}
+        process = mock.Mock()
+        with mock.patch.object(sampler, "_active_diagnostic", None), \
+                mock.patch.object(sampler.subprocess, "Popen", return_value=process), \
+                mock.patch.object(sampler.os, "set_blocking", side_effect=OSError("setup unavailable")), \
+                mock.patch.object(sampler, "_retire", return_value=([], receipt)):
+            result = sampler.sample_owned(None, {"pid": 12, "start": 101}, {"pid": 11, "start": 100},
+                                         self.browser_image, self.guard_image, self.root / "sample.log")
+        self.assertFalse(result["cleanupComplete"])
+        self.assertEqual(result["status"], "diagnostic-cleanup-incomplete")
+        self.assertEqual(result["pid"], 12)
+
+    def test_incomplete_diagnostic_retirement_is_not_a_pass_or_another_worker(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        process = mock.Mock()
+        with mock.patch.object(sampler, "_launch", return_value=process) as launch, \
+                mock.patch.object(sampler, "_retire", return_value=([], {"cleanupComplete": False})):
+            with self.assertRaisesRegex(RuntimeError, "did not retire"):
+                with sampler.watch_shutdowns(observer, [page]):
+                    pass
+            self.assertIs(observer._shutdown_diagnostic, process)
+            with sampler.watch_shutdowns(observer, [page]):
+                pass
+        launch.assert_called_once()
+        self.assertEqual(observer.proof["shutdownSamples"][-1]["status"], "diagnostic-busy")
+
+    def test_incomplete_diagnostic_retirement_keeps_the_original_close_error(self):
+        observer = self.failed_observer(sample_shutdowns=True)
+        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+        original = runner.Failure("original close failure")
+        with mock.patch.object(sampler, "_launch"), \
+                mock.patch.object(sampler, "_retire", return_value=([], {"cleanupComplete": False})):
+            with self.assertRaises(runner.Failure) as caught:
+                with sampler.watch_shutdowns(observer, [page]):
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertIn("did not retire", original.__notes__[0])
 
     def failed_observer(self, sample_shutdowns=False):
         observer = runner.MacObserver(self.root, "photopea", "", mock.Mock(),
@@ -283,7 +487,7 @@ class EvidenceTests(unittest.TestCase):
                         return mock.Mock(returncode=0, stdout=b"")
                     output = Path(directory) / f"{mutation}.log"
                     with mock.patch.object(sampler.subprocess, "run", side_effect=sample) as command:
-                        result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
+                        result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
                     self.assertEqual(result["status"], f"identity-changed-{'after' if mutation == 'after' else 'before'}")
                     self.assertFalse(output.exists())
                     self.assertFalse(output.with_suffix(".stderr.log").exists())
@@ -308,10 +512,10 @@ class EvidenceTests(unittest.TestCase):
                 return mock.Mock(returncode=0)
             with mock.patch.object(sampler, "LIMIT", 32), \
                     mock.patch.object(sampler.subprocess, "run", side_effect=sample):
-                result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
+                result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
             self.assertEqual((result["status"], result["truncated"], output.stat().st_size), ("captured", True, 32))
             with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 5)):
-                result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
+                result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
 
     def test_sampler_timeout_keeps_bounded_diagnostics_without_becoming_a_pass(self):
@@ -335,7 +539,7 @@ class EvidenceTests(unittest.TestCase):
                     with mock.patch.object(sampler, "LIMIT", 32), \
                             mock.patch.object(sampler, "STDERR_LIMIT", 16), \
                             mock.patch.object(sampler.subprocess, "run", side_effect=sample):
-                        result = sampler.sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
+                        result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
                     if changed:
                         self.assertEqual(result["status"], "identity-changed-after")
                         self.assertFalse(output.exists())

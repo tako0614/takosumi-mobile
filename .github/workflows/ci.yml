@@ -2003,7 +2003,7 @@ jobs:
         run: |
           python3 -B native-tests/desktop/test_macos_browser_process.py -v 2>&1 | tee "$RUNNER_TEMP/m3-runner-tests.log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'M3 runner tests failed'; exit 1; }
-          grep -q '^Ran 23 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all twenty-three M3 runner tests ran'; exit 1; }
+          grep -q '^Ran 34 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all thirty-four M3 runner tests ran'; exit 1; }
       - name: Locked CEF version
         id: cef
         run: |
@@ -2260,7 +2260,7 @@ jobs:
       - name: Packaged App resolves its own browser, guard and runtime (anonymous Photopea)
         if: ${{ !cancelled() && steps.packaged-app-build.outcome == 'success' }}
         timeout-minutes: 25
-        run: python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site photopea
+        run: python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site photopea --sample-shutdowns
       # Each smoke's summary (with its `sandbox` and `descendants` records),
       # its top-level logs and the bundle manifests: text only, no binary.
       - name: Keep the smoke summaries

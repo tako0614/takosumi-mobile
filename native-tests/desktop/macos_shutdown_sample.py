@@ -6,15 +6,28 @@ search, signals, heap dump, environment or page data is requested.
 """
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import select
+import signal
 import subprocess
+import sys
 import tempfile
-import threading
 import time
 
 LIMIT = 4 * 1024 * 1024
 STDERR_LIMIT = 8192
 PREFIX = "takosumi-cef-mac-lifecycle: "
+DIAGNOSTIC_BUDGET = 45.0
+RETIRE_BUDGET = 2.0
+REPLY_LIMIT = 16384
+_active_diagnostic = None
+
+
+class DiagnosticRetirementError(RuntimeError):
+    def __init__(self, receipt):
+        super().__init__("The spawned diagnostic helper did not retire")
+        self.receipt = receipt
 
 
 def shutdown_pending(path, identity):
@@ -95,7 +108,7 @@ def capture_state(child, output):
     return record
 
 
-def sample_owned(processes, child, parent, browser, guard, output):
+def _sample_owned(processes, child, parent, browser, guard, output):
     """One one-second sample; discard output if process identity changed meanwhile."""
     result = {"pid": child["pid"], "start": child["start"], "diagnosticOnly": True}
     try:
@@ -142,64 +155,263 @@ def sample_owned(processes, child, parent, browser, guard, output):
         return dict(result, status="sample-error", errorType=type(error).__name__)
 
 
+def _emit(record):
+    """The private worker reports metadata only; a full pipe is not a wait."""
+    try:
+        data = (json.dumps(record) + "\n").encode()
+        if len(data) <= 4096:
+            os.write(1, data)
+    except (OSError, ValueError):
+        pass
+
+
+def _arm_group_deadline(seconds):
+    """A fresh helper session owns this timer and every diagnostic command.
+
+    The independent timer can kill that session even if its worker is stuck
+    in file/libproc IO. The existing App/browser/guard are never in it.
+    This function runs only in the new diagnostic process. The timer execs
+    a fresh interpreter instead of forking Python state on macOS.
+    """
+    group = os.getpid()
+    if os.getpgrp() != group or not 0 < seconds <= DIAGNOSTIC_BUDGET:
+        raise ValueError("Expected the owned diagnostic session")
+    program = """import os,sys,time
+time.sleep(max(0,float(sys.argv[2])-time.monotonic()))
+try:
+    os.write(1,b'{"diagnosticOnly":true,"status":"diagnostic-deadline"}\\n')
+except OSError:
+    pass
+os.killpg(int(sys.argv[1]),9)
+"""
+    return subprocess.Popen([sys.executable, "-B", "-c", program, str(group),
+                             str(time.monotonic() + seconds)],
+                            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _image_spec(image):
+    return {"path": str(image.file.name), "identity": list(image.identity)}
+
+
+def _launch_command(command):
+    global _active_diagnostic
+    if _active_diagnostic is not None:
+        raise RuntimeError("The owned diagnostic helper has not retired")
+    # Keep this Popen object unreaped until _retire has signalled its own
+    # group. The unreaped leader pins the PID against a reused-group kill.
+    process = subprocess.Popen(command,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True,
+                               env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                                    "PYTHONDONTWRITEBYTECODE": "1"})
+    _active_diagnostic = process
+    process._diagnostic_nonblocking = False
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        process._diagnostic_nonblocking = True
+    except Exception as setup_error:
+        try:
+            _, receipt = _retire(process)
+        except Exception as retirement_error:
+            receipt = {"diagnosticOnly": True, "status": "diagnostic-retired",
+                       "cleanupComplete": False, "errorType": type(retirement_error).__name__}
+        if not receipt["cleanupComplete"]:
+            raise DiagnosticRetirementError(receipt) from setup_error
+        raise
+    return process
+
+
+def _launch(spec):
+    return _launch_command([sys.executable, "-B", __file__, json.dumps(spec)])
+
+
+def _read_reply(process):
+    if getattr(process, "_diagnostic_nonblocking", None) is not True:
+        return []  # Setup failed: discard metadata instead of a blocking read.
+    data = bytearray()
+    while len(data) < REPLY_LIMIT:
+        try:
+            block = os.read(process.stdout.fileno(), REPLY_LIMIT - len(data))
+        except BlockingIOError:
+            break
+        if not block:
+            break
+        data.extend(block)
+    records = []
+    for line in data.splitlines():
+        try:
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(record)
+        except ValueError:
+            records.append({"diagnosticOnly": True, "status": "partial-reply"})
+    return records
+
+
+def _retire(process):
+    """Kill only the new diagnostic group, then reap and verify exhaustion.
+
+    No poll/communicate/wait may precede the signal: the held leader is the
+    ownership anchor. After reaping, group probes are read-only, never kills.
+    """
+    global _active_diagnostic
+    if process is not _active_diagnostic:
+        raise ValueError("Expected the currently owned diagnostic helper")
+    end = time.monotonic() + RETIRE_BUDGET
+    error = None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as failure:
+        error = type(failure).__name__
+    reaped = False
+    try:
+        process.wait(timeout=max(0, end - time.monotonic()))
+        reaped = True
+    except subprocess.TimeoutExpired:
+        error = "TimeoutExpired"
+    gone = False
+    while reaped and time.monotonic() < end:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            gone = True
+            break
+        except OSError as failure:
+            error = type(failure).__name__
+            break
+        time.sleep(0.01)
+    records = _read_reply(process)
+    process.stdout.close()
+    if reaped and gone:
+        _active_diagnostic = None
+    return records, {"diagnosticOnly": True, "status": "diagnostic-retired",
+                     "cleanupComplete": reaped and gone, "leaderReaped": reaped,
+                     "groupGone": gone, "exitCode": process.returncode, "errorType": error,
+                     "replyNonblocking": getattr(process, "_diagnostic_nonblocking", None) is True}
+
+
+def _spec(browser, guard, targets, mode):
+    return {"mode": mode, "budget": DIAGNOSTIC_BUDGET,
+            "browser": _image_spec(browser), "guard": _image_spec(guard), "targets": targets}
+
+
+def sample_owned(processes, child, parent, browser, guard, output):
+    """The late failure probe uses the same bounded owner as in-flow probes.
+
+    Native identity and file checks are reconstructed inside the isolated
+    worker; no possibly blocking target inspection runs on the UI runner.
+    """
+    target = {"child": child, "parent": parent, "output": str(output)}
+    try:
+        process = _launch(_spec(browser, guard, [target], "sample"))
+    except DiagnosticRetirementError as error:
+        return dict(error.receipt, pid=child["pid"], start=child["start"],
+                    status="diagnostic-cleanup-incomplete")
+    end = time.monotonic() + DIAGNOSTIC_BUDGET
+    records = []
+    try:
+        while time.monotonic() < end and not records:
+            readable, _, _ = select.select([process.stdout], [], [], max(0, end - time.monotonic()))
+            if readable:
+                records.extend(_read_reply(process))
+    finally:
+        trailing, receipt = _retire(process)
+        records.extend(trailing)
+    if not receipt["cleanupComplete"]:
+        return dict(receipt, pid=child["pid"], start=child["start"], status="diagnostic-cleanup-incomplete")
+    return next((record for record in records if record.get("pid") == child["pid"]),
+                {"pid": child["pid"], "start": child["start"], "diagnosticOnly": True,
+                 "status": "sample-unavailable", "retirement": receipt})
+
+
 @contextmanager
 def watch_shutdowns(observer, pages):
-    """Opt-in diagnostic: sample during close/wait, including a blocked Page.close."""
-    # sample suspends its target at each interval. Keep normal flow verdicts
-    # separate from that probe's scheduling effects; failure_capture remains
-    # available after the original flow has already failed.
+    """Opt-in, time-bounded helper; no runner thread can hold up cleanup."""
     if getattr(observer, "sample_shutdowns", False) is not True:
         yield
         return
+    if getattr(observer, "_shutdown_diagnostic", None) is not None:
+        observer.proof.setdefault("shutdownSamples", []).append(
+            {"diagnosticOnly": True, "status": "diagnostic-busy"})
+        yield
+        return
     identities = {item["pid"]: item for item in observer.identities}
-    targets = [(identities[page.native["nativePid"]], identities[page.process["pid"]],
-                Path(page.process["directory"]) / "browser.log") for page in pages]
-    stopped = threading.Event()
-    records = []
     phase = observer.phase or "first"
+    targets = [{"child": identities[page.native["nativePid"]],
+                "parent": identities[page.process["pid"]],
+                "log": str(Path(page.process["directory"]) / "browser.log"),
+                "output": str(observer.data / "evidence" / f"shutdown-{phase}"
+                              / f"sample-{page.native['nativePid']}.log")} for page in pages]
+    try:
+        if not 1 <= len(targets) <= 2:
+            raise ValueError("Expected one or two owned diagnostic targets")
+        process = _launch(_spec(observer.browser, observer.guard, targets, "watch"))
+    except DiagnosticRetirementError as error:
+        observer._shutdown_diagnostic = _active_diagnostic
+        observer.proof.setdefault("shutdownDiagnosticRetirements", []).append(error.receipt)
+        raise
+    except Exception as error:
+        observer.proof.setdefault("shutdownSamples", []).append(
+            {"diagnosticOnly": True, "status": "worker-start-error", "errorType": type(error).__name__})
+        yield
+        return
+    observer._shutdown_diagnostic = process
+    try:
+        yield
+    finally:
+        original_failure = sys.exc_info()[1]
+        records, receipt = _retire(process)
+        observer.proof.setdefault("shutdownSamples", []).extend(records)
+        observer.proof.setdefault("shutdownDiagnosticRetirements", []).append(receipt)
+        if receipt["cleanupComplete"]:
+            observer._shutdown_diagnostic = None
+        else:
+            # Keep the handle and refuse another launch. The original guard
+            # cleanup still runs as this error unwinds the runner's finally.
+            if original_failure is not None:
+                original_failure.add_note("The owned diagnostic helper did not retire")
+            else:
+                raise RuntimeError("The owned diagnostic helper did not retire")
 
-    def watch():
+
+def _worker(spec):
+    os.set_blocking(1, False)
+    timer = _arm_group_deadline(spec["budget"])
+    # Import native/file adapters only after the independent deadline is armed.
+    from macos_browser_process import Processes
+    from macos_process_image import PinnedImage
+    if spec["mode"] not in ("sample", "watch") or not 1 <= len(spec["targets"]) <= 2:
+        raise ValueError("Invalid private diagnostic request")
+    with PinnedImage(Path(spec["browser"]["path"])) as browser, \
+            PinnedImage(Path(spec["guard"]["path"])) as guard:
+        if list(browser.identity) != spec["browser"]["identity"] or list(guard.identity) != spec["guard"]["identity"]:
+            raise ValueError("The pinned diagnostic images changed")
+        processes = Processes()
         first_seen, attempted = {}, set()
-        while not stopped.wait(0.1):
-            for child, parent, log in targets:
-                if stopped.is_set():
-                    return
+        while True:
+            for target in spec["targets"]:
+                child, parent = target["child"], target["parent"]
                 pid = child["pid"]
                 if pid in attempted:
                     continue
-                try:
-                    if not shutdown_pending(log, child):
+                if spec["mode"] == "watch":
+                    if not shutdown_pending(Path(target["log"]), child):
                         first_seen.pop(pid, None)
                         continue
                     first_seen.setdefault(pid, time.monotonic())
                     if time.monotonic() - first_seen[pid] < 2:
                         continue
-                    attempted.add(pid)
-                    output = observer.data / "evidence" / f"shutdown-{phase}" / f"sample-{pid}.log"
-                    records.append(sample_owned(observer.processes, child, parent,
-                                                observer.browser, observer.guard, output))
-                except Exception as error:
-                    attempted.add(pid)
-                    records.append({"pid": pid, "status": "watch-error", "errorType": type(error).__name__})
+                attempted.add(pid)
+                _emit(_sample_owned(processes, child, parent, browser, guard, Path(target["output"])))
+            time.sleep(0.1)
 
-    worker, started = None, False
+
+if __name__ == "__main__":
     try:
-        worker = threading.Thread(target=watch, name="owned-mac-shutdown-sample")
-        worker.start()
-        started = True
+        if len(sys.argv) != 2 or len(sys.argv[1]) > 65536:
+            raise ValueError("Invalid private diagnostic request")
+        _worker(json.loads(sys.argv[1]))
     except Exception as error:
-        records.append({"status": "thread-start-error", "errorType": type(error).__name__})
-    try:
-        yield
-    finally:
-        stopped.set()
-        if started:
-            # Join before any fixture cleanup. The sample subprocess is
-            # bounded, but filesystem/libproc reads have no hard IO deadline.
-            worker.join()
-        observer.proof.setdefault("shutdownSamples", []).extend(records)
-        try:
-            (observer.data / f"shutdown-samples-{phase}.json").write_text(
-                json.dumps(observer.proof["shutdownSamples"], indent=2) + "\n")
-        except OSError as error:
-            observer.proof["shutdownSampleWriteError"] = type(error).__name__
+        _emit({"diagnosticOnly": True, "status": "worker-error", "errorType": type(error).__name__})
