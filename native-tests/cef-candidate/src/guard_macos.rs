@@ -115,6 +115,8 @@ use std::time::{Duration, Instant};
 
 #[path = "mac_cleanup_role.rs"]
 mod cleanup_role;
+#[path = "mac_drain_entry.rs"]
+mod drain_entry;
 
 /// Opt-in for native diagnostic fixtures only. Default runs never read argv.
 const ROLE_DIAGNOSTICS: &str = "TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS";
@@ -1423,6 +1425,15 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
     } else {
         NATURAL
     };
+    // Capture only the selected entry facts; no formatting or IO enters the drain windows.
+    let drain_entry = drain_entry::capture(run.role_diagnostics, || drain_entry::Entry {
+        root_exit: run.root_exit,
+        stop_observed: run.stop_observed,
+        failure_present: failure.is_some(),
+        non_fatal_present: !run.non_fatal.is_empty(),
+        cleanup_errors_present: !run.cleanup_errors.is_empty(),
+        selected_natural: natural,
+    });
     let empty = run.drain(natural);
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     // The browser counts once, also when no look ever read its start time.
@@ -1447,6 +1458,10 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         "cleanupErrors": run.cleanup_errors,
         "nonFatalErrors": run.non_fatal,
     });
+    if let Some(entry) = drain_entry {
+        // Existing proof facts are already captured; synchronous IO may delay receipt/return.
+        note(format_args!("drain-entry: {entry}"));
+    }
     // One write of the whole document, so a reader never sees a partial one
     // from a successful write.
     let written = serde_json::to_vec(&proof)

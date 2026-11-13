@@ -71,26 +71,23 @@ pub fn run() {
                     println!("PASS: saved SPA route matches before native view construction");
                 }
                 open_on_ui_thread(app.handle(), request(profile), directory.clone())?;
-                let view = SCREENS.with(|screens| {
-                    screens
-                        .borrow()
-                        .get(&label(profile))
-                        .unwrap()
-                        .view
-                        .webview()
+                let (view, factory_start) = SCREENS.with(|screens| {
+                    let screens = screens.borrow();
+                    let screen = screens.get(&label(profile)).unwrap();
+                    (screen.view.webview(), screen.fixture_start.clone())
                 });
-                // Only this fixture's ephemeral loopback certificate. Load
-                // again after trusting it, then await the real bootstrap
-                // document before replacing any factory-started navigation.
+                // Only this fixture's ephemeral loopback certificate.
                 view.context()
                     .unwrap()
                     .allow_tls_certificate_for_host(&certificate, "127.0.0.1");
-                // SPA readback must finish the factory's saved-route load.
-                // Reloading here can interrupt it before its URI settles.
-                // Trust is set in the same setup turn after construction;
-                // do not force the expected route or start a second request.
+                // SPA readback consumes the factory's saved-route load alone.
+                // A different non-SPA readback target is awaited by bootstrap
+                // before this same explicit root load, within its original 5s.
                 if !(spa && readback) {
-                    view.load_uri(&request(profile).url);
+                    let root = request(profile).url;
+                    if !defer_factory_bootstrap(spa, readback, &factory_start, &root) {
+                        view.load_uri(&root);
+                    }
                 }
             }
             let handle = app.handle().clone();
@@ -538,29 +535,70 @@ fn after_spa_close(
     }
 }
 
+fn defer_factory_bootstrap(spa: bool, readback: bool, factory_start: &str, root: &str) -> bool {
+    !spa && readback && factory_start != root
+}
+
+// Registration is not readiness. The new transition may start only while its
+// original shared budget remains, including after synchronous registration.
+fn begin_bootstrap_root_until(
+    view: &webkit2gtk::WebView,
+    root: String,
+    app: AppHandle,
+    deadline: std::time::Instant,
+    next: impl FnOnce() + 'static,
+) {
+    if std::time::Instant::now() >= deadline {
+        app.exit(1);
+        return;
+    }
+    if !after_document_load_until(
+        view,
+        root.clone(),
+        "bootstrap".into(),
+        app.clone(),
+        deadline,
+        next,
+    ) {
+        return;
+    }
+    if std::time::Instant::now() >= deadline {
+        app.exit(1);
+        return;
+    }
+    view.load_uri(&root);
+}
+
 fn bootstrap(app: AppHandle, directory: PathBuf, readback: bool, index: usize) {
     let Some(profile) = [WORK, PERSONAL, "shared"].get(index).copied() else {
         step(app, directory, readback, 0);
         return;
     };
-    let view = SCREENS.with(|screens| {
-        screens
-            .borrow()
-            .get(&label(profile))
-            .unwrap()
-            .view
-            .webview()
+    let (view, factory_start) = SCREENS.with(|screens| {
+        let screens = screens.borrow();
+        let screen = screens.get(&label(profile)).unwrap();
+        (screen.view.webview(), screen.fixture_start.clone())
     });
-    after_document_load(
-        &view,
-        request(profile).url,
-        "bootstrap".into(),
-        app.clone(),
-        move || {
-            println!("PASS: factory bootstrap finished for profile={profile}");
-            bootstrap(app, directory, readback, index + 1);
-        },
-    );
+    let root = request(profile).url;
+    let next_app = app.clone();
+    let next = move || {
+        println!("PASS: factory bootstrap finished for profile={profile}");
+        bootstrap(next_app, directory, readback, index + 1);
+    };
+    if defer_factory_bootstrap(false, readback, &factory_start, &root) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let native = view.clone();
+        after_document_load_until(
+            &view,
+            factory_start,
+            "bootstrap".into(),
+            app.clone(),
+            deadline,
+            move || begin_bootstrap_root_until(&native, root, app, deadline, next),
+        );
+    } else {
+        after_document_load(&view, root, "bootstrap".into(), app, next);
+    }
 }
 
 fn label(profile: &str) -> String {
@@ -959,6 +997,24 @@ fn after_document_load(
     app: AppHandle,
     next: impl FnOnce() + 'static,
 ) {
+    after_document_load_until(
+        view,
+        uri,
+        nonce,
+        app,
+        std::time::Instant::now() + Duration::from_secs(5),
+        next,
+    );
+}
+
+fn after_document_load_until(
+    view: &webkit2gtk::WebView,
+    uri: String,
+    nonce: String,
+    app: AppHandle,
+    deadline: std::time::Instant,
+    next: impl FnOnce() + 'static,
+) -> bool {
     let trail = Rc::new(LoadTrail {
         started: std::time::Instant::now(),
         began: fixture_clock(),
@@ -968,15 +1024,16 @@ fn after_document_load(
         uri,
         nonce,
         app,
-        deadline: std::time::Instant::now() + Duration::from_secs(5),
+        deadline,
         callback: RefCell::new(Some(Box::new(next))),
         handlers: RefCell::new(LoadTrail::watch(view, &trail)),
         trail,
     });
-    poll_document(view.clone(), pending);
+    poll_document(view.clone(), pending)
 }
 
-fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
+// True only admits the existing polling/evaluation; it is not document ready.
+fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) -> bool {
     // The caller registers readiness before starting its target navigation.
     // Do not launch an async evaluation into the document it is about to
     // replace. Check the native document first, including across process swaps.
@@ -985,12 +1042,13 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
             eprintln!("FAIL: expected fixture document not ready: view={}, target={}, nonce={}, native_uri={:?}, loading={}, events={}, view_events={}", gtk::prelude::WidgetExt::widget_name(&view), pending.uri, pending.nonce, view.uri(), view.is_loading(), pending.trail.summary(), fixture_view_events(&gtk::prelude::WidgetExt::widget_name(&view)));
             end_trail(&view, &pending);
             pending.app.exit(1);
+            return false;
         } else {
             gtk::glib::timeout_add_local_once(Duration::from_millis(25), move || {
-                poll_document(view, pending)
+                poll_document(view, pending);
             });
         }
-        return;
+        return true;
     }
     let probe = "({uri: location.href, nonce: document.querySelector('meta[name=sumi-fixture]')?.content, ready: document.readyState})";
     let native = view.clone();
@@ -1013,9 +1071,12 @@ fn poll_document(view: webkit2gtk::WebView, pending: Rc<PendingDocument>) {
         } else {
             // Readiness only. Cookies/storage are read and asserted exactly
             // once after identity matches; failed data is never retried.
-            gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || poll_document(native, pending));
+            gtk::glib::timeout_add_local_once(Duration::from_millis(10), move || {
+                poll_document(native, pending);
+            });
         }
     });
+    true
 }
 
 fn title_and_back_probe(app: AppHandle) {
@@ -1195,4 +1256,27 @@ fn lifecycle(app: &AppHandle, directory: &Path) -> Result<()> {
                 .starts_with("https://sumi.invalid/")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_contract_tests {
+    use super::defer_factory_bootstrap;
+
+    #[test]
+    fn defer_only_a_different_non_spa_readback_target() {
+        for (spa, readback, factory, root, expected) in [
+            (false, true, "/first", "/", true),
+            (false, false, "/first", "/", false),
+            (false, false, "/", "/", false),
+            (false, true, "/", "/", false),
+            (true, true, "/first", "/", false),
+            (true, false, "/first", "/", false),
+            (true, true, "/", "/", false),
+        ] {
+            assert_eq!(
+                defer_factory_bootstrap(spa, readback, factory, root),
+                expected
+            );
+        }
+    }
 }
