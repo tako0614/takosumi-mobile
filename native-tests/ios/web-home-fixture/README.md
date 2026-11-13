@@ -36,6 +36,12 @@ and queries only its Takosumi-process/private-bundle log events, keeping at most
 diagnostic candidates until native execution; an absent exit reason is not a
 successful launch or a causal diagnosis.
 
+If the15-second log query is interrupted, bytes already written are still
+retained under the same512KiB tail bound, with `queryReturned: false`,
+`partial: true` and the original error type. A retention error is separate.
+This partial snapshot does not prove query completion or descendant exit and
+does not release interrupted-command scratch for deletion. No query is retried.
+
 The subsequent original crash report identifies a DYLD launch abort: embedded
 `libswift_Concurrency.dylib` cannot resolve `@rpath/libswiftCore.dylib`. A
 product-owned template based on pinned CLI2.11.4 now adds the OS Swift search

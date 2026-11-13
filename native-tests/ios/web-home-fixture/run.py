@@ -116,19 +116,31 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
         # preinstalled private Tauri App, not the minimal XCTest driver.
         predicate = '(process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")'
         raw = scratch / "target-app-exit-raw.log"
+    except Exception as error:
+        result["errorType"] = type(error).__name__
+        return result
+    try:
         runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
                          "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
+        result["queryReturned"] = True
+    except Exception as error:
+        # command() handles its direct child before raising. A retained tail
+        # is only a partial snapshot; interrupted-command scratch stays held.
+        result.update(queryReturned=False, errorType=type(error).__name__)
+    try:
         with raw.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
             source.seek(max(0, size - 512 * 1024))
-            data = source.read(512 * 1024)
+            # Freeze the size observed above even if an interrupted CLI's
+            # descendant is still appending. This is not a drain receipt.
+            data = source.read(min(size, 512 * 1024))
         with (out / "target-app-exit.log").open("xb") as target:
             target.write(data)
         result.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
-                      sha256=hashlib.sha256(data).hexdigest())
+                      sha256=hashlib.sha256(data).hexdigest(), partial=not result["queryReturned"])
     except Exception as error:
         # Missing/failed diagnostics never replace the original test failure.
-        result["errorType"] = type(error).__name__
+        result["retentionErrorType"] = type(error).__name__
     return result
 
 

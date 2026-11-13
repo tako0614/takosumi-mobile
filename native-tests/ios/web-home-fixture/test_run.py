@@ -177,6 +177,8 @@ class Controls(unittest.TestCase):
         with patch.object(runtime, "command", side_effect=command):
             result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
         self.assertNotIn("errorType", result)
+        self.assertTrue(result["queryReturned"])
+        self.assertFalse(result["partial"])
         self.assertEqual((out / "target-app-exit.log").read_bytes(), b"native target event\n")
         argv, options = calls[1]
         self.assertEqual(argv[:5], ["xcrun", "simctl", "spawn", "owned", "log"])
@@ -211,6 +213,27 @@ class Controls(unittest.TestCase):
         with patch.object(runtime, "command", side_effect=TimeoutError):
             result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
         self.assertEqual(result["errorType"], "TimeoutError")
+        self.assertNotIn("passed", result)
+
+    def test_interrupted_owned_target_query_keeps_partial_tail_and_original_failure(self):
+        out, scratch = self.root / "evidence", self.root / "scratch"
+        out.mkdir(); scratch.mkdir()
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        def command(argv, path, **kwargs):
+            if "spawn" not in argv:
+                return json.dumps({"devices": {"runtime": [device]}})
+            path.write_bytes(b"x" * (1024 * 1024) + b"last partial event")
+            raise subprocess.TimeoutExpired(argv, 15)
+        with patch.object(runtime, "command", side_effect=command) as query:
+            result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+        self.assertEqual(query.call_count, 2, "No second query after interruption")
+        self.assertEqual(result["errorType"], "TimeoutExpired")
+        self.assertTrue((out / "target-app-exit.log").is_file(), "Keep output already written before interruption")
+        self.assertFalse(result["queryReturned"])
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["keptBytes"], 512 * 1024)
+        self.assertTrue((out / "target-app-exit.log").read_bytes().endswith(b"last partial event"))
         self.assertNotIn("passed", result)
 
     def test_existing_harness_server_import_is_not_poisoned_or_left_in_global_namespace(self):
