@@ -111,12 +111,29 @@ can contain multiple system apps, so identities/timestamps still require
 matching. The allowances exclude ownership checks and CLI retirement; they
 are not a total collection deadline. Missing, denied or truncated records
 remain inconclusive. No logs
-are cleared, permission changed or dialog dismissed. These queries have
-SDK-free controls; collection on the actual guest remains unverified.
+are cleared, permission changed or dialog dismissed. Run43330943400 collected
+all four queries without truncation and the retained bytes/hashes matched.
+Its screen was black apart from the status bar, AX contained only SystemUI,
+and the recorded ANR concerned Google Play persistent startup. The initial
+form and new scroll were not reached. Guest CPU/IO pressure was high in that
+ANR report; it does not establish the missing App UI's cause.
+Failure-only collection also retains `dumpsys activity activities`,
+`dumpsys window windows` and `logcat -b crash -d -v threadtime,epoch,usec`,
+each capped at128KiB under the same ownership/command/retirement policy.
+These identify task/window state and any recorded Java/native fatal errors.
+They cover the disposable guest, so package/PID/time must match before
+attributing an event to the App. The crash buffer does not capture every
+JavaScript console error, and empty/truncated/denied output is inconclusive.
+These three new reads have SDK-free controls; actual-guest collection remains
+unverified. Normal App inputs, gesture counts, wait bounds and UI verdicts
+remain unchanged.
 The command/filter behavior follows the Android 16
 [DropBox service](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/services/core/java/com/android/server/DropBoxManagerService.java),
 [logcat](https://android.googlesource.com/platform/system/logging/+/refs/heads/android16-release/logcat/logcat.cpp)
 and [ANR event fields](https://android.googlesource.com/platform/frameworks/base/+/master/services/core/java/com/android/server/am/EventLogTags.logtags).
+The state dump commands are defined by Android16's
+[ActivityManagerService](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/services/core/java/com/android/server/am/ActivityManagerService.java)
+and [WindowManagerService](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/services/core/java/com/android/server/wm/WindowManagerService.java).
 
 The two HTTPS sites and cookie/storage protocol are shared with the iOS
 whole-App fixture. A private generated-project overlay trusts only this run's

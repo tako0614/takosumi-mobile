@@ -124,13 +124,16 @@ class Controls(unittest.TestCase):
         with patch.object(runner.runtime, "command", side_effect=command):
             result = runner.preserve_guest_anr(emulator, scratch, out)
         self.assertTrue(result["diagnosticOnly"])
-        self.assertEqual(emulator.owned.call_count, 4)
+        self.assertEqual(emulator.owned.call_count, 7)
         self.assertEqual([argv for argv, _, _ in calls], [
             [str(emulator.adb), "-s", runner.SERIAL, "shell", *query]
             for query in (("dumpsys", "activity", "lastanr"),
                           ("dumpsys", "activity", "lastanr-traces"),
                           ("logcat", "-b", "events", "-d", "-v", "threadtime,epoch,usec", "-s", "am_anr"),
-                          ("dumpsys", "dropbox", "--print", "system_app_anr"))])
+                          ("dumpsys", "dropbox", "--print", "system_app_anr"),
+                          ("dumpsys", "activity", "activities"),
+                          ("dumpsys", "window", "windows"),
+                          ("logcat", "-b", "crash", "-d", "-v", "threadtime,epoch,usec"))])
         for _, raw, options in calls:
             self.assertEqual(raw.parent, scratch)
             self.assertEqual(options, {"timeout": 10, "read_output": False})
@@ -140,7 +143,7 @@ class Controls(unittest.TestCase):
             self.assertGreater(entry["sourceBytes"], entry["keptBytes"])
             self.assertEqual(saved.stat().st_size, entry["keptBytes"])
             self.assertEqual(entry["keptBytes"],
-                             (128 if name in ("guest-last-anr", "guest-anr-events") else 512) * 1024)
+                             (512 if name in ("guest-last-anr-traces", "guest-system-app-anr") else 128) * 1024)
             self.assertEqual(hashlib.sha256(saved.read_bytes()).hexdigest(), entry["sha256"])
         self.assertFalse(any(out.glob("*-raw.log")))
         self.assertNotIn("passed", result)
@@ -161,6 +164,23 @@ class Controls(unittest.TestCase):
         self.assertNotIn("private identity refusal", str(result))
         self.assertFalse((scratch / "guest-anr-events-raw.log").exists())
         self.assertFalse((out / "guest-system-app-anr.log").exists())
+
+    def test_guest_ownership_loss_before_ui_state_refuses_window_and_crash_reads(self):
+        scratch, out = self.root / "scratch", self.root / "evidence"
+        scratch.mkdir(); out.mkdir()
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        emulator.owned.side_effect = [None] * 4 + [RuntimeError("private identity refusal")]
+        def command(argv, path, **options):
+            path.write_bytes(b"owned guest diagnostic")
+        with patch.object(runner.runtime, "command", side_effect=command) as query:
+            result = runner.preserve_guest_anr(emulator, scratch, out)
+        self.assertEqual(query.call_count, 4)
+        self.assertEqual(emulator.owned.call_count, 5)
+        self.assertEqual(result["queries"]["guest-activity-state"], {"errorType": "RuntimeError"})
+        self.assertNotIn("guest-window-state", result["queries"])
+        self.assertNotIn("guest-crash", result["queries"])
+        self.assertNotIn("private identity refusal", str(result))
+        self.assertFalse((scratch / "guest-activity-state-raw.log").exists())
 
     def test_guest_anr_read_refuses_foreign_ownership_and_preserves_query_failure(self):
         scratch, out = self.root / "scratch", self.root / "evidence"

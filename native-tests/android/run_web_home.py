@@ -292,6 +292,11 @@ def preserve_guest_anr(emulator, scratch, out):
         ("guest-anr-events", ("logcat", "-b", "events", "-d", "-v",
                               "threadtime,epoch,usec", "-s", "am_anr"), 128 * 1024),
         ("guest-system-app-anr", ("dumpsys", "dropbox", "--print", "system_app_anr"), 512 * 1024),
+        # A blank screen need not be the ANR dialog: keep task/window state
+        # and fatal Java/native records before retiring this exact guest.
+        ("guest-activity-state", ("dumpsys", "activity", "activities"), 128 * 1024),
+        ("guest-window-state", ("dumpsys", "window", "windows"), 128 * 1024),
+        ("guest-crash", ("logcat", "-b", "crash", "-d", "-v", "threadtime,epoch,usec"), 128 * 1024),
     ):
         entry = result["queries"][label] = {}
         raw = scratch / (label + "-raw.log")
