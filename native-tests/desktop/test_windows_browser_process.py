@@ -154,7 +154,7 @@ class ReplyingSocket(FakeSocket):
         self.messages.extend(after)
 
 
-def _cdp_receive_control(module, chunks, ticks=None, seed=0, buffer=b""):
+def _cdp_receive_control(module, chunks, ticks=None, seed=0, buffer=b"", command_seed=0):
     """No sockets: run one original command against controlled existing recv results."""
     trace, queued = [], list(chunks)
     values = iter([10.0] * 32 if ticks is None else ticks)
@@ -184,6 +184,7 @@ def _cdp_receive_control(module, chunks, ticks=None, seed=0, buffer=b""):
     websocket.sock, websocket.buffer, websocket.partial = Wire(), buffer, None
     client = module.Cdp(websocket, "sensitive label")
     client.events = [{} for _ in range(seed)]
+    client.next = command_seed
     result, caught = None, None
     with mock.patch.object(module, "time", Clock), mock.patch.object(module, "os", Entropy):
         try:
@@ -275,6 +276,81 @@ class CdpTests(unittest.TestCase):
         client.websocket.messages = [{"id": 2, "result": {}}]
         client.command("sensitive cleanup")
         self.assertEqual(json.dumps(saved, sort_keys=True), before, "Cleanup cannot mutate a copied previous snapshot")
+
+    def test_other_reply_relation_is_closed_without_changing_matching_or_io(self):
+        cases = ((1, "older"), (3, "future"), (None, "invalid"), (True, "invalid"),
+                 (1.0, "invalid"), ("sensitive https://private.invalid/", "invalid"),
+                 (0, "invalid"), (-1, "invalid"), ([], "invalid"), ({}, "invalid"),
+                 (2**53, "invalid"))
+        decode = observer.json.loads
+        gets = []
+        class Decoded(dict):
+            def get(self, key, default=None):
+                gets.append(key)
+                return super().get(key, default)
+        def decoded(text):
+            return Decoded(decode(text))
+        for index, (reply_id, relation) in enumerate(cases):
+            with self.subTest(relation=index):
+                gets.clear()
+                wire = server_frame(1, json.dumps({"id": reply_id}).encode())
+                wire += server_frame(1, b'{"id":2,"result":{"ok":true}}')
+                with mock.patch.object(observer.json, "loads", side_effect=decoded):
+                    client, _, trace, functional, caught = _cdp_receive_control(observer, [wire], command_seed=1)
+                record = client.last_command_observation
+                self.assertIsNone(caught)
+                self.assertEqual(functional["result"], {"ok": True})
+                self.assertEqual(gets, ["id", "id", "result"], "Reuse the original one get per message")
+                self.assertEqual((record["lastOtherReplyRelation"], record["otherReplies"], record["matchingReplies"]),
+                                 (relation, 1, 1))
+                self.assertFalse(client.command_observation_error)
+                self.assertEqual(sum(v[0] == "send" for v in trace), 1)
+                self.assertEqual(sum(v[0] == "recv" for v in trace), 1)
+                self.assertNotIn("sensitive", json.dumps(record))
+                self.assertNotIn("private.invalid", json.dumps(record))
+        for index, reply_id in enumerate((True, 1.0)):
+            with self.subTest(original_equality=index):
+                wire = server_frame(1, json.dumps({"id": reply_id, "result": {"ok": True}}).encode())
+                client, _, _, functional, caught = _cdp_receive_control(observer, [wire])
+                self.assertIsNone(caught)
+                self.assertEqual(functional["result"], {"ok": True})
+                self.assertIsNone(client.last_command_observation["lastOtherReplyRelation"])
+                self.assertEqual(client.last_command_observation["otherReplies"], 0)
+        event = server_frame(1, b'{"method":"sensitive.event"}')
+        reply = server_frame(1, b'{"id":2,"result":{}}')
+        client, _, _, _, _ = _cdp_receive_control(observer, [event + reply], command_seed=1)
+        self.assertIsNone(client.last_command_observation["lastOtherReplyRelation"])
+        self.assertEqual((client.last_command_observation["otherReplies"], client.last_command_observation["events"]), (0, 1))
+        older = server_frame(1, b'{"id":1}')
+        client, _, _, _, caught = _cdp_receive_control(observer, [older], command_seed=1)
+        self.assertIsInstance(caught, Failure)
+        self.assertEqual((client.last_command_observation["lastOtherReplyRelation"],
+                          client.last_command_observation["outcome"]), ("older", "timeout"))
+        for index, (helper, effect) in enumerate((("command_reply_relation", {"side_effect": ValueError("sensitive classifier")}),
+                                                ("command_reply_relation", {"return_value": "sensitive poison"}),
+                                                ("command_observation", {"side_effect": ValueError("sensitive sink")}))):
+            for fails in (False, True):
+                with self.subTest(metadata=index, original_fails=fails):
+                    original = RuntimeError("sensitive original")
+                    chunks = [older, original] if fails else [older + reply]
+                    with mock.patch.object(observer, helper, **effect):
+                        client, _, _, functional, caught = _cdp_receive_control(observer, chunks, command_seed=1)
+                    self.assertTrue(caught is original if fails else caught is None)
+                    self.assertEqual(functional["result"], None if fails else {})
+                    self.assertTrue(client.command_observation_error)
+                    self.assertNotIn("sensitive", json.dumps(client.last_command_observation))
+        record = observer.command_observation(None, "start", ident=2)
+        record["otherReplies"] = 2**31 - 1
+        saved = dict(record)
+        capped = observer.command_observation(record, "message", matching=False, other=True, event=False, reply_id=3, ident=2)
+        self.assertEqual((capped["otherReplies"], capped["lastOtherReplyRelation"]), (2**31 - 1, "future"))
+        self.assertTrue(capped["countsCapped"])
+        self.assertEqual(record, saved, "Copied prior snapshots must not change")
+        fresh = observer.command_observation(None, "start", ident=3)
+        self.assertIsNone(fresh["lastOtherReplyRelation"])
+        self.assertIsNone({}.get("lastOtherReplyRelation"), "Absent older metadata is unknown")
+        self.assertEqual(observer.command_reply_relation(1, 2**53), "unknown")
+        self.assertEqual(observer.command_reply_relation(2, 2), "unknown")
 
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},

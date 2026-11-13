@@ -637,7 +637,7 @@ def command_observation(record, stage, **values):
                 "commandId": ident if 0 <= ident <= 2**53 - 1 else None,
                 "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
                 "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending",
-                "lastReceive": None}
+                "lastReceive": None, "lastOtherReplyRelation": None}
     if record is None:
         return None
     result = dict(record)
@@ -650,6 +650,11 @@ def command_observation(record, stage, **values):
             if increment:
                 result["countsCapped"] |= result[name] == 2**31 - 1
                 result[name] = min(result[name] + 1, 2**31 - 1)
+        if values["other"]:
+            relation = command_reply_relation(values["reply_id"], values["ident"])
+            if type(relation) is not str or relation not in ("older", "future", "invalid", "unknown"):
+                raise ValueError("Invalid closed reply relation")
+            result["lastOtherReplyRelation"] = relation
     elif stage == "receive":
         result["lastReceive"] = receive_snapshot(**values["snapshot"])
     elif stage == "end":
@@ -660,6 +665,20 @@ def command_observation(record, stage, **values):
         if result["outcome"] in ("sending", "waiting"):
             result["outcome"] = "exception"
     return result
+
+
+
+def command_reply_relation(reply_id, ident):
+    """Last nonmatching ID only; not proof of a late reply or a valid remote command.
+
+    Invalid means outside the positive exact-integer diagnostic range, not a
+    change to the original Python equality used to accept matching replies.
+    """
+    if type(reply_id) is not int or not 1 <= reply_id <= 2**53 - 1:
+        return "invalid"
+    if type(ident) is not int or not 1 <= ident <= 2**53 - 1 or reply_id == ident:
+        return "unknown"
+    return "older" if reply_id < ident else "future"
 
 
 def command_error_category(error, closed):
@@ -777,7 +796,8 @@ class Cdp:
                 if message is None:
                     self._observe_command("end", outcome="timeout")
                     raise Failure(f"CDP timeout {method} ({self.label})")
-                if message.get("id") == ident:
+                reply_id = message.get("id")
+                if reply_id == ident:
                     self._observe_command("message", matching=True, other=False, event="method" in message)
                     phase = "reply"
                     if "error" in message:
@@ -787,7 +807,8 @@ class Cdp:
                     self._observe_command("end", outcome="success")
                     return message.get("result", {})
                 else:
-                    self._observe_command("message", matching=False, other="id" in message, event="method" in message)
+                    self._observe_command("message", matching=False, other="id" in message, event="method" in message,
+                                          reply_id=reply_id, ident=ident)
         except Exception as error:
             if phase == "receive":  # CDP_RECEIVE_OBSERVATION
                 self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION

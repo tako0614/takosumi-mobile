@@ -211,6 +211,62 @@ def preserve_stop_observation(emulator, proof):
 # stop-observation-end
 
 
+# sdk-candidate-witness-begin
+SDK_CANDIDATE_WITNESS_CAP = 16
+
+
+def update_sdk_candidate_witness(emulator, pid, start_tick):
+    guard_pid, guard_birth = emulator.process.pid, emulator.birth
+    if not (type(guard_pid) is int and guard_pid > 0 and type(guard_birth) is int and guard_birth >= 0
+            and type(pid) is int and pid > 0 and type(start_tick) is int and start_tick >= 0):
+        return
+    value = getattr(emulator, "sdk_candidate_witness", None)
+    if value is None:
+        value = {"guardPid": guard_pid, "guardStartTick": guard_birth,
+                 "truncated": False, "guardMismatch": False, "records": []}
+        emulator.sdk_candidate_witness = value
+    if (value["guardPid"], value["guardStartTick"]) != (guard_pid, guard_birth):
+        value["guardMismatch"] = True
+        return
+    record = {"pid": pid, "startTick": start_tick}
+    if record in value["records"]:
+        return  # Coalesce repeated validations without an unbounded counter.
+    if len(value["records"]) >= SDK_CANDIDATE_WITNESS_CAP:
+        value["truncated"] = True
+    else:
+        value["records"].append(record)
+
+
+def observe_sdk_candidate(emulator, pid, start_tick):
+    try:
+        update_sdk_candidate_witness(emulator, pid, start_tick)
+    except Exception:
+        pass  # Historical metadata never changes ownership validation.
+
+
+def preserve_sdk_candidate_witness(emulator, proof):
+    try:
+        value = getattr(emulator, "sdk_candidate_witness", None)
+        records = [] if value is None else [
+            {"pid": record["pid"], "startTick": record["startTick"]}
+            for record in value["records"][:SDK_CANDIDATE_WITNESS_CAP]]
+        guard_pid, guard_birth = emulator.process.pid if emulator.process is not None else None, getattr(emulator, "birth", None)
+        truncated = value is not None and value["truncated"]
+        mismatch = value is not None and (value["guardMismatch"] or
+            (value["guardPid"], value["guardStartTick"]) != (guard_pid, guard_birth))
+        proof["emulatorSDKCandidateWitness"] = {
+            "schema": "takosumi.emulator-sdk-candidate-witness@v1", "diagnosticOnly": True,
+            "historicalOnly": True, "capacity": SDK_CANDIDATE_WITNESS_CAP,
+            "guardPid": value["guardPid"] if value is not None else (guard_pid if type(guard_pid) is int and guard_pid > 0 else None),
+            "guardStartTick": value["guardStartTick"] if value is not None else (guard_birth if type(guard_birth) is int and guard_birth >= 0 else None),
+            "truncated": truncated, "guardMismatch": mismatch,
+            "candidateStatus": "single_historical" if len(records) == 1 and not truncated and not mismatch else "unknown",
+            "records": records}
+    except Exception:
+        pass  # Missing metadata or a refused sink cannot replace cleanup/errors.
+# sdk-candidate-witness-end
+
+
 class Emulator:
     def __init__(self, sdk, scratch, out, command):
         self.sdk, self.out, self.command = sdk, out, command
@@ -311,6 +367,7 @@ class Emulator:
                         and all(identity(p) == info for p, info in reversed(chain))
                         and identity(self.process.pid) == (os.getpid(), self.birth), "Unstable emulator ancestry")
                 found.append(pid)
+                observe_sdk_candidate(self, pid, before[1])  # sdk-candidate-witness:validated
             except (FileNotFoundError, ProcessLookupError):
                 continue
         require(found, "No SDK emulator with the owned AVD/port and guard ancestry")
@@ -722,6 +779,7 @@ def main():
                 cleanup_errors.append("emulator:" + type(error).__name__)
             finally:
                 preserve_stop_observation(emulator, proof)
+                preserve_sdk_candidate_witness(emulator, proof)  # sdk-candidate-witness:summary
         for server in servers:
             try:
                 server.stop()

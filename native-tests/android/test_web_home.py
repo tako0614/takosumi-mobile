@@ -597,8 +597,95 @@ class Controls(unittest.TestCase):
     def test_emulator_guard_forwarded_argv_is_not_an_sdk_child(self):
         emulator, proc, identities = self.emulator_process_fixture()
         with patch.object(runner, "Path", return_value=proc), \
-                patch.object(runner, "identity", side_effect=identities.__getitem__):
+                patch.object(runner, "identity", side_effect=identities.__getitem__) as read:
             emulator.owned_process()
+        # sdk-candidate-witness-controls:actual-producer-begin
+        self.assertEqual([call.args[0] for call in read.call_args_list], [100, 200, 200, 200, 200, 100])
+        emulator.process.poll.assert_called_once_with()
+        proof = {}
+        runner.preserve_sdk_candidate_witness(emulator, proof)
+        witness = proof["emulatorSDKCandidateWitness"]
+        self.assertEqual((witness["guardPid"], witness["guardStartTick"]), (100, 100))
+        self.assertEqual(witness["records"], [{"pid": 200, "startTick": 200}])
+        self.assertEqual(witness["candidateStatus"], "single_historical")
+        with patch.object(runner, "Path", return_value=proc), \
+                patch.object(runner, "identity", side_effect=identities.__getitem__) as read, \
+                patch.object(runner, "update_sdk_candidate_witness", side_effect=OSError("private observer failure")):
+            emulator.owned_process()  # Metadata failure cannot reject a validated SDK child.
+        self.assertEqual([call.args[0] for call in read.call_args_list], [100, 200, 200, 200, 200, 100])
+        self.assertEqual(emulator.process.poll.call_count, 2)
+        # sdk-candidate-witness-controls:actual-producer-end
+
+    # sdk-candidate-witness-controls:pure-begin
+    def test_sdk_candidate_witness_is_historical_bounded_and_detached_from_verdict(self):
+        emulator = runner.Emulator.__new__(runner.Emulator)
+        emulator.process, emulator.birth = Mock(pid=101), 42
+        missing = {}
+        runner.preserve_sdk_candidate_witness(emulator, missing)
+        self.assertEqual(missing["emulatorSDKCandidateWitness"]["candidateStatus"], "unknown")
+        self.assertEqual(missing["emulatorSDKCandidateWitness"]["records"], [])
+        for _ in range(100):
+            runner.observe_sdk_candidate(emulator, 200, 300)
+        proof = {"passed": False, "emulatorGuard": {"forcedCleanup": 1}}
+        runner.preserve_sdk_candidate_witness(emulator, proof)
+        witness = proof["emulatorSDKCandidateWitness"]
+        self.assertEqual(witness["records"], [{"pid": 200, "startTick": 300}])
+        self.assertEqual(witness["candidateStatus"], "single_historical")
+        self.assertTrue(witness["historicalOnly"] and witness["diagnosticOnly"])
+        self.assertEqual(set(witness), {"schema", "diagnosticOnly", "historicalOnly", "capacity",
+            "guardPid", "guardStartTick", "truncated", "guardMismatch", "candidateStatus", "records"})
+        self.assertEqual(set(witness["records"][0]), {"pid", "startTick"})
+        runner.observe_sdk_candidate(emulator, 200, 301)  # A different generation is not coalesced.
+        self.assertEqual(witness["records"], [{"pid": 200, "startTick": 300}])
+        witness["records"][0]["pid"] = 999
+        changed = {}
+        runner.preserve_sdk_candidate_witness(emulator, changed)
+        self.assertEqual(changed["emulatorSDKCandidateWitness"]["records"][0]["pid"], 200)
+        self.assertEqual(changed["emulatorSDKCandidateWitness"]["candidateStatus"], "unknown")
+        emulator.birth = 43
+        runner.observe_sdk_candidate(emulator, 201, 302)
+        mismatch = {}
+        runner.preserve_sdk_candidate_witness(emulator, mismatch)
+        self.assertTrue(mismatch["emulatorSDKCandidateWitness"]["guardMismatch"])
+        self.assertEqual(mismatch["emulatorSDKCandidateWitness"]["guardStartTick"], 42)
+        self.assertEqual(len(mismatch["emulatorSDKCandidateWitness"]["records"]), 2)
+        self.assertEqual(mismatch["emulatorSDKCandidateWitness"]["candidateStatus"], "unknown")
+        self.assertFalse(proof["passed"])
+        self.assertEqual(proof["emulatorGuard"], {"forcedCleanup": 1})
+        capped = runner.Emulator.__new__(runner.Emulator)
+        capped.process, capped.birth = Mock(pid=102), 44
+        for pid in range(1, runner.SDK_CANDIDATE_WITNESS_CAP + 2):
+            runner.observe_sdk_candidate(capped, pid, pid + 100)
+        runner.observe_sdk_candidate(capped, 1, 101)
+        snapshot = {}
+        runner.preserve_sdk_candidate_witness(capped, snapshot)
+        trace = snapshot["emulatorSDKCandidateWitness"]
+        self.assertEqual(len(trace["records"]), runner.SDK_CANDIDATE_WITNESS_CAP)
+        self.assertTrue(trace["truncated"])
+        self.assertEqual(trace["candidateStatus"], "unknown")
+        self.assertLess(len(runner.json.dumps(trace)), 4096)
+
+        class RefusingProof(dict):
+            def __setitem__(self, key, value):
+                raise OSError("private sink failure")
+        original = RuntimeError("original functional failure")
+        raised = None
+        cleanup = Mock()
+        refused = RefusingProof(passed=False)
+        try:
+            try:
+                raise original
+            finally:
+                runner.preserve_sdk_candidate_witness(emulator, refused)
+                cleanup()
+        except Exception as error:
+            raised = error
+        self.assertIs(raised, original)
+        cleanup.assert_called_once_with()
+        self.assertEqual(refused, {"passed": False})
+        emulator.process.poll.assert_not_called()
+        capped.process.poll.assert_not_called()
+    # sdk-candidate-witness-controls:pure-end
 
     def test_guard_argv_alone_cannot_establish_emulator_ownership(self):
         emulator, proc, identities = self.emulator_process_fixture()
