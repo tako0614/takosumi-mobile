@@ -286,7 +286,13 @@ const TESTS: &[Test] = tests![
     a_browser_that_cannot_start_leaves_an_incomplete_receipt,
     pid_reuse_zombie_and_listing_rules,
     wait_status_as_root_exit,
+    drain_entry_snapshot_pure_controls,
 ];
+
+// One custom-runner case invokes four shared pure controls, not four native cases.
+fn drain_entry_snapshot_pure_controls() {
+    super::drain_entry::run_controls();
+}
 
 /// Runs the selected tests one at a time. Arguments without a leading `-`
 /// filter test names by substring. Selecting nothing is a failure.

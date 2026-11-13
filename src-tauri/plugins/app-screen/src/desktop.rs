@@ -212,6 +212,9 @@ struct Screen {
     key: String,
     profile: String,
     home: String,
+    // The fixture awaits this actual factory selection before its own load.
+    #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+    fixture_start: String,
 }
 
 thread_local! {
@@ -768,6 +771,8 @@ fn create_screen(
                     key,
                     profile,
                     home,
+                    #[cfg(all(target_os = "linux", feature = "desktop-fixture"))]
+                    fixture_start: start.clone(),
                 },
             )
         });
