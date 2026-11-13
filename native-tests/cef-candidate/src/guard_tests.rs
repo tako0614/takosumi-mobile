@@ -140,6 +140,7 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    guard_readiness_observation_preserves_errno_optional_and_budget,
     terminal_signal_owned_fd_open_failure_cleans_partial_child,
     terminal_signal_readiness_unknown_keeps_eligibility,
     terminal_signal_owned_no_direct_fd_preserves_pid_fallback,
@@ -1245,7 +1246,15 @@ fn stop_observation_is_bounded_and_uses_only_existing_results() {
     observation.reaped(6, false, 0);
     assert!(observation.json()["records"].as_array().unwrap().is_empty());
     observation.begin();
-    observation.signal(7, Some(42), true, "retained_pidfd", libc::SIGTERM, &Ok(()));
+    observation.signal(
+        7,
+        Some(42),
+        true,
+        "retained_pidfd",
+        libc::SIGTERM,
+        &Ok(()),
+        None,
+    );
     observation.signal(
         8,
         None,
@@ -1253,6 +1262,7 @@ fn stop_observation_is_bounded_and_uses_only_existing_results() {
         "direct_pid",
         libc::SIGKILL,
         &Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        None,
     );
     observation.reaped(7, true, 0);
     let proof = observation.json();
@@ -1571,3 +1581,135 @@ fn terminal_signal_owned_fd_open_failure_cleans_partial_child() {
     println!("OWN_LOCAL_CHILD_FD_OPEN_PANIC original_payload_preserved=true ctor_cleanups=3");
 }
 // TERMINAL_SIGNAL_V2_CONTROL_END
+
+// READINESS_OBSERVATION_CONTROL_BEGIN
+fn guard_readiness_observation_preserves_errno_optional_and_budget() {
+    struct RestoreErrno(i32);
+    impl Drop for RestoreErrno {
+        fn drop(&mut self) {
+            unsafe {
+                *libc::__errno_location() = self.0;
+            }
+        }
+    }
+    let _restore = RestoreErrno(unsafe { *libc::__errno_location() });
+    let polls = std::cell::Cell::new(0);
+    let failed = pidfd_readiness_with(-1, |entry| {
+        polls.set(polls.get() + 1);
+        assert_eq!(entry.events, libc::POLLIN | libc::POLLRDNORM);
+        assert_eq!(entry.revents, 0);
+        entry.revents = libc::POLLERR;
+        unsafe {
+            *libc::__errno_location() = libc::EINTR;
+        }
+        -1
+    });
+    assert_eq!(polls.get(), 1);
+    assert_eq!(failed.polled, -1);
+    assert_eq!(failed.revents, libc::POLLERR);
+    assert!(!failed.terminal);
+    assert_eq!(failed.poll_errno, Some(libc::EINTR));
+    // Later activity poisons TLS errno; both captured errors must remain distinct.
+    unsafe {
+        *libc::__errno_location() = libc::EINVAL;
+    }
+    let sent = Err(io::Error::from_raw_os_error(libc::EPERM));
+    unsafe {
+        *libc::__errno_location() = libc::ENOMEM;
+    }
+    let mut observation = StopObservation::default();
+    observation.begin();
+    observation.signal(
+        7,
+        Some(42),
+        false,
+        "retained_pidfd",
+        libc::SIGTERM,
+        &sent,
+        Some(failed),
+    );
+    let proof = observation.json();
+    assert_eq!(
+        proof["readinessFields"],
+        serde_json::json!(["polled", "revents", "terminal", "pollErrno"])
+    );
+    assert_eq!(
+        proof["records"][0]["readiness"],
+        serde_json::json!([-1, libc::POLLERR, false, libc::EINTR])
+    );
+    assert_eq!(proof["records"][0]["errno"], libc::EPERM);
+
+    let quiet = pidfd_readiness_with(-1, |_entry| {
+        unsafe {
+            *libc::__errno_location() = libc::EIO;
+        }
+        0
+    });
+    assert!(!quiet.terminal);
+    assert_eq!(quiet.poll_errno, None); // A successful poll never borrows stale errno.
+    let positive = pidfd_readiness_with(-1, |entry| {
+        entry.revents = libc::POLLIN;
+        1
+    });
+    assert!(positive.terminal);
+    assert_eq!(positive.poll_errno, None);
+    assert_eq!(observation.used, 1); // Capturing a skipped result creates no signal record.
+
+    let callbacks = std::cell::Cell::new(0);
+    let no_signal = signal_readiness(0, Some(&()), |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    let no_fd = signal_readiness(libc::SIGTERM, None::<&()>, |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    assert!(no_signal.is_none() && no_fd.is_none());
+    assert_eq!(callbacks.get(), 0);
+    let once = signal_readiness(libc::SIGTERM, Some(&()), |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    assert_eq!(callbacks.get(), 1);
+    assert_eq!(once.unwrap().polled, 0);
+    observation.signal(8, None, true, "direct_pid", 0, &Ok(()), no_signal);
+    observation.reaped(7, false, 0);
+    let proof = observation.json();
+    assert_eq!(proof["records"][1]["readiness"], serde_json::Value::Null);
+    assert_eq!(proof["records"][2]["readiness"], serde_json::Value::Null);
+    assert_eq!(proof["records"].as_array().unwrap().len(), 3);
+
+    let worst = PidfdReadiness {
+        polled: i32::MIN,
+        revents: i16::MIN,
+        terminal: false,
+        poll_errno: Some(i32::MIN),
+    };
+    let failed_signal = Err(io::Error::from_raw_os_error(i32::MIN));
+    let mut full = StopObservation::default();
+    full.begin();
+    for _ in 0..STOP_OBSERVATION_CAP {
+        full.signal(
+            i32::MAX,
+            Some(u64::MAX),
+            false,
+            "retained_pidfd",
+            libc::SIGUSR1,
+            &failed_signal,
+            Some(worst),
+        );
+    }
+    full.reaped(1, false, 0);
+    let proof = full.json();
+    assert_eq!(
+        proof["records"].as_array().unwrap().len(),
+        STOP_OBSERVATION_CAP
+    );
+    assert_eq!(proof["truncated"], true);
+    let bytes = serde_json::to_vec(&proof).unwrap();
+    assert!(bytes.len() < 16 * 1024);
+    println!("READINESS_OBSERVATION pure=true cap={} bytes={} poll_errno_preserved=true signal_errno_separate=true", STOP_OBSERVATION_CAP, bytes.len());
+    assert_eq!(polls.get(), 1);
+    assert_eq!(callbacks.get(), 1); // Serialization never repeats either poll path.
+}
+// READINESS_OBSERVATION_CONTROL_END

@@ -154,7 +154,128 @@ class ReplyingSocket(FakeSocket):
         self.messages.extend(after)
 
 
+def _cdp_receive_control(module, chunks, ticks=None, seed=0, buffer=b""):
+    """No sockets: run one original command against controlled existing recv results."""
+    trace, queued = [], list(chunks)
+    values = iter([10.0] * 32 if ticks is None else ticks)
+    class Clock:
+        @staticmethod
+        def monotonic():
+            value = next(values)
+            trace.append(("clock", value))
+            return value
+    class Entropy:
+        @staticmethod
+        def urandom(count):
+            trace.append(("random", count))
+            return b"x" * count
+    class Wire:
+        def settimeout(self, value):
+            trace.append(("settimeout", value))
+        def sendall(self, data):
+            trace.append(("send", len(data), hashlib.sha256(data).hexdigest()))
+        def recv(self, count):
+            trace.append(("recv", count))
+            item = queued.pop(0) if queued else TimeoutError("sensitive timeout")
+            if isinstance(item, BaseException):
+                raise item
+            return item
+    websocket = module.WebSocket.__new__(module.WebSocket)
+    websocket.sock, websocket.buffer, websocket.partial = Wire(), buffer, None
+    client = module.Cdp(websocket, "sensitive label")
+    client.events = [{} for _ in range(seed)]
+    result, caught = None, None
+    with mock.patch.object(module, "time", Clock), mock.patch.object(module, "os", Entropy):
+        try:
+            result = client.command("sensitive.method", {"url": "https://private.invalid/"}, session="sensitive session", timeout=1)
+        except Exception as error:
+            caught = error
+    functional = {"result": result, "errorType": None if caught is None else type(caught).__name__,
+                  "errorDigest": None if caught is None else hashlib.sha256(str(caught).encode()).hexdigest(),
+                  "suppressedContext": None if caught is None else caught.__suppress_context__,
+                  "next": client.next, "events": len(client.events), "base": client.base,
+                  "closedDigest": None if client.closed is None else hashlib.sha256(client.closed.encode()).hexdigest(),
+                  "bufferBytes": len(websocket.buffer), "bufferDigest": hashlib.sha256(websocket.buffer).hexdigest(),
+                  "fragmentBytes": None if websocket.partial is None else len(websocket.partial),
+                  "fragmentDigest": None if websocket.partial is None else hashlib.sha256(websocket.partial).hexdigest(),
+                  "unreadChunks": len(queued)}
+    return client, websocket, trace, functional, caught
+
+
 class CdpTests(unittest.TestCase):
+    def test_receive_observation_separates_existing_transport_and_complete_messages(self):
+        reply = json.dumps({"id": 1, "result": {"ok": True}}).encode()
+        frame = server_frame(1, reply)
+        prefix = reply[:10]
+        event = server_frame(1, json.dumps({"method": "sensitive.event"}).encode())
+        cases = (
+            ("socket", [TimeoutError()], None, 0, b"", "timeout", "socket", 0, False, False),
+            ("partial", [frame[:3], TimeoutError()], None, 0, b"", "timeout", "socket", 0, False, False),
+            ("fragment", [server_frame(1, prefix, fin=False), TimeoutError()], None, 0, b"", "timeout", "socket", 1, True, False),
+            ("deadline", [], [10.0, 11.0], 0, frame[:3], "timeout", "deadline", 0, False, False),
+            ("eof", [b""], None, 0, b"", "connection_error", "socket_closed", 0, False, True),
+            ("closed", [server_frame(8, b"")], None, 0, b"", "connection_error", "frame_closed", 1, False, True),
+            ("os", [OSError("sensitive os detail")], None, 0, b"", "connection_error", "socket", 0, False, False),
+            ("json", [server_frame(1, b"{")], None, 0, b"", "exception", "message_bytes", 1, False, False),
+            ("ping", [server_frame(9, b"x"), TimeoutError()], None, 0, b"", "timeout", "socket", 1, False, False),
+            ("reply", [frame], None, 0, b"", "message", "message_bytes", 1, False, False),
+            ("joined", [server_frame(1, prefix, fin=False) + server_frame(0, reply[10:])], None, 0, b"", "message", "message_bytes", 2, False, False),
+            ("eventcap", [event + frame], None, 4096, b"", "message", "message_bytes", 1, False, False),
+        )
+        for index, (_, chunks, ticks, seed, buffer, outcome, boundary, frames, fragment, closed) in enumerate(cases):
+            with self.subTest(case=index):
+                client, websocket, trace, functional, _ = _cdp_receive_control(observer, chunks, ticks, seed, buffer)
+                record = client.last_command_observation
+                receive = record["lastReceive"]
+                transport = receive["transport"]
+                self.assertEqual(receive["outcome"], outcome)
+                self.assertFalse(receive["observationError"] or client.command_observation_error)
+                self.assertEqual((transport["boundary"], transport["frames"], transport["fragmentActive"], transport["closed"]),
+                                 (boundary, frames, fragment, closed))
+                self.assertEqual(transport["bufferedBytes"], len(websocket.buffer))
+                self.assertEqual(transport["fragmentBytes"], 0 if websocket.partial is None else len(websocket.partial))
+                self.assertNotIn("sensitive", json.dumps(record))
+                self.assertNotIn("private.invalid", json.dumps(record))
+                self.assertEqual(sum(v[0] == "send" for v in trace), 2 if index == 8 else 1)
+                if index == 1:
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"], functional["bufferBytes"]), (1, 3, 3))
+                if index == 2:
+                    self.assertEqual(transport["fragmentBytes"], len(prefix))
+                if index == 3:
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"]), (0, 0))
+                    self.assertFalse(any(v[0] == "recv" for v in trace))
+                if index == 11:
+                    self.assertEqual((functional["events"], functional["base"]), (3073, 1024))
+                    self.assertEqual((record["events"], record["matchingReplies"]), (1, 1))
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"]), (0, 0), "Last receive can use held bytes")
+        for index, helper in enumerate(("receive_observation", "receive_snapshot")):
+            with self.subTest(poison=index):
+                original = RuntimeError("sensitive original")
+                with mock.patch.object(observer, helper, side_effect=ValueError("sensitive metadata")):
+                    client, _, _, _, caught = _cdp_receive_control(observer, [original])
+                self.assertTrue(caught is original, "Metadata must retain the original exception")
+                self.assertTrue(client.command_observation_error)
+                self.assertNotIn("sensitive", json.dumps(client.last_command_observation))
+        client = observer.Cdp(FakeSocket([{"id": 1, "result": {}}]), "sensitive label")
+        self.assertEqual(client.command("sensitive.method"), {})
+        self.assertIsNone(client.last_command_observation["lastReceive"]["transport"])
+        self.assertFalse(client.command_observation_error)
+        state = observer.receive_observation(None, "start", buffered=0, fragment=0, fragment_active=False)
+        state.update(readsReturned=2**31-1, bytesReceived=2**31-1, frames=2**31-1)
+        capped = observer.receive_observation(state, "read", buffered=2**31, fragment=0, fragment_active=False, size=1)
+        capped = observer.receive_observation(capped, "frame", buffered=0, fragment=0, fragment_active=False)
+        self.assertTrue(capped["countsCapped"])
+        self.assertTrue(all(capped[key] == 2**31-1 for key in ("readsReturned", "bytesReceived", "frames")))
+        for index, bad in enumerate((dict(capped, payload="sensitive"), dict(capped, frames=True),
+                                     dict(capped, fragmentBytes=1), dict(capped, closed=True))):
+            with self.subTest(shape=index), self.assertRaises(ValueError):
+                observer.receive_snapshot("message", bad)
+        saved = dict(client.last_command_observation)
+        before = json.dumps(saved, sort_keys=True)
+        client.websocket.messages = [{"id": 2, "result": {}}]
+        client.command("sensitive cleanup")
+        self.assertEqual(json.dumps(saved, sort_keys=True), before, "Cleanup cannot mutate a copied previous snapshot")
+
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},
                                        {"id": 1, "result": {"ok": True}}]), "work")

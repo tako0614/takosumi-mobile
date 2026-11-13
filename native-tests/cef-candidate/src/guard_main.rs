@@ -191,16 +191,56 @@ fn pidfd_terminal_ready(polled: libc::c_int, events: libc::c_short) -> bool {
         && events & !(libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP) == 0
 }
 
-fn pidfd_is_terminal(fd: &OwnedFd) -> bool {
+// READINESS_OBSERVATION_BEGIN
+#[derive(Clone, Copy)]
+struct PidfdReadiness {
+    polled: libc::c_int,
+    revents: libc::c_short,
+    terminal: bool,
+    poll_errno: Option<i32>,
+}
+
+fn pidfd_readiness_with(
+    fd: RawFd,
+    poll: impl FnOnce(&mut libc::pollfd) -> libc::c_int,
+) -> PidfdReadiness {
     let mut entry = libc::pollfd {
-        fd: fd.as_raw_fd(),
+        fd,
         events: libc::POLLIN | libc::POLLRDNORM,
         revents: 0,
     };
-    // SAFETY: one valid pollfd, a nonblocking timeout, and no ownership change.
-    let polled = unsafe { libc::poll(&mut entry, 1, 0) };
-    pidfd_terminal_ready(polled, entry.revents)
+    let polled = poll(&mut entry);
+    // Capture the failing poll's errno before classification or a later signal.
+    let poll_errno = if polled < 0 {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    PidfdReadiness {
+        polled,
+        revents: entry.revents,
+        terminal: pidfd_terminal_ready(polled, entry.revents),
+        poll_errno,
+    }
 }
+
+fn pidfd_readiness(fd: &OwnedFd) -> PidfdReadiness {
+    // SAFETY: one valid pollfd, the same nonblocking timeout, no ownership change.
+    pidfd_readiness_with(fd.as_raw_fd(), |entry| unsafe { libc::poll(entry, 1, 0) })
+}
+
+fn signal_readiness<T>(
+    signal: libc::c_int,
+    fd: Option<&T>,
+    poll: impl FnOnce(&T) -> PidfdReadiness,
+) -> Option<PidfdReadiness> {
+    if signal == 0 {
+        None
+    } else {
+        fd.map(poll)
+    }
+}
+// READINESS_OBSERVATION_END
 // TERMINAL_SIGNAL_ELIGIBILITY_END
 
 fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
@@ -614,6 +654,7 @@ struct StopEvent {
     result: Option<&'static str>,
     errno: Option<i32>,
     status: Option<i32>,
+    readiness: Option<PidfdReadiness>,
 }
 
 struct StopObservation {
@@ -659,6 +700,7 @@ impl StopObservation {
         target: &'static str,
         signal: libc::c_int,
         sent: &io::Result<()>,
+        readiness: Option<PidfdReadiness>,
     ) {
         let errno = sent.as_ref().err().and_then(io::Error::raw_os_error);
         let result = if sent.is_ok() {
@@ -685,6 +727,7 @@ impl StopObservation {
             result: Some(result),
             errno,
             status: None,
+            readiness,
         });
     }
 
@@ -700,6 +743,7 @@ impl StopObservation {
             result: None,
             errno: None,
             status: Some(status),
+            readiness: None,
         });
     }
 
@@ -707,10 +751,11 @@ impl StopObservation {
         let records: Vec<_> = self.records[..self.used].iter().flatten().map(|event| {
             serde_json::json!({ "kind": event.kind, "pid": event.pid, "startTick": event.start_tick,
                 "root": event.root, "target": event.target, "signal": event.signal, "result": event.result,
-                "errno": event.errno, "waitStatus": event.status })
+                "errno": event.errno, "waitStatus": event.status,
+                "readiness": event.readiness.map(|ready| serde_json::json!([ready.polled, ready.revents, ready.terminal, ready.poll_errno])) })
         }).collect();
         serde_json::json!({ "schema": "takosumi.guard-stop-observation@v1", "diagnosticOnly": true,
-            "scope": "existing_drain", "capacity": STOP_OBSERVATION_CAP, "truncated": self.truncated, "records": records })
+            "scope": "existing_drain", "readinessFields": ["polled", "revents", "terminal", "pollErrno"], "capacity": STOP_OBSERVATION_CAP, "truncated": self.truncated, "records": records })
     }
 }
 // STOP_OBSERVATION_END
@@ -788,7 +833,8 @@ impl Run {
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
         for (pid, (start_tick, fd)) in &self.tracker.handles {
-            if signal != 0 && pidfd_is_terminal(fd) {
+            let readiness = signal_readiness(signal, Some(fd), pidfd_readiness);
+            if readiness.is_some_and(|ready| ready.terminal) {
                 continue;
             }
             let sent = pidfd_signal(fd, signal);
@@ -799,6 +845,7 @@ impl Run {
                 "retained_pidfd",
                 signal,
                 &sent,
+                readiness,
             );
             match sent {
                 Ok(()) => {
@@ -815,7 +862,8 @@ impl Run {
             if self.child_fd.is_none() {
                 self.child_fd = child_pidfd(pid).ok(); // Retry a failed open.
             }
-            if signal != 0 && self.child_fd.as_ref().is_some_and(pidfd_is_terminal) {
+            let readiness = signal_readiness(signal, self.child_fd.as_ref(), pidfd_readiness);
+            if readiness.is_some_and(|ready| ready.terminal) {
                 return;
             }
             let sent = match &self.child_fd {
@@ -840,6 +888,7 @@ impl Run {
                 },
                 signal,
                 &sent,
+                readiness,
             );
             match sent {
                 Ok(()) => {}

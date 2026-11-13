@@ -447,13 +447,39 @@ class WebSocket:
         accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
         require(headers.get("sec-websocket-accept") == accept, "WebSocket accept key mismatch")
 
+    # CDP_RECEIVE_OBSERVATION_BEGIN
+    def _observe_receive(self, stage, received=None):
+        try:
+            state = getattr(self, "last_receive_observation", None)
+            if stage == "start":
+                self.receive_observation_error = False
+            elif state is None:
+                return  # Do not attribute the constructor's HTTP handshake to a receive.
+            buffer, partial = self.buffer, self.partial
+            if type(buffer) is not bytes or (partial is not None and type(partial) is not bytearray):
+                raise ValueError("Invalid receive observation")
+            if stage == "read" and type(received) is not bytes:
+                raise ValueError("Invalid receive observation")
+            self.last_receive_observation = receive_observation(
+                state, stage, buffered=len(buffer), fragment=0 if partial is None else len(partial),
+                fragment_active=partial is not None, size=len(received) if stage == "read" else 0)
+        except Exception:
+            try:
+                self.receive_observation_error = True
+            except Exception:
+                pass
+    # CDP_RECEIVE_OBSERVATION_END
     def _fill(self, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            self._observe_receive("deadline")  # CDP_RECEIVE_OBSERVATION
             raise TimeoutError("WebSocket read timed out")
         self.sock.settimeout(remaining)
+        self._observe_receive("socket")  # CDP_RECEIVE_OBSERVATION
         chunk = self.sock.recv(65536)
+        self._observe_receive("read", chunk)  # CDP_RECEIVE_OBSERVATION
         if not chunk:
+            self._observe_receive("socket_closed")  # CDP_RECEIVE_OBSERVATION
             raise ConnectionError("WebSocket closed")
         self.buffer += chunk
 
@@ -475,7 +501,9 @@ class WebSocket:
                         mask = self.buffer[offset:offset + 4] if masked else None
                         payload = self.buffer[end - length:end]
                         self.buffer = self.buffer[end:]
+                        self._observe_receive("frame")  # CDP_RECEIVE_OBSERVATION
                         return bool(first & 0x80), first & 0x0F, mask_bytes(payload, mask) if mask else payload
+            self._observe_receive("frame_wait")  # CDP_RECEIVE_OBSERVATION
             self._fill(deadline)
 
     def send_text(self, text):
@@ -497,9 +525,11 @@ class WebSocket:
 
     def receive(self, deadline):
         """The next text message; TimeoutError when none completes in time."""
+        self._observe_receive("start")  # CDP_RECEIVE_OBSERVATION
         while True:
             fin, opcode, payload = self._frame(deadline)
             if opcode == 0x8:
+                self._observe_receive("frame_closed")  # CDP_RECEIVE_OBSERVATION
                 raise ConnectionError("WebSocket closed by the browser")
             if opcode == 0x9:
                 self._send(0xA, payload)
@@ -517,6 +547,7 @@ class WebSocket:
             require(len(self.partial) <= MAX_MESSAGE, "Oversized WebSocket message")
             if fin:
                 message, self.partial = bytes(self.partial), None
+                self._observe_receive("message_bytes")  # CDP_RECEIVE_OBSERVATION
                 return message.decode("utf-8")
 
     def close(self):
@@ -535,6 +566,67 @@ class CdpError(Failure):
         self.error = error
 
 
+# CDP_RECEIVE_OBSERVATION_BEGIN
+_RECEIVE_LIMIT = 2**31 - 1
+_RECEIVE_BOUNDARIES = ("start", "frame_wait", "socket", "read", "frame", "message_bytes",
+                       "deadline", "socket_closed", "frame_closed")
+_RECEIVE_NUMBERS = ("readsReturned", "bytesReceived", "frames", "bufferedBytes", "fragmentBytes")
+
+
+def receive_observation(state, stage, buffered=None, fragment=None, fragment_active=None, size=0):
+    """One receive call's closed progress; buffer/fragment bytes may predate this call."""
+    if type(stage) is not str:
+        raise ValueError("Invalid receive observation")
+    if stage == "start":
+        result = {"boundary": "start", "readsReturned": 0, "bytesReceived": 0, "frames": 0,
+                  "bufferedBytes": 0, "fragmentBytes": 0, "fragmentActive": False,
+                  "countsCapped": False, "closed": False}
+    else:
+        keys = set(_RECEIVE_NUMBERS) | {"boundary", "fragmentActive", "countsCapped", "closed"}
+        if type(state) is not dict or set(state) != keys:
+            raise ValueError("Invalid receive observation")
+        if type(state["boundary"]) is not str or state["boundary"] not in _RECEIVE_BOUNDARIES:
+            raise ValueError("Invalid receive observation")
+        if any(type(state[key]) is not int or not 0 <= state[key] <= _RECEIVE_LIMIT for key in _RECEIVE_NUMBERS):
+            raise ValueError("Invalid receive observation")
+        if any(type(state[key]) is not bool for key in ("fragmentActive", "countsCapped", "closed")):
+            raise ValueError("Invalid receive observation")
+        if ((not state["fragmentActive"] and state["fragmentBytes"] != 0)
+                or state["closed"] != (state["boundary"] in ("socket_closed", "frame_closed"))):
+            raise ValueError("Invalid receive observation")
+        result = dict(state)
+    if stage == "snapshot" and buffered is None and fragment is None and fragment_active is None:
+        return result
+    if (stage != "snapshot" and stage not in _RECEIVE_BOUNDARIES) or type(fragment_active) is not bool:
+        raise ValueError("Invalid receive observation")
+    for key, value in (("bufferedBytes", buffered), ("fragmentBytes", fragment)):
+        if type(value) is not int or value < 0:
+            raise ValueError("Invalid receive observation")
+        result["countsCapped"] |= value > _RECEIVE_LIMIT
+        result[key] = min(value, _RECEIVE_LIMIT)
+    result.update(boundary=result["boundary"] if stage == "snapshot" else stage, fragmentActive=fragment_active)
+    if stage == "read":
+        if type(size) is not int or size < 0:
+            raise ValueError("Invalid receive observation")
+        for key, increment in (("readsReturned", 1), ("bytesReceived", size)):
+            value = result[key] + increment
+            result["countsCapped"] |= value > _RECEIVE_LIMIT
+            result[key] = min(value, _RECEIVE_LIMIT)
+    if stage == "frame":
+        result["countsCapped"] |= result["frames"] == _RECEIVE_LIMIT
+        result["frames"] = min(result["frames"] + 1, _RECEIVE_LIMIT)
+    result["closed"] |= stage in ("socket_closed", "frame_closed")
+    return result
+
+
+def receive_snapshot(outcome, transport=None, observationError=False):
+    if type(outcome) is not str or outcome not in ("message", "timeout", "connection_error", "exception"):
+        raise ValueError("Invalid receive observation")
+    if type(observationError) is not bool:
+        raise ValueError("Invalid receive observation")
+    return {"outcome": outcome, "transport": None if observationError or transport is None else
+            receive_observation(transport, "snapshot"), "observationError": observationError}
+# CDP_RECEIVE_OBSERVATION_END
 # CDP_COMMAND_OBSERVATION_BEGIN
 # Closed metadata only: never store a method, label, session or message value.
 def command_observation(record, stage, **values):
@@ -544,7 +636,8 @@ def command_observation(record, stage, **values):
                 "clockSource": "time.monotonic", "clockUnit": "s",
                 "commandId": ident if 0 <= ident <= 2**53 - 1 else None,
                 "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
-                "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending"}
+                "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending",
+                "lastReceive": None}
     if record is None:
         return None
     result = dict(record)
@@ -557,6 +650,8 @@ def command_observation(record, stage, **values):
             if increment:
                 result["countsCapped"] |= result[name] == 2**31 - 1
                 result[name] = min(result[name] + 1, 2**31 - 1)
+    elif stage == "receive":
+        result["lastReceive"] = receive_snapshot(**values["snapshot"])
     elif stage == "end":
         result.update(outcome=values["outcome"], phase="reply")
     elif stage == "error":
@@ -601,6 +696,7 @@ class Cdp:
         self.marked_at = {}
         self.last_command_observation = None
         self.command_observation_error = False
+        self._last_receive_observation = None  # CDP_RECEIVE_OBSERVATION
 
     def mark(self):
         mark = self.base + len(self.events)
@@ -610,14 +706,34 @@ class Cdp:
     def since(self, mark):
         return self.events[max(0, mark - self.base):]
 
+    # CDP_RECEIVE_OBSERVATION_BEGIN
+    def _remember_receive(self, outcome):
+        try:
+            if isinstance(self.websocket, WebSocket):
+                self.websocket._observe_receive("snapshot")
+            self._last_receive_observation = receive_snapshot(
+                outcome, getattr(self.websocket, "last_receive_observation", None),
+                getattr(self.websocket, "receive_observation_error", False))
+            if self._last_receive_observation["observationError"]:
+                self.command_observation_error = True
+        except Exception:
+            self._last_receive_observation = {"outcome": outcome, "transport": None, "observationError": True}
+            self.command_observation_error = True
+    # CDP_RECEIVE_OBSERVATION_END
     def _next(self, deadline):
         try:
             message = json.loads(self.websocket.receive(deadline))
         except TimeoutError:
+            self._remember_receive("timeout")  # CDP_RECEIVE_OBSERVATION
             return None
         except (ConnectionError, OSError) as error:
+            self._remember_receive("connection_error")  # CDP_RECEIVE_OBSERVATION
             self.closed = str(error)
             raise Failure(f"DevTools connection of {self.label} ended: {error}") from None
+        except Exception:  # CDP_RECEIVE_OBSERVATION
+            self._remember_receive("exception")  # CDP_RECEIVE_OBSERVATION
+            raise  # CDP_RECEIVE_OBSERVATION
+        self._remember_receive("message")  # CDP_RECEIVE_OBSERVATION
         if "method" in message:
             message[RECEIVED_AT] = time.monotonic()
             self.events.append(message)
@@ -630,6 +746,7 @@ class Cdp:
     def _observe_command(self, stage, **values):
         try:
             if stage == "start":
+                self._last_receive_observation = None
                 self.last_command_observation = None
                 self.command_observation_error = False
             if stage == "error":
@@ -656,6 +773,7 @@ class Cdp:
             self._observe_command("wait", sent_at=sent_at, deadline=deadline)
             while True:
                 message = self._next(deadline)
+                self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION
                 if message is None:
                     self._observe_command("end", outcome="timeout")
                     raise Failure(f"CDP timeout {method} ({self.label})")
@@ -671,6 +789,8 @@ class Cdp:
                 else:
                     self._observe_command("message", matching=False, other="id" in message, event="method" in message)
         except Exception as error:
+            if phase == "receive":  # CDP_RECEIVE_OBSERVATION
+                self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION
             self._observe_command("error", sent=sent, closed=self.closed is not None, phase=phase, error=error)
             raise
 
