@@ -70,18 +70,39 @@ public final class WebHomeOperationTest {
     private UiObject2 one(BySelector selector, JSONObject trace, boolean scrollConnectionForm) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
-        boolean keyboardDismissalRequested = false;
+        ConnectionSaveKeyboard keyboard = trace == null ? null : new ConnectionSaveKeyboard();
+        ConnectionSaveKeyboard.Probe keyboardProbe = trace == null ? null : new ConnectionSaveKeyboard.Probe() {
+            public boolean isShown() { return keyboardShown(trace); }
+            public boolean dismiss() {
+                diagnostic(trace, "backRequested", true);
+                boolean returned = false;
+                try {
+                    returned = device.pressBack();
+                    return returned;
+                } finally {
+                    diagnostic(trace, "backReturned", returned);
+                    diagnostic(trace, "keyboardReturnedAtMs", SystemClock.elapsedRealtime());
+                }
+            }
+        };
         boolean formScrollRequested = false;
         do {
-            // A keyboard can appear after setText's first AX snapshot. Only
-            // the connection Save wait may dismiss it, at most once.
-            if (trace != null && !keyboardDismissalRequested) {
-                keyboardDismissalRequested = hideKeyboardIfShown(trace);
+            if (keyboard != null && !keyboard.ready(keyboardProbe)) {
+                SystemClock.sleep(100);
+                continue;
             }
             UiObject2 value = device.findObject(inApp);
             if (value != null && value.isEnabled()) {
                 Rect bounds = value.getVisibleBounds();
                 if (!bounds.isEmpty()) {
+                    if (keyboard != null && SystemClock.elapsedRealtime() >= end) break;
+                    // Finding Save may take long enough for the IME to cover
+                    // it. Discard this object after a dismissal and reacquire.
+                    if (keyboard != null && !keyboard.ready(keyboardProbe)) {
+                        SystemClock.sleep(100);
+                        continue;
+                    }
+                    if (keyboard != null && SystemClock.elapsedRealtime() >= end) break;
                     if (trace != null) {
                         diagnostic(trace, "saveReadyAtMs", SystemClock.elapsedRealtime());
                         diagnostic(trace, "saveBounds", new JSONArray().put(bounds.left).put(bounds.top)
@@ -115,32 +136,24 @@ public final class WebHomeOperationTest {
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }
 
     private void hideKeyboardIfShown() {
-        hideKeyboardIfShown(null);
+        if (keyboardShown(null)) device.pressBack();
     }
 
-    private boolean hideKeyboardIfShown(JSONObject trace) {
+    private boolean keyboardShown(JSONObject trace) {
         if (trace != null) diagnostic(trace, "keyboardStartedAtMs", SystemClock.elapsedRealtime());
         String ime = Settings.Secure.getString(context.getContentResolver(), Settings.Secure.DEFAULT_INPUT_METHOD);
-        boolean queried = false, shown = false, requested = false, returned = false;
+        boolean queried = false, shown = false;
         if (ime != null && ime.contains("/")) {
             String owner = ime.substring(0, ime.indexOf('/'));
             queried = true;
             shown = device.hasObject(By.pkg(owner));
-            if (shown) {
-                requested = true;
-                returned = device.pressBack();
-            }
         }
         if (trace != null) {
             diagnostic(trace, "imeQueried", queried);
             diagnostic(trace, "imePresent", shown);
-            diagnostic(trace, "backRequested", requested);
-            diagnostic(trace, "backReturned", returned);
             diagnostic(trace, "keyboardReturnedAtMs", SystemClock.elapsedRealtime());
         }
-        // Consume the request even when pressBack returned false. A second
-        // Back could navigate away from the form after the keyboard closes.
-        return requested;
+        return shown;
     }
 
     private static void diagnostic(JSONObject target, String key, Object value) {
@@ -152,6 +165,8 @@ public final class WebHomeOperationTest {
         JSONObject trace = new JSONObject();
         diagnostic(trace, "diagnosticOnly", true);
         diagnostic(trace, "attempt", ++connectionAttempts);
+        diagnostic(trace, "backRequested", false);
+        diagnostic(trace, "backReturned", false);
         // Only the latest add is retained; no input text, URL or selector.
         diagnostic(result, "connectionAdd", trace);
         one(By.text("保存して開く"), null, true);

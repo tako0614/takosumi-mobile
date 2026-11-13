@@ -89,6 +89,22 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: saved connection label checks=[1-9][0-9]*")
 
+    def test_actual_driver_save_keyboard_wait_handles_late_ime_and_one_back(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the driver keyboard control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the driver keyboard control")
+        classes = self.root / "keyboard-classes"
+        classes.mkdir()
+        helper = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/ConnectionSaveKeyboard.java"
+        control = runner.HERE / "label-controls/ConnectionSaveKeyboardTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.webhome.ConnectionSaveKeyboardTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: connection Save keyboard checks=[1-9][0-9]*")
+
     def test_ui_result_requires_all_operations_and_actual_cold_replacement(self):
         for defect in ("no-pass", "missing-operation", "same-pid", "invalid-pid", "same-document", "no-diagnostics"):
             result = self.result()

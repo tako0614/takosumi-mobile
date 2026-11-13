@@ -48,6 +48,27 @@ then it continues requiring the actual Save control and clicks once. Other
 control waits retain their existing behavior. The new IME handling and saved
 connection selector remain unqualified by this run.
 
+Run43342701063 passed Work login/navigation and warm return, then stopped
+after Personal's Save wrapper returned. The final screen shows Gboard over
+the form, and the recorded Save center(542,2034) lies inside the final AX's
+`v` key bounds[486,1963][593,2118]. The last IME query reported absent;
+finding the ready Save then took another1,185ms. The keyboard suggestions
+include `Personalv`, but no pointer-event receipt proves the actual tap
+delivery or the final name-field value. A late IME covering Save is consistent
+with these observations; it is separate from the earlier Personal Notes AX
+failure and does not establish that failure's cause.
+
+Only the post-input connection Save wait now reads the configured IME before
+and after locating its candidate. A visible IME consumes at most one Back;
+the old candidate is discarded and the same15-second wait continues until
+the IME is observed absent and Save is reacquired. A false Back return still
+consumes the request. The exact helper compiled into the driver also runs
+under the existing JDK: late appearance during selector lookup, delayed or
+immediate dismissal, false Back, reappearance and no-keyboard controls pass.
+These controls do not compile/run the Android framework integration. Native
+success is pending; input counts, one Save tap, form-scroll policy, deadlines
+and downstream profile/cold/reset assertions remain unchanged.
+
 Run43317859224 passed Work Web login/management, Notes/draft, saved-Work
 selection and background return with the same App PID/document. It then
 stopped before Personal input: the saved Work row pushed the form below the
