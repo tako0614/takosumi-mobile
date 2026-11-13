@@ -11,7 +11,7 @@ import { createServer as reservePort } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { confirmBrowserCleanup } from "./lifecycle.ts";
-import { guardRunning, initialPage } from "./startup.ts";
+import { createStartupObservation, guardRunning, initialPage } from "./startup.ts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const output = process.argv[2];
@@ -78,6 +78,10 @@ async function screenshot(name: string, width: number, height: number, mobile: b
   await writeFile(`${output}/${name}.png`, Buffer.from(shot.data, "base64"));
 }
 
+const startupObservation = createStartupObservation((record) => {
+  console.error("WEBHOME_STARTUP_OBSERVATION", JSON.stringify(record));
+});
+
 try {
   server = await createServer({
     configFile: `${root}vite.config.ts`, cacheDir: join(temporary, "vite-cache"),
@@ -99,7 +103,7 @@ try {
   });
   await log.close();
   const target = await initialPage(`${temporary}/profile/DevToolsActivePort`,
-    () => guardRunning(browser!, startupError));
+    () => guardRunning(browser!, startupError), { observe: startupObservation.observe });
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Owned CDP handshake timed out")), 10_000);
@@ -211,6 +215,7 @@ try {
       "permission initial snapshot ordering", "permission answer ordering", "permission failure and explicit retry", "retired permission callbacks and snapshots"], final };
  } catch (error) {
   testError = error;
+  startupObservation.failure(error);
   throw error;
 } finally {
   let confirmed = !browser;

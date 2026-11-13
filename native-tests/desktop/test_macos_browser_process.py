@@ -465,6 +465,127 @@ os.open(sys.argv[3],os.O_RDONLY)
         self.assertFalse(saved["passed"])
         self.assertEqual(saved["error"], "Failure: original flow failed")
 
+        # CDP_COMMAND_OBSERVATION_CONTROLS_BEGIN (same owning method: count stays 35)
+        browser = sys.modules[runner.Cdp.__module__]
+
+        class Channel:
+            def __init__(self, messages=(), send_error=None):
+                self.messages, self.send_error = list(messages), send_error
+                self.sent, self.deadlines = [], []
+                self.close = mock.Mock()
+
+            def send_text(self, text):
+                self.sent.append(json.loads(text))
+                if self.send_error is not None:
+                    raise self.send_error
+
+            def receive(self, deadline):
+                self.deadlines.append(deadline)
+                item = self.messages.pop(0) if self.messages else TimeoutError("private timeout detail")
+                if isinstance(item, BaseException):
+                    raise item
+                return json.dumps(item)
+
+        with self.subTest(command="matching-other-event"):
+            channel = Channel([{"id": 99, "result": {"private": "late other reply"}},
+                               {"method": "private.event", "params": {"private": "payload"}},
+                               {"id": 1, "result": {"ok": True}}])
+            client = runner.Cdp(channel, "private label")
+            with mock.patch.object(browser.time, "monotonic", return_value=100.0) as clock:
+                result = client.command("private.command", {"private": "payload"}, session="private session")
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(clock.call_count, 2)  # Existing send deadline plus existing event timestamp only.
+            self.assertEqual(channel.deadlines, [105.0] * 3)
+            self.assertEqual(len(client.events), 1)
+            record = client.last_command_observation
+            self.assertEqual({name: record[name] for name in ("commandId", "sendReturned", "matchingReplies", "otherReplies", "events")},
+                             {"commandId": 1, "sendReturned": True, "matchingReplies": 1, "otherReplies": 1, "events": 1})
+            self.assertEqual((record["clockDomain"], record["clockUnit"]), ("host_monotonic", "s"))
+            self.assertEqual((record["sendReturnedAt"], record["deadlineAt"], record["outcome"]), (100.0, 105.0, "success"))
+            self.assertNotIn("private", json.dumps(record))
+
+        for mode in ("send", "receive", "closed", "timeout", "cdp-error"):
+            with self.subTest(command=mode):
+                original = OSError("private send failure") if mode == "send" else json.JSONDecodeError("private parse failure", "private", 0)
+                messages = {"receive": [original], "closed": [ConnectionError("private closure")],
+                            "timeout": [], "cdp-error": [{"id": 1, "error": {"message": "private reply"}}]}.get(mode, [])
+                channel = Channel(messages, original if mode == "send" else None)
+                client = runner.Cdp(channel, "private label")
+                cleanup = 0
+                with mock.patch.object(browser.time, "monotonic", return_value=100.0) as clock:
+                    try:
+                        with self.assertRaises(Exception) as raised:
+                            try:
+                                client.command("private.command")
+                            finally:
+                                cleanup += 1
+                    finally:
+                        self.assertEqual(cleanup, 1)
+                if mode in ("send", "receive"):
+                    self.assertIs(raised.exception, original)
+                self.assertEqual(clock.call_count, 0 if mode == "send" else 1)
+                record = client.last_command_observation
+                self.assertEqual(record["sendReturned"], mode != "send")
+                self.assertEqual(record["outcome"], {"timeout": "timeout", "cdp-error": "cdp_error"}.get(mode, "exception"))
+                self.assertEqual(record["errorCategory"], {"send": "os", "receive": "json", "closed": "channel_closed",
+                                                           "timeout": "failure", "cdp-error": "cdp_error"}[mode])
+                self.assertEqual(record["channelClosed"], mode == "closed")
+                self.assertEqual(record["matchingReplies"], int(mode == "cdp-error"))
+                self.assertNotIn("private", json.dumps(record))
+
+        class RefusingProof(dict):
+            def __setitem__(self, key, value):
+                if key == "cdpBeforeFailureCleanup":
+                    raise OSError("private sink failure")
+                super().__setitem__(key, value)
+
+        for broken in (None, "observer", "classifier", "sink"):
+            with self.subTest(observation=broken):
+                original = runner.Failure("original flow failed")
+                channel = Channel(send_error=original)
+                client = runner.Cdp(channel, "private label")
+                observer = self.failed_observer()
+                observer.clients = [client]
+                observer.first_launch = lambda: client.command("private.command")
+                if broken == "sink":
+                    observer.proof = RefusingProof(observer.proof)
+                def close():
+                    channel.send_error = None
+                    channel.messages = [{"id": client.next + 1, "result": {}}]
+                    client.command("private cleanup")  # Fake-only: prove the pre-cleanup copy is immutable.
+                channel.close.side_effect = close
+                with mock.patch.object(runner, "sample_owned", return_value={}), \
+                        mock.patch.object(browser.time, "monotonic", return_value=100.0):
+                    with self.subTest(phase="original-identity"):
+                        if broken in ("observer", "classifier"):
+                            name = "command_observation" if broken == "observer" else "command_error_category"
+                            with mock.patch.object(browser, name, side_effect=RuntimeError("private observer failure")), \
+                                    self.assertRaises(runner.Failure) as raised:
+                                observer.run()
+                        else:
+                            with self.assertRaises(runner.Failure) as raised:
+                                observer.run()
+                    self.assertIs(raised.exception, original)
+                channel.close.assert_called_once_with()
+                saved = json.loads((self.root / "browser-observation.json").read_text())
+                self.assertFalse(saved["passed"])
+                self.assertEqual(saved["error"], "Failure: original flow failed")
+                if broken == "sink":
+                    self.assertNotIn("cdpBeforeFailureCleanup", saved)
+                else:
+                    receipt = saved["cdpBeforeFailureCleanup"]
+                    self.assertEqual(receipt["omittedClients"], 0)
+                    item = receipt["clients"][0]
+                    self.assertNotIn("private", json.dumps(receipt))
+                    if broken == "observer":
+                        self.assertFalse(item["available"])
+                        self.assertTrue(item["observationError"])
+                    else:
+                        self.assertEqual(item["lastCommand"]["commandId"], 1)
+                        self.assertNotEqual(item["lastCommand"], client.last_command_observation)
+                        self.assertEqual(item["observationError"], broken == "classifier")
+        # CDP_COMMAND_OBSERVATION_CONTROLS_END
+
     def test_failure_stack_capture_requires_identity_and_does_not_repeat_shutdown_sample(self):
         observer = self.failed_observer()
         observer.proof["shutdownSamples"] = [{"pid": 12, "status": "sample-error"}]

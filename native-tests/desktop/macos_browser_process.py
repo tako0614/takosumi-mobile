@@ -444,8 +444,29 @@ class MacObserver(Observer):
             self.finish_final_quit([pages[0]])
         self.proof["passed"] = True
 
+    # CDP_COMMAND_OBSERVATION_BEGIN
+    def capture_command_observations(self):
+        # The existing fixture opens two profiles. Copy before any cleanup send.
+        try:
+            records = []
+            for slot, client in enumerate(self.clients[:2]):
+                try:
+                    record = client.last_command_observation
+                    item = {"clientSlot": slot, "available": record is not None,
+                            "observationError": client.command_observation_error}
+                    if record is not None:
+                        item["lastCommand"] = dict(record)
+                except Exception:
+                    item = {"clientSlot": slot, "available": False, "observationError": True}
+                records.append(item)
+            self.proof["cdpBeforeFailureCleanup"] = {"clients": records, "omittedClients": max(0, len(self.clients) - 2)}
+        except Exception:
+            pass  # A diagnostic sink must not replace the original flow failure.
+    # CDP_COMMAND_OBSERVATION_END
+
     def failure_capture(self):
         # Called only after the original flow has failed, before owned cleanup.
+        self.capture_command_observations()
         # A failed Open can leave the UI thread wedged without entering shutdown,
         # so the shutdown watcher alone cannot collect its stack.
         self.proof["identities"] = self.identities

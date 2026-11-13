@@ -535,6 +535,57 @@ class CdpError(Failure):
         self.error = error
 
 
+# CDP_COMMAND_OBSERVATION_BEGIN
+# Closed metadata only: never store a method, label, session or message value.
+def command_observation(record, stage, **values):
+    if stage == "start":
+        ident = values["ident"]
+        return {"kind": "takosumi.cdp-command-observation@v1", "clockDomain": "host_monotonic",
+                "clockSource": "time.monotonic", "clockUnit": "s",
+                "commandId": ident if 0 <= ident <= 2**53 - 1 else None,
+                "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
+                "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending"}
+    if record is None:
+        return None
+    result = dict(record)
+    if stage == "wait":
+        result.update(sendReturned=True, sendReturnedAt=values["sent_at"], deadlineAt=values["deadline"],
+                      phase="receive", outcome="waiting")
+    elif stage == "message":
+        for name, increment in (("matchingReplies", values["matching"]),
+                                ("otherReplies", values["other"]), ("events", values["event"])):
+            if increment:
+                result["countsCapped"] |= result[name] == 2**31 - 1
+                result[name] = min(result[name] + 1, 2**31 - 1)
+    elif stage == "end":
+        result.update(outcome=values["outcome"], phase="reply")
+    elif stage == "error":
+        result.update(sendReturned=values["sent"], channelClosed=values["closed"],
+                      phase=values["phase"], errorCategory=values["category"])
+        if result["outcome"] in ("sending", "waiting"):
+            result["outcome"] = "exception"
+    return result
+
+
+def command_error_category(error, closed):
+    if closed:
+        return "channel_closed"
+    if isinstance(error, CdpError):
+        return "cdp_error"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ConnectionError):
+        return "connection"
+    if isinstance(error, OSError):
+        return "os"
+    if isinstance(error, json.JSONDecodeError):
+        return "json"
+    if isinstance(error, Failure):
+        return "failure"
+    return "other"
+# CDP_COMMAND_OBSERVATION_END
+
+
 class Cdp:
     """One browser's DevTools connection. Events are kept (the oldest dropped
     past 4096) and addressed by absolute marks."""
@@ -548,6 +599,8 @@ class Cdp:
         # When each mark was taken (monotonic); events carry their receipt
         # time as RECEIVED_AT, for dialog_evidence.
         self.marked_at = {}
+        self.last_command_observation = None
+        self.command_observation_error = False
 
     def mark(self):
         mark = self.base + len(self.events)
@@ -573,23 +626,53 @@ class Cdp:
                 self.base += 1024
         return message
 
+    # CDP_COMMAND_OBSERVATION_BEGIN
+    def _observe_command(self, stage, **values):
+        try:
+            if stage == "start":
+                self.last_command_observation = None
+                self.command_observation_error = False
+            if stage == "error":
+                values["category"] = command_error_category(values.pop("error"), values["closed"])
+            self.last_command_observation = command_observation(self.last_command_observation, stage, **values)
+        except Exception:
+            self.command_observation_error = True
+    # CDP_COMMAND_OBSERVATION_END
+
     def command(self, method, params=None, session=None, timeout=5.0):
         self.next += 1
         ident = self.next
         request = {"id": ident, "method": method, "params": params or {}}
         if session:
             request["sessionId"] = session
-        self.websocket.send_text(json.dumps(request))
-        deadline = time.monotonic() + timeout
-        while True:
-            message = self._next(deadline)
-            if message is None:
-                raise Failure(f"CDP timeout {method} ({self.label})")
-            if message.get("id") == ident:
-                if "error" in message:
-                    raise CdpError(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}",
-                                   message["error"])
-                return message.get("result", {})
+        self._observe_command("start", ident=ident)
+        sent, phase = False, "send"
+        try:
+            self.websocket.send_text(json.dumps(request))
+            sent = True
+            sent_at = time.monotonic()
+            deadline = sent_at + timeout
+            phase = "receive"
+            self._observe_command("wait", sent_at=sent_at, deadline=deadline)
+            while True:
+                message = self._next(deadline)
+                if message is None:
+                    self._observe_command("end", outcome="timeout")
+                    raise Failure(f"CDP timeout {method} ({self.label})")
+                if message.get("id") == ident:
+                    self._observe_command("message", matching=True, other=False, event="method" in message)
+                    phase = "reply"
+                    if "error" in message:
+                        self._observe_command("end", outcome="cdp_error")
+                        raise CdpError(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}",
+                                       message["error"])
+                    self._observe_command("end", outcome="success")
+                    return message.get("result", {})
+                else:
+                    self._observe_command("message", matching=False, other="id" in message, event="method" in message)
+        except Exception as error:
+            self._observe_command("error", sent=sent, closed=self.closed is not None, phase=phase, error=error)
+            raise
 
     def wait_event(self, predicate, mark, timeout, what):
         deadline = time.monotonic() + timeout
