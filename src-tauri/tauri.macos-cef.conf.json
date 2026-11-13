@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "target/macos-cef/cef/": "cef/"
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    }
+  }
+}

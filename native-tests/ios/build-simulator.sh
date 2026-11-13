@@ -55,6 +55,7 @@ assert not re.search(r"(?m)^[ \t]*['\"]?(?:SDKROOT|SUPPORTED_PLATFORMS)(?:\[[^\r
 text = text.replace(marker, marker + "        SDKROOT: iphonesimulator\n        SUPPORTED_PLATFORMS: iphonesimulator\n", 1)
 spec.write_text(text)
 PY
+
 xcodegen generate --spec src-tauri/gen/apple/project.yml --project src-tauri/gen/apple
 # XcodeGen rewrites entitlements from its spec. Reapply the same product writer
 # used by init so regeneration cannot silently remove normal plugin wiring.
@@ -84,6 +85,12 @@ with (bundle / "Info.plist").open("rb") as source:
     info = plistlib.load(source)
 assert info["CFBundleIdentifier"] == "com.takosumi.fixture.simulator", info
 assert info["CFBundleSupportedPlatforms"] == ["iPhoneSimulator"], info
+with Path("src-tauri/Info.ios.plist").open("rb") as source:
+    privacy = plistlib.load(source)
+for purpose in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSFaceIDUsageDescription"):
+    expected = privacy.get(purpose)
+    assert isinstance(expected, str) and expected.strip(), f"Missing product purpose: {purpose}"
+    assert info.get(purpose) == expected, f"App bundle lost product purpose: {purpose}"
 binary = bundle / info["CFBundleExecutable"]
 assert binary.is_file() and binary.stat().st_size > 0, binary
 assert not list(Path("src-tauri/gen/apple/build").rglob("*.ipa")), "Unexpected device IPA"
@@ -91,3 +98,5 @@ print(f"PASS: whole App iOS Simulator SDK build: {bundle}")
 print(f"Executable bytes={binary.stat().st_size}, sha256={hashlib.sha256(binary.read_bytes()).hexdigest()}")
 print("No Simulator runtime, real IdP, push, signing or distribution qualification.")
 PY
+
+python3 -B native-tests/ios/swift_runtime.py

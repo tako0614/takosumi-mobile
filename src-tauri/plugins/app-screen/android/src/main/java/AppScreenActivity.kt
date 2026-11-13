@@ -64,34 +64,132 @@ class AppScreenActivity : AppCompatActivity() {
     private var entry: AppScreenRegistry.Entry? = null
     private var lastKnownUrl: String = ""
     private var visible = false
+    private var resumed = false
     private var evicted = false
     private var profileGeneration = 0L
     private var externalDialog: AlertDialog? = null
     private var lastExternalDeclinedAt = 0L
     private var lastBrowserViewAt = 0L
     private var lastDownloadPromptAt = 0L
-    private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
+    // native-observation-begin:fields
+    private var nativeObservation: AppScreenObservation? = null
+    private var nativeBoundViewIdentity = 0
+    // native-observation-end:fields
 
     private lateinit var container: FrameLayout
     private lateinit var hostView: TextView
     private lateinit var backButton: TextView
     private lateinit var progress: ProgressBar
 
-    private val fileChooser =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val callback = pendingFileCallback
-            pendingFileCallback = null
-            callback?.onReceiveValue(pickedFiles(result.resultCode, result.data))
+    private val mediaConsent: AppScreenMediaConsent by lazy {
+        AppScreenMediaConsent(
+            current = ::mediaContext,
+            prompt = ::promptMedia,
+            hasPermission = { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED },
+            askAndroid = { mediaPermissions.launch(it) },
+        )
+    }
+    private val mediaPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+            mediaConsent.androidResult(granted)
         }
 
+    private fun mediaContext(): AppScreenMediaConsent.Context? {
+        val current = entry ?: return null
+        if (!::request.isInitialized || !visible || !resumed || isFinishing || isDestroyed || evicted) return null
+        // A Web-home popup inherits its opener's null origin restriction.
+        // Legacy installed-app screens keep their existing denial policy.
+        if (current.origins != null || current.host !== this || !current.webView.isAttachedToWindow || !current.webView.isShown) return null
+        val page = current.webView.url ?: return null
+        if (!AppScreenPolicy.isLaunchable(page) || !current.resumeState.canRequestMedia(page)) return null
+        val generation = AppScreenProfileData.generation(this, current.profile)
+        if (generation < 0 || generation != profileGeneration || AppScreenProfileData.isClearing(current.profile)) return null
+        return AppScreenMediaConsent.Context(current.webView, current.profile, generation, current.resumeState.document, page)
+    }
+
+    private fun promptMedia(access: AppScreenMediaConsent.Access, allow: () -> Unit, deny: () -> Unit): () -> Unit {
+        val resources = access.resources.map {
+            if (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE) "カメラ" else "マイク"
+        }.joinToString("と")
+        val parent = if (access.origin == access.topOrigin) "" else "\n表示中のサイト: ${access.topOrigin}"
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("${resources}の使用を許可")
+            .setMessage("${access.origin} が${resources}へのアクセスを求めています。$parent\nこの要求に許可しますか？")
+            .setPositiveButton("許可") { _, _ -> allow() }
+            .setNegativeButton("許可しない") { _, _ -> deny() }
+            .setOnCancelListener { deny() }
+            .create()
+        dialog.show()
+        return { dialog.dismiss() }
+    }
+
+    private val fileSelection: AppScreenFileSelection by lazy {
+        AppScreenFileSelection(
+            current = ::fileSelectionContext,
+            interactive = { visible && resumed },
+            launch = { fileChooser.launch(it) },
+        )
+    }
+    private val fileChooser =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            fileSelection.result(pickedFiles(result.resultCode, result.data))
+        }
+
+    private fun fileSelectionContext(): AppScreenFileSelection.Context? {
+        val current = entry ?: return null
+        if (!::request.isInitialized || isFinishing || isDestroyed || evicted) return null
+        if (current.host !== this || !current.webView.isAttachedToWindow) return null
+        val page = current.webView.url ?: return null
+        // Like media consent, require a committed document. A native picker
+        // can stop this Activity, so result validation does not require resume.
+        if (!AppScreenPolicy.isInScreen(page, current.origins) || !current.resumeState.canRequestMedia(page)) return null
+        val generation = AppScreenProfileData.generation(this, current.profile)
+        if (generation < 0 || generation != profileGeneration || AppScreenProfileData.isClearing(current.profile)) return null
+        return AppScreenFileSelection.Context(current.webView, current.profile, generation, current.resumeState.document, page)
+    }
+
+    // native-observation-begin:helpers
+    private fun initializeNativeObservation() {
+        try {
+            val debuggable = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+            if (debuggable) nativeObservation = AppScreenObservation(
+                debuggable, android.os.Process.myPid(),
+                { SystemClock.elapsedRealtime() },
+                { line -> android.util.Log.i(AppScreenObservation.TAG, line) },
+            )
+        } catch (_: Throwable) { /* Observation is optional, never a functional gate. */ }
+    }
+
+    private fun nativeViewIdentity(view: Any): Int = try {
+        if (nativeObservation == null) 0 else System.identityHashCode(view)
+    } catch (_: Throwable) { 0 }
+
+    private fun nativeRecord(
+        stage: AppScreenObservation.Stage,
+        subject: AppScreenRegistry.Entry? = entry,
+        viewIdentity: Int = nativeBoundViewIdentity,
+        logical: AppScreenObservation.Logical = AppScreenObservation.Logical.UNKNOWN,
+    ) {
+        val observer = nativeObservation ?: return
+        try {
+            observer.record(stage, viewIdentity, subject != null && subject === entry,
+                subject?.host === this, profileGeneration, visible, resumed, evicted, logical)
+        } catch (_: Throwable) { /* No view dereference, fallback or retry. */ }
+    }
+
+    // native-observation-end:helpers
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // native-observation-begin:init
+        initializeNativeObservation()
+        // native-observation-end:init
         val parsed = AppScreenLaunch.parse(this, intent)
         if (parsed == null) {
             finishAndRemoveTask()
             return
         }
         request = parsed
+        fileSelection.restoreAwaitingResult(savedInstanceState?.getBoolean(STATE_FILE_PICKER) == true)
         if (refuseWhileClearing()) return
         profileGeneration = AppScreenProfileData.generation(this, parsed.profile)
         val liveProfile = AppScreenRegistry.get(parsed.key)?.profile
@@ -134,8 +232,10 @@ class AppScreenActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         val parsed = AppScreenLaunch.parse(this, intent) ?: return
         if (parsed.key != request.key || parsed.popup || parsed.profile != request.profile) return
+        mediaConsent.cancel()
         setIntent(intent)
         val keep = keepsLivePage(parsed)
+        if (!keep) fileSelection.cancel()
         request = parsed
         show(target = startUrl(), keepLivePage = keep)
         applyTaskDescription()
@@ -151,8 +251,30 @@ class AppScreenActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        mediaConsent.resumed()
+        // native-observation-begin:resume
+        nativeRecord(AppScreenObservation.Stage.RESUME)
+        // native-observation-end:resume
+    }
+
+    override fun onPause() {
+        resumed = false
+        mediaConsent.paused()
+        super.onPause()
+        // native-observation-begin:pause
+        nativeRecord(AppScreenObservation.Stage.PAUSE)
+        // native-observation-end:pause
+    }
+
     override fun onStop() {
         visible = false
+        mediaConsent.cancel()
+        entry?.takeIf { it.host === this && !it.destroyed }?.let {
+            AppScreenProfileData.persistCookies(applicationContext, it.cookies)
+        }
         super.onStop()
     }
 
@@ -160,15 +282,16 @@ class AppScreenActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         if (!::request.isInitialized) return
         outState.putLong(STATE_GENERATION, profileGeneration)
+        outState.putBoolean(STATE_FILE_PICKER, fileSelection.awaitingResult)
         if (!request.webHome || (profileGeneration >= 0L && AppScreenProfileData.generation(this, request.profile) == profileGeneration)) {
             restorable(lastKnownUrl)?.let { outState.putString(STATE_URL, it) }
         }
     }
 
     override fun onDestroy() {
+        mediaConsent.cancel()
         externalDialog?.dismiss()
-        pendingFileCallback?.onReceiveValue(null)
-        pendingFileCallback = null
+        fileSelection.cancel()
         val current = entry
         if (current != null && current.host === this) {
             unbind(current)
@@ -191,7 +314,11 @@ class AppScreenActivity : AppCompatActivity() {
 
     /** Another activity took over this webview (same app relaunched). */
     internal fun forgetEntry(moved: AppScreenRegistry.Entry) {
-        if (entry === moved) entry = null
+        if (entry === moved) {
+            mediaConsent.cancel()
+            fileSelection.cancel()
+            entry = null
+        }
     }
 
     /** Started (visible, even when not focused in split screen). */
@@ -273,11 +400,15 @@ class AppScreenActivity : AppCompatActivity() {
         entry?.let { if (it.host === this) unbind(it) }
         current.host?.takeIf { it !== this }?.forgetEntry(current)
         val webView = current.webView
+        // native-observation-begin:bind-enter
+        val nativeViewId = nativeViewIdentity(webView)
+        nativeRecord(AppScreenObservation.Stage.BIND_ENTER, current, nativeViewId)
+        // native-observation-end:bind-enter
         (webView.parent as? ViewGroup)?.removeView(webView)
         current.context.baseContext = this
         current.host = this
         webView.webViewClient = ScreenClient(current)
-        webView.webChromeClient = ScreenChromeClient()
+        webView.webChromeClient = ScreenChromeClient(current)
         webView.setDownloadListener { url, _, _, _, _ ->
             // A page cannot keep raising download prompts.
             val now = SystemClock.elapsedRealtime()
@@ -293,17 +424,37 @@ class AppScreenActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
+        // native-observation-begin:add-return
+        nativeRecord(AppScreenObservation.Stage.ADD_RETURN, current, nativeViewId, AppScreenObservation.Logical.ADD_RETURN)
+        // native-observation-end:add-return
         entry = current
+        // native-observation-begin:bind-return
+        nativeBoundViewIdentity = nativeViewId
+        nativeRecord(AppScreenObservation.Stage.BIND_RETURN, current, nativeViewId)
+        // native-observation-end:bind-return
     }
 
     private fun unbind(current: AppScreenRegistry.Entry) {
+        mediaConsent.cancel()
+        fileSelection.cancel()
         val webView = current.webView
+        // native-observation-begin:unbind-enter
+        val nativeViewId = nativeBoundViewIdentity
+        nativeRecord(AppScreenObservation.Stage.UNBIND_ENTER, current, nativeViewId)
+        // native-observation-end:unbind-enter
         container.removeView(webView)
+        // native-observation-begin:remove-return
+        nativeRecord(AppScreenObservation.Stage.REMOVE_RETURN, current, nativeViewId, AppScreenObservation.Logical.REMOVE_RETURN)
+        // native-observation-end:remove-return
         webView.webViewClient = current.detachedClient
         webView.webChromeClient = null
         webView.setDownloadListener(null)
         current.host = null
         current.context.baseContext = applicationContext
+        // native-observation-begin:unbind-return
+        if (current === entry) nativeBoundViewIdentity = 0
+        nativeRecord(AppScreenObservation.Stage.UNBIND_RETURN, current, nativeViewId)
+        // native-observation-end:unbind-return
     }
 
     private fun goBackOrLeave() {
@@ -324,6 +475,8 @@ class AppScreenActivity : AppCompatActivity() {
     }
 
     private fun closeScreen() {
+        mediaConsent.cancel()
+        fileSelection.cancel()
         if (request.popup) finish() else finishAndRemoveTask()
     }
 
@@ -694,6 +847,11 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
             if (view !== entry?.webView) return
+            // native-observation-begin:page_start
+            nativeRecord(AppScreenObservation.Stage.PAGE_START, bound, nativeViewIdentity(view))
+            // native-observation-end:page_start
+            mediaConsent.cancel()
+            fileSelection.cancel()
             bound.resumeState.started(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 // Something reached the main frame without passing the policy.
@@ -708,6 +866,9 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageFinished(view: WebView, url: String?) {
             if (view !== entry?.webView) return
+            // native-observation-begin:page_finish
+            nativeRecord(AppScreenObservation.Stage.PAGE_FINISH, bound, nativeViewIdentity(view))
+            // native-observation-end:page_finish
             progress.visibility = View.GONE
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 leavePage(view, url, offerOnly = false)
@@ -721,6 +882,9 @@ class AppScreenActivity : AppCompatActivity() {
         }
 
         override fun onPageCommitVisible(view: WebView, url: String?) {
+            // native-observation-begin:page-commit
+            if (view === entry?.webView) nativeRecord(AppScreenObservation.Stage.PAGE_COMMIT, bound, nativeViewIdentity(view))
+            // native-observation-end:page-commit
             if (view === entry?.webView && url == view.url) bound.resumeState.committed(url)
         }
 
@@ -728,6 +892,10 @@ class AppScreenActivity : AppCompatActivity() {
             // Subresources and rendered HTTP error responses do not turn a
             // successful main document into a failed navigation.
             if (view === entry?.webView && request.isForMainFrame) {
+                if (request.url.toString() == view.url) {
+                    mediaConsent.cancel()
+                    fileSelection.cancel()
+                }
                 bound.resumeState.failed(request.url.toString())
             }
         }
@@ -739,6 +907,8 @@ class AppScreenActivity : AppCompatActivity() {
          */
         override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
             if (view !== entry?.webView) return
+            mediaConsent.pageChanged(url)
+            fileSelection.pageChanged(url)
             if (url != null && !isAllowedCommittedUrl(url, bound.origins)) {
                 leavePage(view, url, offerOnly = false)
                 return
@@ -780,6 +950,8 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
             if (view === entry?.webView) {
+                mediaConsent.cancel()
+                fileSelection.cancel()
                 // This callback has no main-frame flag. Conservatively keep
                 // the last successful metadata even if a subframe failed TLS.
                 bound.resumeState.failed(error.url)
@@ -795,6 +967,9 @@ class AppScreenActivity : AppCompatActivity() {
                 return true
             }
             if (current === entry) {
+                // native-observation-begin:render-gone
+                nativeRecord(AppScreenObservation.Stage.RENDER_GONE, current, nativeBoundViewIdentity)
+                // native-observation-end:render-gone
                 unbind(current)
                 entry = null
             }
@@ -810,7 +985,7 @@ class AppScreenActivity : AppCompatActivity() {
         }
     }
 
-    private inner class ScreenChromeClient : WebChromeClient() {
+    private inner class ScreenChromeClient(private val bound: AppScreenRegistry.Entry) : WebChromeClient() {
         override fun onCreateWindow(
             view: WebView,
             isDialog: Boolean,
@@ -844,21 +1019,18 @@ class AppScreenActivity : AppCompatActivity() {
             filePathCallback: ValueCallback<Array<Uri>>,
             fileChooserParams: FileChooserParams,
         ): Boolean {
-            pendingFileCallback?.onReceiveValue(null)
-            pendingFileCallback = filePathCallback
-            return try {
-                fileChooser.launch(fileChooserParams.createIntent())
-                true
-            } catch (_: ActivityNotFoundException) {
-                pendingFileCallback = null
-                false
-            }
+            fileSelection.begin(webView, filePathCallback) { fileChooserParams.createIntent() }
+            // Every branch either completes or retains the callback. Returning
+            // false after answering would also ask WebView to cancel it.
+            return true
         }
 
-        // Camera, microphone and location for app screens come later with an
-        // origin-named prompt; until then they are refused.
         override fun onPermissionRequest(request: PermissionRequest) {
-            request.deny()
+            mediaConsent.begin(request, bound.webView)
+        }
+
+        override fun onPermissionRequestCanceled(request: PermissionRequest) {
+            mediaConsent.canceledByWebView(request)
         }
 
         override fun onGeolocationPermissionsShowPrompt(
@@ -891,7 +1063,17 @@ class AppScreenActivity : AppCompatActivity() {
             setPadding(dp(6), 0, dp(6), 0)
         }
         bar.addView(hostView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        backButton = barButton("‹", "戻る") { entry?.webView?.takeIf { it.canGoBack() }?.goBack() }
+        backButton = barButton("‹", "戻る") {
+            // native-observation-begin:back-prefix
+            val nativeSubject = entry
+            val nativeViewId = nativeBoundViewIdentity
+            nativeRecord(AppScreenObservation.Stage.BACK_ENTER, nativeSubject, nativeViewId)
+            // native-observation-end:back-prefix
+            entry?.webView?.takeIf { it.canGoBack() }?.goBack()
+            // native-observation-begin:back-suffix
+            nativeRecord(AppScreenObservation.Stage.BACK_RETURN, nativeSubject, nativeViewId)
+            // native-observation-end:back-suffix
+        }
         bar.addView(backButton)
         bar.addView(barButton("↻", "再読み込み") { entry?.webView?.reload() })
         bar.addView(barButton("⋮", "メニュー") { showMenu(it) })
@@ -942,6 +1124,7 @@ class AppScreenActivity : AppCompatActivity() {
     private companion object {
         const val STATE_URL = "com.takosumi.appscreen.state.URL"
         const val STATE_GENERATION = "com.takosumi.appscreen.state.GENERATION"
+        const val STATE_FILE_PICKER = "com.takosumi.appscreen.state.FILE_PICKER"
         const val SHELL_SCHEME = "takosumi"
         const val PROMPT_COOLDOWN_MS = 5_000L
         const val BROWSER_VIEW_COOLDOWN_MS = 3_000L

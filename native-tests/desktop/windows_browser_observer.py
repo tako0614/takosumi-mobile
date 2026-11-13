@@ -50,11 +50,26 @@ from urllib.parse import urlsplit
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "cef-candidate"))
 from windows_smoke import Failure, ProcessTree, require, sandbox_evidence  # noqa: E402
+from windows_browser_fault import FAULT_EXIT, OwnedBrowser, WindowsProcesses, recovery_paths  # noqa: E402
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_MESSAGE = 16 * 1024 * 1024
 MARKER_WAIT = 30
 SETTLE_WAIT = 10
+# One pure read's bound through a starved DevTools channel; the same order
+# of storm the driver's 60s cancel-inspected bound already waits out.
+STARVED_READ_WAIT = 60
+# A live storm can outlast the base bound while the event stream keeps
+# arriving (run 43173821786: DOMStorage.enable starved the full 60 s under
+# ~90 s of observed renderer churn on the real site). A stream that is
+# still receiving events names a STARVED channel, not a dead one, so the
+# bound then extends in quiet-window steps while events keep landing, up to
+# the absolute cap; a channel that goes quiet fails at its own bound.
+STARVED_QUIET_WAIT = 15
+STARVED_MAX_WAIT = 240
+# The same bound for the dialog-cancel send loop: each timed-out send is
+# re-asked while the profile lives, until the shared storm bound.
+STARVED_SEND_WAIT = 60
 # The fixture site's documents: a navigation within a profile, or the boot
 # load of a new browser (the cef-candidate popup probe's 25 s load bound).
 LOAD_WAIT = 25
@@ -432,13 +447,39 @@ class WebSocket:
         accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
         require(headers.get("sec-websocket-accept") == accept, "WebSocket accept key mismatch")
 
+    # CDP_RECEIVE_OBSERVATION_BEGIN
+    def _observe_receive(self, stage, received=None):
+        try:
+            state = getattr(self, "last_receive_observation", None)
+            if stage == "start":
+                self.receive_observation_error = False
+            elif state is None:
+                return  # Do not attribute the constructor's HTTP handshake to a receive.
+            buffer, partial = self.buffer, self.partial
+            if type(buffer) is not bytes or (partial is not None and type(partial) is not bytearray):
+                raise ValueError("Invalid receive observation")
+            if stage == "read" and type(received) is not bytes:
+                raise ValueError("Invalid receive observation")
+            self.last_receive_observation = receive_observation(
+                state, stage, buffered=len(buffer), fragment=0 if partial is None else len(partial),
+                fragment_active=partial is not None, size=len(received) if stage == "read" else 0)
+        except Exception:
+            try:
+                self.receive_observation_error = True
+            except Exception:
+                pass
+    # CDP_RECEIVE_OBSERVATION_END
     def _fill(self, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            self._observe_receive("deadline")  # CDP_RECEIVE_OBSERVATION
             raise TimeoutError("WebSocket read timed out")
         self.sock.settimeout(remaining)
+        self._observe_receive("socket")  # CDP_RECEIVE_OBSERVATION
         chunk = self.sock.recv(65536)
+        self._observe_receive("read", chunk)  # CDP_RECEIVE_OBSERVATION
         if not chunk:
+            self._observe_receive("socket_closed")  # CDP_RECEIVE_OBSERVATION
             raise ConnectionError("WebSocket closed")
         self.buffer += chunk
 
@@ -460,7 +501,9 @@ class WebSocket:
                         mask = self.buffer[offset:offset + 4] if masked else None
                         payload = self.buffer[end - length:end]
                         self.buffer = self.buffer[end:]
+                        self._observe_receive("frame")  # CDP_RECEIVE_OBSERVATION
                         return bool(first & 0x80), first & 0x0F, mask_bytes(payload, mask) if mask else payload
+            self._observe_receive("frame_wait")  # CDP_RECEIVE_OBSERVATION
             self._fill(deadline)
 
     def send_text(self, text):
@@ -482,9 +525,11 @@ class WebSocket:
 
     def receive(self, deadline):
         """The next text message; TimeoutError when none completes in time."""
+        self._observe_receive("start")  # CDP_RECEIVE_OBSERVATION
         while True:
             fin, opcode, payload = self._frame(deadline)
             if opcode == 0x8:
+                self._observe_receive("frame_closed")  # CDP_RECEIVE_OBSERVATION
                 raise ConnectionError("WebSocket closed by the browser")
             if opcode == 0x9:
                 self._send(0xA, payload)
@@ -502,6 +547,7 @@ class WebSocket:
             require(len(self.partial) <= MAX_MESSAGE, "Oversized WebSocket message")
             if fin:
                 message, self.partial = bytes(self.partial), None
+                self._observe_receive("message_bytes")  # CDP_RECEIVE_OBSERVATION
                 return message.decode("utf-8")
 
     def close(self):
@@ -520,6 +566,140 @@ class CdpError(Failure):
         self.error = error
 
 
+# CDP_RECEIVE_OBSERVATION_BEGIN
+_RECEIVE_LIMIT = 2**31 - 1
+_RECEIVE_BOUNDARIES = ("start", "frame_wait", "socket", "read", "frame", "message_bytes",
+                       "deadline", "socket_closed", "frame_closed")
+_RECEIVE_NUMBERS = ("readsReturned", "bytesReceived", "frames", "bufferedBytes", "fragmentBytes")
+
+
+def receive_observation(state, stage, buffered=None, fragment=None, fragment_active=None, size=0):
+    """One receive call's closed progress; buffer/fragment bytes may predate this call."""
+    if type(stage) is not str:
+        raise ValueError("Invalid receive observation")
+    if stage == "start":
+        result = {"boundary": "start", "readsReturned": 0, "bytesReceived": 0, "frames": 0,
+                  "bufferedBytes": 0, "fragmentBytes": 0, "fragmentActive": False,
+                  "countsCapped": False, "closed": False}
+    else:
+        keys = set(_RECEIVE_NUMBERS) | {"boundary", "fragmentActive", "countsCapped", "closed"}
+        if type(state) is not dict or set(state) != keys:
+            raise ValueError("Invalid receive observation")
+        if type(state["boundary"]) is not str or state["boundary"] not in _RECEIVE_BOUNDARIES:
+            raise ValueError("Invalid receive observation")
+        if any(type(state[key]) is not int or not 0 <= state[key] <= _RECEIVE_LIMIT for key in _RECEIVE_NUMBERS):
+            raise ValueError("Invalid receive observation")
+        if any(type(state[key]) is not bool for key in ("fragmentActive", "countsCapped", "closed")):
+            raise ValueError("Invalid receive observation")
+        if ((not state["fragmentActive"] and state["fragmentBytes"] != 0)
+                or state["closed"] != (state["boundary"] in ("socket_closed", "frame_closed"))):
+            raise ValueError("Invalid receive observation")
+        result = dict(state)
+    if stage == "snapshot" and buffered is None and fragment is None and fragment_active is None:
+        return result
+    if (stage != "snapshot" and stage not in _RECEIVE_BOUNDARIES) or type(fragment_active) is not bool:
+        raise ValueError("Invalid receive observation")
+    for key, value in (("bufferedBytes", buffered), ("fragmentBytes", fragment)):
+        if type(value) is not int or value < 0:
+            raise ValueError("Invalid receive observation")
+        result["countsCapped"] |= value > _RECEIVE_LIMIT
+        result[key] = min(value, _RECEIVE_LIMIT)
+    result.update(boundary=result["boundary"] if stage == "snapshot" else stage, fragmentActive=fragment_active)
+    if stage == "read":
+        if type(size) is not int or size < 0:
+            raise ValueError("Invalid receive observation")
+        for key, increment in (("readsReturned", 1), ("bytesReceived", size)):
+            value = result[key] + increment
+            result["countsCapped"] |= value > _RECEIVE_LIMIT
+            result[key] = min(value, _RECEIVE_LIMIT)
+    if stage == "frame":
+        result["countsCapped"] |= result["frames"] == _RECEIVE_LIMIT
+        result["frames"] = min(result["frames"] + 1, _RECEIVE_LIMIT)
+    result["closed"] |= stage in ("socket_closed", "frame_closed")
+    return result
+
+
+def receive_snapshot(outcome, transport=None, observationError=False):
+    if type(outcome) is not str or outcome not in ("message", "timeout", "connection_error", "exception"):
+        raise ValueError("Invalid receive observation")
+    if type(observationError) is not bool:
+        raise ValueError("Invalid receive observation")
+    return {"outcome": outcome, "transport": None if observationError or transport is None else
+            receive_observation(transport, "snapshot"), "observationError": observationError}
+# CDP_RECEIVE_OBSERVATION_END
+# CDP_COMMAND_OBSERVATION_BEGIN
+# Closed metadata only: never store a method, label, session or message value.
+def command_observation(record, stage, **values):
+    if stage == "start":
+        ident = values["ident"]
+        return {"kind": "takosumi.cdp-command-observation@v1", "clockDomain": "host_monotonic",
+                "clockSource": "time.monotonic", "clockUnit": "s",
+                "commandId": ident if 0 <= ident <= 2**53 - 1 else None,
+                "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
+                "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending",
+                "lastReceive": None, "lastOtherReplyRelation": None}
+    if record is None:
+        return None
+    result = dict(record)
+    if stage == "wait":
+        result.update(sendReturned=True, sendReturnedAt=values["sent_at"], deadlineAt=values["deadline"],
+                      phase="receive", outcome="waiting")
+    elif stage == "message":
+        for name, increment in (("matchingReplies", values["matching"]),
+                                ("otherReplies", values["other"]), ("events", values["event"])):
+            if increment:
+                result["countsCapped"] |= result[name] == 2**31 - 1
+                result[name] = min(result[name] + 1, 2**31 - 1)
+        if values["other"]:
+            relation = command_reply_relation(values["reply_id"], values["ident"])
+            if type(relation) is not str or relation not in ("older", "future", "invalid", "unknown"):
+                raise ValueError("Invalid closed reply relation")
+            result["lastOtherReplyRelation"] = relation
+    elif stage == "receive":
+        result["lastReceive"] = receive_snapshot(**values["snapshot"])
+    elif stage == "end":
+        result.update(outcome=values["outcome"], phase="reply")
+    elif stage == "error":
+        result.update(sendReturned=values["sent"], channelClosed=values["closed"],
+                      phase=values["phase"], errorCategory=values["category"])
+        if result["outcome"] in ("sending", "waiting"):
+            result["outcome"] = "exception"
+    return result
+
+
+
+def command_reply_relation(reply_id, ident):
+    """Last nonmatching ID only; not proof of a late reply or a valid remote command.
+
+    Invalid means outside the positive exact-integer diagnostic range, not a
+    change to the original Python equality used to accept matching replies.
+    """
+    if type(reply_id) is not int or not 1 <= reply_id <= 2**53 - 1:
+        return "invalid"
+    if type(ident) is not int or not 1 <= ident <= 2**53 - 1 or reply_id == ident:
+        return "unknown"
+    return "older" if reply_id < ident else "future"
+
+
+def command_error_category(error, closed):
+    if closed:
+        return "channel_closed"
+    if isinstance(error, CdpError):
+        return "cdp_error"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ConnectionError):
+        return "connection"
+    if isinstance(error, OSError):
+        return "os"
+    if isinstance(error, json.JSONDecodeError):
+        return "json"
+    if isinstance(error, Failure):
+        return "failure"
+    return "other"
+# CDP_COMMAND_OBSERVATION_END
+
+
 class Cdp:
     """One browser's DevTools connection. Events are kept (the oldest dropped
     past 4096) and addressed by absolute marks."""
@@ -533,6 +713,9 @@ class Cdp:
         # When each mark was taken (monotonic); events carry their receipt
         # time as RECEIVED_AT, for dialog_evidence.
         self.marked_at = {}
+        self.last_command_observation = None
+        self.command_observation_error = False
+        self._last_receive_observation = None  # CDP_RECEIVE_OBSERVATION
 
     def mark(self):
         mark = self.base + len(self.events)
@@ -542,14 +725,34 @@ class Cdp:
     def since(self, mark):
         return self.events[max(0, mark - self.base):]
 
+    # CDP_RECEIVE_OBSERVATION_BEGIN
+    def _remember_receive(self, outcome):
+        try:
+            if isinstance(self.websocket, WebSocket):
+                self.websocket._observe_receive("snapshot")
+            self._last_receive_observation = receive_snapshot(
+                outcome, getattr(self.websocket, "last_receive_observation", None),
+                getattr(self.websocket, "receive_observation_error", False))
+            if self._last_receive_observation["observationError"]:
+                self.command_observation_error = True
+        except Exception:
+            self._last_receive_observation = {"outcome": outcome, "transport": None, "observationError": True}
+            self.command_observation_error = True
+    # CDP_RECEIVE_OBSERVATION_END
     def _next(self, deadline):
         try:
             message = json.loads(self.websocket.receive(deadline))
         except TimeoutError:
+            self._remember_receive("timeout")  # CDP_RECEIVE_OBSERVATION
             return None
         except (ConnectionError, OSError) as error:
+            self._remember_receive("connection_error")  # CDP_RECEIVE_OBSERVATION
             self.closed = str(error)
             raise Failure(f"DevTools connection of {self.label} ended: {error}") from None
+        except Exception:  # CDP_RECEIVE_OBSERVATION
+            self._remember_receive("exception")  # CDP_RECEIVE_OBSERVATION
+            raise  # CDP_RECEIVE_OBSERVATION
+        self._remember_receive("message")  # CDP_RECEIVE_OBSERVATION
         if "method" in message:
             message[RECEIVED_AT] = time.monotonic()
             self.events.append(message)
@@ -558,23 +761,59 @@ class Cdp:
                 self.base += 1024
         return message
 
+    # CDP_COMMAND_OBSERVATION_BEGIN
+    def _observe_command(self, stage, **values):
+        try:
+            if stage == "start":
+                self._last_receive_observation = None
+                self.last_command_observation = None
+                self.command_observation_error = False
+            if stage == "error":
+                values["category"] = command_error_category(values.pop("error"), values["closed"])
+            self.last_command_observation = command_observation(self.last_command_observation, stage, **values)
+        except Exception:
+            self.command_observation_error = True
+    # CDP_COMMAND_OBSERVATION_END
+
     def command(self, method, params=None, session=None, timeout=5.0):
         self.next += 1
         ident = self.next
         request = {"id": ident, "method": method, "params": params or {}}
         if session:
             request["sessionId"] = session
-        self.websocket.send_text(json.dumps(request))
-        deadline = time.monotonic() + timeout
-        while True:
-            message = self._next(deadline)
-            if message is None:
-                raise Failure(f"CDP timeout {method} ({self.label})")
-            if message.get("id") == ident:
-                if "error" in message:
-                    raise CdpError(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}",
-                                   message["error"])
-                return message.get("result", {})
+        self._observe_command("start", ident=ident)
+        sent, phase = False, "send"
+        try:
+            self.websocket.send_text(json.dumps(request))
+            sent = True
+            sent_at = time.monotonic()
+            deadline = sent_at + timeout
+            phase = "receive"
+            self._observe_command("wait", sent_at=sent_at, deadline=deadline)
+            while True:
+                message = self._next(deadline)
+                self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION
+                if message is None:
+                    self._observe_command("end", outcome="timeout")
+                    raise Failure(f"CDP timeout {method} ({self.label})")
+                reply_id = message.get("id")
+                if reply_id == ident:
+                    self._observe_command("message", matching=True, other=False, event="method" in message)
+                    phase = "reply"
+                    if "error" in message:
+                        self._observe_command("end", outcome="cdp_error")
+                        raise CdpError(f"CDP {method} failed ({self.label}): {json.dumps(message['error'])[:500]}",
+                                       message["error"])
+                    self._observe_command("end", outcome="success")
+                    return message.get("result", {})
+                else:
+                    self._observe_command("message", matching=False, other="id" in message, event="method" in message,
+                                          reply_id=reply_id, ident=ident)
+        except Exception as error:
+            if phase == "receive":  # CDP_RECEIVE_OBSERVATION
+                self._observe_command("receive", snapshot=self._last_receive_observation)  # CDP_RECEIVE_OBSERVATION
+            self._observe_command("error", sent=sent, closed=self.closed is not None, phase=phase, error=error)
+            raise
 
     def wait_event(self, predicate, mark, timeout, what):
         deadline = time.monotonic() + timeout
@@ -740,9 +979,10 @@ class Page:
     def send(self, method, params=None, timeout=5.0):
         return self.cdp.command(method, params, self.session, timeout)
 
-    def evaluate(self, expression, gesture=False):
+    def evaluate(self, expression, gesture=False, timeout=5.0):
         result = self.send("Runtime.evaluate", {"expression": expression, "returnByValue": True,
-                                                "awaitPromise": True, "userGesture": gesture})
+                                                "awaitPromise": True, "userGesture": gesture},
+                           timeout)
         require(not result.get("exceptionDetails"), json.dumps(result.get("exceptionDetails"))[:1000])
         return result["result"].get("value")
 
@@ -755,7 +995,7 @@ class Page:
 
 class Observer:
     def __init__(self, data, site, app_pid, phase, win32=None, real_site=None, installed=None,
-                 expect_sandbox=True):
+                 expect_sandbox=True, recovery_images=None, recovery_app_data=None):
         self.data, self.site, self.app_pid, self.phase = data, site, app_pid, phase
         # W7: each profile's browser must show Chromium's sandbox (False:
         # the unsandboxed candidate, recorded only).
@@ -763,6 +1003,8 @@ class Observer:
         # W6 (--packaged): the installed App's directory; each guard and
         # browser must run from its cef\ (installed_from).
         self.installed = installed
+        self.recovery_images = recovery_images
+        self.recovery_app_data = recovery_app_data
         # W4: the app link leads to this real site (None: the fixture's /app/).
         self.real = REAL_SITES[real_site] if real_site else None
         self.real_name = real_site
@@ -843,10 +1085,14 @@ class Observer:
         self.settled(lambda: self.guard_ended(receipt), message, bound)
         with open(receipt, "rb") as source:
             value = json.loads(source.read())
+        self.check_normal_receipt(value, message)
+        return value
+
+    @staticmethod
+    def check_normal_receipt(value, message):
         require(value["rootExit"] == 0 and value["complete"] is True and value["kernelNoChildren"] is True
                 and value["forcedCleanup"] == 0 and value["remaining"] == [] and value["cleanupErrors"] == []
                 and value["error"] is None, f"{message}: abnormal receipt {json.dumps(value)[:500]}")
-        return value
 
     def cookie_of(self):
         key = self.key
@@ -855,14 +1101,140 @@ class Observer:
 
     def sample(self, page):
         key = json.dumps(self.key)
-        return page.evaluate(
+        return self.read_evaluate(page,
             f"({{document:globalThis[{key}],storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
             "origin:location.origin,frame:window===top,page:document.querySelector('main')?.dataset.page??null,"
             "user:document.querySelector('main')?.dataset.user??null})")
 
+    def read_evaluate(self, page, expression, gesture=False):
+        """One pure read or same-effect write through a starved DevTools
+        channel. A busy renderer can starve one reply while the cancelled
+        quit's churn continues (run 42961067390: Photopea kept Work's
+        renderer busy through the post-cancel sample; run 42983025866:
+        Photopea starved even the reply to the beforeunload listener's own
+        removal). A timed-out evaluate still holds its queue position in
+        the renderer — run 43061069602 starved ELEVEN re-sent evaluates at
+        the back of a still-deep queue while the page's own tasks kept
+        running — so the bound is spent waiting on each request already
+        sent, not re-queuing behind the churn. Anything else raises."""
+        deadline = time.monotonic() + STARVED_READ_WAIT
+        attempts = 0
+        while True:
+            try:
+                value = page.evaluate(expression, gesture,
+                                      max(5.0, deadline - time.monotonic()))
+                break
+            except Failure as error:
+                if "CDP timeout" in str(error):
+                    attempts += 1
+                    self.proof.setdefault("starvedEvaluateRetries", []).append(
+                        {"attempt": attempts, "error": str(error)[:200]})
+                    if time.monotonic() < deadline:
+                        time.sleep(0.05)
+                        continue
+                raise
+        return value
+
+    def contended_sample(self, page, mark):
+        """A post-quit state read that never waits on the renderer's task
+        queue. A sustained ad-helper storm can starve a Runtime.evaluate
+        through its whole claimed-position bound (run 43068513364: the
+        Personal profile's single claimed position starved all 60 s while
+        ~20 renderer helpers kept spawning on the real site; run
+        43061069602 starved ELEVEN re-sent evaluates on Work). Every
+        element here is serviced by the browser process instead: the
+        frame tree's root frame gives the live document's origin, the
+        storage service answers localStorage, the network service answers
+        cookies, and the already-recorded event stream proves no
+        main-frame navigation committed or began and no renderer crash
+        landed since the given mark — together the same oracle the
+        evaluate sample proves: this document and its synthetic state are
+        unchanged (a killed-and-never-reloaded renderer would pass the
+        browser-serviced reads, so targetCrashed is part of the scan). A
+        frameRequestedNavigation alone is not a commit and
+        navigatedWithinDocument keeps the document, so neither counts; a
+        same-document fragment load on the root is refused rather than
+        risk a load in flight. An engine without the storage read
+        domains falls back to the claimed-position renderer read; the
+        oracle is unchanged."""
+        # Browser-serviced reads still ride the same DevTools channel: under
+        # the same storm that dispatched and answered every control-pipe
+        # command, run 43090171027 starved Page.getFrameTree's flat
+        # SETTLE_WAIT on Work. Each send here claims its queue position and
+        # waits on it against ONE shared storm bound; a timeout is recorded
+        # and re-sent only while the bound lasts, then raised on its own
+        # name — never masked by the storage-domain fallback below.
+        deadline = time.monotonic() + STARVED_READ_WAIT
+        hard_deadline = time.monotonic() + STARVED_MAX_WAIT
+        def starved(method, params=None):
+            nonlocal deadline
+            while True:
+                try:
+                    return page.send(method, params,
+                                     max(5.0, deadline - time.monotonic()))
+                except Failure as error:
+                    if "CDP timeout" not in str(error):
+                        raise
+                    now = time.monotonic()
+                    events = getattr(page.cdp, "events", ()) or ()
+                    quiet_for = now - events[-1].get(RECEIVED_AT, 0.0) if events else None
+                    storm_live = quiet_for is not None and quiet_for < STARVED_QUIET_WAIT
+                    self.proof.setdefault("starvedBrowserReadRetries", []).append(
+                        {"profile": page.process["profile"], "method": method,
+                         "error": str(error)[:200],
+                         "channelQuietSeconds": round(quiet_for, 1) if quiet_for is not None else None})
+                    if storm_live and now < hard_deadline:
+                        deadline = min(now + STARVED_QUIET_WAIT, hard_deadline)
+                        continue
+                    if now < deadline:
+                        time.sleep(0.05)
+                        continue
+                    raise
+        # getFrameTree itself has no storage-domain fallback: without the root
+        # frame's id the navigation scan below cannot run at all, so a missing
+        # Page domain or a destroyed target fails here on its own name.
+        tree = starved("Page.getFrameTree")["frameTree"]["frame"]
+        root = tree["id"]
+        origin = tree.get("securityOrigin")
+        if origin is None:
+            split = urlsplit(tree.get("url", ""))
+            origin = f"{split.scheme}://{split.netloc}"
+        try:
+            starved("DOMStorage.enable")
+            items = dict(starved("DOMStorage.getDOMStorageItems",
+                                 {"storageId": {"securityOrigin": origin, "isLocalStorage": True}})
+                         .get("entries") or [])
+            cookies = starved("Network.getCookies", {"urls": [origin]})["cookies"]
+            state = {"storage": items.get(self.key),
+                     "cookie": next((item["value"] for item in cookies if item["name"] == self.key), None),
+                     "origin": origin}
+        except CdpError as error:
+            self.proof.setdefault("browserSampleFallbacks", []).append(
+                {"profile": page.process["profile"], "error": str(error)[:200]})
+            state = self.sample(page)
+        require(page.cdp.base <= mark,
+                "Events covering the quit window were dropped; document continuity is unproven")
+        # A crashed renderer that never reloads still answers every
+        # browser-serviced read above while its document is gone — targetCrashed
+        # is session-scoped and emitted without Inspector.enable, so the stream
+        # already holds it. A same-document fragment change can fire
+        # frameStartedLoading on the root: refused rather than risk a load in
+        # flight, and hash churn is not part of the quit window's contract.
+        nav = next((event for event in page.cdp.since(mark)
+                    if event.get("sessionId") == page.session
+                    and (event["method"] == "Inspector.targetCrashed"
+                         or event["method"] == "Page.frameNavigated"
+                         and (event.get("params") or {}).get("frame", {}).get("id") == root
+                         or event["method"] == "Page.frameStartedLoading"
+                         and (event.get("params") or {}).get("frameId") == root)), None)
+        require(nav is None,
+                f"The quit window replaced, began replacing, or crashed the main document: "
+                f"{json.dumps(nav)[:300]}")
+        return state
+
     def persisted(self, page):
         key = json.dumps(self.key)
-        return page.evaluate(
+        return self.read_evaluate(page,
             f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()},"
             "page:document.querySelector('main')?.dataset.page??null,"
             "user:document.querySelector('main')?.dataset.user??null})")
@@ -1064,8 +1436,10 @@ class Observer:
         """W4: after the final quit request, a real site may ask its own
         beforeunload (the quit then waits for an answer). Accept only that
         (final_quit_dialog; recorded, as is a refused one) until every
-        remaining profile's guard has ended."""
+        remaining profile's guard has ended normally. Forced descendant
+        cleanup ends a guard too, but the App refuses that quit."""
         accepted = self.proof["finalQuitDialogsAccepted"] = []
+        receipts = self.proof["finalQuitReceipts"] = []
         marks = {id(page): page.cdp.mark() for page in pages}
         deadline = time.monotonic() + FINAL_QUIT_WAIT
         remaining = list(pages)
@@ -1073,6 +1447,13 @@ class Observer:
             require(time.monotonic() < deadline, "The final quit did not end every remaining profile")
             for page in list(remaining):
                 if self.guard_ended(page.process["guardReceipt"]):
+                    with open(page.process["guardReceipt"], "rb") as source:
+                        value = json.loads(source.read())
+                    receipts.append({"profile": page.process["profile"], "receipt": value})
+                    # Preserve the exact refusal before failing: otherwise
+                    # M3 marks this observer passed, then only reports the
+                    # outer App timeout because the App retained the profile.
+                    self.check_normal_receipt(value, f"Final quit for {page.process['profile']}")
                     remaining.remove(page)
                     continue
                 try:
@@ -1116,6 +1497,75 @@ class Observer:
             return []
         return [line[:300] for line in text.splitlines() if RAISE_REFUSED in line]
 
+    def answer_permission(self, page):
+        """The App-held prompt round trip. The page asks for a notification
+        permission under user activation; this opted-in browser holds the
+        runtime callback open and reports it on the pipe instead of showing
+        its own prompt. The permission-requested checkpoint hands the prompt
+        to the App driver, whose click on the home's own row answers it; the
+        page's resolved value is the evidence, never assumed."""
+        self.step("notification permission answered through the App", page)
+        key = json.dumps("__sumiPermissionProbe")
+        state = page.evaluate(
+            f"(()=>{{const g=globalThis[{key}]={{result:null,error:null}};"
+            f"g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));"
+            f"return {{permission:Notification.permission}};}})()", True)
+        require(state["permission"] == "default",
+                f"A held prompt needs an undecided permission: {state}")
+        self.checkpoint("permission-requested")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            # A busy renderer can starve one poll's reply (run 42983025866's
+            # family); this loop already re-asks within its own 30 s bound,
+            # so a starved read just means ask again rather than fail the
+            # whole step on the first starved reply.
+            try:
+                state = page.evaluate(
+                    f"(()=>({{permission:Notification.permission,result:globalThis[{key}].result,"
+                    f"error:globalThis[{key}].error}}))()", True)
+            except Failure as error:
+                if "CDP timeout" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                continue
+            if state["result"] or state["error"]:
+                break
+            time.sleep(0.2)
+        require(state.get("result") == "granted",
+                f"The App's answer did not reach the held callback: {state}")
+        entry = dict(state, profile=page.process["profile"])
+        self.proof["permissionAnswered"] = entry
+        self.case("permission-answered-by-app", entry)
+        return entry
+
+    def media_dismissal(self, page):
+        """A held media request has no runtime dismissal of its own: it
+        retires with its document. The page raises a real getUserMedia; the
+        driver confirms the App's held row and records its label, then the
+        page reloads — the row's disappearance (asserted by the driver) is
+        the retirement evidence, never the request's own promise. Runs only
+        where the driver also opted in via the shared flag."""
+        if os.environ.get("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL") != "1":
+            return
+        self.step("media permission held for the App then retired with its document", page)
+        key = json.dumps("__sumiMediaProbe")
+        state = page.evaluate(
+            f"(()=>{{const g=globalThis[{key}]={{stream:null,error:null,settled:false}};"
+            f"g.promise=navigator.mediaDevices.getUserMedia({{audio:true}})"
+            f".then(s=>{{g.stream=s;g.settled=true;return s}},e=>{{g.error=String(e);g.settled=true}});"
+            f"return {{devices:typeof navigator.mediaDevices!=='undefined',secure:isSecureContext}};}})()", True)
+        require(state and state["devices"] is True,
+                f"A held media request needs navigator.mediaDevices: {state}")
+        self.checkpoint("media-requested")
+        held = self.marker("media-held-seen.json")
+        page.evaluate("(()=>{location.reload();return true})()", True)
+        self.checkpoint("media-navigated")
+        # The reload replaces the document; let it arrive before the next
+        # evaluation (a page between documents fails Runtime.evaluate).
+        self.settled(lambda: page.evaluate("document.readyState") == "complete",
+                     "The reloaded document did not come back", MARKER_WAIT, tolerate=True)
+        self.proof["mediaRetired"] = {"requested": True, "secure": state.get("secure"),
+                                      "heldLabel": held.get("label")}
+
     def dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
         return page.cdp.wait_event(
             lambda event: event["method"] == "Page.javascriptDialogOpening" and event.get("sessionId") == page.session
@@ -1134,12 +1584,46 @@ class Observer:
         (dialog_failure) before it goes on."""
         attempt = time.monotonic()
         try:
-            try:
-                page.send("Page.handleJavaScriptDialog", {"accept": False})
-            except CdpError as error:
-                if not (self.real and opened is not None and error.error.get("message") == NO_DIALOG):
+            send_deadline = attempt + STARVED_SEND_WAIT
+            send_retry = 0
+            while True:
+                try:
+                    page.send("Page.handleJavaScriptDialog", {"accept": False})
+                    break
+                except CdpError as error:
+                    no_dialog = error.error.get("message") == NO_DIALOG
+                    if self.real and opened is not None and no_dialog:
+                        return self.cancelled_by_browser(page, what, opened, attempt, error)
+                    # Only after a starved send may "no dialog" mean that send
+                    # landed late; before any send it means the browser closed
+                    # the dialog itself, which the fixture run must refuse.
+                    if no_dialog and send_retry and self.dialog_cancelled_close(page, mark) is not None:
+                        return "observer"
                     raise
-                return self.cancelled_by_browser(page, what, opened, attempt, error)
+                except Failure as error:
+                    # A busy renderer can starve one DevTools reply while the
+                    # dialog stays open (run 42953633716: Photopea kept
+                    # spawning renderers through Work's whole cancel window;
+                    # run 42971293681 exhausted all three blind sends). A
+                    # timed-out send may still land: the dialog's own close,
+                    # not another blind send, decides what happened — and a
+                    # dead profile cannot be answered at all.
+                    if "CDP timeout" not in str(error) or time.monotonic() >= send_deadline:
+                        raise
+                    send_retry += 1
+                    self.proof.setdefault("dialogSendRetries", []).append(
+                        {"attempt": send_retry, "error": str(error)[:200]})
+                    page.cdp.drain(0.5)
+                    if self.dialog_cancelled_close(page, mark) is not None:
+                        # The timed-out send landed: on a real site record
+                        # through the browser-cancel path (which send or actor
+                        # delivered it is unknowable); on the fixture it is
+                        # the observer's own cancel.
+                        if self.real and opened is not None:
+                            return self.cancelled_by_browser(page, what, opened, attempt, error)
+                        return "observer"
+                    require(not self.guard_ended(page.process["guardReceipt"]),
+                            f"{what}: the profile ended while its cancel starved")
             page.cdp.wait_event(
                 lambda event: event["method"] == "Page.javascriptDialogClosed"
                 and event.get("sessionId") == page.session and event["params"].get("result") is False,
@@ -1170,6 +1654,15 @@ class Observer:
             if RECEIVED_AT in closed and RECEIVED_AT in opened else None,
             "cancelAfterOpening": round(attempt - opened[RECEIVED_AT], 3) if RECEIVED_AT in opened else None})
         return "browser"
+
+    def dialog_cancelled_close(self, page, mark):
+        """The page session's javascriptDialogClosed with result false among
+        the events since `mark` — the only proof a held dialog was cancelled,
+        whichever send or actor delivered it."""
+        return next((event for event in page.cdp.since(mark)
+                     if event["method"] == "Page.javascriptDialogClosed"
+                     and event.get("sessionId") == page.session
+                     and event["params"].get("result") is False), None)
 
     def dialog_failure(self, what, watched, error, opened=None, attempt=None):
         """Diagnostics only, after a failed dialog step: for each watched
@@ -1204,6 +1697,163 @@ class Observer:
                         entry["guardReceipt"] = json.loads(source.read())
             except Exception as failure:  # diagnostics only: keep the original failure
                 entry["evidenceError"] = repr(failure)[:300]
+
+    def popup_loaded(self, evaluate, url):
+        """Same load bound as the cef-candidate and Linux popup probes: the
+        requested fixture page itself, not the new window's initial
+        about:blank. The navigation entry keeps the URL actually loaded."""
+        deadline = time.monotonic() + LOAD_WAIT
+        loaded = False
+        while time.monotonic() < deadline and not loaded:
+            try:
+                loaded = bool(evaluate(
+                    f"performance.getEntriesByType('navigation')[0]?.name==={json.dumps(url)}"
+                    "&&document.readyState==='complete'"
+                    "&&Boolean(document.querySelector('main[data-page]'))"))
+            except Failure:
+                # A page between documents counts as not yet.
+                loaded = False
+            if not loaded:
+                time.sleep(0.1)
+        require(loaded, "Popup document must load the requested fixture page")
+
+    def work_popup_probe(self, work, personal, expected):
+        """A sign-in style popup on the local fixture: window.open from Work
+        opens a native popup inside Work's own browser process (same
+        profile). It shares Work's storage and cookie, reports Work as its
+        opener, and hands a result back by postMessage before closing
+        itself; Personal sees neither. Synthetic state, not provider login.
+        Mirrors the Linux runner's popupProbe."""
+        state = {"method": "Standard window.open/postMessage/window.close on the local fixture site; "
+                           "synthetic state, not provider login"}
+        ref = f"sumi_popup_{self.nonce.replace('-', '')}"
+        url = f"{self.site}/?{ref}"
+        result = f"popup:{self.nonce}"
+        key = json.dumps(self.key)
+
+        def page_targets(page):
+            return [target for target in page.cdp.command("Target.getTargets")["targetInfos"]
+                    if target["type"] == "page"]
+
+        require([target["targetId"] for target in page_targets(work)] == [work.target["targetId"]],
+                "Work must have one document before its popup")
+        state["accepted"] = work.evaluate(
+            "(()=>{window.__sumiMessages=[];window.__sumiOnMessage=e=>{"
+            f"if(e.data?.sumi==={json.dumps(self.nonce)})window.__sumiMessages.push("
+            f"{{origin:e.origin,fromPopup:e.source===globalThis[{json.dumps(ref)}],data:e.data}})"
+            "};addEventListener('message',window.__sumiOnMessage);"
+            f"globalThis[{json.dumps(ref)}]=window.open({json.dumps(url)},{json.dumps(ref)},"
+            "'popup,width=600,height=500');"
+            f"return Boolean(globalThis[{json.dumps(ref)}])}})()",
+            True)
+        require(state["accepted"] is True, "Popup request must be accepted")
+        target = {}
+
+        def appeared():
+            found = [item for item in page_targets(work) if item["targetId"] != work.target["targetId"]]
+            require(len(found) <= 1, "Unexpected popup family")
+            target.update(next((item for item in found
+                                if item.get("openerId") == work.target["targetId"]), {}))
+            return bool(target)
+        self.settled(appeared, "Popup did not appear in Work's own browser process")
+        state["target"] = {"targetId": target["targetId"], "openerId": target.get("openerId"),
+                           "url": target.get("url")}
+        require([item["targetId"] for item in page_targets(personal)] == [personal.target["targetId"]],
+                "The popup must not appear in Personal")
+        session = work.cdp.command("Target.attachToTarget",
+                                   {"targetId": target["targetId"], "flatten": True})["sessionId"]
+
+        def evaluate(expression, gesture=False):
+            value = work.cdp.command("Runtime.evaluate",
+                                     {"expression": expression, "returnByValue": True,
+                                      "awaitPromise": True, "userGesture": gesture}, session)
+            require(not value.get("exceptionDetails"), json.dumps(value.get("exceptionDetails"))[:1000])
+            return value["result"].get("value")
+
+        self.popup_loaded(evaluate, url)
+        state["context"] = evaluate(
+            "({href:location.href,origin:location.origin,secure:isSecureContext,"
+            "opener:window.opener!==null,openerOrigin:window.opener?.location.origin,"
+            "tauri:typeof __TAURI_INTERNALS__,ipc:typeof window.ipc,"
+            "wry:typeof window.webkit?.messageHandlers?.ipc,webview2:typeof window.chrome?.webview})")
+        require(state["context"]["origin"] == self.site, "The popup must load the fixture origin")
+        require(state["context"]["secure"] is True, "The popup document must be a secure context")
+        require(state["context"]["opener"] is True and state["context"]["openerOrigin"] == self.site,
+                "The popup must keep Work as its opener")
+        for field in ("tauri", "ipc", "wry", "webview2"):
+            require(state["context"][field] == "undefined",
+                    f"A CEF popup must not see the App's {field} bridge")
+        state["sharedBefore"] = evaluate(
+            f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()}}})")
+        require(state["sharedBefore"] == {"storage": expected[0]["storage"], "cookie": expected[0]["cookie"]},
+                "The popup must share Work's storage and cookie")
+        evaluate(
+            f"(()=>{{localStorage.setItem({key},{json.dumps(result)});"
+            f"document.cookie={json.dumps(self.key + '=' + result + '; Max-Age=86400; Path=/; Secure; SameSite=Lax')};"
+            f"window.opener.postMessage({{sumi:{json.dumps(self.nonce)},result:{json.dumps(result)}}},"
+            f"{json.dumps(self.site)});setTimeout(()=>window.close(),0);return true}})()",
+            True)
+
+        def closed_back():
+            return (work.evaluate(f"globalThis[{json.dumps(ref)}].closed") is True
+                    and not any(item["targetId"] == target["targetId"] for item in page_targets(work)))
+        self.settled(closed_back, "Popup did not close back to Work")
+        state["messages"] = work.evaluate("window.__sumiMessages")
+        require(state["messages"] == [{"origin": self.site, "fromPopup": True,
+                                       "data": {"sumi": self.nonce, "result": result}}],
+                "Work must receive exactly its popup's result")
+        state["workAfter"] = work.evaluate(
+            f"({{storage:localStorage.getItem({key}),cookie:{self.cookie_of()}}})")
+        require(state["workAfter"] == {"storage": result, "cookie": result},
+                "Work must see the state its popup wrote")
+        require(self.sample(personal) == expected[1],
+                "Personal must see neither the popup nor its state")
+        # Restore Work's first-launch state, which the later phases check.
+        work.evaluate(
+            f"(()=>{{localStorage.setItem({key},{json.dumps(expected[0]['storage'])});"
+            f"document.cookie={json.dumps(self.key + '=' + expected[0]['cookie'] + '; Max-Age=86400; Path=/; Secure; SameSite=Lax')};"
+            "removeEventListener('message',window.__sumiOnMessage);delete window.__sumiOnMessage;"
+            f"delete window.__sumiMessages;delete globalThis[{json.dumps(ref)}];return true}})()")
+        require(self.sample(work) == expected[0], "Work must keep its document after the popup")
+        state["passed"] = True
+        return state
+
+    def open_popup_for_quit(self, page):
+        """A popup left open when the App quits closes with its profile: the
+        native close chain covers it, and the runner then requires a normal
+        guard and App exit. Quit only after the popup's own document
+        loaded, so its native browser exists in the profile's close
+        chain. Mirrors the Linux runner's openPopupForQuit."""
+        ref = f"sumi_quit_popup_{self.nonce.replace('-', '')}"
+        url = f"{self.site}/?{ref}"
+        accepted = page.evaluate(
+            f"(()=>{{globalThis[{json.dumps(ref)}]=window.open({json.dumps(url)},{json.dumps(ref)},"
+            "'popup,width=500,height=400');"
+            f"return Boolean(globalThis[{json.dumps(ref)}])}})()",
+            True)
+        require(accepted is True, "Popup request must be accepted")
+        target = {}
+
+        def appeared():
+            found = [item for item in page.cdp.command("Target.getTargets")["targetInfos"]
+                     if item["type"] == "page" and item.get("openerId") == page.target["targetId"]]
+            target.update(found[0] if found else {})
+            return bool(target)
+        self.settled(appeared, "Popup did not appear before the final quit")
+        session = page.cdp.command("Target.attachToTarget",
+                                   {"targetId": target["targetId"], "flatten": True})["sessionId"]
+
+        def evaluate(expression):
+            value = page.cdp.command("Runtime.evaluate", {"expression": expression, "returnByValue": True},
+                                     session)
+            require(not value.get("exceptionDetails"), json.dumps(value.get("exceptionDetails"))[:1000])
+            return value["result"].get("value")
+
+        self.popup_loaded(evaluate, url)
+        observed = evaluate("({navigation:performance.getEntriesByType('navigation')[0]?.name??null,"
+                            "href:location.href,ready:document.readyState})")
+        return {"targetId": target["targetId"], "openerId": target.get("openerId"),
+                "profile": page.process["profile"], "requested": url, "observed": observed}
 
     def first_launch(self):
         win = self.win
@@ -1369,6 +2019,15 @@ class Observer:
                 f"Work's GUI thread focus record could not be captured: {json.dumps(evidence['threadFocus'])}")
         self.case("reuse-raises-window", evidence)
 
+        if not self.real:
+            # A sign-in style popup on the local fixture site only: the real
+            # sites are anonymous and use their own content. The case name
+            # sits between reuse and the quit cases in OBSERVED_CASES, from
+            # which real-site runs exclude it too.
+            self.step("Work same-origin popup", work)
+            self.proof["popup"] = self.work_popup_probe(work, personal, expected)
+            self.case("work-same-origin-popup", self.proof["popup"])
+
         # Chrome's real beforeunload path needs sticky user activation. CDP's
         # userGesture is synthetic and is reported as such, not a real click.
         self.step("Work beforeunload setup", work)
@@ -1441,7 +2100,17 @@ class Observer:
                           "delete window.__sumiBeforeUnload;return true})()")
         self.case("quit-partial-order", {"workReceipt": self.proof["workClosedFirst"],
                                          "dialog": self.proof["partialDialog"], "dialogClosedBy": closed_by})
+        # The opted-in browser holds Personal's permission prompt for the
+        # App's own answer: this run's checkpoint hands it to the driver,
+        # whose click on the home row grants it before the final quit.
+        self.answer_permission(personal)
+        self.media_dismissal(personal)
         self.step("Personal final exit", personal)
+        if not self.real:
+            # Personal's own popup stays open for the final quit: its native
+            # browser is inside the profile's close chain, and the run's
+            # normal receipts cover it (mirrors the Linux runner).
+            self.proof["finalPopup"] = self.open_popup_for_quit(personal)
         self.checkpoint("request-final-exit")
         if self.real:
             self.finish_final_quit([personal])
@@ -1487,9 +2156,127 @@ class Observer:
         except Exception as error:  # diagnostics only
             self.proof["failureForeground"] = {"error": str(error)}
 
+    def recovery(self):
+        """Fresh-case, same-running-App recovery, with one explicit owned fault."""
+        require(not self.real and self.installed is None and self.recovery_images and self.recovery_app_data,
+                "Recovery requires the standalone synthetic-site fixture and exact process images")
+        api = WindowsProcesses(self.win.kernel32)
+        initial = self.proof["opened"] = self.marker("app-browser-process-recover-initial.json")
+        work, personal = [self.attach(self.process_of(initial, name)) for name in ("Work", "Personal")]
+
+        def held(process, allow_fault=False):
+            return OwnedBrowser(api, {"app": self.app_pid, "guard": process["pid"],
+                                     "browser": process["opened"]["nativePid"]},
+                                self.recovery_images, allow_fault)
+
+        def data(page):
+            value = self.sample(page)
+            return {name: value.get(name) for name in ("document", "storage", "cookie", "user")}
+
+        def cache_identity(process):
+            paths = recovery_paths(process, self.recovery_app_data, self.data / "r")
+            result = {}
+            for name in ("root", "cache"):
+                path = paths[name]
+                info = path.lstat()
+                require(path.is_dir() and not path.is_symlink() and info.st_ino > 0
+                        and not (getattr(info, "st_file_attributes", 0) & 0x400),
+                        "Plain identifiable cache directory required")
+                result[name] = {"device": info.st_dev, "inode": info.st_ino}
+            return result
+
+        with held(personal.process) as other:
+            for index, page in enumerate((work, personal)):
+                self.sign_in(page, ("work", "personal")[index])
+                key, value = json.dumps(self.key), json.dumps(f"{index}:{self.nonce}")
+                cookie = json.dumps(f"{self.key}={index}:{self.nonce}; Max-Age=86400; Path=/; Secure; SameSite=Lax")
+                page.evaluate(f"(()=>{{globalThis[{key}]={value};localStorage.setItem({key},{value});"
+                              f"document.cookie={cookie};return true}})()")
+            expected = [data(page) for page in (work, personal)]
+            require([value["cookie"] for value in expected] == [f"0:{self.nonce}", f"1:{self.nonce}"],
+                    "Both recovery seeds must exist in their separate profiles")
+            self.win.close(work.native["windowId"])
+            seed_receipt = self.normal_receipt(work.process["guardReceipt"], "Work seed must close normally")
+            self.proof["seedNormal"] = seed_receipt
+            self.checkpoint("recover-seeded")
+
+            before = self.marker("app-browser-process-recover-before.json")
+            crashed = self.attach(self.process_of(before, "Work"))
+            saved = dict(expected[0], document=None)
+            require(data(crashed) == saved, "Recovery input must be durable before the induced crash")
+            require(data(personal) == expected[1], "Personal changed before the induced crash")
+            cache_before = cache_identity(crashed.process)
+            with held(crashed.process, allow_fault=True) as target:
+                self.proof["fault"] = target.fault()
+                self.settled(lambda: self.guard_ended(crashed.process["guardReceipt"]),
+                             "The exact crash guard must finish", 30)
+                target.guard_ended()
+                receipt = json.loads(Path(crashed.process["guardReceipt"]).read_bytes())
+                require(type(receipt.get("rootExit")) is int and receipt["rootExit"] == FAULT_EXIT
+                        and receipt.get("complete") is True and receipt.get("kernelNoChildren") is True
+                        and receipt.get("remaining") == [] and receipt.get("cleanupErrors") == []
+                        and receipt.get("nonFatalErrors") == [] and receipt.get("error") is None
+                        and type(receipt.get("forcedCleanup")) is int and receipt["forcedCleanup"] >= 0,
+                        "The injected failure must have an exact, conclusive abnormal receipt")
+                self.proof["injectedAbnormal"] = receipt
+                other.validate()
+                self.checkpoint("recover-crashed")
+
+                offered = self.marker("app-browser-process-recover-offered.json")
+                require(offered == before["processes"], "Ordinary open must only offer recovery")
+                require(data(personal) == expected[1], "Offering recovery changed Personal")
+                self.case("recovery-requires-consent")
+                self.checkpoint("recover-consent")
+                reopened = self.marker("app-browser-process-recover-open.json")
+                require(reopened.get("explicitRecovery") is True and reopened["connections"] == before["connections"],
+                        "Explicit recovery must retain the exact saved connections")
+                fresh = self.process_of(reopened, "Work")
+                require(self.process_of(reopened, "Personal") == self.process_of(before, "Personal"),
+                        "Personal's native ownership changed during recovery")
+                require(fresh["profile"] == crashed.process["profile"]
+                        and fresh["directory"] == crashed.process["directory"]
+                        and fresh["pid"] != crashed.process["pid"]
+                        and fresh["opened"]["nativePid"] != crashed.native["nativePid"],
+                        "Recovery must reuse the profile/directory with new native processes")
+                recovered = self.attach(fresh)
+                with held(fresh) as replacement:
+                    require(all(replacement.identities[role]["created"] >= target.identities[role]["created"]
+                                for role in ("guard", "browser")), "Replacement generation predates the crash")
+                    require(data(recovered) == saved and cache_identity(fresh) == cache_before,
+                            "Recovery replaced the saved data or cache directories")
+                    self.case("recovery-keeps-settled-data")
+                    other.validate()
+                    require(data(personal) == expected[1], "Recovery changed Personal's document or data")
+                    self.case("recovery-preserves-other-profile")
+                    incidents = list((Path(fresh["directory"]) / "recoveries").iterdir())
+                    require(len(incidents) == 1, "One recovery incident must retain the abnormal generation")
+                    incident_file = incidents[0]
+                    info = incident_file.lstat()
+                    require(incident_file.is_file() and not incident_file.is_symlink()
+                            and not (getattr(info, "st_file_attributes", 0) & 0x400)
+                            and info.st_nlink == 1 and 0 < info.st_size <= 1024 * 1024,
+                            "A bounded plain recovery incident is required")
+                    incident = json.loads(incident_file.read_bytes())
+                    require(incident.get("schema") == 1 and incident.get("profile") == fresh["profile"]
+                            and incident.get("guardPid") == crashed.process["pid"]
+                            and incident.get("nativePid") == crashed.native["nativePid"]
+                            and incident.get("receipt") == receipt,
+                            "The original abnormal receipt must survive unchanged in the incident")
+                    self.proof["incident"] = incident
+                    self.case("recovery-retains-abnormal-receipt")
+                    for page in (recovered, personal):
+                        self.sandbox(page.process, "recovery-final")
+                    replacement.validate()
+                    self.proof["reopened"] = reopened
+                    self.proof["cacheIdentity"] = cache_before
+                    self.checkpoint("recover-inspected")
+        self.proof["passed"] = True
+
     def run(self):
         try:
-            if self.phase:
+            if self.phase == "recover":
+                self.recovery()
+            elif self.phase:
                 self.relaunch(self.phase)
             else:
                 self.first_launch()
@@ -1515,7 +2302,10 @@ def main():
     parser.add_argument("--data", type=Path, required=True, help="the runner's session directory")
     parser.add_argument("--site", required=True, help="the fixture site origin")
     parser.add_argument("--app-pid", type=int, required=True)
-    parser.add_argument("--phase", default="", choices=["", "restart", "reset"])
+    parser.add_argument("--phase", default="", choices=["", "restart", "reset", "recover"])
+    for role in ("app", "guard", "browser"):
+        parser.add_argument(f"--recovery-{role}", type=Path)
+    parser.add_argument("--recovery-app-data", type=Path)
     parser.add_argument("--real-site", choices=sorted(REAL_SITES), help="W4: the app link's real site")
     parser.add_argument("--installed", type=Path,
                         help="W6: the installed App's directory; its guards and browsers must run from its cef")
@@ -1524,12 +2314,22 @@ def main():
     args = parser.parse_args()
     if args.real_site and args.phase:
         parser.error("--real-site runs the first launch only")
+    recovery_images = {role: str(getattr(args, f"recovery_{role}")) for role in ("app", "guard", "browser")}
+    if args.phase == "recover" and (args.installed or args.real_site or args.recovery_app_data is None or
+                                    any(getattr(args, f"recovery_{role}") is None for role in recovery_images)):
+        parser.error("--phase recover needs exact App/guard/browser paths and a standalone synthetic site")
+    if args.phase != "recover":
+        if args.recovery_app_data is not None or any(getattr(args, f"recovery_{role}") is not None
+                                                   for role in recovery_images):
+            parser.error("Recovery process paths are only accepted with --phase recover")
+        recovery_images = None
     if os.name != "nt":
         parser.error("windows_browser_observer.py runs on Windows")
     data = args.data.resolve(strict=True)
     require((data / ".owned-browser-reference").is_file(), "No owned session directory")
     Observer(data, args.site, args.app_pid, args.phase, Win32(), args.real_site, args.installed,
-             expect_sandbox=not args.unsandboxed_candidate).run()
+             expect_sandbox=not args.unsandboxed_candidate, recovery_images=recovery_images,
+             recovery_app_data=args.recovery_app_data).run()
 
 
 if __name__ == "__main__":

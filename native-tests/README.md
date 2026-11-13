@@ -1,7 +1,28 @@
 # App-screen native tests
 
-These tests exercise the product's plain WebViews. They do not sign in to any
-real service, use provider/DB/SSO credentials, or qualify distribution.
+This directory contains native Web-app fixtures and SDK-free runner controls.
+They do not sign in to real accounts, use provider/DB/SSO credentials, or qualify distribution.
+
+## Portable desktop runner controls
+
+CI keeps the isolated Chromium case's top-level `browser.log` and `guard.json`
+after startup failure, plus `receipt.json` when the case succeeds.
+Run43297320017 timed out during CDP discovery before opening the
+shared UI; retaining stderr and the guard receipt makes that boundary
+inspectable. Profiles, Vite scratch and recursive browser data are excluded.
+Collection does not retry startup, extend its 20-second budget or pass the UI.
+
+When changing the desktop runners or their CI workflow, run the shared
+runner/protocol/workflow controls with Python 3's standard library:
+
+```bash
+python3 -B native-tests/desktop/test_windows_browser_process.py
+```
+
+These controls start no App, SDK, browser or external service. CI runs them
+in Quality as well as the native Windows jobs, so a stale workflow contract
+cannot hide behind a successful portable Web build. Native build, OS input,
+packaged startup and process-cleanup qualification remain separate.
 
 ## Public Web-app operation probe (experimental)
 
@@ -94,6 +115,23 @@ CEF experiments are separate from this GTK repair and Tauri App integration.
 
 ## Whole App iOS Simulator SDK build
 
+Normal iOS init uses the product-owned `src-tauri/ios-project.yml` through the
+supported Tauri config hook. It preserves CLI2.11.4's template and adds only
+an explicit OS Swift runpath before bundled back-deployment frameworks. The
+whole-App Simulator originally aborted in dyld because its embedded Swift
+concurrency library could not resolve `@rpath/libswiftCore.dylib`. Existing
+generated projects need regeneration from the repository root after this
+template change. The candidate has no signing, platform-only SDK override or
+manual runtime-copy step in the product template; native launch qualification
+remains pending.
+
+The SDK script inspects actual App/runtime bytes with the installed `otool`,
+requires the intended main-image runpath order, and keeps load commands,
+dependencies and image hashes in `swift-runtime-proof.json` outside the App.
+That artifact is retained even if the route check fails; the later UI runner
+binds it to the SDK checkout and actual App/runtime hashes. This search-route
+check is not complete loader-closure or launch qualification.
+
 On a disposable macOS checkout with Xcode, CocoaPods, Rust and Bun:
 
 ```bash
@@ -116,19 +154,253 @@ The normal kit Apple push writer runs again after regeneration; the development
 entitlement must survive before compilation. This is wiring evidence, not push delivery.
 It requires one nonempty Simulator `.app` with the exact fixture identifier
 and Simulator platform, rejects a device IPA, and prints the executable digest.
-CI runs this after the macOS desktop compile, serialized with the other desktop
-SDK checks. The desktop matrix waits for the native job to finish but still
-runs if that independent job fails; a native failure keeps the workflow red.
-Quality failure or workflow cancellation prevents the matrix from running.
+CI builds this SDK in the whole-App job, separate from the desktop matrix and
+its standalone download case. Both jobs wait for `native-plugins` and still
+run if that job fails, provided Quality passed; the native failure stays red.
+Quality failure or workflow cancellation prevents these jobs from running.
 The SDK lane uses the standard `macos-26-intel` runner after hosted arm64
 capacity prevented job acquisition. It compiles the host's x86_64 Simulator
 target; Apple Silicon/iOS device runtime remains separate qualification.
 This is an SDK compile check: it does not install or launch the App,
 test WKWebsiteDataStore isolation, authenticate, or qualify APNs/distribution.
 Simulator/device runtime checks remain separate from the portable Swift policy tests.
-Compiler caches are saved after non-cancelled SDK failures as well as success,
-so a source repair can reuse completed compilation. Failed checks stay failed;
-cached compiler files are not accepted App artifacts or runtime evidence.
+The SDK/whole-App job restores the existing desktop compiler cache read-only,
+without another cache writer. Failed checks stay failed; cached compiler
+files are not accepted App artifacts or runtime evidence.
+
+The separate [whole-App Web-home fixture](ios/web-home-fixture/README.md) is
+a source candidate that installs this exact Simulator App and drives its
+connection form, synthetic Web authentication/home/apps, native navigation,
+profile separation, warm/cold resume and explicit profile reset. Its native
+result remains pending; SDK compilation and the standalone download host do
+not qualify that whole-App flow.
+
+### Android original-response comparison
+
+The standalone [Gecko download fixture](android/gecko-download-fixture/README.md)
+compares original cookie/Blob response streams, UUID context isolation/reopen and
+cancel/close cleanup on loopback HTTP. The separate anonymous Photopea operation
+case requires real HTTPS file Open, document retention across profile switches
+and original-response OS export with exact PNG pixels. Its Java-only toolchain
+and pinned engine remain separate from product adoption; source/API compilation
+does not qualify those native operations, profile-clear completion or real IdP.
+
+### iOS download runtime qualification
+
+At the boot-status wait deadline, the runner can observe that the same CLI has
+already exited successfully. It accepts this only together with the latest
+native terminal `Finished` record, and saves that paired readback. If the native
+boot finished but the CLI is still live, it waits for that same child once within
+the remaining total boot budget below. There is no reboot or new CLI attempt.
+An unfinished/nonzero CLI or an observation beyond the total ceiling preserves
+the original timeout. The original 2fd and 6d0a runs did not reach XCTest; their
+cleanup inventory timeouts remain separate unresolved observations.
+On failure after creation readback, the runner retains bounded `.log` tails
+from that exact new device's recorded log directory before cleanup. It refuses
+foreign paths, directory aliases, symlinks and multiply linked files; at most
+four 64 KiB tails are copied through a held directory descriptor. Shared
+CoreSimulator service logs and binary dumps are not collected. Missing logs
+remain diagnostic absence and do not change boot deadlines or native verdicts.
+The one CA-import command retains its original 60-second wait. A failure records
+fixed-size libproc identity/image reads of its still-unreaped direct child before
+retirement, checking parent and birth around the image read. Only a closed image
+class (`xcrun`, `simctl`, other/unavailable), PID/birth/state and stage timing are
+saved; no arguments, environment, certificate contents or service census.
+These libproc calls have no hard I/O deadline. They start only after failure and
+cannot establish a keychain-service cause. No additional simctl, sampling, import
+retry or TLS exception is added. Missing diagnostic data cannot replace the
+original exception or skip direct-child retirement. The stage receipt is written
+after retirement on failure; successful import records its actual exit instead.
+
+The WKDownload candidate has policy cases for active Web-home/frame origins,
+the explicit same-origin Blob exception, attachment disposition and safe
+filename handling. The whole App SDK lane compiles its UIKit/WebKit wiring.
+The first runtime fixture is `ios/download-fixture/run.py --out /absolute/new/evidence`.
+It needs existing Xcode, XcodeGen, OpenSSL and an available iOS 17+ iPhone runtime
+on macOS. It creates one disposable Simulator, trusts a new loopback HTTPS CA
+only inside that device, and deletes that exact device after an identity readback.
+It does not install SDKs/runtimes, alter host trust or use signing credentials.
+The first cold boot has a 180-second initial wait. Distinct native migration-plugin
+transitions near that deadline or explicit native `Finished` permit the same
+readiness process to continue once, for at most 120 seconds within a total
+300-second ceiling; elapsed counters alone do not. Monotonic time is rechecked
+after diagnostic writes before accepting an exit or starting the continuation,
+and after that wait. Actual `bootstatus` exit0 within the budget is required
+before trust or tests; native text alone cannot pass. A timeout
+retires only the directly owned CLI, preserving the original failure separately
+from termination errors. Interrupted commands retain scratch even if their
+direct child reaps, because that alone cannot prove spawned build/test children
+are gone. Unreaped commands also force failure; neither case authorizes group
+signals or deleting a potentially live build directory.
+Its small host compiles the product coordinator, navigator, policy and download
+owner directly; only the unused Tauri shell signal is replaced with a refusal.
+The desktop macOS CI job runs this case independently of the SDK/whole-App
+job. Each case creates and retires its own Simulator on its own CI host.
+CI explicitly prepares XcodeGen before the standalone case; this dependency
+previously came from the SDK's Tauri init. The runtime runner still requires
+its tools to exist and does not install an SDK or generate the whole App.
+
+The disposable host supplies an explicit `Info.plist` with Boolean file-sharing
+and opening-in-place keys, merged with Xcode's generated bundle fields. XCTest
+records and requires the installed bundle's two flags, `Download Fixture`
+display name, and owned `Documents/keep.txt` before opening the first Web page.
+This addresses an unverified configuration boundary from 791d830, where the
+real Files picker opened but showed `On My iPhone is Empty`; the old built
+bundle's flags were not retained. It changes only the fixture, not the product's
+document-sharing policy. The actual folder, final Save tap and exported bytes
+remain required; the configuration readback alone cannot qualify an export.
+
+The actual XCTest uses visible links, a fixture session cookie, the native Save
+prompt and the OS Save to Files UI. It reads the cookie/Blob exports from the
+fixture App's Documents and requires their exact bytes. A second UUID profile
+must receive the cookie-denied page. During the first cookie export, the host
+removes the actual session while UIKit's activity is pending, observes that its
+original file still exists with exact bytes, then the test completes Save to
+Files. The final receipt requires this removal/retention observation and later
+temporary cleanup; an omitted observation cannot pass. Decline, partial transfer Cancel and actual
+session removal must remove only owned temporary files, keeping unrelated
+sentinels. The server must observe both slow responses disconnect before their
+last bytes; server shutdown cannot stand in for a WebKit cancel. Test output
+must contain the actual method pass and one executed test with zero failures.
+Logs, XCTest screenshots/hierarchy/result bundle and file receipts are retained;
+ephemeral private keys remain outside the uploaded evidence. The Python harness
+controls exercise real TLS/cookie and false-success checks, not native behavior.
+After a completed failed test, the runner also exports the original result
+bundle's attachments with the installed `xcresulttool`, so screenshots and the
+accessibility snapshot can be read without Xcode. This single diagnostic command
+has a 60-second wait and the same direct-child retirement rules. An absent
+bundle or interrupted xcodebuild is not exported; neither missing attachments
+nor export failure changes the original test failure. No test is retried.
+After Save, the existing ten-second return check refuses any host-side Files
+picker, activity sheet or popover and requires the foreground native Close to
+be ready. A provider that is already not running is not enumerated; an unknown
+state remains blocking. Ordinary Close preserves its separate existing readiness
+wait when no export surface exists. A hierarchy retained only by DocumentsApp
+may count as no longer blocking only when the real native Close is enabled/hittable
+in the foreground host and neither those provider surfaces nor any of their
+descendants is hittable. In 43224385576, the Blob picker visibly disappeared within the bound while the
+absence gate still matched; retained provider AX is an inference because that
+run did not capture its teardown hierarchy. Host absence or a non-hittable
+provider alone cannot pass. The later real Close, Inspect files, exact exported bytes and
+temporary cleanup remain required; this fixture correction does not establish
+product export reliability or the cause of other failures.
+If the test reaches the Save to Files tap, it keeps an immediate post-tap
+screenshot. The second existing five-second action wait requires the resolved
+cell to exist, be enabled and be hittable. Its verdict records the last predicate's
+existing scalar reads and their timestamps before asserting, without another AX
+query on the failure path. Its full resolved state is attached after a successful
+wait and immediately before the single real tap; teardown preserves both
+the host and DocumentsApp hierarchies. This diagnoses a share sheet that stays
+open after a tap; it does not establish the cause or repair of that OS handoff.
+Independently, it keeps up to 32 observations of the original input file and
+the same activity's presentation after session removal: one immediately, then
+on a one-second timer whose cadence is not a hard wall-time guarantee. The observer
+holds the activity weakly and records only timestamps and boolean observations;
+it neither retains the download owner nor writes an exported file. These
+observations distinguish file existence, readable bytes and exact-byte equality;
+the existence/read operations are separate observations, not an atomic snapshot.
+Only this fixture target defines `SUMI_DOWNLOAD_FIXTURE`. It enables a weakly
+capturing observer of the product owner's closed event/state names: presentation
+outcome, transfer failure, activity completion, state changes and cleanup. The
+first 64 events and an explicit truncation flag accompany the samples, without
+owners, controllers, URLs, errors or response data. Ordinary App builds have no
+observer. It neither intercepts callbacks nor changes transitions or verdicts.
+Each existing lifecycle callback also persists the bounded trace after sampling
+has begun, including events after the 32-sample timer stops. This fixes a
+diagnostic gap in run43272033643, where sampling ended before the real Files
+Save; actual completion and cleanup still need native evidence. It adds no
+sample, UI query, retry or longer wait. The trace covers this first cookie flow,
+has no owner identifiers, and cannot establish attribution for concurrent
+downloads. Callback/check events are not proof of completed cleanup or final UI
+state; `remove-succeeded` separately records the actual removal return.
+These in-process reads/writes have no hard I/O deadline. After a completed failed test,
+one bounded `get_app_container` call (20 seconds) locates this fixture's data on
+the exact owned Simulator. The reader refuses foreign paths, symlinks, hardlinks,
+oversized data and unexpected fields. Missing observations stay unknown; they
+cannot replace the original failure or satisfy the successful export receipt.
+The fixture is unqualified until its actual Simulator run passes. It is not the
+whole Tauri UI, a physical device, a real IdP or an HTTP-auth qualification.
+
+After this first case, cover navigation before consent, adapted/iPad export
+presentation and return from an inactive application. The tiny exported files
+already exercise completion during modal transitions, but that timing still
+needs an actual Simulator result.
+Use neither a replacement URLSession fetch nor a synthetic WKDownload delegate
+result as the success oracle. Real IdP, device, HTTP-auth and distribution
+qualification remain separate.
+
+## Linux pending notification close
+
+The actual App/browser-process runner's existing `--notifications /owned/dunst`
+phase now keeps Dunst and Work alive while Personal closes normally with one
+pending standard page Notification. This follows the native permission,
+same-tag isolation and trusted-click baseline; that baseline alone is not the
+new close evidence. It uses the existing disposable Xvfb/private D-Bus session.
+
+The unique Personal Notify call is tied to its D-Bus sender, call serial, the
+owned daemon's exact reply ID and the sender's attested native browser PID.
+After Personal's normal zero-forced-cleanup receipt, the probe records whether
+the alert remains. It does not impose a disappearance deadline or require an
+event from a destroyed page. If the alert remains, one real pointer-checked
+click must produce a default ActionInvoked for that same daemon/client/ID.
+An unrelated alert or action cannot pass. Work's guard remains live, and its
+URL, top-level document and page-target set must remain unchanged during a
+recorded one-second observation after retirement/action. The baseline's closed
+Notification objects are not an oracle for absence of later click delivery.
+
+`notification-pending-close-result.json` and the original D-Bus trace retain
+that result before the daemon stops normally. An absent alert proves only its
+observed absence, not the cause. This is a bounded wrong-profile regression,
+not proof of arbitrarily delayed delivery, notification-driven reopening of a
+retired profile, profile reset, Service Worker/Web Push or other OSes. The
+current runner's notification path uses the fixture Python guard as root;
+Chromium sandbox/Rust-guard notification combinations remain unqualified.
+
+Add `--notification-reset` to that command to extend the same phase: after
+Personal closes normally, the actual home confirms its saved-data clear and
+proves its `cef-profiles` directory absent before reopening the same saved
+connection. Work's native process and profile directory stay live. The observer
+attaches the new Personal native/guard generation and requires actual
+`Notification.permission === 'default'`, Permissions API `prompt`, and removal
+of the fixture's own synthetic storage/cookie, while Work retains its grant and
+distinct fixture state. No permission override is used. The old alert, if still
+present, receives one native click bound to its original daemon/client/reply ID.
+Both live pages' URL, focus/visibility/pageshow observations, target inventory and
+fixture state must stay unchanged for the recorded interval. This proves a
+bounded absence of page/window rerouting, not an `onclick` result on a destroyed
+Notification object or a Web Push result. New Personal then closes normally
+before Work exits. The nested reset receipt records both native generations and
+the actual home clear; the ordinary `--notifications` path stays separate.
+
+`node --test native-tests/desktop/notification-route.test.mjs` rejects wrong
+reply serial/client/service, duplicate/malformed replies and actions for a
+different notification. Those protocol controls are not native evidence.
+Before the first inspection HTTP request, the observer retains the attested
+native/guard generations. A connection failure can therefore use the existing
+profile/ancestry/executable-checked kernel snapshot even before a CDP Client
+exists. No connection retry or longer timeout is added. If the failing guard
+already ended, a snapshot of another labeled live profile does not diagnose it.
+An initial document-readiness failure also retains the last completed predicate
+evaluation (origin match, ready state, app-content match and visibility/focus).
+It may precede an evaluation error; later DOM/screenshot readiness cannot
+retroactively pass the unchanged ten-second gate.
+
+With `fixture-inspection` and `TAKOSUMI_BROWSER_PROCESS_INSPECT=1`, the CEF
+browser also writes bounded `SUMI_DOWNLOAD` observations to its existing
+profile `browser.log`. The observer explicitly preserves pinned CEF's default
+admission (`CanDownload=true`) and Chrome-style handling
+(`OnBeforeDownload=false`). It never invokes or retains a download callback.
+Only item IDs, status flags, byte counts and numeric interruption reasons are
+copied on the UI thread; URLs, paths, names, headers and content are omitted.
+A bounded nonblocking queue sends at most 64 observations plus one truncation
+marker to a separate stderr writer. No CEF object crosses threads. Product
+builds have no observer; no permission, download preference or deadline changes.
+An `observer-ready` line and sequence numbers help interpret retained output,
+but write errors or shutdown without joining/flushing can leave missing or
+partial diagnostics. Absence of an event is inconclusive. Native completion
+flags diagnose lifecycle; the real final file and exact bytes are still the
+download acceptance oracle. The fixture sources are included in Linux and
+Windows runtime source freezes.
 
 ## Desktop GTK runtime fixture
 
@@ -338,8 +610,118 @@ an App acceptance result.
 
 ## Android
 
+`bash native-tests/android/build-app.sh` is the separate whole Tauri App SDK
+compile check. It requires a fresh checkout without `src-tauri/gen/android`,
+Linux x86_64, JDK 17, Android SDK/platform 36, Build-Tools 36.0.0 and an installed
+NDK. It refuses signing inputs and a foreign Cargo target. CI uses NDK
+29.0.14206865 and the same pinned Kit/contract as the desktop/iOS lanes.
+Normal Kit init generates the complete App with the private package ID
+`com.takosumi.fixture.android`; normal plugins, manifest hardening and embedded
+shared UI remain present. The debug APK has Gradle's disposable debug signature;
+it is not a release or an unsigned distribution artifact.
+
+The check requires one APK, actual min/target SDK 28/36, nonexported product FCM
+service with opt-in initialization, the product deep-link scheme and backup
+policy. The manifest must reference the actual packaged extraction-rules XML;
+its compiled resource ID is bound through the APK resource table to that file.
+Its cloud-backup/device-transfer exclusions must match the normal Kit-generated
+input. Every native library must be x86_64 ELF, and the packaged App library
+must match the actual Cargo output byte for byte. SDK signature/manifest tools,
+ZIP CRC and tracked-source preservation are required. Only `whole-app-proof.json`
+is uploaded; the APK, generated debug key and Firebase configuration are not.
+The first whole-App debug APK build passed in
+[CI43236148268](https://github.com/tako0614/takosumi-mobile/actions/runs/43236148268/job/131244314392).
+Its private fixture package had actual min/target SDK 28/36 and four x86_64 ELF
+libraries; SDK signature/manifest/resource checks and Cargo byte identity passed.
+Only the proof JSON was retained, so the APK cannot be independently downloaded
+and rechecked from that artifact. This is a prerequisite for actual whole-App
+connection/login/home/resume qualification; the library tests below and an APK
+compile cannot establish that UI behavior, real IdP, physical-device or update
+qualification. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#android)
+describe the SDK/NDK setup; the builder itself does not install an Android SDK.
+`python3 -B native-tests/android/test_apk_policy.py` exercises SDK-free reference
+binding controls, including a different valid resource, wrong package and
+ambiguous/missing file mappings. These controls do not compile an APK.
+
+The [whole-App Android UI candidate](android/web-home-fixture/README.md) adds a
+separate UI Automator driver after that build, using two owned HTTPS origins.
+It is source/local harness evidence only until its first native CI result.
+Its per-App, two-host test CA rebuild is recorded separately from the normal
+SDK APK, and the Cargo App library must remain byte-identical. It checks the
+installed APK bytes before and after actual UI operations, and restores the
+normal APK after confirmed emulator shutdown. Neither APK nor fixture keys
+enter the artifacts. The pinned Kit/contract and product native runtime are
+unchanged; this does not qualify real credentials, SSO, Push or distribution.
+
+`AppScreenMediaConsentTest` checks the camera/microphone consent state machine,
+including OS denial, stale results and document/profile changes. The actual
+`MediaPermissionActivityTest` uses an intercepted HTTPS fixture in the production
+WebView and Activity, without substituting the WebChromeClient. It requires the
+origin-named site prompt, observes a still-pending `getUserMedia` request before
+site denial, then opens a new document and accepts the site prompt. The real
+Android permission UI must appear while the request is still pending; OS denial
+must reject it and return to the same resumed screen. The same scenario then
+explicitly allows the OS prompt and requires one live, enabled native audio
+track, no video track, and an inactive stream with ended tracks after stopping.
+A fresh profile at the same origin must still show the site prompt despite the
+app-wide OS grant, and its denial must reject the request. Missing dialogs,
+skipped tests, early rejection or early grant cannot qualify these paths.
+
+The disposable CI AVD explicitly enables guest audio input. The first
+`-no-audio` run reached OS allow but rejected capture with `NotReadableError`;
+its cause is not established. The next fixture uses the default audio backend
+without that flag. [QEMU2 forwards `-no-audio` to its disabled driver](https://android.googlesource.com/platform/external/qemu/+/emu-master-dev/android-qemu2-glue/main.cpp#1950);
+zero-filled input in another backend path does not prove WebView can start.
+Host microphone input is never opted in, and the
+[documented `adb emu avd hostmicoff` command](https://developer.android.com/studio/releases/emulator)
+must acknowledge `OK` before testing. That acknowledgment is not an independent
+host-mic state readback. Failures retain bounded audio logcat, the DOM exception
+message and input-device types (no device identifiers or labels). The native
+result remains required: no synthetic WebView grant is used. The default
+backend run still returned `NotReadableError` and logged a failed `pa` driver
+initialization. The next CI fixture starts its own PulseAudio server on a
+private UNIX socket with only a null sink and its monitor source. It loads no
+hardware discovery modules and reads back the exact sink/source/module list
+before starting the emulator. Host input remains disabled. Cleanup targets only
+the owned server and emulator; no shared audio service is changed. Cleanup
+captures each child PID and kernel birth, binds signals with a Linux pidfd,
+and bounds TERM/KILL waits to three/two seconds. Four real-child controls cover
+normal exit, forced exit, wrong identity refusal and an already-exited child.
+Unverified identity or failed cleanup makes the job fail; it never falls back
+to signaling a raw PID. The EXIT trap explicitly preserves the original failure
+or reports a cleanup failure. The PA artifact is capped at 64 KiB. This is
+a targeted backend experiment, not proof that PA initialization caused the
+browser failure. The probe checks stream lifecycle without recording or
+inspecting samples.
+It does not qualify physical microphone quality, camera capture, background
+capture, cross-origin iframe permission or other Android/OEM versions.
+
+The plugin manifest also declares `MODIFY_AUDIO_SETTINGS`, Android's normal
+audio-routing permission. The matching WebView 133 code refuses low-latency
+input-device selection without it, even when `RECORD_AUDIO` is granted. The
+native probe checks the installed permission before audio initialization and
+still requires the real site/OS consent and stream lifecycle. The fresh test
+install/process matters because Chromium caches the normal permission. This
+fix does not by itself qualify the audio backend or physical capture.
+
 The profile-reset instrumentation requires both `MULTI_PROFILE` and
 `DELETE_BROWSING_DATA`; unsupported capabilities fail instead of skipping tests.
+
+The instrumentation APK targets SDK 36, matching the generated product App's
+`src-tauri/gen/android/app/build.gradle.kts`. Earlier native results used the
+library's implicit target SDK 28 even on the API 36 emulator; retain that
+limitation when interpreting their OS permission and storage behavior.
+The media and file-selection cases assert the actual runtime target SDK.
+
+`FileSelectionActivityTest` creates one uniquely named small text file in the
+disposable emulator's MediaStore Downloads collection, opens a real WebView
+file input with a pointer gesture, and selects that exact file in DocumentsUI.
+It requires the original document to receive the exact name, byte length,
+MIME type and `File.text()` contents, then resume the same profile. It deletes
+only the URI it created. No broad storage grant, provider substitution,
+WebChromeClient replacement or simulated picker result is used. The DocumentsUI
+selectors cover the default English CI AVD; other picker apps, OEMs, locales,
+multiple-file selection and recreation while a picker is open remain separate.
 The initial API35 emulator used WebView124 and passed profile isolation but
 failed the two deletion preconditions. The next CI candidate selects the
 official API36 Google APIs x86_64 image and logs its revision and actual WebView
@@ -390,6 +772,11 @@ or iOS data-store isolation. WKWebView/device qualification remains necessary.
 ## Profile data reset candidate
 
 The shared WebHome confirmation has a separate actual-browser component test.
+It also controls deferred permission-list and answer replies around live events
+in the real shared UI: a late snapshot must not hide the next held prompt,
+transport failure keeps the prompt available for an explicit retry, and retired
+listeners/snapshots cannot restore the permission panel. The permission adapter
+is synthetic; these cases do not grant a native permission or qualify OS prompts.
 From the product root on Linux, with modern Node (22.12+), Python with pidfd
 support, the existing dependencies and an installed Chrome:
 

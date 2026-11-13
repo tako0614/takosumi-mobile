@@ -39,10 +39,13 @@ def main():
     parser.add_argument("--profile", required=True)
     parser.add_argument("--native-start", required=True)
     parser.add_argument("--guard-start", required=True)
+    parser.add_argument("--binding", default="app-browser-process-open.json", choices=[
+        "app-browser-process-open.json", "app-browser-process-recover-initial.json",
+        "app-browser-process-recover-before.json", "app-browser-process-recover-open.json"])
     args = parser.parse_args()
     require(str(uuid.UUID(args.profile)) == args.profile, "Canonical profile UUID required")
     data = owned_case_path(args.data)
-    opened = json.loads(data.joinpath("app-browser-process-open.json").read_text())
+    opened = json.loads(data.joinpath(args.binding).read_text())
     matches = [p for p in opened["processes"] if p["profile"] == args.profile]
     require(len(matches) == 1, "One exact profile binding is required")
     process = matches[0]

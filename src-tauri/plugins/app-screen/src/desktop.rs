@@ -18,7 +18,10 @@ use tauri::{
 use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
 use crate::resume::ResumeStore;
-use crate::{models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, Result};
+use crate::{
+    models::is_launchable_url, CapabilitiesResponse, Error, OpenRequest, PendingPermission,
+    ResolvePermissionRequest, Result,
+};
 #[cfg(target_os = "linux")]
 mod gtk_initial_load;
 #[cfg(target_os = "linux")]
@@ -220,7 +223,10 @@ pub fn init() -> TauriPlugin<tauri::Wry> {
     let builder = Builder::new("app-screen").invoke_handler(tauri::generate_handler![
         capabilities,
         open,
-        clear_profile
+        clear_profile,
+        recover_profile,
+        pending_permissions,
+        resolve_permission
     ]);
     #[cfg(all(
         any(target_os = "linux", windows, target_os = "macos"),
@@ -295,7 +301,92 @@ fn capabilities_of<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Capabilitie
     CapabilitiesResponse {
         pin_shortcut: false,
         clear_profile,
+        recover_profile: {
+            #[cfg(all(
+                any(target_os = "linux", windows),
+                feature = "desktop-process-experiment"
+            ))]
+            {
+                _app.try_state::<process_adapter::Backend>().is_some()
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", windows),
+                feature = "desktop-process-experiment"
+            )))]
+            {
+                false
+            }
+        },
+        permission_prompts: {
+            #[cfg(all(
+                any(target_os = "linux", windows, target_os = "macos"),
+                feature = "desktop-process-experiment"
+            ))]
+            {
+                _app.try_state::<process_adapter::Backend>().is_some()
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", windows, target_os = "macos"),
+                feature = "desktop-process-experiment"
+            )))]
+            {
+                false
+            }
+        },
     }
+}
+
+#[tauri::command]
+async fn recover_profile(
+    app: AppHandle,
+    payload: crate::RecoverProfileRequest,
+) -> Result<crate::RecoverProfileResponse> {
+    #[cfg(all(
+        any(target_os = "linux", windows),
+        feature = "desktop-process-experiment"
+    ))]
+    if app.try_state::<process_adapter::Backend>().is_some() {
+        return process_adapter::recover_profile(app, payload).await;
+    }
+    let _ = (app, payload);
+    Err(Error::InvalidRequest(
+        "Browser recovery is unavailable on this backend.",
+    ))
+}
+
+/// Site permission prompts the profile browsers are holding for the App.
+/// Empty when the prompt surface is off: nothing can be held without it.
+#[tauri::command]
+async fn pending_permissions(app: AppHandle) -> Result<Vec<PendingPermission>> {
+    #[cfg(all(
+        any(target_os = "linux", windows, target_os = "macos"),
+        feature = "desktop-process-experiment"
+    ))]
+    if let Some(prompts) = app.try_state::<process_adapter::PermissionPrompts>() {
+        return Ok(prompts.list());
+    }
+    let _ = app;
+    Ok(Vec::new())
+}
+
+/// The person's answer to one held prompt; carries the rest still held.
+#[tauri::command]
+async fn resolve_permission(
+    app: AppHandle,
+    payload: ResolvePermissionRequest,
+) -> Result<Vec<PendingPermission>> {
+    payload.validate()?;
+    #[cfg(all(
+        any(target_os = "linux", windows, target_os = "macos"),
+        feature = "desktop-process-experiment"
+    ))]
+    if app.try_state::<process_adapter::Backend>().is_some() {
+        return process_adapter::resolve_permission(app, payload).await;
+    }
+    let _ = (app, payload);
+    Err(Error::InvalidRequest(
+        "Browser permission prompts are unavailable on this backend.",
+    ))
 }
 
 #[tauri::command]

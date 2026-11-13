@@ -2,9 +2,11 @@ import { isTauri, invoke } from "@tauri-apps/api/core";
 import { platform } from "@tauri-apps/plugin-os";
 import { render } from "solid-js/web";
 import { createSignal } from "solid-js";
-import { webClientSelected, webHomeRequest } from "./web-connections.ts";
+import { webClientSelected } from "./web-connections.ts";
 import { WebHome } from "./web-home.tsx";
 import { clearWebProfileData } from "./web-profile-data.ts";
+import { createWebPermissionPrompts, type WebPermissionPrompts } from "./web-permissions.ts";
+import { openWebConnection, recoverWebProfile } from "./web-profile-recovery.ts";
 import "./web-home.css";
 
 // Keep the old native client and its saved credentials intact during migration.
@@ -23,10 +25,18 @@ if (!web) {
 } else {
   let allowLegacyMobile = false;
   const [canClearData, setCanClearData] = createSignal(false);
+  const [canRecover, setCanRecover] = createSignal(false);
+  const [permissionPrompts, setPermissionPrompts] = createSignal<WebPermissionPrompts>();
   if (isTauri()) {
     void invoke<unknown>("plugin:app-screen|capabilities").then((value) => {
       setCanClearData(typeof value === "object" && value !== null &&
         (value as Record<string, unknown>).clearProfile === true);
+      setCanRecover(typeof value === "object" && value !== null &&
+        (value as Record<string, unknown>).recoverProfile === true);
+      if (typeof value === "object" && value !== null &&
+        (value as Record<string, unknown>).permissionPrompts === true) {
+        setPermissionPrompts(createWebPermissionPrompts(invoke));
+      }
     }).catch(() => { /* Unsupported engines must not advertise data deletion. */ });
     try {
       const os = platform();
@@ -35,9 +45,11 @@ if (!web) {
   }
   render(() => <WebHome storage={storage} allowLegacyMobile={allowLegacyMobile}
     clearData={canClearData() ? (connection) => clearWebProfileData(connection, invoke) : undefined}
+    recover={canRecover() ? (connection, ticket) => recoverWebProfile(connection, ticket, invoke) : undefined}
+    permissionPrompts={permissionPrompts()}
     open={async (connection) => {
     if (isTauri()) {
-      await invoke("plugin:app-screen|open", { payload: webHomeRequest(connection) });
+      await openWebConnection(connection, invoke);
     } else {
       // Browser preview uses an ordinary Web page, with no native capabilities.
       if (connection.profile !== "shared") {

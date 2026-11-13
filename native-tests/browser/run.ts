@@ -11,6 +11,7 @@ import { createServer as reservePort } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { confirmBrowserCleanup } from "./lifecycle.ts";
+import { createStartupObservation, guardRunning, initialPage } from "./startup.ts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const output = process.argv[2];
@@ -19,7 +20,8 @@ await mkdir(output, { mode: 0o700 });
 const temporary = await mkdtemp(join(process.env.RUNNER_TEMP || process.env.TMPDIR || tmpdir(), "sumi-webhome-ui-"));
 const sourceFiles = ["src/web-home.tsx", "src/web-home.css", "src/web-connections.ts", "src/web-profile-data.ts",
   "native-tests/browser/web-home.html", "native-tests/browser/web-home.fixture.tsx", "native-tests/browser/run.ts",
-  "native-tests/browser/tsconfig.json", "native-tests/browser/guard.py", "native-tests/browser/lifecycle.ts", "native-tests/desktop/web_home.py", "vite.config.ts", "bun.lock"];
+  "native-tests/browser/tsconfig.json", "native-tests/browser/guard.py", "native-tests/browser/lifecycle.ts",
+  "native-tests/browser/startup.ts", "native-tests/desktop/web_home.py", "vite.config.ts", "bun.lock"];
 async function sourceHashes() {
   return Object.fromEntries(await Promise.all(sourceFiles.map(async (path) => [path,
     createHash("sha256").update(await readFile(`${root}${path}`)).digest("hex")])));
@@ -76,6 +78,10 @@ async function screenshot(name: string, width: number, height: number, mobile: b
   await writeFile(`${output}/${name}.png`, Buffer.from(shot.data, "base64"));
 }
 
+const startupObservation = createStartupObservation((record) => {
+  console.error("WEBHOME_STARTUP_OBSERVATION", JSON.stringify(record));
+});
+
 try {
   server = await createServer({
     configFile: `${root}vite.config.ts`, cacheDir: join(temporary, "vite-cache"),
@@ -96,22 +102,8 @@ try {
     browser!.once("error", (error) => { startupError = error; resolve(); });
   });
   await log.close();
-  const deadline = Date.now() + 20_000;
-  let port = 0;
-  while (!port && Date.now() < deadline) {
-    assert(!startupError && browser.exitCode === null, "Owned Chrome exited during startup");
-    try { port = Number((await readFile(`${temporary}/profile/DevToolsActivePort`, "utf8")).split("\n")[0]); } catch { }
-    if (!port) await delay(25);
-  }
-  assert(port, "Owned Chrome did not expose its private CDP endpoint");
-  const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(5_000) });
-  assert(response.ok);
-  const pages = (await response.json() as { type: string; url: string; webSocketDebuggerUrl: string }[])
-    .filter((target) => target.type === "page");
-  assert.equal(pages.length, 1, "Fresh owned browser must have exactly its initial page");
-  const target = pages[0]!;
-  assert.equal(target.url, "about:blank", "Unexpected page in fresh owned browser");
-  assert(target.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${port}/`));
+  const target = await initialPage(`${temporary}/profile/DevToolsActivePort`,
+    () => guardRunning(browser!, startupError), { observe: startupObservation.observe });
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Owned CDP handshake timed out")), 10_000);
@@ -177,13 +169,53 @@ try {
   const final = await evaluate("resetFixture.snapshot()");
   assert.equal(final.clears.length, 3, "Removing settings started another deletion");
   assert.deepEqual(final.saved, initial.slice(1), "Removing one setting changed another profile");
+
+  const firstPrompt = { profile: initial[1].profile, promptId: 71, origin: "https://permission-first.example", kind: "prompt", permissions: 1 << 15 };
+  const nextPrompt = { ...firstPrompt, promptId: 72, origin: "https://permission-next.example" };
+  const permissionPanel = "document.querySelector('section[aria-labelledby=permissions-heading]')";
+  await evaluate("resetFixture.permissions.begin()");
+  await check("resetFixture.permissions.snapshot().listing", "Initial permission snapshot was not requested");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(firstPrompt)}])`);
+  await check(`${permissionPanel}?.textContent.includes('permission-first.example')`, "Live permission prompt did not render");
+  await evaluate("resetFixture.permissions.finishList([])");
+  await check(`${permissionPanel}?.textContent.includes('permission-first.example')`, "Late initial snapshot hid a newer permission prompt");
+
+  await evaluate(`${permissionPanel}.querySelectorAll('button')[1].click()`);
+  await check("resetFixture.permissions.snapshot().answering", "Permission answer did not reach its adapter");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(nextPrompt)}])`);
+  await evaluate("resetFixture.permissions.finishAnswer([])");
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example')`, "Late answer snapshot hid the next permission prompt");
+  await evaluate(`${permissionPanel}.querySelector('button').click()`);
+  await evaluate("resetFixture.permissions.failAnswer()");
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example') && document.querySelector('[role=alert]').textContent === 'Synthetic permission transport refusal'`, "Answer failure hid the held prompt or its cause");
+  await evaluate(`${permissionPanel}.querySelector('button').click()`);
+  await evaluate("resetFixture.permissions.finishAnswer([])");
+  await check(`!${permissionPanel}`, "Successful answer did not retire its prompt");
+  assert.deepEqual(await evaluate("resetFixture.permissions.snapshot().answers"), [
+    { prompt: firstPrompt, decision: "allow" }, { prompt: nextPrompt, decision: "deny" }, { prompt: nextPrompt, decision: "deny" },
+  ], "The shared UI answered the wrong held prompt or retried automatically");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate(`resetFixture.permissions.emit([${JSON.stringify(firstPrompt)}])`);
+  await check(`!${permissionPanel}`, "An already queued callback revived a retired permission surface");
+
+  await evaluate("resetFixture.permissions.begin()");
+  await evaluate(`resetFixture.permissions.finishList([${JSON.stringify(nextPrompt)}])`);
+  await check(`${permissionPanel}?.textContent.includes('permission-next.example')`, "Initial snapshot without a competing event was ignored");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate("resetFixture.permissions.begin()");
+  await evaluate("resetFixture.permissions.end()");
+  await evaluate(`resetFixture.permissions.finishList([${JSON.stringify(firstPrompt)}])`);
+  await check(`!${permissionPanel}`, "A late snapshot revived a retired permission surface");
+  await check("resetFixture.permissions.snapshot().unlistened === 3", "Permission registrations were not released exactly once");
   assert.equal(errors.length, 0, JSON.stringify(errors));
   assert.deepEqual(await sourceHashes(), before, "Fixture or shared source changed during the run");
-  finalReceipt = { result: "pass", component: "shared WebHome + clear request adapter",
-    native: "synthetic, no engine deletion", node: process.version, browser: version, sourceHashes: before,
-    cases: ["shared clear hidden", "confirmation lock", "cancel", "pending", "false receipt", "completed receipt", "native refusal", "preference removal"], final };
+  finalReceipt = { result: "pass", component: "shared WebHome + clear and permission adapters",
+    native: "synthetic, no engine deletion or native permission", node: process.version, browser: version, sourceHashes: before,
+    cases: ["shared clear hidden", "confirmation lock", "cancel", "pending", "false receipt", "completed receipt", "native refusal", "preference removal",
+      "permission initial snapshot ordering", "permission answer ordering", "permission failure and explicit retry", "retired permission callbacks and snapshots"], final };
  } catch (error) {
   testError = error;
+  startupObservation.failure(error);
   throw error;
 } finally {
   let confirmed = !browser;
@@ -214,4 +246,4 @@ try {
 }
 assert(finalReceipt && lifecycle, "No completed UI and browser lifecycle receipt");
 await writeFile(`${output}/receipt.json`, JSON.stringify({ ...finalReceipt, lifecycle, privateProfileRemoved: true }, null, 2));
-console.log("PASS: real shared WebHome confirmation/cancel/pending/failure/completion; native deletion is simulated");
+console.log("PASS: real shared WebHome clear and permission ordering/error/retirement; native adapters are simulated");

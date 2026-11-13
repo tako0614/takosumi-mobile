@@ -68,10 +68,10 @@ the native title bar. Windows/Linux keep profile directories separate from the
 trusted shell; macOS uses dedicated UUID data stores. Popups inherit their
 opener's native environment/store. The shell and mobile/desktop adapters share
 `WebHome`, connection persistence, profile identity and validated `OpenRequest`.
-CEF across every desktop OS would require a separate Tauri 3 alpha migration;
-this candidate keeps the existing Tauri 2 mobile plugins. On Linux, the
-explicit `desktop-cef` feature opens each connection in its own guarded CEF
-browser process packaged under the bundle's `cef/` resources; see
+The explicit `desktop-cef` feature keeps the Tauri 2 shell and mobile plugins
+while opening each connection in its own guarded CEF browser process on Linux,
+Windows and macOS. On Linux, the browser is packaged under the bundle's `cef/`
+resources; see
 [Linux packaging](native-tests/cef-candidate/README.md#linux-packaging-desktop-cef).
 On Windows the same adapter and a Job Object guard compile and are tested in
 CI, with the browser in Chromium's sandbox (CEF's bootstrap with the browser
@@ -86,11 +86,61 @@ and [Windows sandbox (W7)](native-tests/cef-candidate/README.md#windows-sandbox-
 On macOS the per-profile browser builds as an app bundle with its helper apps
 and runs on its own in CI; see
 [macOS browser process (M1)](native-tests/cef-candidate/README.md#macos-browser-process-m1).
+Its guard/adapter are covered by M2 component tests. The explicit
+[macOS actual App fixture (M3)](native-tests/cef-candidate/README.md#macos-actual-app-fixture-m3)
+adds the shared home/profile flow on macOS 14+; its native qualification is
+limited to anonymous Excalidraw/Photopea fixtures. Both passed all three
+launches in [CI43195505965](https://github.com/tako0614/takosumi-mobile/actions/runs/43195505965).
+The intermittent ordinary-shutdown failure remains unresolved: a later
+unbundled Photopea run returned normally from the browser root but left
+helpers requiring forced cleanup.
+The [macOS packaging candidate (M4)](native-tests/cef-candidate/README.md#macos-packaging-m4)
+places that browser and guard in the Tauri App's own resources. The local
+debug `.app` builds and embedded product-browser sandbox smoke passed.
+Packaged Excalidraw and Photopea each passed the three-launch home/profile
+flow with normal inner/outer receipts in
+[CI43202312305](https://github.com/tako0614/takosumi-mobile/actions/runs/43202312305).
+Signing and distribution remain separate release work.
+
+On Linux/Windows with `desktop-cef`, opening a saved connection after its browser
+crashes can offer **保存データを保持して開き直す** on the home. This explicit action
+keeps that connection's UUID and site-data directory and starts a new browser;
+it does not clear the profile. It is available only after the original guard
+proves that all its processes ended, with no unresolved ownership errors or
+live Chromium lock. The original abnormal receipt is retained privately under
+the profile's `recoveries/` directory. Unsaved changes and writes interrupted by
+the crash may be lost. Ordinary open, clear and quit keep their stricter normal
+exit checks. This recovery applies to a browser tracked by the still-running
+App; it does not qualify recovery after an App/OS crash. macOS and mobile do not
+advertise this command. The synthetic-site Windows same-App browser-fault
+case passed in [CI43218039839](https://github.com/tako0614/takosumi-mobile/actions/runs/43218039839/job/131182189815).
+Installed-package recovery and interrupted-write integrity remain unqualified.
+
+The ordinary Windows product entry now returns through the event loop before
+exiting, as the actual-App fixture already does, allowing remaining shell
+WebView2 controllers to drop. The unsigned installed-product smoke passed in
+[CI43272033643](https://github.com/tako0614/takosumi-mobile/actions/runs/43272033643/job/131370792374):
+eight seconds up, normal App exit and an empty job within the original ten-second
+bound. The prior four-process remainder is absent in this run. This is a bounded
+first-launch/close check; distribution and updates remain release work.
 
 The GTK content adapter routes HTTPS-origin Blob exports through WebKit's
 native download service while keeping them out of page navigation. Its
 Excalidraw/Photopea file checks and remaining platform limits are described in
 [native tests](native-tests/README.md).
+
+The iOS Web-home adapter now hands download actions and attachment responses
+to the original WKDownload, with native confirmation, transfer cancellation
+and OS export. It keeps the originating profile and does not reopen the URL
+in Safari or copy cookies. The standalone native host compiling these product
+sources passed on an iOS 26.5 / iPhone 11 Simulator: original Cookie/Blob
+exports, profile isolation, close during transfer/export, and owned temporary
+file cleanup. A later run failed after Save to Files while the real Files
+picker remained visible; export reliability is still open. Whole-App UI,
+real IdP, physical-device and background/crash behavior remain unqualified.
+See the
+[download contract](src-tauri/plugins/app-screen/README.md#ios-web-home-downloads)
+and [runtime fixture](native-tests/README.md#ios-download-runtime-qualification).
 
 Web homes remember an eligible last page separately for each connection and
 profile, including another app's https origin. Native document outcomes gate
@@ -226,6 +276,24 @@ bun install
 bun run mobile:check
 bun run tauri:dev
 ```
+
+For Android, initialize the native project with `bun run tauri:android:init`,
+then use `bun run tauri:android:dev` to select and run on a device or emulator.
+The default command does not open Android Studio or force a network host.
+Arguments are forwarded to the installed Tauri CLI:
+
+```bash
+bun run tauri:android:dev --help
+bun run tauri:android:dev "device name" --host 192.0.2.10
+bun run tauri:android:dev --open --host 192.0.2.10
+```
+
+Replace the example device name and address with your actual device and a
+reachable development-machine address. `--open` selects Android Studio instead
+of directly running on the device. `--host` is optional; when supplied, the
+shared Vite configuration uses Tauri's `TAURI_DEV_HOST` for the server and HMR.
+Do not use `0.0.0.0` as the address a device connects to. CLI argument checks and
+`bun run doctor` do not establish device launch or LAN connectivity.
 
 Every Takosumi instance includes the built-in public OIDC client
 `takosumi-mobile` (redirect exactly `takosumi://oauth/callback`, PKCE S256) and

@@ -503,6 +503,44 @@ pub struct CapabilitiesResponse {
     pub pin_shortcut: bool,
     #[serde(default)]
     pub clear_profile: bool,
+    #[serde(default)]
+    pub recover_profile: bool,
+    #[serde(default)]
+    pub permission_prompts: bool,
+}
+
+/// A separate user-confirmed restart of one ended browser generation. The
+/// normal open command never grants this consent or erases saved site data.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverProfileRequest {
+    pub open: OpenRequest,
+    pub generation: String,
+}
+
+impl RecoverProfileRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.open.web_home || !is_isolated_profile(&self.open.profile) {
+            return Err(crate::Error::InvalidRequest(
+                "Browser recovery requires an isolated Web home.",
+            ));
+        }
+        self.open.validate()?;
+        if !self.generation.parse::<u64>().is_ok_and(|generation| {
+            generation > 0 && generation.to_string() == self.generation
+        }) {
+            return Err(crate::Error::InvalidRequest(
+                "Browser recovery generation is invalid.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverProfileResponse {
+    pub reopened: bool,
 }
 
 /// Explicitly clear one isolated Web connection, never the legacy shared jar.
@@ -542,6 +580,60 @@ pub struct ClearProfileResponse {
     pub cleared: bool,
 }
 
+/// Which runtime callback a held permission prompt is waiting on. Shared by
+/// the browser-process protocol and the App's prompt surface.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionKind {
+    /// A Chrome permission prompt (`on_show_permission_prompt`).
+    Prompt,
+    /// A camera/microphone media access request.
+    Media,
+}
+
+/// The App's answer to a held permission prompt.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+/// One site permission prompt the profile's browser is holding for the
+/// App's answer. `prompt_id` is only unique inside its profile; the pair is
+/// the App-side identifier.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPermission {
+    pub profile: String,
+    pub prompt_id: u64,
+    pub origin: String,
+    pub kind: PermissionKind,
+    pub permissions: u32,
+}
+
+/// The App's answer to one held prompt. The decision reaches the browser's
+/// held callback; a prompt already gone on the browser side is retired
+/// without one.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvePermissionRequest {
+    pub profile: String,
+    pub prompt_id: u64,
+    pub decision: PermissionDecision,
+}
+
+impl ResolvePermissionRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if !is_isolated_profile(&self.profile) || self.prompt_id == 0 {
+            return Err(crate::Error::InvalidRequest(
+                "A browser permission answer needs its held prompt.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PinShortcutResponse {
@@ -551,6 +643,34 @@ pub struct PinShortcutResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_requires_an_isolated_web_home_origin_and_exact_generation() {
+        let profile = "10448f17-8fb9-40b9-a690-4d3aaafc4e31";
+        let mut recovery = RecoverProfileRequest {
+            open: request("https://sumi.example/", profile),
+            generation: "1".into(),
+        };
+        recovery.open.key = format!("web-home:{profile}:https://sumi.example");
+        assert!(recovery.validate().is_err());
+        recovery.open.web_home = true;
+        recovery.validate().unwrap();
+        recovery.open.url = "https://different.example/".into();
+        assert!(recovery.validate().is_err());
+        recovery.open.url = "https://sumi.example/".into();
+        for generation in ["", "0", "01", "+1", "-1", "18446744073709551616"] {
+            recovery.generation = generation.into();
+            assert!(recovery.validate().is_err(), "{generation}");
+        }
+        recovery.generation = "1".into();
+        recovery.open.profile = SHARED_PROFILE.into();
+        recovery.open.key = "web-home:https://sumi.example".into();
+        assert!(recovery.validate().is_err());
+        recovery.open.web_home = false;
+        recovery.open.key = "app:cap:web".into();
+        recovery.open.validate().unwrap(); // valid legacy request, never recovery
+        assert!(recovery.validate().is_err());
+    }
 
     #[test]
     fn clear_profile_targets_never_include_shared_or_another_connection() {

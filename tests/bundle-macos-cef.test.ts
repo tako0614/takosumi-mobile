@@ -2,6 +2,7 @@
 // only copies files, so it runs on any OS), and its pure helpers.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -44,7 +45,7 @@ function fat(cpus: number[]): Buffer {
 }
 
 let cases = 0;
-function distribution(options: { framework?: Buffer; browser?: Buffer; helper?: Buffer; sandbox?: boolean } = {}) {
+function distribution(options: { framework?: Buffer; browser?: Buffer; helper?: Buffer; guard?: Buffer | false; sandbox?: boolean } = {}) {
   const base = path.join(root, `case-${cases++}`);
   const cef = path.join(base, "cef_macos_aarch64");
   const framework = path.join(cef, "Chromium Embedded Framework.framework");
@@ -62,6 +63,7 @@ function distribution(options: { framework?: Buffer; browser?: Buffer; helper?: 
   writeFileSync(path.join(cef, "archive.json"), JSON.stringify({ name: "cef_binary_test_macosarm64_minimal.tar.bz2" }));
   writeFileSync(path.join(bin, "takosumi-cef-browser-process"), options.browser ?? macho(ARM64, "browser"), { mode: 0o755 });
   writeFileSync(path.join(bin, "takosumi-cef-browser-helper"), options.helper ?? macho(ARM64, "helper"), { mode: 0o755 });
+  if (options.guard !== false) writeFileSync(path.join(bin, "takosumi-browser-guard"), options.guard ?? macho(ARM64, "guard"), { mode: 0o755 });
   return { base, cef, framework, bin, out: path.join(base, "out") };
 }
 
@@ -97,6 +99,67 @@ describe("bundle-macos-cef helpers", () => {
 });
 
 describe("bundle-macos-cef", () => {
+  test("stages the same-architecture guard beside the browser app for Tauri resource resolution", () => {
+    const { cef, bin, out } = distribution();
+    const result = bundle(["--cef", cef, "--bin", bin, "--out", out, "--with-guard"]);
+    expect(result.status).toBe(0);
+    const source = readFileSync(path.join(bin, bundler.GUARD));
+    expect(readFileSync(path.join(out, bundler.GUARD))).toEqual(source);
+    const manifest = JSON.parse(readFileSync(path.join(out, "bundle.json"), "utf8"));
+    expect(manifest.guard).toEqual({
+      path: bundler.GUARD,
+      size: source.length,
+      sha256: createHash("sha256").update(source).digest("hex"),
+      mode: "755",
+    });
+    expect(existsSync(path.join(out, manifest.bundle, "Contents", "MacOS", bundler.BROWSER))).toBe(true);
+  });
+
+  test("refuses missing, linked, mismatched or non-Mach-O guards before writing the app", () => {
+    for (const guard of [false, macho(X86_64), Buffer.from("ELF guard")] as const) {
+      const fixture = distribution({ guard });
+      const result = bundle(["--cef", fixture.cef, "--bin", fixture.bin, "--out", fixture.out, "--with-guard"]);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(guard === false ? "not found or not a plain file" : "the guard must be a thin arm64");
+      expect(existsSync(fixture.out)).toBe(false);
+    }
+    const fixture = distribution();
+    const guard = path.join(fixture.bin, bundler.GUARD);
+    rmSync(guard);
+    symlinkSync(bundler.HELPER, guard);
+    const result = bundle(["--cef", fixture.cef, "--bin", fixture.bin, "--out", fixture.out, "--with-guard"]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("not found or not a plain file");
+    expect(existsSync(fixture.out)).toBe(false);
+  });
+
+  test("never replaces an existing staged guard or writes a fixture into the product stage", () => {
+    const { cef, bin, out } = distribution();
+    mkdirSync(out);
+    writeFileSync(path.join(out, bundler.GUARD), "existing guard");
+    const refused = bundle(["--cef", cef, "--bin", bin, "--out", out, "--with-guard"]);
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain("already exists");
+    expect(readFileSync(path.join(out, bundler.GUARD), "utf8")).toBe("existing guard");
+    expect(existsSync(path.join(out, `${bundler.BROWSER}.app`))).toBe(false);
+    const productStage = path.resolve(path.dirname(SCRIPT), "../src-tauri/target/macos-cef/cef");
+    const fixture = bundle(["--cef", cef, "--bin", bin, "--out", productStage, "--fixture", "--with-guard"]);
+    expect(fixture.status).toBe(2);
+    expect(fixture.stderr).toContain("never written to the product stage path");
+    const alias = path.join(root, "product-stage-alias");
+    symlinkSync(path.resolve(path.dirname(SCRIPT), "../src-tauri"), alias);
+    const aliased = bundle(["--cef", cef, "--bin", bin, "--out", path.join(alias, "target/macos-cef/cef"), "--fixture", "--with-guard"]);
+    expect(aliased.status).toBe(2);
+    expect(aliased.stderr).toContain("never written to the product stage path");
+    // Tauri copies the whole cef/ subtree: nesting a fixture below that
+    // root would also put its inspection binaries into the product App.
+    for (const stage of [productStage, path.join(alias, "target/macos-cef/cef")]) {
+      const nested = bundle(["--cef", cef, "--bin", bin, "--out", path.join(stage, "nested/fixture"), "--fixture", "--with-guard"]);
+      expect(nested.status).toBe(2);
+      expect(nested.stderr).toContain("or beneath it");
+    }
+  });
+
   test("assembles the app bundle: browser, framework with its links, five helper apps", () => {
     const { cef, bin, out } = distribution();
     const result = bundle(["--cef", cef, "--bin", bin, "--out", out]);

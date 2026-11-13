@@ -22,3 +22,5 @@ src-tauri/plugins/*/jvm-tests/.gradle/
 src-tauri/plugins/*/jvm-tests/.kotlin/
 native-tests/android/.gradle/
 native-tests/android/build/
+native-tests/android/web-home-fixture/.gradle/
+native-tests/android/web-home-fixture/build/

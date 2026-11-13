@@ -6,6 +6,90 @@ import XCTest
 /// `resume-url-cases.json`, the tables `src/url-policy.ts` and
 /// `AppScreenPolicy.kt` are tested with.
 final class AppScreenPolicyFixtureTests: XCTestCase {
+    func testDownloadsRequireVisibleWebHomeAndNativeFrameOrigin() {
+        let origin = "https://app.example"
+        let blob = "blob:https://app.example/1234"
+        func allowed(_ url: String, source: String? = "https://app.example", page: String? = "https://app.example/editor",
+                     explicit: Bool = true, webHome: Bool = true, visible: Bool = true) -> Bool {
+            AppScreenPolicy.canDownload(url, sourceOrigin: source, page: page,
+                                        explicitDownload: explicit, webHome: webHome, visible: visible)
+        }
+        XCTAssertTrue(allowed("https://files.example/export?format=pdf", explicit: false))
+        XCTAssertTrue(allowed(blob))
+        XCTAssertFalse(allowed(blob, explicit: false))
+        XCTAssertFalse(allowed(blob, source: "https://other.example"))
+        XCTAssertFalse(allowed(blob, source: origin + "/editor"))
+        XCTAssertFalse(allowed(blob, source: nil))
+        XCTAssertFalse(allowed(blob, page: nil))
+        XCTAssertFalse(allowed(blob, visible: false))
+        XCTAssertFalse(allowed(blob, webHome: false))
+        for url in ["blob:null/id", "blob:https://ipc.localhost/id", "file:///private/data", "data:text/plain,body",
+                    "http://app.example/file", "https://user:pass@app.example/file", "https://ipc.localhost/file"] {
+            XCTAssertFalse(allowed(url), url)
+        }
+        XCTAssertFalse(allowed(blob, page: "https://ipc.localhost/"))
+        XCTAssertEqual(AppScreenPolicy.decide(blob, mainFrame: true, origins: nil), .block)
+        XCTAssertFalse(AppScreenPolicy.isLaunchable(blob))
+    }
+
+    func testSuggestedDownloadFilenameCannotChoosePathOrHideExtension() {
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("../../secrets/export.txt"), "export.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("C:\\private\\export.txt"), "export.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("\u{0}bad\nfile\u{202E}.txt"), "badfile.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename(".."), "download")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename(" .hidden.txt "), "hidden.txt")
+        XCTAssertEqual(AppScreenPolicy.downloadFilename("report:final.pdf"), "reportfinal.pdf")
+    }
+
+    func testAttachmentDownloadsEvenWhenWebKitCanRenderItsMimeType() {
+        XCTAssertTrue(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: false, contentDisposition: nil))
+        XCTAssertTrue(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: "Attachment; filename=report.pdf"))
+        XCTAssertFalse(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: "inline; filename=attachment"))
+        XCTAssertFalse(AppScreenPolicy.shouldDownloadResponse(canShowMIMEType: true, contentDisposition: nil))
+    }
+
+    func testLongUnicodeDownloadNameKeepsItsExtensionWithinByteLimit() {
+        let name = AppScreenPolicy.downloadFilename(String(repeating: "資料🦀", count: 100) + ".pdf")
+        XCTAssertLessThanOrEqual(name.utf8.count, 180)
+        XCTAssertTrue(name.hasSuffix(".pdf"))
+        XCTAssertFalse(name.contains("/"))
+        XCTAssertFalse(name.isEmpty)
+    }
+
+    func testMediaPromptEligibilityIncludesOtherHttpsFrames() {
+        // Cross-origin frames can ask through WebKit's own Permissions Policy;
+        // no origin is automatically granted by this eligibility decision.
+        for origin in ["https://app.example", "https://call.example:8443", "https://[::1]:8443"] {
+            XCTAssertTrue(AppScreenPolicy.canPromptForMediaCapture(
+                origin: origin, page: "https://app.example/room", visible: true), origin)
+        }
+    }
+
+    func testMediaNativeOriginPreservesIpv6AndNonDefaultPorts() {
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 0), "https://call.example")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 443), "https://call.example")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "call.example", port: 8443), "https://call.example:8443")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "::1", port: 8443), "https://[::1]:8443")
+        XCTAssertEqual(AppScreenPolicy.mediaCaptureOrigin(scheme: "https", host: "[::1]", port: 8443), "https://[::1]:8443")
+        for item in [("http", "call.example", 443), ("https", "", 443), ("https", "ipc.localhost", 443), ("https", "call.example", -1), ("https", "call.example", 65_536)] {
+            XCTAssertNil(AppScreenPolicy.mediaCaptureOrigin(scheme: item.0, host: item.1, port: item.2))
+        }
+    }
+
+    func testMediaPromptRefusesHiddenMissingAndNonWebDocuments() {
+        let site = "https://call.example"
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: site, visible: false))
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: nil, visible: true))
+        XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: nil, page: site, visible: true))
+        for invalid in ["http://call.example", "about:blank", "file:///private/file", "https://ipc.localhost", "https://tauri.localhost", "https://user:pass@call.example"] {
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: invalid, page: site, visible: true), invalid)
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: site, page: invalid, visible: true), invalid)
+        }
+        for notAnOrigin in [site + "/room", site + "?token=secret", site + "#fragment"] {
+            XCTAssertFalse(AppScreenPolicy.canPromptForMediaCapture(origin: notAnOrigin, page: site, visible: true), notAnOrigin)
+        }
+    }
+
     func testClearRemovesEveryScopeForTheExactKeyWithoutChangingOtherProfiles() {
         let key = "web-home:11111111-1111-4111-8111-111111111111:https://sumi.example"
         let personal = "web-home:22222222-2222-4222-8222-222222222222:https://sumi.example"

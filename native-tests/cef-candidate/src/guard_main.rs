@@ -181,6 +181,68 @@ fn child_pidfd(pid: i32) -> io::Result<OwnedFd> {
     pidfd_open(pid)
 }
 
+// TERMINAL_SIGNAL_ELIGIBILITY_BEGIN
+/// Only a known terminal notification permits skipping a nonzero signal.
+/// These descriptors come from pidfd_open(flags=0), so readiness covers the
+/// whole thread group. Errors, invalid fds and unknown events stay eligible.
+fn pidfd_terminal_ready(polled: libc::c_int, events: libc::c_short) -> bool {
+    polled == 1
+        && events & libc::POLLIN != 0
+        && events & !(libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP) == 0
+}
+
+// READINESS_OBSERVATION_BEGIN
+#[derive(Clone, Copy)]
+struct PidfdReadiness {
+    polled: libc::c_int,
+    revents: libc::c_short,
+    terminal: bool,
+    poll_errno: Option<i32>,
+}
+
+fn pidfd_readiness_with(
+    fd: RawFd,
+    poll: impl FnOnce(&mut libc::pollfd) -> libc::c_int,
+) -> PidfdReadiness {
+    let mut entry = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLRDNORM,
+        revents: 0,
+    };
+    let polled = poll(&mut entry);
+    // Capture the failing poll's errno before classification or a later signal.
+    let poll_errno = if polled < 0 {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    PidfdReadiness {
+        polled,
+        revents: entry.revents,
+        terminal: pidfd_terminal_ready(polled, entry.revents),
+        poll_errno,
+    }
+}
+
+fn pidfd_readiness(fd: &OwnedFd) -> PidfdReadiness {
+    // SAFETY: one valid pollfd, the same nonblocking timeout, no ownership change.
+    pidfd_readiness_with(fd.as_raw_fd(), |entry| unsafe { libc::poll(entry, 1, 0) })
+}
+
+fn signal_readiness<T>(
+    signal: libc::c_int,
+    fd: Option<&T>,
+    poll: impl FnOnce(&T) -> PidfdReadiness,
+) -> Option<PidfdReadiness> {
+    if signal == 0 {
+        None
+    } else {
+        fd.map(poll)
+    }
+}
+// READINESS_OBSERVATION_END
+// TERMINAL_SIGNAL_ELIGIBILITY_END
+
 fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: a live owned pidfd, a null siginfo and no flags.
     let result = unsafe {
@@ -578,6 +640,126 @@ fn prepare(args: &[OsString]) -> Result<Prepared, (u8, String)> {
     })
 }
 
+// STOP_OBSERVATION_BEGIN
+const STOP_OBSERVATION_CAP: usize = 64;
+
+#[derive(Clone, Copy)]
+struct StopEvent {
+    kind: &'static str,
+    pid: i32,
+    start_tick: Option<u64>,
+    root: bool,
+    target: Option<&'static str>,
+    signal: Option<&'static str>,
+    result: Option<&'static str>,
+    errno: Option<i32>,
+    status: Option<i32>,
+    readiness: Option<PidfdReadiness>,
+}
+
+struct StopObservation {
+    active: bool,
+    records: [Option<StopEvent>; STOP_OBSERVATION_CAP],
+    used: usize,
+    truncated: bool,
+}
+
+impl Default for StopObservation {
+    fn default() -> Self {
+        Self {
+            active: false,
+            records: [None; STOP_OBSERVATION_CAP],
+            used: 0,
+            truncated: false,
+        }
+    }
+}
+
+impl StopObservation {
+    fn begin(&mut self) {
+        self.active = true;
+    }
+
+    fn push(&mut self, event: StopEvent) {
+        if !self.active {
+            return;
+        }
+        if self.used < STOP_OBSERVATION_CAP {
+            self.records[self.used] = Some(event);
+            self.used += 1;
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn signal(
+        &mut self,
+        pid: i32,
+        start_tick: Option<u64>,
+        root: bool,
+        target: &'static str,
+        signal: libc::c_int,
+        sent: &io::Result<()>,
+        readiness: Option<PidfdReadiness>,
+    ) {
+        let errno = sent.as_ref().err().and_then(io::Error::raw_os_error);
+        let result = if sent.is_ok() {
+            "ok"
+        } else if errno == Some(libc::ESRCH) {
+            "esrch"
+        } else {
+            "error"
+        };
+        let signal = if signal == libc::SIGTERM {
+            "term"
+        } else if signal == libc::SIGKILL {
+            "kill"
+        } else {
+            "other"
+        };
+        self.push(StopEvent {
+            kind: "signal",
+            pid,
+            start_tick,
+            root,
+            target: Some(target),
+            signal: Some(signal),
+            result: Some(result),
+            errno,
+            status: None,
+            readiness,
+        });
+    }
+
+    fn reaped(&mut self, pid: i32, root: bool, status: i32) {
+        // A waitpid PID cannot safely be rejoined to an old pidfd generation.
+        self.push(StopEvent {
+            kind: "reap",
+            pid,
+            start_tick: None,
+            root,
+            target: None,
+            signal: None,
+            result: None,
+            errno: None,
+            status: Some(status),
+            readiness: None,
+        });
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let records: Vec<_> = self.records[..self.used].iter().flatten().map(|event| {
+            serde_json::json!({ "kind": event.kind, "pid": event.pid, "startTick": event.start_tick,
+                "root": event.root, "target": event.target, "signal": event.signal, "result": event.result,
+                "errno": event.errno, "waitStatus": event.status,
+                "readiness": event.readiness.map(|ready| serde_json::json!([ready.polled, ready.revents, ready.terminal, ready.poll_errno])) })
+        }).collect();
+        serde_json::json!({ "schema": "takosumi.guard-stop-observation@v1", "diagnosticOnly": true,
+            "scope": "existing_drain", "readinessFields": ["polled", "revents", "terminal", "pollErrno"], "capacity": STOP_OBSERVATION_CAP, "truncated": self.truncated, "records": records })
+    }
+}
+// STOP_OBSERVATION_END
+
 struct Run {
     me: i32,
     tracker: Tracker,
@@ -588,6 +770,7 @@ struct Run {
     forced: BTreeSet<i32>,
     cleanup_errors: BTreeSet<String>,
     non_fatal: BTreeSet<String>,
+    stop_observation: StopObservation,
 }
 
 fn exit_code(status: libc::c_int) -> i32 {
@@ -621,6 +804,11 @@ impl Run {
                     _ => return Err(fault(&error)),
                 }
             }
+            self.stop_observation.reaped(
+                pid,
+                Some(pid) == self.child && self.root_exit.is_none(),
+                status,
+            );
             if Some(pid) == self.child && self.root_exit.is_none() {
                 self.root_exit = Some(exit_code(status));
             }
@@ -644,8 +832,22 @@ impl Run {
     /// child while it is unreaped.
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
-        for (pid, (_, fd)) in &self.tracker.handles {
-            match pidfd_signal(fd, signal) {
+        for (pid, (start_tick, fd)) in &self.tracker.handles {
+            let readiness = signal_readiness(signal, Some(fd), pidfd_readiness);
+            if readiness.is_some_and(|ready| ready.terminal) {
+                continue;
+            }
+            let sent = pidfd_signal(fd, signal);
+            self.stop_observation.signal(
+                *pid,
+                Some(*start_tick),
+                Some(*pid) == self.child && self.root_exit.is_none(),
+                "retained_pidfd",
+                signal,
+                &sent,
+                readiness,
+            );
+            match sent {
                 Ok(()) => {
                     self.forced.insert(*pid);
                 }
@@ -660,6 +862,10 @@ impl Run {
             if self.child_fd.is_none() {
                 self.child_fd = child_pidfd(pid).ok(); // Retry a failed open.
             }
+            let readiness = signal_readiness(signal, self.child_fd.as_ref(), pidfd_readiness);
+            if readiness.is_some_and(|ready| ready.terminal) {
+                return;
+            }
             let sent = match &self.child_fd {
                 Some(fd) => pidfd_signal(fd, signal),
                 // Still no pidfd: signal by pid. SIGCHLD has its default
@@ -671,6 +877,19 @@ impl Run {
                     _ => Err(io::Error::last_os_error()),
                 },
             };
+            self.stop_observation.signal(
+                pid,
+                None,
+                true,
+                if self.child_fd.is_some() {
+                    "direct_pidfd"
+                } else {
+                    "direct_pid"
+                },
+                signal,
+                &sent,
+                readiness,
+            );
             match sent {
                 Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
@@ -741,6 +960,7 @@ impl Run {
     /// The bounded drain every run takes, however it ended. Returns whether
     /// the kernel reported no children (ECHILD).
     fn drain(&mut self, signals: &Signals) -> bool {
+        self.stop_observation.begin();
         'phases: for (signal, budget) in DRAIN {
             if let Some(signal) = signal {
                 self.send(signal);
@@ -791,6 +1011,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         forced: BTreeSet::new(),
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
+        stop_observation: StopObservation::default(),
     };
     let mut failure = None;
     // A stop requested before the browser starts (a parent already gone, or a
@@ -835,6 +1056,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         "error": failure,
         "cleanupErrors": run.cleanup_errors,
         "nonFatalErrors": run.non_fatal,
+        "stopObservation": run.stop_observation.json(),
     });
     // One write of the whole document, so a reader never sees a partial one
     // from a successful write.

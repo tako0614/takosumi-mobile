@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' version '9.1.1' }
+
+// A separate Java-only comparison fixture, never a product dependency.
+android {
+    namespace 'com.takosumi.fixture.geckodownload'
+    compileSdk { version = release(37) { minorApiLevel = 2 } }
+    defaultConfig {
+        applicationId 'com.takosumi.fixture.geckodownload'
+        minSdk 28
+        targetSdk 36
+        versionCode 1
+        versionName '1'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        ndk { abiFilters 'x86_64' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+dependencies {
+    implementation 'org.mozilla.geckoview:geckoview:159.0.20261102144711'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.test:core:1.6.1'
+}

@@ -1,6 +1,9 @@
 const COMMANDS: &[&str] = &[
     "capabilities",
     "clear_profile",
+    "recover_profile",
+    "pending_permissions",
+    "resolve_permission",
     "open",
     "pin_shortcut",
     "open_client",

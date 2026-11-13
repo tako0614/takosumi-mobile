@@ -12,6 +12,7 @@ import re
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -22,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import windows_browser_observer as observer  # noqa: E402
 import windows_browser_process as runner  # noqa: E402
+import windows_browser_fault as fault  # noqa: E402
 from windows_smoke import Failure  # noqa: E402
 
 
@@ -152,7 +154,204 @@ class ReplyingSocket(FakeSocket):
         self.messages.extend(after)
 
 
+def _cdp_receive_control(module, chunks, ticks=None, seed=0, buffer=b"", command_seed=0):
+    """No sockets: run one original command against controlled existing recv results."""
+    trace, queued = [], list(chunks)
+    values = iter([10.0] * 32 if ticks is None else ticks)
+    class Clock:
+        @staticmethod
+        def monotonic():
+            value = next(values)
+            trace.append(("clock", value))
+            return value
+    class Entropy:
+        @staticmethod
+        def urandom(count):
+            trace.append(("random", count))
+            return b"x" * count
+    class Wire:
+        def settimeout(self, value):
+            trace.append(("settimeout", value))
+        def sendall(self, data):
+            trace.append(("send", len(data), hashlib.sha256(data).hexdigest()))
+        def recv(self, count):
+            trace.append(("recv", count))
+            item = queued.pop(0) if queued else TimeoutError("sensitive timeout")
+            if isinstance(item, BaseException):
+                raise item
+            return item
+    websocket = module.WebSocket.__new__(module.WebSocket)
+    websocket.sock, websocket.buffer, websocket.partial = Wire(), buffer, None
+    client = module.Cdp(websocket, "sensitive label")
+    client.events = [{} for _ in range(seed)]
+    client.next = command_seed
+    result, caught = None, None
+    with mock.patch.object(module, "time", Clock), mock.patch.object(module, "os", Entropy):
+        try:
+            result = client.command("sensitive.method", {"url": "https://private.invalid/"}, session="sensitive session", timeout=1)
+        except Exception as error:
+            caught = error
+    functional = {"result": result, "errorType": None if caught is None else type(caught).__name__,
+                  "errorDigest": None if caught is None else hashlib.sha256(str(caught).encode()).hexdigest(),
+                  "suppressedContext": None if caught is None else caught.__suppress_context__,
+                  "next": client.next, "events": len(client.events), "base": client.base,
+                  "closedDigest": None if client.closed is None else hashlib.sha256(client.closed.encode()).hexdigest(),
+                  "bufferBytes": len(websocket.buffer), "bufferDigest": hashlib.sha256(websocket.buffer).hexdigest(),
+                  "fragmentBytes": None if websocket.partial is None else len(websocket.partial),
+                  "fragmentDigest": None if websocket.partial is None else hashlib.sha256(websocket.partial).hexdigest(),
+                  "unreadChunks": len(queued)}
+    return client, websocket, trace, functional, caught
+
+
 class CdpTests(unittest.TestCase):
+    def test_receive_observation_separates_existing_transport_and_complete_messages(self):
+        reply = json.dumps({"id": 1, "result": {"ok": True}}).encode()
+        frame = server_frame(1, reply)
+        prefix = reply[:10]
+        event = server_frame(1, json.dumps({"method": "sensitive.event"}).encode())
+        cases = (
+            ("socket", [TimeoutError()], None, 0, b"", "timeout", "socket", 0, False, False),
+            ("partial", [frame[:3], TimeoutError()], None, 0, b"", "timeout", "socket", 0, False, False),
+            ("fragment", [server_frame(1, prefix, fin=False), TimeoutError()], None, 0, b"", "timeout", "socket", 1, True, False),
+            ("deadline", [], [10.0, 11.0], 0, frame[:3], "timeout", "deadline", 0, False, False),
+            ("eof", [b""], None, 0, b"", "connection_error", "socket_closed", 0, False, True),
+            ("closed", [server_frame(8, b"")], None, 0, b"", "connection_error", "frame_closed", 1, False, True),
+            ("os", [OSError("sensitive os detail")], None, 0, b"", "connection_error", "socket", 0, False, False),
+            ("json", [server_frame(1, b"{")], None, 0, b"", "exception", "message_bytes", 1, False, False),
+            ("ping", [server_frame(9, b"x"), TimeoutError()], None, 0, b"", "timeout", "socket", 1, False, False),
+            ("reply", [frame], None, 0, b"", "message", "message_bytes", 1, False, False),
+            ("joined", [server_frame(1, prefix, fin=False) + server_frame(0, reply[10:])], None, 0, b"", "message", "message_bytes", 2, False, False),
+            ("eventcap", [event + frame], None, 4096, b"", "message", "message_bytes", 1, False, False),
+        )
+        for index, (_, chunks, ticks, seed, buffer, outcome, boundary, frames, fragment, closed) in enumerate(cases):
+            with self.subTest(case=index):
+                client, websocket, trace, functional, _ = _cdp_receive_control(observer, chunks, ticks, seed, buffer)
+                record = client.last_command_observation
+                receive = record["lastReceive"]
+                transport = receive["transport"]
+                self.assertEqual(receive["outcome"], outcome)
+                self.assertFalse(receive["observationError"] or client.command_observation_error)
+                self.assertEqual((transport["boundary"], transport["frames"], transport["fragmentActive"], transport["closed"]),
+                                 (boundary, frames, fragment, closed))
+                self.assertEqual(transport["bufferedBytes"], len(websocket.buffer))
+                self.assertEqual(transport["fragmentBytes"], 0 if websocket.partial is None else len(websocket.partial))
+                self.assertNotIn("sensitive", json.dumps(record))
+                self.assertNotIn("private.invalid", json.dumps(record))
+                self.assertEqual(sum(v[0] == "send" for v in trace), 2 if index == 8 else 1)
+                if index == 1:
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"], functional["bufferBytes"]), (1, 3, 3))
+                if index == 2:
+                    self.assertEqual(transport["fragmentBytes"], len(prefix))
+                if index == 3:
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"]), (0, 0))
+                    self.assertFalse(any(v[0] == "recv" for v in trace))
+                if index == 11:
+                    self.assertEqual((functional["events"], functional["base"]), (3073, 1024))
+                    self.assertEqual((record["events"], record["matchingReplies"]), (1, 1))
+                    self.assertEqual((transport["readsReturned"], transport["bytesReceived"]), (0, 0), "Last receive can use held bytes")
+        for index, helper in enumerate(("receive_observation", "receive_snapshot")):
+            with self.subTest(poison=index):
+                original = RuntimeError("sensitive original")
+                with mock.patch.object(observer, helper, side_effect=ValueError("sensitive metadata")):
+                    client, _, _, _, caught = _cdp_receive_control(observer, [original])
+                self.assertTrue(caught is original, "Metadata must retain the original exception")
+                self.assertTrue(client.command_observation_error)
+                self.assertNotIn("sensitive", json.dumps(client.last_command_observation))
+        client = observer.Cdp(FakeSocket([{"id": 1, "result": {}}]), "sensitive label")
+        self.assertEqual(client.command("sensitive.method"), {})
+        self.assertIsNone(client.last_command_observation["lastReceive"]["transport"])
+        self.assertFalse(client.command_observation_error)
+        state = observer.receive_observation(None, "start", buffered=0, fragment=0, fragment_active=False)
+        state.update(readsReturned=2**31-1, bytesReceived=2**31-1, frames=2**31-1)
+        capped = observer.receive_observation(state, "read", buffered=2**31, fragment=0, fragment_active=False, size=1)
+        capped = observer.receive_observation(capped, "frame", buffered=0, fragment=0, fragment_active=False)
+        self.assertTrue(capped["countsCapped"])
+        self.assertTrue(all(capped[key] == 2**31-1 for key in ("readsReturned", "bytesReceived", "frames")))
+        for index, bad in enumerate((dict(capped, payload="sensitive"), dict(capped, frames=True),
+                                     dict(capped, fragmentBytes=1), dict(capped, closed=True))):
+            with self.subTest(shape=index), self.assertRaises(ValueError):
+                observer.receive_snapshot("message", bad)
+        saved = dict(client.last_command_observation)
+        before = json.dumps(saved, sort_keys=True)
+        client.websocket.messages = [{"id": 2, "result": {}}]
+        client.command("sensitive cleanup")
+        self.assertEqual(json.dumps(saved, sort_keys=True), before, "Cleanup cannot mutate a copied previous snapshot")
+
+    def test_other_reply_relation_is_closed_without_changing_matching_or_io(self):
+        cases = ((1, "older"), (3, "future"), (None, "invalid"), (True, "invalid"),
+                 (1.0, "invalid"), ("sensitive https://private.invalid/", "invalid"),
+                 (0, "invalid"), (-1, "invalid"), ([], "invalid"), ({}, "invalid"),
+                 (2**53, "invalid"))
+        decode = observer.json.loads
+        gets = []
+        class Decoded(dict):
+            def get(self, key, default=None):
+                gets.append(key)
+                return super().get(key, default)
+        def decoded(text):
+            return Decoded(decode(text))
+        for index, (reply_id, relation) in enumerate(cases):
+            with self.subTest(relation=index):
+                gets.clear()
+                wire = server_frame(1, json.dumps({"id": reply_id}).encode())
+                wire += server_frame(1, b'{"id":2,"result":{"ok":true}}')
+                with mock.patch.object(observer.json, "loads", side_effect=decoded):
+                    client, _, trace, functional, caught = _cdp_receive_control(observer, [wire], command_seed=1)
+                record = client.last_command_observation
+                self.assertIsNone(caught)
+                self.assertEqual(functional["result"], {"ok": True})
+                self.assertEqual(gets, ["id", "id", "result"], "Reuse the original one get per message")
+                self.assertEqual((record["lastOtherReplyRelation"], record["otherReplies"], record["matchingReplies"]),
+                                 (relation, 1, 1))
+                self.assertFalse(client.command_observation_error)
+                self.assertEqual(sum(v[0] == "send" for v in trace), 1)
+                self.assertEqual(sum(v[0] == "recv" for v in trace), 1)
+                self.assertNotIn("sensitive", json.dumps(record))
+                self.assertNotIn("private.invalid", json.dumps(record))
+        for index, reply_id in enumerate((True, 1.0)):
+            with self.subTest(original_equality=index):
+                wire = server_frame(1, json.dumps({"id": reply_id, "result": {"ok": True}}).encode())
+                client, _, _, functional, caught = _cdp_receive_control(observer, [wire])
+                self.assertIsNone(caught)
+                self.assertEqual(functional["result"], {"ok": True})
+                self.assertIsNone(client.last_command_observation["lastOtherReplyRelation"])
+                self.assertEqual(client.last_command_observation["otherReplies"], 0)
+        event = server_frame(1, b'{"method":"sensitive.event"}')
+        reply = server_frame(1, b'{"id":2,"result":{}}')
+        client, _, _, _, _ = _cdp_receive_control(observer, [event + reply], command_seed=1)
+        self.assertIsNone(client.last_command_observation["lastOtherReplyRelation"])
+        self.assertEqual((client.last_command_observation["otherReplies"], client.last_command_observation["events"]), (0, 1))
+        older = server_frame(1, b'{"id":1}')
+        client, _, _, _, caught = _cdp_receive_control(observer, [older], command_seed=1)
+        self.assertIsInstance(caught, Failure)
+        self.assertEqual((client.last_command_observation["lastOtherReplyRelation"],
+                          client.last_command_observation["outcome"]), ("older", "timeout"))
+        for index, (helper, effect) in enumerate((("command_reply_relation", {"side_effect": ValueError("sensitive classifier")}),
+                                                ("command_reply_relation", {"return_value": "sensitive poison"}),
+                                                ("command_observation", {"side_effect": ValueError("sensitive sink")}))):
+            for fails in (False, True):
+                with self.subTest(metadata=index, original_fails=fails):
+                    original = RuntimeError("sensitive original")
+                    chunks = [older, original] if fails else [older + reply]
+                    with mock.patch.object(observer, helper, **effect):
+                        client, _, _, functional, caught = _cdp_receive_control(observer, chunks, command_seed=1)
+                    self.assertTrue(caught is original if fails else caught is None)
+                    self.assertEqual(functional["result"], None if fails else {})
+                    self.assertTrue(client.command_observation_error)
+                    self.assertNotIn("sensitive", json.dumps(client.last_command_observation))
+        record = observer.command_observation(None, "start", ident=2)
+        record["otherReplies"] = 2**31 - 1
+        saved = dict(record)
+        capped = observer.command_observation(record, "message", matching=False, other=True, event=False, reply_id=3, ident=2)
+        self.assertEqual((capped["otherReplies"], capped["lastOtherReplyRelation"]), (2**31 - 1, "future"))
+        self.assertTrue(capped["countsCapped"])
+        self.assertEqual(record, saved, "Copied prior snapshots must not change")
+        fresh = observer.command_observation(None, "start", ident=3)
+        self.assertIsNone(fresh["lastOtherReplyRelation"])
+        self.assertIsNone({}.get("lastOtherReplyRelation"), "Absent older metadata is unknown")
+        self.assertEqual(observer.command_reply_relation(1, 2**53), "unknown")
+        self.assertEqual(observer.command_reply_relation(2, 2), "unknown")
+
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},
                                        {"id": 1, "result": {"ok": True}}]), "work")
@@ -206,6 +405,36 @@ class CdpTests(unittest.TestCase):
                          {"profile": "P", "type": "alert", "origin": "https://excalidraw.com"})
         self.assertNotIn("secret", json.dumps(watch.proof), "only the origin of a real site's URL is kept")
         self.assertEqual(cdp.websocket.sent, [], "nothing may answer the refused dialog")
+
+    def test_the_final_quit_requires_normal_cleanup_before_reporting_success(self):
+        normal = {"rootExit": 0, "complete": True, "kernelNoChildren": True,
+                  "remaining": [], "forcedCleanup": 0, "cleanupErrors": [], "error": None}
+        # Run 43179155497: Personal's browser exited 0, but its guard had to
+        # kill ten descendants. Any JSON receipt used to end this loop and
+        # mark the observer passed, hiding the reason for the App's refusal
+        # behind the outer guard's subsequent 45-second timeout.
+        for changed in ({"forcedCleanup": 10}, {"rootExit": 2},
+                        {"remaining": [17]}, {"complete": False},
+                        {"kernelNoChildren": False}, {"cleanupErrors": ["failed"]},
+                        {"error": "failed"}, {}):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "guard.json"
+                receipt = dict(normal, **changed)
+                path.write_text(json.dumps(receipt))
+                cdp = observer.Cdp(FakeSocket([]), "personal")
+                page = observer.Page(cdp, "S", {
+                    "opened": {"windowId": 1, "nativePid": 2}, "profile": "Personal",
+                    "guardReceipt": str(path)}, {"targetId": "T"})
+                watch = observer.Observer(Path(directory), "https://127.0.0.1:1", 1, "",
+                                          real_site="photopea")
+                if changed:
+                    with self.assertRaisesRegex(Failure, "Final quit.*Personal.*abnormal receipt"):
+                        watch.finish_final_quit([page])
+                else:
+                    watch.finish_final_quit([page])
+                self.assertEqual(watch.proof["finalQuitReceipts"],
+                                 [{"profile": "Personal", "receipt": receipt}])
+                self.assertEqual(cdp.websocket.sent, [], "an ended profile needs no CDP commands")
 
     def test_photopea_is_entered_from_its_landing_and_excalidraw_directly(self):
         class FakePage:
@@ -403,6 +632,277 @@ class CdpTests(unittest.TestCase):
         cdp.drain(5)
         self.assertEqual(cdp.mark(), 4200)
         self.assertEqual([event["method"] for event in cdp.since(4198)], ["E4198", "E4199"])
+
+    def test_a_starved_read_rides_the_sent_requests_queue_position(self):
+        calls = []
+
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                calls.append(timeout)
+                return {"ok": True}
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.read_evaluate(FakePage(), "1"), {"ok": True})
+        # The whole starved bound waits on the request already sent — it is
+        # not re-queued behind a still-deep renderer task queue.
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0], 5.0)
+
+    def test_a_timed_out_starved_read_is_recorded_before_raising(self):
+        calls = []
+
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                calls.append(timeout)
+                raise Failure("CDP timeout Runtime.evaluate (P)")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.object(observer, "STARVED_READ_WAIT", 0.001):
+            with self.assertRaisesRegex(Failure, "CDP timeout"):
+                watch.read_evaluate(FakePage(), "1")
+        retries = watch.proof["starvedEvaluateRetries"]
+        self.assertEqual(retries[0]["attempt"], 1)
+        self.assertIn("CDP timeout", retries[0]["error"])
+
+    def test_a_starved_read_reraises_non_timeout_failures_unrecorded(self):
+        class FakePage:
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                raise Failure("CDP Runtime.evaluate failed (P): boom")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "boom"):
+            watch.read_evaluate(FakePage(), "1")
+        self.assertNotIn("starvedEvaluateRetries", watch.proof)
+
+    def contended_page(self, sends, events, evaluate=None, base=0):
+        class FakeCdp:
+            def __init__(self):
+                self.base = base
+
+            # Faithful to Cdp.since only while base == 0; tests needing a
+            # nonzero base refuse before reaching this scan.
+            def since(self, mark):
+                return events[mark:]
+
+        class FakePage:
+            def __init__(self):
+                self.cdp = FakeCdp()
+                self.session = "S1"
+                self.target = {"targetId": "T1"}
+                self.process = {"profile": "P"}
+                self.calls = []
+
+            def send(self, method, params=None, timeout=5.0):
+                self.calls.append(method)
+                result = sends[method]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            def evaluate(self, expression, gesture=False, timeout=5.0):
+                self.calls.append("Runtime.evaluate")
+                return evaluate or {"document": "0:n", "storage": "0:n",
+                                    "cookie": "0:n", "origin": "https://site.test"}
+
+            def pages(self):
+                return [self.target["targetId"]]
+
+        sends.setdefault(
+            "Page.getFrameTree",
+            {"frameTree": {"frame": {"id": "F", "securityOrigin": "https://site.test"}}})
+        return FakePage()
+
+    def test_a_contended_sample_reads_state_off_the_renderer_queue(self):
+        key = "sumi_app_process_no-such-case"
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"], ["other", "x"]]},
+             "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0),
+                         {"storage": "0:n", "cookie": "0:n", "origin": "https://site.test"})
+        self.assertNotIn("Runtime.evaluate", page.calls)
+
+    def test_a_contended_sample_refuses_a_main_frame_navigation(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Page.frameNavigated", "sessionId": "S1",
+              "params": {"frame": {"id": "F2", "parentId": "F"}}},
+             {"method": "Page.frameNavigated", "sessionId": "S1",
+              "params": {"frame": {"id": "F"}}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "replaced"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_a_main_frame_load(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Page.frameStartedLoading", "sessionId": "S1",
+              "params": {"frameId": "F"}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "began replacing"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_a_crashed_renderer(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}},
+            [{"method": "Inspector.targetCrashed", "sessionId": "S1", "params": {}}])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "crashed"):
+            watch.contended_sample(page, 0)
+
+    def test_a_contended_sample_refuses_dropped_event_coverage(self):
+        page = self.contended_page(
+            {"DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [], base=5)
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with self.assertRaisesRegex(Failure, "were dropped"):
+            watch.contended_sample(page, 0)
+        self.assertTrue(page.calls, "the sends precede the coverage check")
+
+    def test_a_contended_sample_falls_back_when_the_storage_domains_are_missing(self):
+        missing = observer.CdpError("CDP DOMStorage.enable failed (P): method missing",
+                                  {"message": "method missing"})
+        page = self.contended_page(
+            {"DOMStorage.enable": missing,
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertIn("Runtime.evaluate", page.calls)
+        self.assertEqual(len(watch.proof["browserSampleFallbacks"]), 1)
+
+    def test_a_contended_sample_rides_out_a_starved_browser_read(self):
+        # Run 43090171027: the storm that still answered every control-pipe
+        # command starved getFrameTree's flat SETTLE_WAIT. The send claims
+        # its position and waits out one shared bound instead of failing on
+        # the first 10 s.
+        key = "sumi_app_process_no-such-case"
+        starved = {"n": 0}
+        def flaky(method):
+            starved["n"] += 1
+            if starved["n"] == 1:
+                return Failure("CDP timeout Page.getFrameTree (P)")
+            return {"frameTree": {"frame": {"id": "F", "securityOrigin": "https://site.test"}}}
+        class Sends(dict):
+            def setdefault(self, key, default=None):
+                # Keep the key absent so __missing__ keeps producing the
+                # flaky results; contended_page would otherwise pin a
+                # static default tree.
+                return default if key == "Page.getFrameTree" else super().setdefault(key, default)
+            def __missing__(self, method):
+                return flaky(method) if method == "Page.getFrameTree" else {}
+        sends = Sends({"DOMStorage.enable": {},
+                       "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
+                       "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
+        page = self.contended_page(sends, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertEqual([call for call in page.calls if call == "Page.getFrameTree"],
+                         ["Page.getFrameTree", "Page.getFrameTree"])
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertEqual(retries[0]["method"], "Page.getFrameTree")
+        self.assertIn("CDP timeout", retries[0]["error"])
+
+    def test_a_contended_sample_names_a_starved_browser_read_after_the_bound(self):
+        page = self.contended_page(
+            {"Page.getFrameTree": Failure("CDP timeout Page.getFrameTree (P)"),
+             "DOMStorage.enable": {},
+             "DOMStorage.getDOMStorageItems": {"entries": []},
+             "Network.getCookies": {"cookies": []}}, [])
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.object(observer, "STARVED_READ_WAIT", 0.001):
+            with self.assertRaisesRegex(Failure, "CDP timeout Page.getFrameTree"):
+                watch.contended_sample(page, 0)
+        self.assertEqual(watch.proof["starvedBrowserReadRetries"][0]["method"],
+                         "Page.getFrameTree")
+
+    def contended_page_with_events(self, sends, events):
+        page = self.contended_page(sends, events)
+        page.cdp.events = events
+        return page
+
+    def test_a_starved_read_extends_only_while_the_storm_stays_live(self):
+        # Run 43173821786: DOMStorage.enable starved the full base bound
+        # while renderer churn kept the event stream alive. A stream still
+        # receiving events names a starved channel, so the bound extends in
+        # quiet-window steps and the late answer still lands.
+        key = "sumi_app_process_no-such-case"
+        attempts = {"n": 0}
+
+        def flaky(method):
+            attempts["n"] += 1
+            if attempts["n"] <= 3:
+                return Failure("CDP timeout DOMStorage.enable (P)")
+            return {}
+
+        class Sends(dict):
+            def __missing__(self, method):
+                return flaky(method) if method == "DOMStorage.enable" else {}
+
+        sends = Sends({"DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
+                       "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
+        events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
+        page = self.contended_page_with_events(sends, events)
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.multiple(observer, STARVED_READ_WAIT=0.01,
+                                 STARVED_QUIET_WAIT=0.05, STARVED_MAX_WAIT=5.0):
+            self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
+        self.assertEqual(attempts["n"], 4)
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertEqual(len(retries), 3)
+        self.assertTrue(all(retry["method"] == "DOMStorage.enable" for retry in retries))
+        self.assertTrue(all(retry["channelQuietSeconds"] == 0.0 for retry in retries))
+
+    def test_a_starved_read_still_names_the_method_past_the_hard_cap(self):
+        # Storm liveness extends only up to STARVED_MAX_WAIT: a channel that
+        # never quietens and never answers raises on the method's own name
+        # rather than waiting forever. send keeps the event stream fresh, so
+        # the extension path is what must give up — a dead-stream run would
+        # end on the soft deadline and never exercise the cap at all.
+        events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
+
+        class Cdp:
+            base = 0
+
+            def since(self, mark):
+                return events[mark:]
+
+        class Page:
+            def __init__(self):
+                self.attempts = 0
+                self.cdp = Cdp()
+                self.cdp.events = [{"method": "Target.targetCreated",
+                                    observer.RECEIVED_AT: time.monotonic()}]
+                self.session = "S1"
+                self.process = {"profile": "P"}
+
+            def send(self, method, params=None, timeout=5.0):
+                self.attempts += 1
+                # A broken bound without the hard cap would retry forever;
+                # fail the test on a distinct name instead of hanging.
+                if self.attempts > 100000:
+                    raise Failure("starved read ignored the hard cap")
+                self.cdp.events.append(
+                    {"method": "Target.targetCreated",
+                     observer.RECEIVED_AT: time.monotonic()})
+                raise Failure(f"CDP timeout {method} (P)")
+
+        watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
+        with mock.patch.multiple(observer, STARVED_READ_WAIT=0.01,
+                                 STARVED_QUIET_WAIT=0.01, STARVED_MAX_WAIT=0.05):
+            with self.assertRaisesRegex(Failure, "CDP timeout Page.getFrameTree"):
+                watch.contended_sample(Page(), 0)
+        retries = watch.proof["starvedBrowserReadRetries"]
+        self.assertTrue(retries)
+        self.assertTrue(all(retry["method"] == "Page.getFrameTree" for retry in retries))
 
 
 class TcpTableTests(unittest.TestCase):
@@ -759,6 +1259,163 @@ def main_source():
     return (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
 
 
+class FakeProcessApi:
+    """Handle objects keep their generation even when a PID is reused."""
+    def __init__(self):
+        self.images = {role: rf"C:\fixture\{role}.exe" for role in ("app", "guard", "browser")}
+        self.pids = {"app": 10, "guard": 20, "browser": 30}
+        self.objects = {pid: {"pid": pid, "created": pid * 100, "image": fault.image_key(self.images[role]),
+                              "live": True, "exit": None} for role, pid in self.pids.items()}
+        self.parent_ids = {30: 20, 20: 10}
+        self.opened, self.closed, self.signals = [], [], []
+        self.fail_open = None
+
+    def open(self, pid, terminate=False):
+        if pid == self.fail_open:
+            raise Failure("synthetic process access refusal")
+        handle = self.objects[pid]
+        self.opened.append((pid, terminate))
+        return handle
+
+    def identity(self, handle):
+        return {key: handle[key] for key in ("pid", "created", "image")}
+
+    def live(self, handle):
+        return handle["live"]
+
+    def parents(self):
+        return dict(self.parent_ids)
+
+    def terminate(self, handle):
+        self.signals.append(handle)
+        handle.update(live=False, exit=fault.FAULT_EXIT)
+
+    def wait(self, handle, milliseconds):
+        if handle["live"]:
+            raise Failure("synthetic process is still live")
+
+    def exit_code(self, handle):
+        return handle["exit"]
+
+    def close(self, handle):
+        self.closed.append(handle)
+
+
+class WindowsFaultTests(unittest.TestCase):
+    def recovery_layout(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        app_data, runtime = root / "local-app-data" / "fixture-case", root / "case" / "r"
+        profile = "11111111-1111-4111-8111-111111111111"
+        directory = app_data / "browser-process-experiment" / profile
+        cache = directory / "cef-profiles" / profile
+        cache.mkdir(parents=True)
+        receipt = runtime / "owned-guard" / "guard.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("")
+        process = {"profile": profile, "directory": str(directory), "guardReceipt": str(receipt),
+                   "opened": {"nativeCache": str(cache)}}
+        return process, app_data, runtime
+
+    def test_persistent_profile_is_in_app_data_while_guard_state_is_in_runtime(self):
+        process, app_data, runtime = self.recovery_layout()
+        paths = fault.recovery_paths(process, app_data, runtime)
+        # On Windows, the runner's Temp path can use RUNNER~1 while strict
+        # resolution returns runneradmin. Compare the same canonical paths.
+        self.assertEqual(paths["cache"], Path(process["opened"]["nativeCache"]).resolve(strict=True))
+        self.assertTrue(paths["cache"].is_relative_to(app_data.resolve(strict=True)))
+        self.assertFalse(paths["cache"].is_relative_to(runtime.resolve(strict=True)))
+        self.assertTrue(paths["receipt"].resolve(strict=True).is_relative_to(runtime.resolve(strict=True)))
+
+    def test_runtime_or_another_app_is_not_a_persistent_profile_owner(self):
+        process, app_data, runtime = self.recovery_layout()
+        for wrong in (runtime, app_data.parent):
+            with self.assertRaises(Failure):
+                fault.recovery_paths(process, wrong, runtime)
+
+    def test_foreign_guard_receipt_and_mismatched_native_cache_are_refused(self):
+        process, app_data, runtime = self.recovery_layout()
+        foreign = app_data / "foreign.json"
+        foreign.write_text("{}")
+        wrong = dict(process, guardReceipt=str(foreign))
+        with self.assertRaises(Failure):
+            fault.recovery_paths(wrong, app_data, runtime)
+        wrong = dict(process, opened={"nativeCache": str(app_data)})
+        with self.assertRaises(Failure):
+            fault.recovery_paths(wrong, app_data, runtime)
+
+    def test_only_the_held_browser_can_receive_the_explicit_fixture_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            proof = owned.fault()
+            self.assertEqual(proof["exit"], 73)
+            self.assertEqual(api.opened, [(10, False), (20, False), (30, True)])
+            self.assertEqual(api.signals, [owned.handles["browser"]])
+            self.assertTrue(api.objects[10]["live"])
+            self.assertTrue(api.objects[20]["live"])
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(len(api.signals), 1)
+        self.assertEqual(len(api.closed), 3)
+
+    def test_observation_only_lineages_never_acquire_termination_access(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images) as owned:
+            with self.assertRaises(Failure):
+                owned.fault()
+        self.assertEqual(api.signals, [])
+        self.assertFalse(any(terminate for _, terminate in api.opened))
+
+    def test_wrong_parent_image_birth_or_dead_owner_refuses_before_fault(self):
+        for defect in ("parent", "image", "birth", "dead", "missing-parent"):
+            with self.subTest(defect=defect):
+                api = FakeProcessApi()
+                with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+                    if defect == "parent":
+                        api.parent_ids[30] = 999
+                    elif defect == "image":
+                        api.objects[20]["image"] = fault.image_key(r"C:\foreign\guard.exe")
+                    elif defect == "birth":
+                        api.objects[30]["created"] = 1
+                    elif defect == "dead":
+                        api.objects[10]["live"] = False
+                    else:
+                        del api.parent_ids[20]
+                    with self.assertRaises(Failure):
+                        owned.fault()
+                    self.assertEqual(api.signals, [])
+
+    def test_pid_reuse_cannot_redirect_a_held_browser_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            original = api.objects[30]
+            original["live"] = False
+            api.objects[30] = dict(original, created=9999, live=True)
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(api.signals, [])
+            self.assertTrue(api.objects[30]["live"])
+
+    def test_partial_capture_refusal_closes_existing_handles(self):
+        api = FakeProcessApi()
+        api.fail_open = 30
+        with self.assertRaises(Failure):
+            fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True)
+        self.assertEqual(api.opened, [(10, False), (20, False)])
+        self.assertEqual(len(api.closed), 2)
+        self.assertEqual(api.signals, [])
+
+    def test_owner_ending_during_ancestry_inspection_refuses_the_fault(self):
+        api = FakeProcessApi()
+        with fault.OwnedBrowser(api, api.pids, api.images, allow_fault=True) as owned:
+            def owner_ends():
+                api.objects[10]["live"] = False
+                return dict(api.parent_ids)
+            api.parents = owner_ends
+            with self.assertRaises(Failure):
+                owned.fault()
+            self.assertEqual(api.signals, [])
+
+
 class RunnerTests(unittest.TestCase):
     def test_case_names_also_fit_the_app_identifier(self):
         for name in ("sumi-w3", "a", "x" * 24):
@@ -906,15 +1563,19 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(re.fullmatch(re.escape(product["productName"]) + r"_.*_x64-setup\.exe",
                                       "TakosumiFixture_0.1.0_x64-setup.exe"))
         # The upload takes one gathered directory; the gathering copies only
-        # the named evidence, through one copier that never takes an
-        # executable, a library or an installer.
+        # named reports through Copy-Evidence and standalone browser text
+        # through the SDK-free, tested allowlist copier.
         upload = job[job.index("name: cef-windows-package-evidence"):]
         self.assertIn("path: ${{ runner.temp }}/w6-evidence\n          if-no-files-found", upload)
         gather = job[job.index("- name: Gather the W6 evidence"):job.index("- name: Keep the W6 evidence")]
         self.assertIn("if: ${{ always() }}", gather)
         self.assertIn("$never = @('.exe', '.dll', '.pdb', '.lib', '.msi', '.sys', '.node')", gather)
         self.assertIn("$text = @('.json', '.log', '.txt', '.html', '.md')", gather)
-        self.assertEqual(gather.count("Copy-Item"), 1, "every copy goes through Copy-Evidence")
+        self.assertEqual(gather.count("Copy-Item"), 1, "report copies go through Copy-Evidence")
+        self.assertIn("python -B takosumi-mobile/native-tests/desktop/windows_package_evidence.py "
+                      "--source $tree --destination (Join-Path $out $name)", gather)
+        self.assertIn("'cef-profiles'", gather)
+        self.assertIn("native-tests/desktop/windows_package_evidence.py", runner.WINDOWS_SOURCES)
         self.assertIn("if ($never -contains $extension -or ($allowed -and $allowed -notcontains $extension) "
                       "-or (Test-Binary $file.FullName)) {", gather)
         # MZ, ELF and ZIP by content; a failed copy is logged, not fatal.
@@ -932,10 +1593,10 @@ class RunnerTests(unittest.TestCase):
                    "'fixture-stage.json' = 'takosumi-mobile/src-tauri/target/windows-cef-fixture/stage.json'",
                    "$trees = @{ 'case' = $env:W6_CASE; 'browser-smoke' = (Join-Path $env:RUNNER_TEMP 'w6-browser-smoke') }",
                    "Get-ChildItem -LiteralPath $tree -Recurse -File",
-                   "Get-ChildItem -LiteralPath $profile.FullName -File -Filter '*.log'"]
+                   "foreach ($name in @('browser.log', 'cef-native.log'))"]
         for source in sources:
             self.assertIn(source, gather)
-        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 5, "no other source is gathered")
+        self.assertEqual(gather.count("Get-ChildItem -LiteralPath"), 4, "no other source is gathered")
         for forbidden in ("setup", "bundle", "target-w3", "*.exe", "*.dll"):
             self.assertNotIn(forbidden, gather, f"the evidence must not include {forbidden}")
 
@@ -975,12 +1636,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(f"'^test result: ok\\. {tests} passed; 0 failed'", job)
 
     def test_the_macos_job_bundles_and_smokes_the_browser(self):
-        """M1: cef-macos builds the browser and its helper, bundles them with
-        CEF's framework, runs both smokes with the seatbelt check and uploads
-        text only."""
+        """M1/M4: cef-macos runs standalone and packaged browser smokes
+        with the seatbelt check and uploads text evidence only."""
         workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         job = workflow[workflow.index("\n  cef-macos:\n"):]
-        self.assertIn("    runs-on: macos-latest\n    timeout-minutes: 75\n", job)
+        self.assertRegex(job, r"(?m)^    runs-on: macos-latest$")
+        # M4 adds packaged site flows. Comments between the fields must
+        # not change which runner/bounded job this contract checks.
+        self.assertRegex(job, r"(?m)^    timeout-minutes: 100$")
         self.assertIn("run: cargo build --locked --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper "
                       "--bin takosumi-browser-guard\n", job)
         self.assertIn('node scripts/bundle-macos-cef.mjs --cef "$cef" --bin "$CARGO_TARGET_DIR/debug" '
@@ -993,6 +1656,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(smokes, [
             f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-product/{app}" '
             '--work "$RUNNER_TEMP" --expect-sandbox',
+            f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser '
+            f'"$CARGO_TARGET_DIR/debug/bundle/macos/Takosumi.app/Contents/Resources/cef/{app}" '
+            '--work "$RUNNER_TEMP" --expect-sandbox',
             f'run: python3 -B native-tests/cef-candidate/windows_smoke.py --browser "$RUNNER_TEMP/m1-fixture/{app}" '
             '--work "$RUNNER_TEMP" --expect-load --reuse --expect-sandbox',
         ])
@@ -1001,12 +1667,38 @@ class RunnerTests(unittest.TestCase):
                      "m1-fixture/bundle.json"):
             self.assertIn(f"${{{{ runner.temp }}}}/{path}\n", upload)
         self.assertNotIn(".app\n", upload)
-        self.assertNotIn("target-cef", upload)
+        paths = re.search(r"(?m)^          path: \|\n((?:            .+\n)+)", upload)
+        self.assertIsNotNone(paths)
+        entries = [entry.strip() for entry in paths.group(1).splitlines()]
+        self.assertEqual([entry for entry in entries if entry.startswith("target-cef/")], [
+            f"target-cef/debug/bundle/macos/{name}.app/Contents/Info.plist"
+            for name in ("Takosumi", "TakosumiFixture")
+        ])
+        for entry in entries:
+            # Packaged Info.plist is text; do not permit its containing app
+            # or arbitrary target files when accepting these new paths.
+            self.assertRegex(entry, r"\.(json|log|plist)$")
         self.assertNotIn("codesign", job)
         # The window wait's decisions run, every test of them.
         source = (HERE.parents[1] / "native-tests/cef-candidate/src/window_wait.rs").read_text(encoding="utf-8")
         self.assertIn('rustc --edition 2021 --test native-tests/cef-candidate/src/window_wait.rs -o "$exe"\n', job)
         self.assertIn(f"grep -q '^test result: ok\\. {source.count('#[test]')} passed; 0 failed'", job)
+
+    def test_the_macos_job_runs_both_sites_with_and_without_packaged_resources(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-macos:\n"):]
+        flows = [line.strip() for line in job.splitlines()
+                 if line.strip().startswith("run: python3 -B native-tests/desktop/macos_browser_process.py ")]
+        unbundled = ('run: python3 -B native-tests/desktop/macos_browser_process.py '
+                     '--binary "$CARGO_TARGET_DIR/debug/takosumi-mobile" '
+                     '--browser "$RUNNER_TEMP/m1-fixture/takosumi-cef-browser-process.app/Contents/MacOS/'
+                     'takosumi-cef-browser-process" --guard "$CARGO_TARGET_DIR/debug/takosumi-browser-guard" '
+                     '--work "$RUNNER_TEMP" --site ')
+        packaged = ('run: python3 -B native-tests/desktop/macos_browser_process.py --packaged '
+                    '--binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site ')
+        # Only packaged Photopea opts into scheduling-perturbing diagnostics.
+        self.assertEqual(flows, [unbundled + "excalidraw", unbundled + "photopea",
+                                 packaged + "excalidraw", packaged + "photopea --sample-shutdowns"])
 
     def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
         """M2: cef-macos runs every macOS guard self-test, then the adapter's
@@ -1058,8 +1750,20 @@ class RunnerTests(unittest.TestCase):
         required = re.findall(r"^\s+desktop::process_adapter::macos_tests::([a-z_]+)(?: \\|;)", adapter, re.M)
         self.assertEqual(sorted(required), sorted(tests))
         self.assertEqual(len(required), len(set(required)))
+        # The same macos_tests filter also includes the executable identity
+        # module. Require every one of those tests, not just a larger total.
+        image = (HERE.parents[1] / "src-tauri/plugins/app-screen/src/desktop/process_image.rs").read_text(
+            encoding="utf-8")
+        image_tests = re.findall(r"^    #\[test\]\n    fn ([a-z_]+)\(\)", image, re.M)
+        self.assertTrue(image_tests)
+        self.assertEqual(len(image_tests), image.count("#[test]"))
+        image_required = re.findall(r"^\s+desktop::process_macos::image::macos_tests::([a-z_]+)(?: \\|;)",
+                                    adapter, re.M)
+        self.assertEqual(sorted(image_required), sorted(image_tests))
+        self.assertEqual(len(image_required), len(set(image_required)))
         self.assertIn('grep -qF "test $name ... ok" "$log"', adapter)
-        self.assertIn(f"grep -q '^test result: ok\\. {len(tests)} passed; 0 failed; 0 ignored' \"$log\"", adapter)
+        self.assertIn(f"grep -q '^test result: ok\\. {len(tests) + len(image_tests)} passed; 0 failed; 0 ignored' \"$log\"",
+                      adapter)
         # The socket check uses the browser bundle's identifier, as the
         # bundler writes it.
         bundler = (HERE.parents[1] / "scripts/bundle-macos-cef.mjs").read_text(encoding="utf-8")
@@ -1102,7 +1806,7 @@ class RunnerTests(unittest.TestCase):
         workflow = (root / "ci.yml").read_text(encoding="utf-8")
         w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
         w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
-        for job, stage, runs in ((w3, "w3-stage", 1), (w4, "w4-stage", 2)):
+        for job, stage, runs in ((w3, "w3-stage", 2), (w4, "w4-stage", 2)):
             self.assertNotIn("unsandboxed-candidate", job)
             self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
                           "--bin takosumi-browser-guard\n", job)
@@ -1115,6 +1819,50 @@ class RunnerTests(unittest.TestCase):
                               '--guard "$stage\\takosumi-browser-guard.exe" ', line)
             self.assertEqual(job.count(f"$stage = Join-Path $env:RUNNER_TEMP '{stage}\\cef'\n"), runs)
             self.assertIn("key: cef-windows-app-cargo-w7-", job)
+
+    def test_recovery_is_a_fresh_case_with_six_required_cases_and_its_fault_source_pinned(self):
+        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
+        start = job.index("      - name: Actual home recovery after an owned browser fault\n")
+        step = job[start:job.index("      - name: Remove the fixture CA\n", start)]
+        self.assertIn("steps.w3-tls.outcome == 'success'", step)
+        self.assertIn("'sumi-w3-recover'", step)
+        command = next(line for line in step.splitlines() if line.strip().startswith("python -B "))
+        self.assertIn(" --recover | Tee-Object", command)
+        for other_mode in ("--packaged", "--real-site", "--restart", "--reset", "--unsandboxed-candidate"):
+            self.assertNotIn(other_mode, command)
+        cases = re.search(r"\$recoveryCases = @\((.*?)\n          \)", step, re.S)
+        self.assertIsNotNone(cases)
+        self.assertEqual(re.findall(r"'([a-z-]+)'", cases.group(1)),
+                         list(runner.OBSERVED_CASES["recover"]) + list(runner.FINAL_CASES))
+        self.assertIn(".Count -ne 6", step)
+        self.assertIn("$summary.phases[0].phase -ne 'recover'", step)
+        self.assertIn("native-tests/desktop/windows_browser_fault.py", runner.WINDOWS_SOURCES)
+
+    def test_recovery_final_sandbox_evidence_must_name_the_replacement_pid(self):
+        opened = {"processes": [{"profile": "work", "opened": {"nativePid": 30}}]}
+        record = {"profile": "work", "stage": "recovery-final", "browser": {"pid": 29},
+                  "renderers": [], "problems": []}
+        with self.assertRaises(Failure):
+            runner.sandbox_summary({"sandbox": [record]}, opened, True, ("recovery-final",))
+        record["browser"]["pid"] = 30
+        self.assertEqual(len(runner.sandbox_summary({"sandbox": [record]}, opened, True,
+                                                   ("recovery-final",))), 1)
+
+    def test_recovery_rejects_combined_or_unsandboxed_modes_before_creating_the_case(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as root:
+            case = Path(root) / "not-created"
+            command = [sys.executable, "-B", str(HERE / "windows_browser_process.py"),
+                       "--binary", "unused.exe", "--browser", "unused-browser.exe", "--guard", "unused-guard.exe",
+                       "--data", str(case), "--tls-cert", "unused.cert", "--tls-key", "unused.key",
+                       "--tls-ca", "unused.ca", "--recover"]
+            for mode in (["--restart"], ["--reset"], ["--packaged"], ["--real-site", "photopea"],
+                         ["--unsandboxed-candidate"]):
+                result = subprocess.run(command + mode, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("standalone sandboxed synthetic-site scenario", result.stderr)
+                self.assertFalse(case.exists())
 
     def test_the_sandboxed_browsers_dll_is_hashed_with_it(self):
         import tempfile
@@ -1189,8 +1937,12 @@ class RunnerTests(unittest.TestCase):
         # After CefShutdown: the sandboxed browser records and ends with
         # ExitProcess; the unsandboxed candidate records and returns.
         main = (HERE.parents[1] / "native-tests/cef-candidate/src/process_main.rs").read_text(encoding="utf-8")
-        self.assertIn("    shutdown();\n    let code = i32::from(failed);\n    #[cfg(windows)]\n"
-                      "    children_windows::finish(code, cfg!(feature = \"windows-sandbox\"));\n    code\n}", main)
+        ending = ("    let code = i32::from(failed);\n    #[cfg(windows)]\n"
+                  "    children_windows::finish(code, cfg!(feature = \"windows-sandbox\"));\n    code\n}")
+        self.assertIn(ending, main)
+        # macOS may record CefShutdown's return between these operations.
+        # Windows must still finish only after CefShutdown has returned.
+        self.assertLess(main.index("\n    shutdown();"), main.index(ending))
 
     def test_a_packaged_run_lets_the_app_resolve_its_bundle(self):
         class Args:

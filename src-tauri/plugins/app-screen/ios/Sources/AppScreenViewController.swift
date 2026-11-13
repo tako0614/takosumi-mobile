@@ -2,6 +2,66 @@ import SafariServices
 import UIKit
 import WebKit
 
+#if DEBUG
+import os
+
+/// Metadata only in the exact private whole-App fixture. Never an authority or readiness signal.
+private enum AppScreenNavigationWitness {
+    enum Event: String {
+        case opened = "open", request, returned, provisional, commit, finish
+        case failedProvisional = "fail_provisional", failed = "fail", cap
+        case policyAllow = "policy_allow"
+        case contentTerminated = "content_terminated"
+    }
+    enum Target: String {
+        case instance, editor, other, unknown
+        case editorPageTwo = "editor_page_two"
+    }
+    private static let enabled = Bundle.main.bundleIdentifier == "com.takosumi.fixture.simulator"
+    private static let log = OSLog(subsystem: "com.takosumi.fixture.simulator.navigation", category: "navigation")
+    private static var views = 0
+    private static var emitted = 0
+
+    static func nextView() -> Int {
+        guard enabled, views < 65_535 else { return 0 }
+        views += 1
+        return views
+    }
+
+    static func target(_ url: URL) -> Target {
+        // Read only the URL value already selected by the coordinator, never WKWebView.url.
+        if url.scheme == "https", url.host == "127.0.0.1" { return .instance }
+        if url.scheme == "https", url.host == "localhost" { return .editor }
+        return .other
+    }
+
+    static func policyTarget(_ url: URL?) -> Target {
+        guard let url = url else { return .unknown }
+        if url.scheme == "https", url.host == "localhost",
+           URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath == "/editor/page-two" {
+            return .editorPageTwo
+        }
+        return target(url)
+    }
+
+    static func record(_ event: Event, view: Int, request: Int, relation: Int, target: Target,
+                       reused: Bool, kept: Bool, resume: Bool, initial: Bool, sameView: Bool) {
+        guard enabled, emitted <= 512 else { return }
+        let capped = emitted == 512
+        emitted += 1
+        // The 513th line is one explicit cap marker, then all recording stops.
+        os_log("com.takosumi.fixture.simulator.nav v=1 seq=%{public}d event=%{public}@ view=%{public}d request=%{public}d relation=%{public}d target=%{public}@ reused=%{public}d kept=%{public}d resume=%{public}d initial=%{public}d sameView=%{public}d timeMs=%{public}lld",
+               log: log, type: .default, Int32(emitted), (capped ? Event.cap : event).rawValue,
+               Int32(capped ? 0 : view), Int32(capped ? 0 : request), Int32(capped ? 0 : relation),
+               (capped ? Target.unknown : target).rawValue, Int32(!capped && reused ? 1 : 0),
+               Int32(!capped && kept ? 1 : 0), Int32(!capped && resume ? 1 : 0),
+               Int32(!capped && initial ? 1 : 0), Int32(!capped && sameView ? 1 : 0),
+               Int64(ProcessInfo.processInfo.systemUptime * 1000))
+    }
+}
+#endif
+
+
 /// The declared native app the bar offers ("{name}で開く"). A verified one has
 /// its links; an unverified one has none and sends the person to the chooser.
 struct AppScreenBannerClient {
@@ -246,15 +306,30 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Where to go when a page the screen does not show was reached in place.
     var fallbackURL: URL?
     private var lastDownloadPromptAt: Date?
+    private var currentDownload: AppScreenDownloadActivity?
+    private var lastNativeDownloadPromptAt: Date?
     /// Last committed URL. The host label shows only this, never the URL of
     /// a navigation that has not committed yet (no spoofing by slow loads).
     private(set) var committedURL: URL?
     private(set) var needsReload = false
     private let resumeState = AppScreenResumeState()
+#if DEBUG
+    private let witnessView = AppScreenNavigationWitness.nextView()
+    private weak var witnessWebView: WKWebView?
+    private weak var witnessNavigation: WKNavigation?
+    private var witnessRequest = 0
+    private var witnessTarget = AppScreenNavigationWitness.Target.unknown
+    private var witnessReused = false
+    private var witnessResume = false
+    private var witnessInitial = false
+#endif
     private var observations: [NSKeyValueObservation] = []
 
     init(webView: WKWebView) {
         super.init()
+#if DEBUG
+        witnessWebView = webView
+#endif
         webView.navigationDelegate = self
         webView.uiDelegate = self
         observations = [
@@ -275,10 +350,59 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func invalidate(_ webView: WKWebView) {
+        cancelDownloads()
         observations.removeAll()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         screen = nil
+    }
+
+    func cancelDownloads() {
+        let current = currentDownload
+        currentDownload = nil
+        current?.cancel()
+    }
+
+    func resumeDownloadPresentation() { currentDownload?.resumePresentation() }
+
+    private func downloadOrigin(_ frame: WKFrameInfo) -> String? {
+        AppScreenPolicy.mediaCaptureOrigin(scheme: frame.securityOrigin.protocol,
+                                          host: frame.securityOrigin.host, port: frame.securityOrigin.port)
+    }
+
+    private func canDownload(_ webView: WKWebView, target: URL?, sourceOrigin: String?, explicit: Bool) -> Bool {
+        if let last = lastNativeDownloadPromptAt, Date().timeIntervalSince(last) < 3 { return false }
+        return currentDownload == nil && AppScreenPolicy.canDownload(
+            target?.absoluteString ?? "", sourceOrigin: sourceOrigin, page: committedURL?.absoluteString,
+            explicitDownload: explicit, webHome: screen?.isWebHomeDownloadScreen(webView, navigator: self) ?? false,
+            visible: screen?.canPromptForMediaCapture(webView, navigator: self) ?? false)
+    }
+
+    @available(iOS 14.5, *)
+    private func adoptDownload(_ download: WKDownload, webView: WKWebView, sourceOrigin: String) {
+        guard currentDownload == nil, download.webView === webView else { download.cancel(nil); return }
+        lastNativeDownloadPromptAt = Date()
+        let id = UUID()
+        let activity = AppScreenDownload(id: id, download: download, sourceOrigin: sourceOrigin,
+            context: { [weak self, weak webView] in
+                guard let self = self, let webView = webView, self.currentDownload?.id == id,
+                      let screen = self.screen,
+                      screen.isWebHomeDownloadScreen(webView, navigator: self),
+                      screen.isCurrentVisibleWebView(webView, navigator: self) else { return nil }
+                return screen
+            }, declined: { [weak self] in
+                if self?.currentDownload?.id == id { self?.lastNativeDownloadPromptAt = Date() }
+            }, ended: { [weak self] in
+                if self?.currentDownload?.id == id { self?.currentDownload = nil }
+            })
+        currentDownload = activity
+        activity.start()
+    }
+
+    private func isDownloadResponse(_ response: WKNavigationResponse) -> Bool {
+        response.isForMainFrame && AppScreenPolicy.shouldDownloadResponse(
+            canShowMIMEType: response.canShowMIMEType,
+            contentDisposition: (response.response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition"))
     }
 
     func reloadIfNeeded(_ webView: WKWebView) {
@@ -345,6 +469,61 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         return false
     }
 
+#if DEBUG
+    func witnessOpen(reused: Bool, kept: Bool, resume: Bool) {
+        AppScreenNavigationWitness.record(.opened, view: witnessView, request: 0, relation: 0, target: .unknown,
+            reused: reused, kept: kept, resume: resume, initial: false, sameView: true)
+    }
+
+    func witnessRequestStart(_ start: URL, initial: URL, reused: Bool, resume: Bool) {
+        witnessRequest = min(65_535, witnessRequest + 1)
+        witnessNavigation = nil
+        witnessTarget = AppScreenNavigationWitness.target(start)
+        witnessReused = reused
+        witnessResume = resume
+        witnessInitial = start == initial
+        witnessRecord(.request, relation: 0, sameView: true)
+    }
+
+    func witnessReturned(_ navigation: WKNavigation?) {
+        witnessNavigation = navigation
+        witnessRecord(.returned, relation: navigation == nil ? 0 : 1, sameView: true)
+    }
+
+    private func witnessPolicyAllowed(_ url: URL?, mainFrame: Bool, webView: WKWebView) {
+        guard mainFrame, witnessView > 0, webView === witnessWebView else { return }
+        AppScreenNavigationWitness.record(.policyAllow, view: witnessView, request: 0, relation: 0,
+            target: AppScreenNavigationWitness.policyTarget(url), reused: false, kept: false,
+            resume: false, initial: false, sameView: true)
+    }
+
+    private func witnessContentTerminated(_ webView: WKWebView) {
+        guard witnessView > 0, webView === witnessWebView else { return }
+        AppScreenNavigationWitness.record(.contentTerminated, view: witnessView, request: 0, relation: 0,
+            target: .unknown, reused: false, kept: false, resume: false, initial: false, sameView: true)
+    }
+
+    private func witnessCallback(_ event: AppScreenNavigationWitness.Event, _ webView: WKWebView,
+                                 _ navigation: WKNavigation?) {
+        let relation: Int
+        if let navigation = navigation, let held = witnessNavigation { relation = navigation === held ? 1 : 2 }
+        else { relation = 0 }
+        let sameView = webView === witnessWebView
+        let matched = relation == 1 && sameView
+        AppScreenNavigationWitness.record(event, view: witnessView,
+            request: matched ? witnessRequest : 0, relation: relation,
+            target: matched ? witnessTarget : .unknown,
+            reused: matched && witnessReused, kept: false, resume: matched && witnessResume,
+            initial: matched && witnessInitial, sameView: sameView)
+    }
+
+    private func witnessRecord(_ event: AppScreenNavigationWitness.Event, relation: Int, sameView: Bool) {
+        AppScreenNavigationWitness.record(event, view: witnessView, request: witnessRequest, relation: relation,
+            target: witnessTarget, reused: witnessReused, kept: false, resume: witnessResume,
+            initial: witnessInitial, sameView: sameView)
+    }
+#endif
+
     // MARK: WKNavigationDelegate
 
     func webView(
@@ -355,10 +534,19 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let url = navigationAction.request.url
         // A nil target frame is a new window; it is judged as a main frame.
         let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        if #available(iOS 14.5, *), navigationAction.shouldPerformDownload,
+           screen?.isWebHomeDownloadScreen(webView, navigator: self) == true {
+            decisionHandler(canDownload(webView, target: url, sourceOrigin: downloadOrigin(navigationAction.sourceFrame),
+                                        explicit: true) ? .download : .cancel)
+            return
+        }
         switch AppScreenPolicy.decide(
             url?.absoluteString ?? "", mainFrame: mainFrame, origins: origins)
         {
         case .inApp:
+#if DEBUG
+            witnessPolicyAllowed(url, mainFrame: mainFrame, webView: webView)
+#endif
             decisionHandler(.allow)
         case .block:
             decisionHandler(.cancel)
@@ -388,6 +576,14 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
+        if #available(iOS 14.5, *), isDownloadResponse(navigationResponse),
+           screen?.isWebHomeDownloadScreen(webView, navigator: self) == true {
+            let url = navigationResponse.response.url
+            decisionHandler(canDownload(webView, target: url,
+                                        sourceOrigin: url.flatMap { AppScreenPolicy.origin(of: $0.absoluteString) },
+                                        explicit: false) ? .download : .cancel)
+            return
+        }
         if !navigationResponse.canShowMIMEType,
            navigationResponse.isForMainFrame,
            let url = navigationResponse.response.url,
@@ -402,15 +598,42 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decisionHandler(.allow)
     }
 
+    @available(iOS 14.5, *)
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        guard navigationAction.shouldPerformDownload, let origin = downloadOrigin(navigationAction.sourceFrame),
+              canDownload(webView, target: navigationAction.request.url, sourceOrigin: origin, explicit: true) else {
+            download.cancel(nil); return
+        }
+        adoptDownload(download, webView: webView, sourceOrigin: origin)
+    }
+
+    @available(iOS 14.5, *)
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        let url = navigationResponse.response.url
+        guard isDownloadResponse(navigationResponse),
+              let origin = url.flatMap({ AppScreenPolicy.origin(of: $0.absoluteString) }),
+              canDownload(webView, target: url, sourceOrigin: origin, explicit: false) else {
+            download.cancel(nil); return
+        }
+        adoptDownload(download, webView: webView, sourceOrigin: origin)
+    }
+
     private func navigationID(_ navigation: WKNavigation) -> Int {
         Int(bitPattern: Unmanaged.passUnretained(navigation).toOpaque())
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+#if DEBUG
+        witnessCallback(.provisional, webView, navigation)
+#endif
         if let navigation = navigation { resumeState.begin(navigationID(navigation)) }
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+#if DEBUG
+        witnessCallback(.commit, webView, navigation)
+#endif
+        currentDownload?.cancelUnconfirmed()
         if let navigation = navigation { resumeState.commit(navigationID(navigation)) }
         if let url = webView.url, !keepsCommitted(webView, url) { return }
         committedURL = webView.url
@@ -418,6 +641,9 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+#if DEBUG
+        witnessCallback(.finish, webView, navigation)
+#endif
         if let navigation = navigation {
             resumeState.finish(navigationID(navigation), success: true, url: webView.url?.absoluteString)
         }
@@ -435,14 +661,24 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+#if DEBUG
+        witnessCallback(.failedProvisional, webView, navigation)
+#endif
         failedNavigation(webView, navigation: navigation, error: error)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+#if DEBUG
+        witnessCallback(.failed, webView, navigation)
+#endif
         failedNavigation(webView, navigation: navigation, error: error)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+#if DEBUG
+        witnessContentTerminated(webView)
+#endif
+        cancelDownloads()
         if screen != nil {
             webView.reload()
         } else {
@@ -540,8 +776,8 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             textField: field)
     }
 
-    /// Camera and microphone for app screens come later with an origin-named
-    /// prompt; until then they are refused (as on Android).
+    /// WebKit owns the site prompt; OS camera/microphone consent alone never
+    /// grants every page access. Inactive or detached sessions cannot prompt.
     @available(iOS 15.0, *)
     func webView(
         _ webView: WKWebView,
@@ -550,7 +786,16 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         type: WKMediaCaptureType,
         decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-        decisionHandler(.deny)
+        switch type {
+        case .camera, .microphone, .cameraAndMicrophone: break
+        @unknown default: decisionHandler(.deny); return
+        }
+        let visible = screen?.canPromptForMediaCapture(webView, navigator: self) ?? false
+        let eligible = AppScreenPolicy.canPromptForMediaCapture(
+            origin: AppScreenPolicy.mediaCaptureOrigin(scheme: origin.protocol, host: origin.host, port: origin.port),
+            page: committedURL?.absoluteString,
+            visible: visible)
+        decisionHandler(eligible ? .prompt : .deny)
     }
 }
 
@@ -658,9 +903,18 @@ final class AppScreenCoordinator {
             AppScreenResume.record(url, key: key, scope: scope, appOrigin: appOrigin, webHome: webHome)
         } : nil
         touch(session.key)
+#if DEBUG
+        session.navigator.witnessOpen(reused: existing != nil, kept: keep, resume: request.resume)
+#endif
         if !keep {
             let start = (request.resume ? AppScreenResume.recall(request) : nil) ?? request.url
+#if DEBUG
+            session.navigator.witnessRequestStart(start, initial: request.url, reused: existing != nil, resume: request.resume)
+            let navigation = session.webView.load(URLRequest(url: start))
+            session.navigator.witnessReturned(navigation)
+#else
             session.webView.load(URLRequest(url: start))
+#endif
         }
 
         if let screen = screen, screen.presentingViewController != nil, !screen.isBeingDismissed {
@@ -821,17 +1075,26 @@ final class AppScreenViewController: UIViewController {
         coordinator.setVisible(session.key, true)
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        session.navigator.resumeDownloadPresentation()
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         // Covered by its own popup it stays on the stack and stays alive.
-        if isBeingDismissed || presentingViewController == nil {
+        if isBeingDismissed || (presentingViewController == nil && presentedViewController == nil) {
             pendingDialog?.cancel()
             // The app may already be reopened in a new controller.
-            if ownsSession() { coordinator.setVisible(session.key, false) }
+            if ownsSession() {
+                session.navigator.cancelDownloads()
+                coordinator.setVisible(session.key, false)
+            }
         }
     }
 
     func show(_ next: AppScreenSession) {
+        session.navigator.cancelDownloads()
         coordinator.setVisible(session.key, false)
         session = next
         coordinator.setVisible(next.key, true)
@@ -852,6 +1115,7 @@ final class AppScreenViewController: UIViewController {
     private func attach(_ next: AppScreenSession) {
         if attachedSession === next { return }
         if let previous = attachedSession {
+            previous.navigator.cancelDownloads()
             if previous.navigator.screen === self { previous.navigator.screen = nil }
             previous.webView.removeFromSuperview()
         }
@@ -1146,11 +1410,29 @@ final class AppScreenViewController: UIViewController {
             !isBeingDismissed && !isBeingPresented && transitionCoordinator == nil
     }
 
+    func canPromptForMediaCapture(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        canPresent() && isCurrentVisibleWebView(webView, navigator: navigator)
+    }
+
+    func isWebHomeDownloadScreen(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        session.webHome && session.webView === webView && session.navigator === navigator
+    }
+
+    func isCurrentVisibleWebView(_ webView: WKWebView, navigator: AppScreenNavigator) -> Bool {
+        guard !isBeingDismissed, !webView.isHidden, viewIfLoaded?.isHidden == false,
+              let window = webView.window, window === viewIfLoaded?.window, !window.isHidden,
+              UIApplication.shared.applicationState == .active else { return false }
+        // Pinned Tauri/Tao also supports legacy UIApplicationDelegate windows.
+        if let scene = window.windowScene, scene.activationState != .foregroundActive { return false }
+        return session.webView === webView && session.navigator === navigator
+    }
+
     func presentPopup(configuration: WKWebViewConfiguration, origins: AppScreenOrigins?) -> WKWebView? {
         guard canPresent() else { return nil }
         configuration.websiteDataStore = session.webView.configuration.websiteDataStore
         configuration.processPool = session.webView.configuration.processPool
         let popup = coordinator.makePopupSession(configuration: configuration, origins: origins, profile: session.profile)
+        popup.webHome = session.webHome
         popup.title = session.title
         let controller = AppScreenViewController(coordinator: coordinator, session: popup)
         controller.modalPresentationStyle = .fullScreen

@@ -1,4 +1,4 @@
 {
   "extends": "../../tsconfig.json",
-  "include": ["run.ts", "web-home.fixture.tsx", "../../src/web-home.tsx", "../../src/web-profile-data.ts", "../../src/web-connections.ts"]
+  "include": ["run.ts", "startup.test.ts", "web-home.fixture.tsx", "../../src/web-home.tsx", "../../src/web-profile-data.ts", "../../src/web-connections.ts"]
 }

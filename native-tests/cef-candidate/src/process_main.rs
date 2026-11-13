@@ -1,8 +1,12 @@
 //! Opt-in browser service for Linux, Windows and macOS. Its only control
 //! input is the parent's pipe.
-//! No remote-page IPC/V8 extension or permission handler. Explicit fixture
-//! inspection (`fixture-inspection` builds only) uses a loopback DevTools
-//! port, never the parent's control pipe.
+//! No remote-page IPC/V8 extension. The permission handler records each
+//! request in the profile's browser.log; only when the App opted in
+//! (`TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS=1`) does it hold the
+//! runtime's callback open for the App's `resolvePermission` answer —
+//! otherwise the runtime's own prompt handling stays untouched. Explicit
+//! fixture inspection (`fixture-inspection` builds only) uses a loopback
+//! DevTools port, never the parent's control pipe.
 //!
 //! The browser itself, entered through `run`: from the executable
 //! (`browser_main.rs`: Linux, and the Windows unsandboxed candidate) or, for
@@ -21,7 +25,10 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 use tauri_plugin_app_screen::{
-    browser_process::{decode, external_link, link_host, read_packet, Reply, Request},
+    browser_process::{
+        decode, external_link, link_host, read_packet, PermissionDecision, PermissionKind, Reply,
+        Request,
+    },
     OpenRequest,
 };
 
@@ -36,6 +43,18 @@ pub(crate) mod children_windows;
 #[cfg(target_os = "macos")]
 #[path = "mac_front.rs"]
 pub(crate) mod mac_front;
+
+#[cfg(target_os = "macos")]
+#[path = "mac_lifecycle.rs"]
+mod mac_lifecycle;
+
+#[cfg(target_os = "macos")]
+#[path = "mac_bundle.rs"]
+mod mac_bundle;
+
+#[cfg(feature = "fixture-inspection")]
+#[path = "download_observation.rs"]
+mod download_observation;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
@@ -59,6 +78,17 @@ struct State {
     boot: Option<Vec<u8>>,
     screens: BTreeMap<i32, Screen>,
     pending_close: BTreeMap<i32, u64>,
+    /// Runtime permission callbacks this process holds open for the App's
+    /// answer, by the pipe's own `prompt_id` sequence (`permission_seq`).
+    /// Filled only while the App opted in (`permission_events`); a bounded
+    /// count keeps a site from exhausting memory with prompts nobody
+    /// answers.
+    pending_permissions: BTreeMap<u64, HeldPermission>,
+    permission_seq: u64,
+    /// The App answers its profile's site permission prompts itself
+    /// (`TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS=1`). Without it the
+    /// handler stays observation-only and the runtime's own prompt shows.
+    permission_events: bool,
     pending: usize,
     live: usize,
     last_id: u64,
@@ -72,6 +102,29 @@ struct State {
     quitting: bool,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
+/// A permission callback the runtime left to this process. `Prompt` also
+/// records CEF's own prompt id, which is what `on_dismiss_permission_prompt`
+/// reports back; media requests have no such id.
+enum HeldPermission {
+    Prompt {
+        callback: PermissionPromptCallback,
+        cef_id: u64,
+    },
+    Media {
+        callback: MediaAccessCallback,
+        permissions: u32,
+        /// Media requests carry no CEF prompt id, so no dismissal reaches
+        /// `on_dismiss_permission_prompt`: a held media request is retired
+        /// only through its browser's own lifetime — the browser closing or
+        /// the main frame committing a new load, after which every pending
+        /// request of the old document tree is dead.
+        browser_id: i32,
+    },
+}
+/// Held permission prompts the App has not answered yet: past this bound a
+/// new request falls back to the runtime's own handling rather than piling
+/// up unanswered.
+const MAX_PENDING_PERMISSIONS: usize = 16;
 /// Whether the control pipe's reader may still post a request to the UI
 /// thread. Closed before the message loop is asked to quit, under the same
 /// lock the reader holds while it posts, so nothing is posted afterwards.
@@ -88,15 +141,41 @@ fn reply(value: Reply) {
     let mut out = io::stdout().lock();
     // A broken parent pipe cannot authorize another operation. EOF also posts
     // the owned shutdown task; never print protocol data to the site's console.
-    let _ = serde_json::to_writer(&mut out, &value);
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    if serde_json::to_writer(&mut out, &value).is_err()
+        || out.write_all(b"\n").is_err()
+        || out.flush().is_err()
+    {
+        // Keep reply() panic-free like the ignored write errors it reports:
+        // an explicit writeln! discards the result on this CEF UI thread,
+        // where an unwind would abort the process, however a toolchain
+        // happens to treat eprintln! on a broken stderr.
+        let _ = writeln!(
+            io::stderr().lock(),
+            "A browser reply could not be written to the control pipe."
+        );
+    }
 }
 fn error(id: u64, message: &str) {
     reply(Reply::Error {
         id,
         message: message.into(),
     });
+}
+#[cfg(target_os = "macos")]
+pub(super) fn request_system_quit() {
+    // Cocoa calls this on its main thread. Before initialization/after exit
+    // there is no owned state; an existing numbered shutdown keeps its ID.
+    let profile = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .filter(|state| !state.quitting && state.shutdown.is_none())
+            .map(|state| state.profile.clone())
+    });
+    if let Some(profile) = profile {
+        mac_lifecycle::record("system-quit-request", mac_lifecycle::BROWSER, None);
+        reply(Reply::QuitRequested { profile });
+    }
 }
 fn maybe_quit() {
     let done = with_state(|state| {
@@ -149,6 +228,16 @@ fn admission(shutdown: bool, id: u64, last_id: u64, recorded: bool, quitting: bo
     }
 }
 fn close_all(id: Option<u64>, failed: bool) {
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record(
+        if failed {
+            "abnormal-shutdown-request"
+        } else {
+            "shutdown-request"
+        },
+        mac_lifecycle::BROWSER,
+        None,
+    );
     let browsers = with_state(|state| {
         state.failed |= failed;
         state.shutdown = Some(id.unwrap_or(0));
@@ -736,6 +825,9 @@ wrap_life_span_handler! {
                 }
                 state.live-=1;
             });
+            // Media holds in this browser die with it; the map keeps the
+            // retirement single-shot if CEF also dismissed anything first.
+            retire_media_permissions_for_browser(id);
             #[cfg(windows)]
             children_windows::mark(children_windows::Mark::BrowserClosed);
             // A cancel clears the shutdown, so the remaining windows stay open.
@@ -779,6 +871,12 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(Lifetime::new(self.id,self.key.clone(),self.bound)) }
         fn load_handler(&self) -> Option<LoadHandler> {Some(Loads::new())}
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {Some(LinkMenu::new())}
+        fn permission_handler(&self) -> Option<PermissionHandler> {Some(Permissions::new())}
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            #[cfg(feature = "fixture-inspection")]
+            if inspection() { return Some(download_observation::handler()); }
+            None
+        }
     }
 }
 /// `MENU_ID_USER_FIRST` in cef_types.h.
@@ -814,6 +912,14 @@ wrap_context_menu_handler! {
 wrap_load_handler! {
     struct Loads;
     impl LoadHandler {
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            let (Some(browser),Some(frame))=(browser,frame) else {return;};
+            if frame.is_main()==0{return;}
+            // The old document tree is dead once a new main-frame load
+            // commits; media requests it still held need this dismissal —
+            // requests of the new document only exist after this point.
+            retire_media_permissions_for_browser(browser.identifier());
+        }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code:i32) {
             let (Some(browser),Some(frame))=(browser,frame) else {return;};
             if frame.is_main()==0{return;}
@@ -829,6 +935,105 @@ wrap_load_handler! {
     }
 }
 
+/// Hold a runtime permission callback for the App's own answer and report it
+/// on the pipe once. `None` — the caller then returns 0 and the runtime keeps
+/// its own handling — when the App did not opt in, or the bounded wait set is
+/// full (a site spamming unanswered prompts never starves the browser).
+fn hold_permission(
+    held: HeldPermission,
+    origin: String,
+    kind: PermissionKind,
+    permissions: u32,
+) -> Option<u64> {
+    with_state(|state| {
+        if !state.permission_events
+            || state.pending_permissions.len() >= MAX_PENDING_PERMISSIONS
+        {
+            return None;
+        }
+        state.permission_seq += 1;
+        let prompt_id = state.permission_seq;
+        state.pending_permissions.insert(prompt_id, held);
+        reply(Reply::PermissionRequested {
+            profile: state.profile.clone(),
+            prompt_id,
+            origin,
+            kind,
+            permissions,
+        });
+        Some(prompt_id)
+    })
+}
+
+/// Media requests have no CEF dismissal of their own: they die with their
+/// document, so the held entry is retired on the two events after which no
+/// request of that browser can still be live — `on_before_close` and a
+/// committed main-frame load. Removal from the map keeps each retirement
+/// single-shot whichever event lands first; a never-matched id (-1, no
+/// browser) simply stays held until its answer or process drop as before.
+fn retire_media_permissions_for_browser(browser_id: i32) {
+    let (gone, profile) = with_state(|state| {
+        let gone: Vec<u64> = state
+            .pending_permissions
+            .iter()
+            .filter_map(|(seq, held)| {
+                matches!(held, HeldPermission::Media { browser_id: id, .. } if *id == browser_id)
+                    .then_some(*seq)
+            })
+            .collect();
+        for seq in &gone {
+            state.pending_permissions.remove(seq);
+        }
+        (gone, state.profile.clone())
+    });
+    for seq in gone {
+        reply(Reply::PermissionDismissed {
+            profile: profile.clone(),
+            prompt_id: seq,
+        });
+    }
+}
+
+wrap_permission_handler! {
+    // The browser never decides a permission itself: each request is recorded
+    // in the profile's own browser.log (stderr). Without the App's opt-in the
+    // return value leaves the Chrome runtime's own handling untouched; with
+    // it the callback is held open for the App's `resolvePermission` — its
+    // prompt is then the App's UX, not Chrome's. `on_dismiss` covers only
+    // prompts the runtime itself ended; an App-resolved one is already gone.
+    struct Permissions;
+    impl PermissionHandler {
+        fn on_request_media_access_permission(&self, browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
+            let origin=requesting_origin.map(ToString::to_string).unwrap_or_default();
+            eprintln!("permission: media origin={origin} permissions={requested_permissions:#x}");
+            if let Some(callback)=callback {
+                let browser_id=browser.map(|browser|browser.identifier()).unwrap_or(-1);
+                if hold_permission(HeldPermission::Media{callback:callback.clone(),permissions:requested_permissions,browser_id},origin,PermissionKind::Media,requested_permissions).is_some() { return 1; }
+            }
+            0
+        }
+        fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
+            let origin=requesting_origin.map(ToString::to_string).unwrap_or_default();
+            eprintln!("permission: prompt id={prompt_id} origin={origin} permissions={requested_permissions:#x}");
+            if let Some(callback)=callback {
+                if hold_permission(HeldPermission::Prompt{callback:callback.clone(),cef_id:prompt_id},origin,PermissionKind::Prompt,requested_permissions).is_some() { return 1; }
+            }
+            0
+        }
+        fn on_dismiss_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, result: PermissionRequestResult) {
+            eprintln!("permission: dismissed id={prompt_id} result={result:?}");
+            let gone=with_state(|state| {
+                let seq=state.pending_permissions.iter().find_map(|(seq,held)|
+                    matches!(held,HeldPermission::Prompt{cef_id,..} if *cef_id==prompt_id).then_some(*seq));
+                seq.inspect(|seq|{state.pending_permissions.remove(seq);})
+            });
+            if let Some(seq)=gone {
+                reply(Reply::PermissionDismissed{profile:with_state(|state|state.profile.clone()),prompt_id:seq});
+            }
+        }
+    }
+}
+
 fn open(id: u64, payload: OpenRequest) {
     let existing = with_state(|state| {
         state
@@ -838,6 +1043,7 @@ fn open(id: u64, payload: OpenRequest) {
             .map(|screen| screen.browser.clone())
     });
     if let Some(browser) = existing {
+        eprintln!("browser command {id}: reusing browser {}", browser.identifier());
         if !payload.resume {
             browser
                 .main_frame()
@@ -845,7 +1051,11 @@ fn open(id: u64, payload: OpenRequest) {
                 .load_url(Some(&CefString::from(payload.url.as_str())));
         }
         let host = browser.host().unwrap();
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-focus-begin", mac_lifecycle::BROWSER, None);
         host.set_focus(1);
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-focus-return", mac_lifecycle::BROWSER, None);
         // set_focus only moves keyboard focus inside the browser. A window
         // covered by another profile stays hidden unless it is raised.
         match raise(&host) {
@@ -866,7 +1076,11 @@ fn open(id: u64, payload: OpenRequest) {
             #[cfg(not(windows))]
             Ok(()) => {}
         }
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-raise-return", mac_lifecycle::BROWSER, None);
         opened(id, payload.key, &browser);
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("reuse-reply-return", mac_lifecycle::BROWSER, None);
         return;
     }
     let context = with_state(|state| {
@@ -885,6 +1099,7 @@ fn open(id: u64, payload: OpenRequest) {
         runtime_style: RuntimeStyle::CHROME,
         ..Default::default()
     };
+    eprintln!("browser command {id}: creating a new browser");
     if browser_host_create_browser(
         Some(&info),
         Some(&mut client),
@@ -929,6 +1144,15 @@ fn dispatch(bytes: Option<&[u8]>) {
         }
     };
     let id = request.id();
+    eprintln!(
+        "browser command {id}: {}",
+        match &request {
+            Request::Open { .. } => "open",
+            Request::Close { .. } => "close",
+            Request::Shutdown { .. } => "shutdown",
+            Request::ResolvePermission { .. } => "resolve-permission",
+        }
+    );
     let shutdown = matches!(request, Request::Shutdown { .. });
     let admitted = with_state(|state| {
         let admitted = admission(
@@ -996,11 +1220,35 @@ fn dispatch(bytes: Option<&[u8]>) {
                 close_all(Some(id), false);
             }
         }
+        Request::ResolvePermission { id, prompt_id, decision } => {
+            let held = with_state(|state| state.pending_permissions.remove(&prompt_id));
+            match held {
+                Some(HeldPermission::Prompt { callback, .. }) => {
+                    callback.cont(match decision {
+                        PermissionDecision::Allow => PermissionRequestResult::ACCEPT,
+                        PermissionDecision::Deny => PermissionRequestResult::DENY,
+                    });
+                    reply(Reply::PermissionResolved { id });
+                }
+                Some(HeldPermission::Media { callback, permissions, .. }) => {
+                    match decision {
+                        PermissionDecision::Allow => callback.cont(permissions),
+                        PermissionDecision::Deny => callback.cancel(),
+                    }
+                    reply(Reply::PermissionResolved { id });
+                }
+                None => error(id, "No pending browser permission prompt"),
+            }
+        }
     }
 }
 wrap_task! {
     struct PipeTask { bytes: Option<Vec<u8>> }
-    impl Task { fn execute(&self) { dispatch(self.bytes.as_deref()); } }
+    impl Task { fn execute(&self) {
+        #[cfg(target_os = "macos")]
+        mac_lifecycle::record("control-task-enter", mac_lifecycle::BROWSER, None);
+        dispatch(self.bytes.as_deref());
+    } }
 }
 // macOS: the next look for a new browser's NSWindow (`await_window`).
 #[cfg(target_os = "macos")]
@@ -1042,12 +1290,6 @@ wrap_browser_process_handler! {
         fn default_client(&self) -> Option<Client> { Some(ClientHandler::new(0,String::new(),false)) }
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-wrap_app! {
-    struct Application;
-    impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) } }
-}
-#[cfg(windows)]
 wrap_app! {
     struct Application;
     impl App {
@@ -1055,10 +1297,25 @@ wrap_app! {
             // The browser process's own command line; its helpers inherit
             // the feature switches from it.
             if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
-            if let Some(command_line) = command_line { disable_native_occlusion(command_line); }
+            if let Some(command_line) = command_line {
+                let _ = &command_line;
+                #[cfg(windows)]
+                disable_native_occlusion(command_line);
+                #[cfg(feature = "fixture-inspection")]
+                fake_media_device(command_line);
+            }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) }
     }
+}
+/// Fixture browsers only: one synthetic capture device, so a real
+/// getUserMedia call reaches the permission handler on hardware-free
+/// CI/Xvfb hosts instead of failing device enumeration before any prompt.
+/// A staged or packaged browser is built without the feature and never
+/// gets this switch.
+#[cfg(feature = "fixture-inspection")]
+fn fake_media_device(command_line: &mut CommandLine) {
+    command_line.append_switch(Some(&CefString::from("use-fake-device-for-media-stream")));
 }
 
 /// Windows: Chromium's native window occlusion tracking is off, as Electron
@@ -1320,6 +1577,11 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
             boot: Some(boot),
             screens: BTreeMap::new(),
             pending_close: BTreeMap::new(),
+            pending_permissions: BTreeMap::new(),
+            permission_seq: 0,
+            permission_events: std::env::var_os("TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS")
+                .as_deref()
+                == Some(std::ffi::OsStr::new("1")),
             pending: 1,
             live: 0,
             last_id: 0,
@@ -1331,8 +1593,17 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         }))
     });
     let port = inspection_port(&directory);
+    #[cfg(target_os = "macos")]
+    let executable = std::env::current_exe().expect("The browser executable's path");
+    #[cfg(target_os = "macos")]
+    let main_bundle = mac_bundle::browser_bundle(&executable)
+        .expect("The browser must run from its own app bundle's Contents/MacOS");
     let settings = Settings {
         no_sandbox: i32::from(without_sandbox(std::env::args_os().skip(1))),
+        // CEF propagates this setting to every helper. Its default searches
+        // the outermost .app, which is the Tauri App in a packaged build.
+        #[cfg(target_os = "macos")]
+        main_bundle_path: CefString::from(main_bundle.to_str().expect("UTF-8 browser bundle")),
         root_cache_path: CefString::from(cache.to_str().unwrap()),
         log_file: CefString::from(directory.join("cef-native.log").to_str().unwrap()),
         remote_debugging_port: port,
@@ -1352,13 +1623,33 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         let mut reader = BufReader::new(io::stdin());
         loop {
             let bytes = read_packet(&mut reader).ok().flatten();
+            #[cfg(target_os = "macos")]
+            mac_lifecycle::record(
+                "control-packet-read",
+                mac_lifecycle::BROWSER,
+                Some(i32::from(bytes.is_some())),
+            );
             let stop = bytes.is_none();
             let open = CONTROL_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
             if !*open {
                 break;
             }
             let mut task = PipeTask::new(bytes);
-            if post_task(ThreadId::UI, Some(&mut task)) != 1 || stop {
+            let posted = post_task(ThreadId::UI, Some(&mut task));
+            #[cfg(target_os = "macos")]
+            mac_lifecycle::record(
+                "control-task-post-return",
+                mac_lifecycle::BROWSER,
+                Some(posted),
+            );
+            if posted != 1 {
+                // A command the parent believes sent would otherwise vanish
+                // without a reply and no trace (run 43076506208's reopened
+                // Work Open is exactly this shape: sent, never answered).
+                eprintln!("A browser command could not reach the UI thread; the control reader ends.");
+                break;
+            }
+            if stop {
                 break;
             }
         }
@@ -1372,7 +1663,32 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
         state.failed
     });
     drop(app);
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record("cef-shutdown-begin", mac_lifecycle::BROWSER, None);
+    // A site that keeps spawning helpers can leave CefShutdown waiting
+    // forever (run 42976970505: Photopea churned renderers for ~58 s past
+    // cef-shutdown-begin until teardown killed the tree; the App's
+    // sequential quit wedged behind it and the sibling profile's
+    // beforeunload was never asked). Every screen is already closed and
+    // the stopped reply was reported, so bound the teardown wait; past it,
+    // record and leave with the hung-process failure code (2, as Chromium's
+    // own teardown watchdog). The earlier command outcome cannot make an
+    // incomplete CefShutdown successful. _exit skips atexit handlers that
+    // could re-enter the wedged runtime; the guard still accounts for any
+    // helper left running and the App retains the abnormal profile.
+    #[cfg(target_os = "macos")]
+    let _ = std::thread::Builder::new()
+        .name("cef-shutdown-bound".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, Some(2));
+            // SAFETY: immediate process exit cannot unwind into the blocked
+            // runtime. An incomplete shutdown makes no flush guarantee.
+            unsafe { libc::_exit(2) };
+        });
     shutdown();
+    #[cfg(target_os = "macos")]
+    mac_lifecycle::record("cef-shutdown-return", mac_lifecycle::BROWSER, None);
     let code = i32::from(failed);
     #[cfg(windows)]
     children_windows::finish(code, cfg!(feature = "windows-sandbox"));

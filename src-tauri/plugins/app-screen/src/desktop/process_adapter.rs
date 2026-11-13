@@ -10,8 +10,11 @@ use super::{failure, private_directory, process_setup as setup};
 #[cfg(unix)]
 use crate::browser_process::write_until;
 use crate::{
-    browser_process::{external_link, read_packet, Reply, Request, MAX_PACKET_BYTES},
-    Error, OpenRequest, Result,
+    browser_process::{
+        external_link, read_packet, Reply, Request, MAX_PACKET_BYTES,
+    },
+    Error, OpenRequest, PendingPermission, PermissionDecision, PermissionKind,
+    ResolvePermissionRequest, Result,
 };
 use std::{
     collections::BTreeMap,
@@ -20,7 +23,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -31,7 +34,25 @@ use std::{
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     process::ChildStdin,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+/// Closed diagnostic fields for the opted-in Mac fixture, never page data.
+/// A returned stage observes only this boundary; it is not delivery proof.
+fn mac_open_trace(stage: &'static str, guard: u32, request: u64, ok: Option<bool>) {
+    if !cfg!(target_os = "macos") || !setup::inspection(&setup::environment) {
+        return;
+    }
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let record = format!(
+        "takosumi-mac-open-stage: {}\n",
+        serde_json::json!({"stage":stage,"appPid":std::process::id(),"guardPid":guard,
+            "requestId":request,"ok":ok,"unixMicros":micros})
+    );
+    let _ = std::io::stderr().lock().write_all(record.as_bytes());
+}
 
 #[derive(Clone)]
 pub(super) struct Backend(Arc<Mutex<State>>, Arc<ExitPhase>);
@@ -58,6 +79,123 @@ struct State {
     spawner: mpsc::Sender<SpawnRequest>,
 }
 type SpawnRequest = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+struct SpawnOptions {
+    no_sandbox: bool,
+    on_quit: Option<Box<dyn Fn() + Send>>,
+    /// When set, the browser holds every site permission prompt of this
+    /// profile for the App's `resolve_permission` instead of the runtime's
+    /// own prompt handling; the callback receives each held request (and
+    /// each dismissal of one still held) exactly once. Whoever opts in owns
+    /// answering every request — an ignored event leaves its prompt held.
+    on_permission_event: Option<Box<dyn Fn(PermissionEvent) + Send>>,
+    /// Runs once when this Process is dropped, on whichever thread drops it —
+    /// callers removing a Process already hold the state lock, so the closure
+    /// must only touch state of its own (held-prompt hygiene for its profile).
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+/// A site permission prompt the profile's browser is holding for the App's
+/// answer, or the end of one (dismissed or superseded before any answer).
+#[derive(Debug)]
+pub(super) enum PermissionEvent {
+    Requested {
+        prompt_id: u64,
+        origin: String,
+        kind: PermissionKind,
+        permissions: u32,
+    },
+    Dismissed {
+        prompt_id: u64,
+    },
+}
+
+/// Every prompt the App is currently holding, behind its own lock — never
+/// inside the backend state lock. The process reader dispatches events while
+/// a command holds that lock, so this map must lock independently and
+/// briefly.
+#[derive(Clone, Default)]
+pub(super) struct PermissionPrompts(
+    std::sync::Arc<Mutex<BTreeMap<(String, u64), PendingPermission>>>,
+);
+
+impl PermissionPrompts {
+    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, u64), PendingPermission>> {
+        // A poisoned map still holds every recorded prompt; recovering it is
+        // strictly better than silently dropping a held-prompt event.
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    // The emit stays under the map lock: the resolve command and the reader
+    // thread can then never deliver a stale list over a newer one.
+    fn note(
+        &self,
+        profile: &str,
+        event: PermissionEvent,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        match event {
+            PermissionEvent::Requested {
+                prompt_id,
+                origin,
+                kind,
+                permissions,
+            } => {
+                prompts.insert(
+                    (profile.to_owned(), prompt_id),
+                    PendingPermission {
+                        profile: profile.to_owned(),
+                        prompt_id,
+                        origin,
+                        kind,
+                        permissions,
+                    },
+                );
+            }
+            PermissionEvent::Dismissed { prompt_id } => {
+                prompts.remove(&(profile.to_owned(), prompt_id));
+            }
+        }
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
+    }
+    fn drop(
+        &self,
+        profile: &str,
+        prompt_id: u64,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        prompts.remove(&(profile.to_owned(), prompt_id));
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
+    }
+    fn drop_profile(
+        &self,
+        profile: &str,
+        emit: impl FnOnce(&[PendingPermission]),
+    ) -> Vec<PendingPermission> {
+        let mut prompts = self.locked();
+        prompts.retain(|(owner, _), _| owner != profile);
+        let list = prompts.values().cloned().collect::<Vec<_>>();
+        emit(&list);
+        list
+    }
+    pub(super) fn list(&self) -> Vec<PendingPermission> {
+        self.locked().values().cloned().collect()
+    }
+}
+// Standalone native/protocol fixtures have no Tauri App exit owner.
+impl From<bool> for SpawnOptions {
+    fn from(no_sandbox: bool) -> Self {
+        Self {
+            no_sandbox,
+            on_quit: None,
+            on_permission_event: None,
+            on_drop: None,
+        }
+    }
+}
 /// The App's end of a browser's control pipe: non-blocking on Linux, a
 /// bounded writer thread on Windows (`process_windows::Input`).
 #[cfg(unix)]
@@ -141,6 +279,8 @@ struct Process {
     input: Option<Input>,
     replies: mpsc::Receiver<std::result::Result<Reply, String>>,
     profile: String,
+    key: String,
+    reader_finished: Arc<AtomicBool>,
     directory: PathBuf,
     next: u64,
     uncertain: bool,
@@ -156,6 +296,10 @@ struct Process {
     /// after `Drop` has removed the directory (fields drop after `drop`).
     _runtime_lock: std::fs::File,
     program: PathBuf,
+    /// Pin the executable inode before spawn; Chromium may report its
+    /// hard-linked code-sign clone as the running image on macOS.
+    #[cfg(target_os = "macos")]
+    executable: macos::Executable,
     /// Opening order: an App quit closes the oldest profile first.
     order: u64,
     /// The guard's stop request (Windows): this App created it under a fresh
@@ -166,6 +310,15 @@ struct Process {
     /// (`None` before any reopen); reported by `status`.
     #[cfg(windows)]
     foreground_grant: Option<bool>,
+    /// Profile-scoped cleanup the owner registered at spawn (held-prompt
+    /// hygiene), run once at the top of drop.
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+struct ReaderFinished(Arc<AtomicBool>);
+impl Drop for ReaderFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 /// How long a browser that agreed to stop (it answered Stopped, or its pipe
@@ -295,6 +448,7 @@ pub(super) fn install<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<()> {
                 Arc::new(Mutex::new(state)),
                 Arc::new(ExitPhase::default()),
             ));
+            app.manage(PermissionPrompts::default());
         }
         Err(error) => {
             let reason = format!("The desktop browser is unavailable: {error}");
@@ -379,12 +533,16 @@ fn prepare<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<State> {
 }
 
 pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
+    mac_open_trace("ipc-dispatch", 0, 0, None);
     let backend = app.state::<Backend>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        mac_open_trace("blocking-enter", 0, 0, None);
         if backend.1.state.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidRequest("The browser is closing."));
         }
+        mac_open_trace("backend-lock-begin", 0, 0, None);
         let mut state = backend.0.lock().map_err(failure)?;
+        mac_open_trace("backend-lock-return", 0, 0, None);
         if backend.1.state.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidRequest("The browser is closing."));
         }
@@ -401,50 +559,206 @@ pub(super) async fn open(app: AppHandle, payload: OpenRequest) -> Result<()> {
             .transpose()
             .map_err(failure)?
             .flatten();
-        if exited.is_some_and(|status| !status.success()) {
-            return Err(Error::InvalidRequest(
-                "Previous browser process ended abnormally; profile data is retained.",
-            ));
-        }
-        if exited.is_some() {
+        if let Some(status) = exited {
             // A guard may exit zero after forced descendant cleanup. Reuse
             // requires its complete normal receipt, not its status alone.
-            state.processes.get(&profile).unwrap().normal_guard()?;
+            let process = state.processes.get_mut(&profile).unwrap();
+            let normal = if status.success() {
+                process.normal_guard()
+            } else {
+                Err(Error::InvalidRequest(
+                    "Previous browser process ended abnormally; profile data is retained.",
+                ))
+            };
+            if let Err(error) = normal {
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    // Child exit can beat EOF processing on the reply thread.
+                    // Only wait after this exact guard is reaped; a late or
+                    // uncertain reader still cannot authorize recovery.
+                    reader_finished_within(&process.reader_finished, Duration::from_millis(250));
+                    if process.recovery_proof(&payload.key).is_ok() {
+                        return Err(Error::BrowserRecoveryRequired {
+                            profile: profile.clone(),
+                            key: payload.key.clone(),
+                            generation: process.order.to_string(),
+                        });
+                    }
+                }
+                return Err(error);
+            }
             state.processes.remove(&profile);
         } else if let Some(process) = state.processes.get_mut(&profile) {
             if process.recover()? {
                 state.processes.remove(&profile);
             }
         }
-        if let Some(process) = state.processes.get_mut(&profile) {
-            process.open(payload)
-        } else {
-            if state.processes.len() >= 32 {
-                return Err(Error::InvalidRequest("Browser profile limit reached."));
-            }
-            let key = payload.key.clone();
-            // Windows: the bundled executables are checked again now, not
-            // only when the App started.
-            #[cfg(windows)]
-            setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
-            let runtime = free_runtime(&state.runtime_root)?;
-            let mut process = Process::spawn(
-                state.program.clone(),
-                state.guard.clone(),
-                state.directory.join(&profile),
-                runtime,
-                payload,
-                &state.spawner,
-                state.no_sandbox,
-            )?;
-            // Retain ownership before waiting for the native creation reply.
-            let result = process.expect_open(1, &key);
-            state.processes.insert(profile, process);
-            result
+        let result = open_in_state(&app, &mut state, payload);
+        mac_open_trace("backend-open-return", 0, 0, Some(result.is_ok()));
+        result
+    })
+    .await
+    .map_err(failure)?;
+    mac_open_trace("ipc-return", 0, 0, Some(result.is_ok()));
+    result
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn reader_finished_within(finished: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !finished.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
         }
+        std::thread::sleep(Duration::from_millis(5).min(deadline - now));
+    }
+    true
+}
+
+fn open_in_state(app: &AppHandle, state: &mut State, payload: OpenRequest) -> Result<()> {
+    let profile = payload.profile.clone();
+    if let Some(process) = state.processes.get_mut(&profile) {
+        process.open(payload)
+    } else {
+        if state.processes.len() >= 32 {
+            return Err(Error::InvalidRequest("Browser profile limit reached."));
+        }
+        let key = payload.key.clone();
+        let app = app.clone();
+        // Windows: the bundled executables are checked again now, not
+        // only when the App started.
+        #[cfg(windows)]
+        setup::recheck(state.bundle.as_deref(), &state.program, &state.guard)?;
+        let runtime = free_runtime(&state.runtime_root)?;
+        // Opt in only when the App's prompt surface exists: a registered map
+        // both holds the answer path and advertises each held prompt. The
+        // reader dispatch cannot take the state lock, so the map is its own
+        // mutex; the drop hook retires the profile's entries with it.
+        let (on_permission_event, on_drop) = match app.try_state::<PermissionPrompts>() {
+            Some(prompts) => {
+                let prompts = prompts.inner().clone();
+                let note_profile = profile.clone();
+                let note_app = app.clone();
+                let note_prompts = prompts.clone();
+                let on_event = Box::new(move |event| {
+                    note_prompts.note(&note_profile, event, |list| {
+                        let _ = note_app.emit("app-screen:permission-prompts", list);
+                    });
+                }) as Box<dyn Fn(PermissionEvent) + Send>;
+                let drop_profile = profile.clone();
+                let drop_app = app.clone();
+                let on_drop = Box::new(move || {
+                    prompts.drop_profile(&drop_profile, |list| {
+                        let _ = drop_app.emit("app-screen:permission-prompts", list);
+                    });
+                }) as Box<dyn FnOnce() + Send>;
+                (Some(on_event), Some(on_drop))
+            }
+            // Without the surface the runtime's own prompt stays untouched.
+            None => (None, None),
+        };
+        let mut process = Process::spawn(
+            state.program.clone(),
+            state.guard.clone(),
+            state.directory.join(&profile),
+            runtime,
+            payload,
+            &state.spawner,
+            SpawnOptions {
+                no_sandbox: state.no_sandbox,
+                on_quit: Some(Box::new(move || {
+                    // The reader never takes the backend lock. request_exit
+                    // latches now and drains on a separate blocking worker.
+                    request_exit(&app, 0);
+                })),
+                on_permission_event,
+                on_drop,
+            },
+        )?;
+        // Retain ownership before waiting for the native creation reply.
+        let result = process.expect_open(1, &key);
+        state.processes.insert(profile, process);
+        result
+    }
+}
+
+/// Explicit consent never substitutes for evidence that the old browser and
+/// all its descendants ended. macOS does not yet have this kernel proof.
+#[cfg(any(target_os = "linux", windows))]
+pub(super) async fn recover_profile(
+    app: AppHandle,
+    payload: crate::RecoverProfileRequest,
+) -> Result<crate::RecoverProfileResponse> {
+    payload.validate()?;
+    let backend = app.state::<Backend>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = backend.0.lock().map_err(failure)?;
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let profile = payload.open.profile.clone();
+        let request = Request::Open {
+            id: 1,
+            payload: payload.open,
+        };
+        request.validate(&profile)?;
+        let Request::Open { payload: open, .. } = request else {
+            unreachable!()
+        };
+        retire_for_recovery(
+            &mut state,
+            &profile,
+            &open.key,
+            &payload.generation,
+            &backend.1,
+        )?;
+        // This uses the original UUID/cache and fresh runtime/guard. Its normal
+        // Opened reply must still prove native process and cache identity.
+        open_in_state(&app, &mut state, open)?;
+        Ok(crate::RecoverProfileResponse { reopened: true })
     })
     .await
     .map_err(failure)?
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn retire_for_recovery(
+    state: &mut State,
+    profile: &str,
+    key: &str,
+    generation: &str,
+    phase: &ExitPhase,
+) -> Result<()> {
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    let process = state
+        .processes
+        .get_mut(profile)
+        .ok_or(Error::InvalidRequest(
+            "The browser generation has changed; open this connection again.",
+        ))?;
+    if generation != process.order.to_string() {
+        return Err(Error::InvalidRequest(
+            "The browser recovery confirmation is stale.",
+        ));
+    }
+    let proof = process.recovery_proof(key)?;
+    // The reply reader has finished, including any old App quit request.
+    // Recheck the latch after observing that completion, before retiring it.
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    process.preserve_recovery(&proof)?;
+    if process.recovery_proof(key)? != proof {
+        return Err(Error::InvalidRequest("Browser recovery evidence changed."));
+    }
+    if phase.state.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidRequest("The browser is closing."));
+    }
+    state.processes.remove(profile);
+    Ok(())
 }
 
 /// The next free runtime directory for a new browser. Names are unique within
@@ -636,6 +950,51 @@ pub(super) async fn clear_profile(
     .map_err(failure)?
 }
 
+/// The App answers one held site permission prompt. `Ok` carries the prompts
+/// still held afterwards: the browser answered, so the entry is retired
+/// whether it applied the decision or reported the prompt already gone. An
+/// `Err` keeps the entry — the answer may not have reached the callback.
+pub(super) async fn resolve_permission(
+    app: AppHandle,
+    payload: ResolvePermissionRequest,
+) -> Result<Vec<PendingPermission>> {
+    payload.validate()?;
+    let backend = app.state::<Backend>().inner().clone();
+    let prompts = app
+        .try_state::<PermissionPrompts>()
+        .ok_or(Error::InvalidRequest(
+            "Browser permission prompts are unavailable on this backend.",
+        ))?
+        .inner()
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let mut state = backend.0.lock().map_err(failure)?;
+        if backend.1.state.load(Ordering::Acquire) != 0 {
+            return Err(Error::InvalidRequest("The browser is closing."));
+        }
+        let process = state
+            .processes
+            .get_mut(&payload.profile)
+            .ok_or(Error::InvalidRequest(
+                "This connection has no open browser to answer.",
+            ))?;
+        process.resolve_permission(
+            payload.prompt_id,
+            payload.decision,
+            std::time::Instant::now() + Duration::from_secs(15),
+        )?;
+        let list = prompts.drop(&payload.profile, payload.prompt_id, |list| {
+            let _ = app.emit("app-screen:permission-prompts", list);
+        });
+        Ok(list)
+    })
+    .await
+    .map_err(failure)?
+}
+
 /// Drop this profile's tracked browser once it has ended normally. One whose
 /// last window was just closed is still exiting for a moment, so wait within
 /// the bounded deadline before refusing it as still open; an abnormal end
@@ -781,8 +1140,16 @@ impl Process {
         runtime: PathBuf,
         payload: OpenRequest,
         spawner: &mpsc::Sender<SpawnRequest>,
-        no_sandbox: bool,
+        options: impl Into<SpawnOptions>,
     ) -> Result<Self> {
+        let SpawnOptions {
+            no_sandbox,
+            on_quit,
+            on_permission_event,
+            on_drop,
+        } = options.into();
+        #[cfg(target_os = "macos")]
+        let executable = macos::Executable::open(&program).map_err(failure)?;
         private_directory(&directory)?;
         if directory
             .symlink_metadata()
@@ -800,6 +1167,7 @@ impl Process {
             eprintln!("Detached browser data was not removed: {problem}");
         }
         let profile = payload.profile.clone();
+        let key = payload.key.clone();
         #[cfg(target_os = "linux")]
         if !setup::socket_path_fits(&runtime) {
             return Err(Error::InvalidRequest(
@@ -942,6 +1310,7 @@ impl Process {
         // known to be safe for CEF; that sharing is a known limit.
         #[cfg(target_os = "macos")]
         {
+            setup::guard_role_diagnostics(&mut command, &setup::environment);
             for key in MACOS_ENVIRONMENT {
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);
@@ -975,6 +1344,13 @@ impl Process {
             .open(directory.join("browser.log"))
             .map_err(failure)?;
         command.env("TAKOSUMI_BROWSER_PROCESS_DIRECTORY", &directory);
+        // An opted-in App answers this profile's permission prompts itself:
+        // the browser then holds each runtime callback open until
+        // `resolve_permission`. Without an owner the runtime's own prompt
+        // handling stays untouched.
+        if on_permission_event.is_some() {
+            command.env("TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS", "1");
+        }
         #[cfg(target_os = "linux")]
         command.env("LD_LIBRARY_PATH", program.parent().unwrap());
         command
@@ -1003,6 +1379,7 @@ impl Process {
         let input = child.stdin.take().expect("Owned child stdin");
         let stdout = child.stdout.take().expect("Owned child stdout");
         let (send, replies) = mpsc::channel();
+        let reader_finished = Arc::new(AtomicBool::new(false));
         let process = Self {
             child,
             #[cfg(unix)]
@@ -1012,6 +1389,8 @@ impl Process {
             input: None,
             replies,
             profile,
+            key,
+            reader_finished: reader_finished.clone(),
             directory,
             next: 1,
             uncertain: false,
@@ -1021,11 +1400,14 @@ impl Process {
             runtime: unowned.0.take().expect("Owned runtime directory"),
             _runtime_lock: runtime_lock,
             program,
+            #[cfg(target_os = "macos")]
+            executable,
             order: NEXT_ORDER.fetch_add(1, Ordering::SeqCst),
             #[cfg(windows)]
             stop,
             #[cfg(windows)]
             foreground_grant: None,
+            on_drop,
         };
         #[cfg(unix)]
         nonblocking(process.input.as_ref().unwrap())?;
@@ -1037,9 +1419,11 @@ impl Process {
             process
         };
         let owner = process.profile.clone();
+        let guard_pid = process.child.id();
         std::thread::Builder::new()
             .name("browser-process-replies".into())
             .spawn(move || {
+                let _finished = ReaderFinished(reader_finished);
                 let mut reader = BufReader::new(stdout);
                 loop {
                     let reply = match read_packet(&mut reader) {
@@ -1048,6 +1432,13 @@ impl Process {
                         Ok(None) => break,
                         Err(error) => Err(error.to_string()),
                     };
+                    let opened_id = match &reply {
+                        Ok(Reply::Opened { id, .. }) => Some(*id),
+                        _ => None,
+                    };
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-opened", guard_pid, id, None);
+                    }
                     // The person chose to open a link outside the App. The browser
                     // runs with its profile's HOME and XDG directories, so the App
                     // opens it with the person's own desktop; never a command reply.
@@ -1064,10 +1455,88 @@ impl Process {
                             }
                             continue;
                         }
+                        Ok(Reply::QuitRequested { profile }) if profile != owner => {
+                            Err("Foreign browser quit request".to_string())
+                        }
+                        Ok(Reply::QuitRequested { .. }) => {
+                            if let Some(on_quit) = &on_quit {
+                                mac_open_trace("reader-quit-callback-begin", guard_pid, 0, None);
+                                on_quit();
+                                mac_open_trace("reader-quit-callback-return", guard_pid, 0, None);
+                                continue;
+                            }
+                            Err("Browser quit request has no App owner".to_string())
+                        }
+                        // An opted-in App answers this profile's site
+                        // permission prompts itself; another profile's is a
+                        // protocol fault, and an event with no owner means
+                        // the child was told to emit something nobody reads.
+                        Ok(Reply::PermissionRequested { profile, .. }) if profile != owner => {
+                            Err("Foreign browser permission request".to_string())
+                        }
+                        Ok(Reply::PermissionRequested {
+                            prompt_id,
+                            origin,
+                            kind,
+                            permissions,
+                            ..
+                        }) => {
+                            if let Some(on_event) = &on_permission_event {
+                                mac_open_trace(
+                                    "reader-permission-callback-begin",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
+                                on_event(PermissionEvent::Requested {
+                                    prompt_id,
+                                    origin,
+                                    kind,
+                                    permissions,
+                                });
+                                mac_open_trace(
+                                    "reader-permission-callback-return",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
+                                continue;
+                            }
+                            Err("Browser permission request has no App owner".to_string())
+                        }
+                        Ok(Reply::PermissionDismissed { profile, .. }) if profile != owner => {
+                            Err("Foreign browser permission dismissal".to_string())
+                        }
+                        Ok(Reply::PermissionDismissed { prompt_id, .. }) => {
+                            if let Some(on_event) = &on_permission_event {
+                                mac_open_trace(
+                                    "reader-permission-callback-begin",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
+                                on_event(PermissionEvent::Dismissed { prompt_id });
+                                mac_open_trace(
+                                    "reader-permission-callback-return",
+                                    guard_pid,
+                                    0,
+                                    None,
+                                );
+                                continue;
+                            }
+                            Err("Browser permission dismissal has no App owner".to_string())
+                        }
                         other => other,
                     };
                     let failed = reply.is_err();
-                    if send.send(reply).is_err() || failed {
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-enqueue-begin", guard_pid, id, None);
+                    }
+                    let sent = send.send(reply);
+                    if let Some(id) = opened_id {
+                        mac_open_trace("reader-enqueue-return", guard_pid, id, Some(sent.is_ok()));
+                    }
+                    if sent.is_err() || failed {
                         break;
                     }
                 }
@@ -1137,9 +1606,12 @@ impl Process {
             }
             let actual = match &reply {
                 // The reply reader consumes these; one here is a protocol fault.
-                Reply::OpenExternal { .. } => {
+                Reply::OpenExternal { .. }
+                | Reply::QuitRequested { .. }
+                | Reply::PermissionRequested { .. }
+                | Reply::PermissionDismissed { .. } => {
                     return Err(Wait::Fault(Error::InvalidRequest(
-                        "Unexpected external link request.",
+                        "Unexpected unsolicited browser event.",
                     )))
                 }
                 Reply::Opened { id, .. }
@@ -1147,7 +1619,8 @@ impl Process {
                 | Reply::Stopped { id }
                 | Reply::Error { id, .. }
                 | Reply::CloseBlocked { id, .. }
-                | Reply::Cancelled { id, .. } => *id,
+                | Reply::Cancelled { id, .. }
+                | Reply::PermissionResolved { id } => *id,
             };
             // A reply to an earlier request that timed out (e.g. a person answering
             // a beforeunload dialog late) is stale, not a protocol fault.
@@ -1161,6 +1634,9 @@ impl Process {
             }
             if let Reply::Error { message, .. } = reply {
                 return Err(Wait::Rejected(message));
+            }
+            if matches!(&reply, Reply::Opened { .. }) {
+                mac_open_trace("receive-opened-return", self.child.id(), id, Some(true));
             }
             return Ok(reply);
         }
@@ -1199,19 +1675,54 @@ impl Process {
                 window_id,
                 native_pid,
                 ..
-            } if actual == key
-                && profile == self.profile
-                && browser_id > 0
-                && window_id > 0
-                && native_pid > 0
-                && native_owned(native_pid, &self.child, &self.program)
-                && same_path(
+            } => {
+                let fields_match = actual == key
+                    && profile == self.profile
+                    && browser_id > 0
+                    && window_id > 0
+                    && native_pid > 0;
+                mac_open_trace("identity-begin", self.child.id(), self.next, None);
+                #[cfg(not(target_os = "macos"))]
+                let owned = fields_match && native_owned(native_pid, &self.child, &self.program);
+                #[cfg(target_os = "macos")]
+                let owned = fields_match
+                    && native_owned(native_pid, &self.child, &self.program, &self.executable);
+                mac_open_trace("identity-return", self.child.id(), self.next, Some(owned));
+                mac_open_trace("cache-path-begin", self.child.id(), self.next, None);
+                let cache_matches = same_path(
                     &cache_path,
                     &self.directory.join("cef-profiles").join(&self.profile),
-                ) =>
-            {
+                );
+                mac_open_trace(
+                    "cache-path-return",
+                    self.child.id(),
+                    self.next,
+                    Some(cache_matches),
+                );
+                if !owned || !cache_matches {
+                    #[cfg(target_os = "macos")]
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "takosumi-mac-open-rejected: {}",
+                        serde_json::json!({
+                            "keyMatch":actual==key,"profileMatch":profile==self.profile,
+                            "browserIdPositive":browser_id>0,"windowIdPositive":window_id>0,
+                            "nativePidPositive":native_pid>0,"identityCheckAttempted":fields_match,
+                            "nativeOwned":owned,"cachePathMatch":cache_matches
+                        })
+                    );
+                    return Err(Error::InvalidRequest(
+                        "Browser profile creation was not confirmed.",
+                    ));
+                }
                 self.opened = serde_json::json!({"key":actual,"profile":profile,"browserId":browser_id,"nativeCache":cache_path,"windowId":window_id,"nativePid":native_pid});
                 self.opening = None;
+                mac_open_trace(
+                    "confirm-opened-return",
+                    self.child.id(),
+                    self.next,
+                    Some(true),
+                );
                 Ok(())
             }
             _ => Err(Error::InvalidRequest(
@@ -1220,12 +1731,24 @@ impl Process {
         }
     }
     fn open(&mut self, payload: OpenRequest) -> Result<()> {
+        mac_open_trace("process-open-enter", self.child.id(), 0, None);
         if self.uncertain {
-            return Err(Error::InvalidRequest(
-                "Previous browser command is incomplete; profile data is retained.",
-            ));
+            // A command whose deadline passed may already have its reply
+            // queued: settle it once before refusing, without sending
+            // anything new (a starved browser can still answer late).
+            if self.recover()? {
+                return Err(Error::InvalidRequest(
+                    "The browser ended before its earlier command settled; open this connection again.",
+                ));
+            }
+            if self.uncertain {
+                return Err(Error::InvalidRequest(
+                    "Previous browser command is incomplete; profile data is retained.",
+                ));
+            }
         }
         let key = payload.key.clone();
+        self.key = key.clone();
         self.next = self
             .next
             .checked_add(1)
@@ -1241,11 +1764,64 @@ impl Process {
         {
             self.foreground_grant = Some(windows::allow_foreground(pid));
         }
+        mac_open_trace("send-open-begin", self.child.id(), id, None);
         if let Err(error) = self.send(Request::Open { id, payload }, deadline) {
+            mac_open_trace("send-open-return", self.child.id(), id, Some(false));
             self.uncertain = true;
             return Err(error);
         }
+        mac_open_trace("send-open-return", self.child.id(), id, Some(true));
         self.expect_open_until(id, &key, deadline)
+    }
+    /// The App's answer to one held permission prompt (an `Requested`
+    /// event's `prompt_id`). `PermissionResolved` confirms the runtime
+    /// applied it; an outright refusal (`Reply::Error`) was answered, so it
+    /// leaves the profile usable — anything else leaves it in doubt, as an
+    /// unconfirmed create or close does. The bool says the held prompt is
+    /// over on the browser side: `true` resolved, `false` refused because
+    /// it was already gone — either way the App retires its entry. An `Err`
+    /// means the answer may not have arrived, so the entry stays.
+    pub(super) fn resolve_permission(
+        &mut self,
+        prompt_id: u64,
+        decision: PermissionDecision,
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
+        if self.uncertain {
+            return Err(Error::InvalidRequest(
+                "Previous browser command is incomplete; profile data is retained.",
+            ));
+        }
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(Error::InvalidRequest("Browser command limit reached."))?;
+        let id = self.next;
+        if let Err(error) = self.send(
+            Request::ResolvePermission {
+                id,
+                prompt_id,
+                decision,
+            },
+            deadline,
+        ) {
+            self.uncertain = true;
+            return Err(error);
+        }
+        match self.receive(id, deadline) {
+            Ok(Reply::PermissionResolved { .. }) => Ok(true),
+            Err(Wait::Rejected(_)) => Ok(false),
+            Ok(_) => {
+                self.uncertain = true;
+                Err(Error::InvalidRequest(
+                    "Browser permission reply was not confirmed.",
+                ))
+            }
+            Err(wait) => {
+                self.uncertain = true;
+                Err(wait.into())
+            }
+        }
     }
     fn shutdown(&mut self) -> Result<bool> {
         // A person answers each window's beforeunload in turn: the reply bound
@@ -1421,11 +1997,168 @@ impl Process {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    #[cfg(any(target_os = "linux", windows))]
+    fn recovery_proof(&mut self, key: &str) -> Result<serde_json::Value> {
+        use std::io::Read;
+        let refused = || {
+            Error::InvalidRequest(
+            "The ended browser's process ownership is not fully confirmed; saved data is retained.",
+        )
+        };
+        let status = self
+            .child
+            .try_wait()
+            .map_err(failure)?
+            .ok_or_else(refused)?;
+        if self.key != key
+            || self.uncertain
+            || self.opening.is_some()
+            || !self.reader_finished.load(Ordering::Acquire)
+            || self.guard_receipt != self.runtime.join("guard.json")
+        {
+            return Err(refused());
+        }
+        require_recovery_directory(&self.runtime)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let file = options.open(&self.guard_receipt).map_err(failure)?;
+        let metadata = file.metadata().map_err(failure)?;
+        if !metadata.is_file() || metadata.len() > 65536 {
+            return Err(refused());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(refused());
+            }
+        }
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes).map_err(failure)?;
+        if bytes.len() > 65536 {
+            return Err(refused());
+        }
+        let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(failure)?;
+        require_recovery_guard(&proof, status.code())?;
+        // Never remove a Chromium lock. A second App/browser, foreign host,
+        // unreadable lock or reused live PID leaves recovery unavailable.
+        for path in [
+            &self.directory,
+            &self.directory.join("cef-profiles"),
+            &self.directory.join("cef-profiles").join(&self.profile),
+        ] {
+            require_recovery_directory(path)?;
+        }
+        if singleton_live(&self.directory.join("cef-profiles")) {
+            return Err(refused());
+        }
+        Ok(proof)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn preserve_recovery(&self, proof: &serde_json::Value) -> Result<()> {
+        let directory = self.directory.join("recoveries");
+        private_directory(&directory)?;
+        require_recovery_directory(&directory)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(failure)?
+            .as_nanos();
+        let path = directory.join(format!("{stamp}-{}-{}.json", self.child.id(), self.order));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut record = options.open(path).map_err(failure)?;
+        // Only private process/profile evidence. No page URL, boot payload,
+        // cookies, response bytes or credentials enter this incident record.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": 1, "profile": self.profile, "generation": self.order.to_string(),
+            "guardPid": self.child.id(), "nativePid": self.opened["nativePid"],
+            "runtimeName": self.runtime.file_name().map(|name| name.to_string_lossy()),
+            "receipt": proof
+        }))
+        .map_err(failure)?;
+        record.write_all(&bytes).map_err(failure)?;
+        record.sync_all().map_err(failure)?;
+        #[cfg(unix)]
+        {
+            // Persist the incident entry (and a newly created recoveries
+            // directory) before the old runtime can be retired.
+            std::fs::File::open(&directory)
+                .map_err(failure)?
+                .sync_all()
+                .map_err(failure)?;
+            std::fs::File::open(&self.directory)
+                .map_err(failure)?
+                .sync_all()
+                .map_err(failure)?;
+        }
+        Ok(())
+    }
+
     fn normal_guard(&self) -> Result<()> {
         let proof: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&self.guard_receipt).map_err(failure)?)
                 .map_err(failure)?;
         require_normal_guard(&proof)
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn require_recovery_directory(path: &std::path::Path) -> Result<()> {
+    let metadata = path.symlink_metadata().map_err(failure)?;
+    let plain = metadata.is_dir();
+    #[cfg(windows)]
+    let plain = {
+        use std::os::windows::fs::MetadataExt;
+        plain && metadata.file_attributes() & 0x400 == 0
+    };
+    if plain {
+        Ok(())
+    } else {
+        Err(Error::InvalidRequest(
+            "Browser recovery requires a plain owned directory.",
+        ))
+    }
+}
+
+/// This is abnormal recovery clearance, never a normal-shutdown receipt.
+/// Linux ECHILD / Windows empty Job can prove exhaustion after forced cleanup;
+/// the original nonzero root status and forced count remain in the incident.
+#[cfg(any(target_os = "linux", windows))]
+fn require_recovery_guard(proof: &serde_json::Value, guard_exit: Option<i32>) -> Result<()> {
+    let root = proof["rootExit"].as_i64();
+    let forced = proof["forcedCleanup"].as_u64();
+    if root.is_some()
+        && forced.is_some()
+        && (root != Some(0) || forced != Some(0))
+        && guard_exit == Some(if root == Some(0) { 0 } else { 1 })
+        && proof["complete"] == true
+        && proof["kernelNoChildren"] == true
+        && proof["remaining"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+        && proof.get("error") == Some(&serde_json::Value::Null)
+        && proof["cleanupErrors"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+        && proof["nonFatalErrors"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidRequest(
+            "Browser crash recovery needs complete process exhaustion; saved data is retained.",
+        ))
     }
 }
 /// A guard's receipt shows a normal end: the browser exited 0, nothing was
@@ -1461,6 +2194,160 @@ fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_clearance_preserves_abnormality_and_requires_kernel_exhaustion() {
+        let valid = serde_json::json!({"rootExit":-9,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":3,"error":null,"cleanupErrors":[],"nonFatalErrors":[]});
+        require_recovery_guard(&valid, Some(1)).unwrap();
+        assert!(require_normal_guard(&valid).is_err());
+        for (field, value) in [
+            ("rootExit", serde_json::json!("-9")),
+            ("forcedCleanup", serde_json::json!(-1)),
+            ("complete", serde_json::json!(false)),
+            ("kernelNoChildren", serde_json::json!(false)),
+            ("remaining", serde_json::json!([123])),
+            ("error", serde_json::json!("unconfirmed")),
+            ("cleanupErrors", serde_json::json!(["failed"])),
+            ("nonFatalErrors", serde_json::json!(["unknown status"])),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(require_recovery_guard(&bad, Some(1)).is_err(), "{field}");
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                require_recovery_guard(&missing, Some(1)).is_err(),
+                "missing {field}"
+            );
+        }
+        for status in [None, Some(0), Some(2)] {
+            assert!(require_recovery_guard(&valid, status).is_err());
+        }
+        let mut forced_only = valid.clone();
+        forced_only["rootExit"] = serde_json::json!(0);
+        require_recovery_guard(&forced_only, Some(0)).unwrap();
+        forced_only["forcedCleanup"] = serde_json::json!(0);
+        assert!(require_recovery_guard(&forced_only, Some(0)).is_err());
+        require_normal_guard(&forced_only).unwrap();
+    }
+
+    #[test]
+    fn recovery_waits_for_reader_completion_but_does_not_invent_it() {
+        let finished = Arc::new(AtomicBool::new(false));
+        assert!(!reader_finished_within(&finished, Duration::from_millis(1)));
+        let reader = finished.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            reader.store(true, Ordering::Release);
+        });
+        assert!(reader_finished_within(&finished, Duration::from_secs(2)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_archives_the_exact_ended_generation_without_clearing_either_profile() {
+        let root = std::env::temp_dir().join(format!("sumi-recovery-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let guard = root.join("crashed.py");
+        let proof = serde_json::json!({"rootExit":-9,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":2,"error":null,"cleanupErrors":[],"nonFatalErrors":[]});
+        std::fs::write(
+            &guard,
+            format!(
+                "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text({:?})\nsys.exit(1)\n",
+                proof.to_string()
+            ),
+        )
+        .unwrap();
+        let parent = spawner().unwrap();
+        let payload = work_payload();
+        let profile = payload.profile.clone();
+        let key = payload.key.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard.clone(),
+            root.join(&profile),
+            root.join("runtime"),
+            payload,
+            &parent,
+            true,
+        )
+        .unwrap();
+        let generation = process.order.to_string();
+        let guard_pid = process.child.id();
+        let runtime = process.runtime.clone();
+        assert!(exit_within(&mut process.child, Duration::from_secs(5))
+            .is_some_and(|status| status.code() == Some(1)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !process.reader_finished.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cache = root.join(&profile).join("cef-profiles");
+        private_directory(&cache.join(&profile)).unwrap();
+        std::fs::write(cache.join(&profile).join("kept"), b"Work").unwrap();
+        let personal = root.join("personal-kept");
+        std::fs::write(&personal, b"Personal").unwrap();
+        let mut state = State {
+            program: PathBuf::from("/bin/true"),
+            guard,
+            directory: root.clone(),
+            runtime_root: root.clone(),
+            no_sandbox: true,
+            processes: BTreeMap::from([(profile.clone(), process)]),
+            spawner: parent,
+        };
+        let phase = ExitPhase::default();
+        assert!(release_ended(&mut state, &profile, std::time::Instant::now()).is_err());
+        assert!(retire_for_recovery(&mut state, &profile, &key, "999999", &phase).is_err());
+        assert!(
+            retire_for_recovery(&mut state, &profile, "foreign key", &generation, &phase).is_err()
+        );
+        phase.state.store(1, Ordering::Release);
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        phase.state.store(0, Ordering::Release);
+        let process = state.processes.get_mut(&profile).unwrap();
+        process.uncertain = true;
+        assert!(process.recovery_proof(&key).is_err());
+        process.uncertain = false;
+        std::os::unix::fs::symlink(
+            format!("{}-{}", hostname(), std::process::id()),
+            cache.join("SingletonLock"),
+        )
+        .unwrap();
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        assert!(cache.join("SingletonLock").symlink_metadata().is_ok());
+        std::fs::remove_file(cache.join("SingletonLock")).unwrap(); // owned test lock only
+        let outside = root.join("outside");
+        private_directory(&outside).unwrap();
+        let records = root.join(&profile).join("recoveries");
+        std::os::unix::fs::symlink(&outside, &records).unwrap();
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_file(&records).unwrap(); // owned test link only
+        assert!(state.processes.contains_key(&profile));
+        retire_for_recovery(&mut state, &profile, &key, &generation, &phase).unwrap();
+        assert!(!state.processes.contains_key(&profile));
+        assert_eq!(
+            std::fs::read(cache.join(&profile).join("kept")).unwrap(),
+            b"Work"
+        );
+        assert_eq!(std::fs::read(&personal).unwrap(), b"Personal");
+        let files = std::fs::read_dir(&records)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let incident: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(files[0].path()).unwrap()).unwrap();
+        assert_eq!(incident["receipt"], proof);
+        assert_eq!(incident["guardPid"], guard_pid);
+        assert_eq!(incident["generation"], generation);
+        assert_eq!(incident["profile"], profile);
+        assert_eq!(runtime.exists(), setup::KEEP_ENDED_RUNTIME);
+        assert!(retire_for_recovery(&mut state, &profile, &key, &generation, &phase).is_err());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn an_unresolvable_browser_leaves_the_app_running_with_its_reason() {
         // The test executable has no packaged `cef/` resources beside it, so
@@ -2251,6 +3138,76 @@ sys.stdin.read()' "$1"
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
+    fn an_open_retries_after_a_queued_late_answer_settles_the_doubt() {
+        // The earlier request's reply can already be queued when the App's
+        // deadline passed (run 43076506208: a real site's cancelled quit
+        // starved the Work browser's own pipe so its resumed Open went
+        // unanswered). The open settles that doubt from the queued answer
+        // once instead of refusing the profile until exit.
+        let root = std::env::temp_dir().join(format!("sumi-open-recover-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let work = "11111111-1111-4111-8111-111111111111";
+        let guard = recovering_guard(&root);
+        let program = std::fs::canonicalize("/bin/sleep").unwrap();
+        let parent = spawner().unwrap();
+        let (mut process, send) = in_doubt(&root, &guard, &program, &parent, 1, work);
+        let key = format!("web-home:{work}:https://excalidraw.com");
+        process.opening = Some(key.clone());
+        let cache = process.directory.join("cef-profiles").join(work);
+        let native_pid: u32 = marker(&process.guard_receipt.with_file_name("native"))
+            .parse()
+            .unwrap();
+        // The timed-out Open's own verified answer, id 2, arrived late.
+        send.send(Ok(Reply::Opened {
+            id: 2,
+            key: key.clone(),
+            profile: work.to_owned(),
+            browser_id: 1,
+            cache_path: cache.to_string_lossy().into_owned(),
+            window_id: 7,
+            native_pid,
+        }))
+        .unwrap();
+        // The retry's reuse answer, id 3, lands while the retry waits.
+        let retry_send = send.clone();
+        let retry_key = key.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            retry_send
+                .send(Ok(Reply::Opened {
+                    id: 3,
+                    key: retry_key,
+                    profile: work.to_owned(),
+                    browser_id: 1,
+                    cache_path: cache.to_string_lossy().into_owned(),
+                    window_id: 7,
+                    native_pid,
+                }))
+                .unwrap();
+        });
+        let retry_payload: OpenRequest = serde_json::from_value(serde_json::json!({
+            "key":key,"url":"https://excalidraw.com/","title":"App","profile":work,
+            "webHome":true,"resume":true
+        }))
+        .unwrap();
+        process.open(retry_payload).unwrap();
+        assert!(!process.uncertain, "the queued answer settled the doubt");
+        assert_eq!(process.next, 3, "the retry sent exactly one new request");
+        assert_eq!(process.opened["nativePid"], native_pid);
+        drop(process);
+        // Without a queued answer the open is still refused while in doubt.
+        let (mut process, _send) = in_doubt(&root, &guard, &program, &parent, 2, work);
+        let refused_payload: OpenRequest = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{work}:https://excalidraw.com"),"url":"https://excalidraw.com/",
+            "title":"App","profile":work,"webHome":true,"resume":true
+        }))
+        .unwrap();
+        assert!(process.open(refused_payload).is_err(), "still in doubt");
+        assert!(process.uncertain, "an empty queue cannot settle it");
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
     fn a_timed_out_shutdown_leaves_the_late_answer_for_recovery() {
         // The person's cancel is already queued when the reply deadline has
         // passed: the timeout must not consume it.
@@ -2344,6 +3301,287 @@ sys.stdin.read()' "$1"
         );
         drop(process);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn system_quit_events_do_not_poison_cancel_or_the_next_shutdown() {
+        let root = std::env::temp_dir().join(format!("sumi-system-quit-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nfirst=json.loads(sys.stdin.readline())\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nprint(json.dumps({{'event':'cancelled','id':first['id'],'profile':'{profile}'}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let requested = Arc::new(AtomicU64::new(0));
+        let observed = requested.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: Some(Box::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_permission_event: None,
+                on_drop: None,
+            },
+        )
+        .unwrap();
+        let first = process.shutdown();
+        let uncertain = process.uncertain;
+        let last = if matches!(first, Ok(false)) {
+            process.shutdown()
+        } else {
+            Ok(false)
+        };
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(first, Ok(false)),
+            "quit intent must not become a command reply: {first:?}"
+        );
+        assert!(!uncertain, "cancel must leave the profile usable");
+        assert!(
+            matches!(last, Ok(true)),
+            "the next numbered shutdown must still complete: {last:?}"
+        );
+        assert_eq!(
+            requested.load(Ordering::SeqCst),
+            2,
+            "both intents reached the App owner"
+        );
+    }
+    #[test]
+    fn system_quit_rejects_foreign_or_unowned_requests() {
+        let root = std::env::temp_dir().join(format!("sumi-quit-refusal-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let parent = spawner().unwrap();
+        let own = "11111111-1111-4111-8111-111111111111";
+        let requested = Arc::new(AtomicU64::new(0));
+        for (index, foreign) in [true, false].into_iter().enumerate() {
+            let profile = if foreign {
+                "22222222-2222-4222-8222-222222222222"
+            } else {
+                own
+            };
+            let directory = root.join(index.to_string());
+            private_directory(&directory).unwrap();
+            let guard = directory.join("guard.py");
+            std::fs::write(&guard, format!("import json,sys\nprint(json.dumps({{'event':'quitRequested','profile':'{profile}'}}),flush=True)\nsys.stdin.read()\n")).unwrap();
+            let payload = serde_json::from_value(serde_json::json!({
+                "key":format!("web-home:{own}:https://excalidraw.com"),
+                "url":"https://excalidraw.com/","title":"App","profile":own,"webHome":true
+            }))
+            .unwrap();
+            let observed = requested.clone();
+            let callback: Box<dyn Fn() + Send> = Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut process = Process::spawn(
+                PathBuf::from("/bin/true"),
+                guard,
+                directory.join("p").join(own),
+                directory.join("r"),
+                payload,
+                &parent,
+                SpawnOptions {
+                    no_sandbox: true,
+                    on_quit: foreign.then_some(callback),
+                    on_permission_event: None,
+                    on_drop: None,
+                },
+            )
+            .unwrap();
+            let result = process.shutdown();
+            let uncertain = process.uncertain;
+            drop(process);
+            let expected = if foreign {
+                "Foreign browser quit request"
+            } else {
+                "Browser quit request has no App owner"
+            };
+            assert!(
+                matches!(result, Err(Error::Desktop(ref message)) if message == expected),
+                "{result:?}"
+            );
+            assert!(uncertain);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(requested.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn held_permission_prompts_reach_the_app_owner_and_resolve() {
+        // The stand-in browser reports one held prompt, is answered through
+        // `resolve_permission`, confirms it, then reports a dismissal and the
+        // shutdown. The events reach the registered owner only — never the
+        // command replies — and the opt-in env reaches the child.
+        let root = std::env::temp_dir().join(format!("sumi-permission-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "11111111-1111-4111-8111-111111111111";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,os,sys\nassert os.environ.get('TAKOSUMI_BROWSER_PROCESS_PERMISSION_EVENTS')=='1'\nprint(json.dumps({{'event':'permissionRequested','profile':'{profile}','prompt_id':7,'origin':'https://excalidraw.com','kind':'prompt','permissions':8}}),flush=True)\nline=json.loads(sys.stdin.readline())\nassert line['operation']=='resolvePermission' and line['prompt_id']==7 and line['decision']=='allow',line\nprint(json.dumps({{'event':'permissionResolved','id':line['id']}}),flush=True)\nprint(json.dumps({{'event':'permissionDismissed','profile':'{profile}','prompt_id':9}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nassert last['operation']=='shutdown',last\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://excalidraw.com"),
+            "url":"https://excalidraw.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: None,
+                on_permission_event: Some(Box::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                })),
+                on_drop: None,
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while events.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !events.lock().unwrap().is_empty(),
+            "the held prompt must reach the App owner"
+        );
+        process
+            .resolve_permission(
+                7,
+                PermissionDecision::Allow,
+                std::time::Instant::now() + Duration::from_secs(20),
+            )
+            .unwrap();
+        let stopped = process.shutdown();
+        drop(process);
+        let events = std::mem::take(&mut *events.lock().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(stopped, Ok(true)), "{stopped:?}");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PermissionEvent::Requested {
+                    prompt_id: 7,
+                    kind: PermissionKind::Prompt,
+                    permissions: 8,
+                    ..
+                }, PermissionEvent::Dismissed { prompt_id: 9 }]
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            match &events[0] {
+                PermissionEvent::Requested { origin, .. } => origin.as_str(),
+                _ => "",
+            },
+            "https://excalidraw.com"
+        );
+    }
+    #[test]
+    fn permission_prompts_track_and_retire_their_entries() {
+        // The App-side map: requests add, dismissals and answers retire a
+        // single (profile, prompt) pair, and a dropped process retires every
+        // prompt its profile still held.
+        let prompts = PermissionPrompts::default();
+        let requested = |prompt_id: u64| PermissionEvent::Requested {
+            prompt_id,
+            origin: "https://photopea.com".to_owned(),
+            kind: PermissionKind::Prompt,
+            permissions: 8,
+        };
+        assert!(prompts.list().is_empty());
+        let emitted = Mutex::new(Vec::<Vec<(String, u64)>>::new());
+        let record = |list: &[PendingPermission]| {
+            emitted.lock().unwrap().push(
+                list.iter()
+                    .map(|item| (item.profile.clone(), item.prompt_id))
+                    .collect(),
+            );
+        };
+        assert_eq!(prompts.note("p", requested(7), &record).len(), 1);
+        assert_eq!(prompts.note("p", requested(9), &record).len(), 2);
+        assert_eq!(prompts.note("q", requested(3), &record).len(), 3);
+        assert_eq!(
+            prompts
+                .note("p", PermissionEvent::Dismissed { prompt_id: 7 }, &record)
+                .len(),
+            2
+        );
+        assert_eq!(prompts.drop("p", 7, &record).len(), 2);
+        let list = prompts.drop("p", 9, &record);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].profile, "q");
+        assert!(prompts.drop_profile("q", &record).is_empty());
+        assert_eq!(
+            emitted.lock().unwrap().as_slice(),
+            [
+                vec![("p".to_owned(), 7)],
+                vec![("p".to_owned(), 7), ("p".to_owned(), 9)],
+                vec![("p".to_owned(), 7), ("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("p".to_owned(), 9), ("q".to_owned(), 3)],
+                vec![("q".to_owned(), 3)],
+                vec![],
+            ]
+        );
+    }
+    #[test]
+    fn resolve_permission_accepts_a_prompt_the_browser_already_dropped() {
+        // The held prompt ended browser-side before the App's answer: the
+        // runtime refuses the resolve, which the App reads as answered — the
+        // entry is stale and retires, never an uncertainty.
+        let root =
+            std::env::temp_dir().join(format!("sumi-permission-stale-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let profile = "22222222-2222-4222-8222-222222222222";
+        let guard = root.join("guard.py");
+        std::fs::write(&guard, format!("import json,sys\nline=json.loads(sys.stdin.readline())\nassert line['operation']=='resolvePermission',line\nprint(json.dumps({{'event':'error','id':line['id'],'message':'prompt is no longer held'}}),flush=True)\nlast=json.loads(sys.stdin.readline())\nassert last['operation']=='shutdown',last\nprint(json.dumps({{'event':'stopped','id':last['id']}}),flush=True)\nopen(sys.argv[1],'w').write(json.dumps({NORMAL_RECEIPT}))\n")).unwrap();
+        let parent = spawner().unwrap();
+        let payload = serde_json::from_value(serde_json::json!({
+            "key":format!("web-home:{profile}:https://photopea.com"),
+            "url":"https://photopea.com/","title":"App","profile":profile,"webHome":true
+        }))
+        .unwrap();
+        let mut process = Process::spawn(
+            PathBuf::from("/bin/true"),
+            guard,
+            root.join("p").join(profile),
+            root.join("r"),
+            payload,
+            &parent,
+            SpawnOptions {
+                no_sandbox: true,
+                on_quit: None,
+                on_permission_event: None,
+                on_drop: None,
+            },
+        )
+        .unwrap();
+        let resolved = process.resolve_permission(
+            7,
+            PermissionDecision::Deny,
+            std::time::Instant::now() + Duration::from_secs(20),
+        );
+        let stopped = process.shutdown();
+        drop(process);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(resolved, Ok(false)), "{resolved:?}");
+        assert!(matches!(stopped, Ok(true)), "{stopped:?}");
     }
     #[test]
     fn external_link_requests_never_reach_command_replies() {
@@ -3236,6 +4474,11 @@ impl Drop for Unowned {
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        // Held-prompt hygiene runs first: its entries are dead the moment
+        // this Process is, and must not wait on the drain below.
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
         self.input.take();
         if matches!(self.child.try_wait(), Ok(None)) {
             // A live, unreaped direct Child cannot have its PID recycled.
@@ -3260,9 +4503,9 @@ impl Drop for Process {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        // Every caller drops a browser right after verifying its guard's
-        // normal receipt; any other ended guard is dropped only at the App's
-        // end. A guard still running keeps its sockets and receipt.
+        // Normal reuse verifies the normal receipt; explicit recovery first
+        // archives a conclusive abnormal receipt. Other ended guards are
+        // dropped only at App exit. A live guard keeps its sockets/receipt.
         if !setup::KEEP_ENDED_RUNTIME && matches!(self.child.try_wait(), Ok(Some(_))) {
             if let Err(problem) = setup::remove_runtime(&self.runtime) {
                 eprintln!("A browser runtime directory was not removed: {problem}");
@@ -3579,10 +4822,9 @@ mod macos_tests {
             macos::parent_and_start(native_pid).map(|(parent, _)| parent),
             Some(guard)
         );
-        assert_eq!(
-            macos::image_of(native_pid).as_deref(),
-            Some(located.program.as_path())
-        );
+        assert!(process
+            .executable
+            .matches(&macos::image_of(native_pid).unwrap()));
         let tree = descendants(guard);
         println!("guard {guard}, browser {native_pid}, tree while open: {tree:?}");
         assert!(tree.len() >= 2, "no CEF helper below the browser: {tree:?}");

@@ -33,12 +33,16 @@ OBSERVER_WAIT = 85
 SESSION_WAIT = OBSERVER_WAIT + APP_EXIT_WAIT + 20
 LINUX_SOURCES = (
     "bun.lock", "package.json", "index.html", "vite.config.ts", "tsconfig.json",
+    "src/web-profile-recovery.ts",
     "native-tests/browser/guard.py", "native-tests/desktop/web_home.py",
     "native-tests/desktop/browser_process.py", "native-tests/desktop/browser-process.mjs",
+    "native-tests/desktop/notification-close.mjs",
+    "native-tests/desktop/notification-route.mjs",
     "native-tests/desktop/browser_snapshot.py", "native-tests/desktop/test_browser_snapshot.py",
     "native-tests/cef-candidate/Cargo.toml", "native-tests/cef-candidate/Cargo.lock",
     "native-tests/cef-candidate/build.rs",
     "native-tests/cef-candidate/src/process_main.rs", "native-tests/cef-candidate/src/browser_main.rs",
+    "native-tests/cef-candidate/src/download_observation.rs",
     "native-tests/cef-candidate/src/guard_main.rs",
     "native-tests/cef-candidate/src/guard_entry.rs",
     "native-tests/cef-candidate/x11-owner.py",
@@ -47,6 +51,7 @@ LINUX_SOURCES = (
     "native-tests/desktop/native-files.mjs", "native-tests/desktop/browser_apps.py",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs",
     "src-tauri/src/lib.rs", "src-tauri/src/main.rs", "src-tauri/tests/desktop/browser_process.rs",
+    "src-tauri/tests/desktop/browser_process_linux.rs",
     "src-tauri/tauri.conf.json", "src-tauri/tauri.web-client.conf.json",
     "src-tauri/plugins/app-screen/Cargo.toml", "src-tauri/plugins/app-screen/build.rs",
 )
@@ -146,7 +151,7 @@ def worker(args):
     enable_child_subreaper()
     result = {"passed": False}
     phase = os.environ.get("TAKOSUMI_BROWSER_PROCESS_PHASE", "")
-    require(phase in {"", "restart", "reset", "notify", "files"}, "Unknown browser fixture phase")
+    require(phase in {"", "restart", "reset", "notify", "files", "recover"}, "Unknown browser fixture phase")
     suffix = f"-{phase}" if phase else ""
     with (args.data / f"app{suffix}.log").open("x") as log:
         app = subprocess.Popen([str(args.binary)], stdout=log, stderr=subprocess.STDOUT)
@@ -272,8 +277,12 @@ def main():
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
     parser.add_argument("--files", action="store_true",
                         help="relaunch and verify the native OS Open/Save As chooser in Work (Excalidraw only)")
+    parser.add_argument("--recover", action="store_true",
+                        help="standalone two-profile crash and explicit same-App recovery with retained saved data")
     parser.add_argument("--notifications", type=Path,
                         help="relaunch with this owned Dunst binary and verify native permission UI and OS notifications")
+    parser.add_argument("--notification-reset", action="store_true",
+                        help="with --notifications, clear and reopen Personal from the home before acting on its old alert")
     parser.add_argument("--guard", type=Path, default=GUARD,
                         help="the App's per-profile browser guard (default: the fixture guard.py; "
                              "or the Rust takosumi-browser-guard binary)")
@@ -284,6 +293,12 @@ def main():
                                        "account, so the browsers run with the Chromium sandbox")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.recover and (args.restart or args.reset or args.files or args.notifications or args.notification_reset):
+        parser.error("--recover is a standalone scenario; other scenarios cannot be combined")
+    if args.recover and not args.packaged and args.guard.suffix == ".py":
+        parser.error("--recover requires --guard pointing to the product Rust guard (its complete incident schema)")
+    if args.notification_reset and not args.notifications:
+        parser.error("--notification-reset requires --notifications")
     args.binary = args.binary.resolve(strict=True)
     args.browser = args.browser.resolve(strict=True)
     args.data = args.data.absolute()
@@ -310,7 +325,8 @@ def main():
     env = dict(os.environ)
     # Only --restart selects the restart phase; never inherit it from the caller.
     env.pop("TAKOSUMI_BROWSER_PROCESS_PHASE", None)
-    for key in ("TAKOSUMI_BROWSER_PROCESS_FILES_INPUT", "TAKOSUMI_BROWSER_PROCESS_FILES_NONCE"):
+    for key in ("TAKOSUMI_BROWSER_PROCESS_FILES_INPUT", "TAKOSUMI_BROWSER_PROCESS_FILES_NONCE",
+                "TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET"):
         env.pop(key, None)
     for key, name in {"HOME":"home", "XDG_DATA_HOME":"data", "XDG_CONFIG_HOME":"config",
                       "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "TMPDIR":"tmp"}.items():
@@ -339,6 +355,9 @@ def main():
                TAKOSUMI_BROWSER_PROCESS_SNAPSHOT_PROGRAM=str(args.browser),
                TAKOSUMI_BROWSER_PROCESS_INSPECT="1",
                TAKOSUMI_BROWSER_PROCESS_APP=args.app,
+               # The mjs observer drives the media hold/retire choreography;
+               # Windows/macOS observer flows never write its checkpoints.
+               TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL="1",
                WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="1", G_DEBUG="fatal-criticals")
     # A recording stand-in for the desktop's opener, first on PATH: the App hands
     # links the person chose to open outside to xdg-open. Nothing real opens.
@@ -397,6 +416,11 @@ def main():
         hand_over(session, *args.session_user)
         os.chmod(args.data, 0o711)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+    if args.recover:
+        proof = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="recover"), files, before, head, "-recover")
+        require(proof["passed"] is True, "The native crash recovery execution did not pass")
+        require(not (session / "external-open.log").exists(), "Recovery must not open an external browser")
+        return
     proof = run_session(args, env, files, before, head, "")
     require(proof["passed"] is True, "The native execution did not pass")
     if args.restart:
@@ -413,7 +437,8 @@ def main():
         # Another launch: native Chrome permission UI and real OS notifications
         # per profile, through an owned notification daemon on the session bus.
         notify = run_session(args, dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE="notify",
-                                        TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications)),
+                                        TAKOSUMI_BROWSER_PROCESS_NOTIFIER=str(args.notifications),
+                                        TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET="1" if args.notification_reset else "0"),
                              files, before, head, "-notify")
         require(notify["passed"] is True, "The notification native execution did not pass")
     if args.files:

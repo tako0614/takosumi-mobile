@@ -140,6 +140,13 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    guard_readiness_observation_preserves_errno_optional_and_budget,
+    terminal_signal_owned_fd_open_failure_cleans_partial_child,
+    terminal_signal_readiness_unknown_keeps_eligibility,
+    terminal_signal_owned_no_direct_fd_preserves_pid_fallback,
+    terminal_signal_owned_terminal_unreaped_child_is_not_forced,
+    terminal_signal_owned_live_handler_exit_zero_stays_forced,
+    stop_observation_is_bounded_and_uses_only_existing_results,
     normal_exit_writes_a_complete_normal_receipt,
     a_non_zero_browser_exit_is_reported_and_fails,
     a_detached_helper_is_reaped_and_counted_as_forced_cleanup,
@@ -458,6 +465,7 @@ impl Case {
             .as_object()
             .unwrap()
             .keys()
+            .filter(|name| name.as_str() != "stopObservation") // Optional diagnostics never change required receipt fields.
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
@@ -1231,3 +1239,477 @@ fn the_stat_parser_uses_the_final_name_delimiter() {
         Some(expected)
     );
 }
+
+// STOP_OBSERVATION_CONTROL_BEGIN
+fn stop_observation_is_bounded_and_uses_only_existing_results() {
+    let mut observation = StopObservation::default();
+    observation.reaped(6, false, 0);
+    assert!(observation.json()["records"].as_array().unwrap().is_empty());
+    observation.begin();
+    observation.signal(
+        7,
+        Some(42),
+        true,
+        "retained_pidfd",
+        libc::SIGTERM,
+        &Ok(()),
+        None,
+    );
+    observation.signal(
+        8,
+        None,
+        true,
+        "direct_pid",
+        libc::SIGKILL,
+        &Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        None,
+    );
+    observation.reaped(7, true, 0);
+    let proof = observation.json();
+    let records = proof["records"].as_array().unwrap();
+    assert_eq!(records[0]["startTick"], 42);
+    assert_eq!(records[0]["result"], "ok");
+    assert_eq!(records[1]["startTick"], serde_json::Value::Null);
+    assert_eq!(records[1]["result"], "esrch");
+    assert_eq!(records[1]["errno"], libc::ESRCH);
+    assert_eq!(records[2]["startTick"], serde_json::Value::Null);
+    assert_eq!(records[2]["waitStatus"], 0);
+    for _ in 0..STOP_OBSERVATION_CAP {
+        observation.reaped(9, false, 0);
+    }
+    let proof = observation.json();
+    assert_eq!(
+        proof["records"].as_array().unwrap().len(),
+        STOP_OBSERVATION_CAP
+    );
+    assert_eq!(proof["truncated"], true);
+    assert!(serde_json::to_vec(&proof).unwrap().len() < 16 * 1024);
+}
+// STOP_OBSERVATION_CONTROL_END
+
+// TERMINAL_SIGNAL_CONTROL_BEGIN
+const TERMINAL_LOCAL_CHILD: &str = r#"
+import os,signal,sys
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+print("ready", flush=True)
+sys.stdin.readline()
+os._exit(0 if sys.argv[1] == "exit" else 2)
+"#;
+
+// These pidfds name only the child created here. poll never reaps it.
+fn terminal_local_wait(fd: &OwnedFd, millis: i32) -> bool {
+    let mut item = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLRDNORM,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut item, 1, millis) };
+    result == 1
+        && item.revents & libc::POLLIN != 0
+        && item.revents & !(libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP) == 0
+}
+
+struct TerminalLocalChild {
+    child: Child,
+    fd: OwnedFd,
+    reaped: bool,
+}
+
+// The temporary owner is established immediately after spawn, before fd-open
+// or any injected failure. A successful transfer takes the Child exactly once.
+static TERMINAL_CTOR_CLEANUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+struct TerminalSpawnOwner(Option<Child>);
+
+impl Drop for TerminalSpawnOwner {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // This is still our unreaped direct child: no Run or other waiter
+            // has received it, so its numeric PID cannot have been recycled.
+            if child.kill().is_err() || child.wait().is_err() {
+                let _ = writeln!(io::stderr(), "OWN_LOCAL_CHILD_CTOR_CLEANUP incomplete");
+                std::process::abort(); // Never continue catch_unwind with unknown cleanup.
+            }
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) };
+            let empty =
+                result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+            if !empty {
+                let _ = writeln!(io::stderr(), "OWN_LOCAL_CHILD_CTOR_CLEANUP no_echild");
+                std::process::abort();
+            }
+            TERMINAL_CTOR_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = writeln!(
+                io::stdout(),
+                "OWN_LOCAL_CHILD_CTOR_CLEANUP reaped=true echild=true"
+            );
+        }
+    }
+}
+
+impl TerminalLocalChild {
+    fn new(mode: &str) -> Self {
+        Self::try_new_with_fd(mode, pidfd_open).unwrap()
+    }
+
+    fn try_new_with_fd(
+        mode: &str,
+        open: impl FnOnce(i32) -> io::Result<OwnedFd>,
+    ) -> io::Result<Self> {
+        let mut pending = TerminalSpawnOwner(Some(
+            Command::new("/usr/bin/python3")
+                .args(["-I", "-S", "-c", TERMINAL_LOCAL_CHILD, mode])
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        ));
+        let fd = open(pending.0.as_ref().unwrap().id() as i32)?;
+        let mut owned = Self {
+            child: pending.0.take().unwrap(),
+            fd,
+            reaped: false,
+        };
+        let mut line = String::new();
+        BufReader::new(owned.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        Ok(owned)
+    }
+}
+
+impl Drop for TerminalLocalChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            if !terminal_local_wait(&self.fd, 0) {
+                let _ = pidfd_signal(&self.fd, libc::SIGKILL);
+            }
+            if terminal_local_wait(&self.fd, 3_000) {
+                self.reaped = self.child.wait().is_ok();
+            }
+            eprintln!("OWN_LOCAL_CHILD_CLEANUP drop_reaped={}", self.reaped);
+        }
+    }
+}
+
+fn terminal_local_run(child: &TerminalLocalChild) -> Run {
+    let mut run = Run {
+        me: std::process::id() as i32,
+        tracker: Tracker::default(),
+        child: Some(child.child.id() as i32),
+        child_fd: Some(child.fd.try_clone().unwrap()),
+        root_exit: None,
+        forced: BTreeSet::new(),
+        cleanup_errors: BTreeSet::new(),
+        non_fatal: BTreeSet::new(),
+        stop_observation: StopObservation::default(),
+    };
+    // The existing ownership observer retains this live child's genuine pidfd/start tick.
+    run.safe_observe();
+    assert!(run.tracker.handles.contains_key(&(child.child.id() as i32)));
+    run.stop_observation.begin();
+    run
+}
+
+fn terminal_local_finish(run: &mut Run, child: &mut TerminalLocalChild, label: &str) {
+    assert!(
+        terminal_local_wait(&child.fd, 3_000),
+        "owned child did not reach terminal readiness"
+    );
+    let empty = run.reap().unwrap();
+    child.reaped = empty;
+    println!(
+        "OWN_LOCAL_CHILD_CLEANUP case={label} echild={empty} root_exit={:?}",
+        run.root_exit
+    );
+    assert!(empty, "owned local child was not reaped to ECHILD");
+    assert_eq!(run.root_exit, Some(0));
+    assert!(run.cleanup_errors.is_empty());
+}
+
+fn terminal_signal_owned_terminal_unreaped_child_is_not_forced() {
+    let mut child = TerminalLocalChild::new("exit");
+    let mut run = terminal_local_run(&child);
+    let pid = child.child.id() as i32;
+    let start = run.tracker.handles[&pid].0;
+    child
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"exit\n")
+        .unwrap();
+    assert!(terminal_local_wait(&run.tracker.handles[&pid].1, 3_000));
+    // No wait occurred: the same flags=0 retained pidfd is already terminal.
+    run.send(libc::SIGTERM);
+    assert_eq!(
+        run.tracker.handles[&pid].0, start,
+        "terminal identity must remain retained until reap"
+    );
+    let proof = run.stop_observation.json();
+    let signals = proof["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["kind"] == "signal")
+        .count();
+    let ok = proof["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["kind"] == "signal" && r["result"] == "ok")
+        .count();
+    terminal_local_finish(&mut run, &mut child, "terminal-before-send");
+    println!("OWN_TERMINAL_CONTRAST terminal_before_send=true forced={} signals={signals} signal_ok={ok}", run.forced.len());
+    assert!(
+        run.forced.is_empty(),
+        "already terminal owned child must not count as forced"
+    );
+    assert_eq!(
+        signals, 0,
+        "retained and direct-pidfd paths must both skip known terminal children"
+    );
+}
+
+fn terminal_signal_owned_live_handler_exit_zero_stays_forced() {
+    let mut child = TerminalLocalChild::new("live");
+    let mut run = terminal_local_run(&child);
+    let pid = child.child.id() as i32;
+    assert!(!terminal_local_wait(&run.tracker.handles[&pid].1, 0));
+    run.send(libc::SIGTERM);
+    terminal_local_finish(&mut run, &mut child, "live-handler-exit-zero");
+    println!(
+        "OWN_TERMINAL_CONTRAST live_before_send=true forced={} root_exit_zero=true",
+        run.forced.len()
+    );
+    assert!(
+        run.forced.contains(&pid),
+        "live signal Ok must remain forced after handler exit 0"
+    );
+}
+// TERMINAL_SIGNAL_CONTROL_END
+
+// TERMINAL_SIGNAL_EXTRA_CONTROL_BEGIN
+fn terminal_signal_readiness_unknown_keeps_eligibility() {
+    for events in [
+        libc::POLLIN,
+        libc::POLLIN | libc::POLLRDNORM,
+        libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP,
+    ] {
+        assert!(pidfd_terminal_ready(1, events));
+    }
+    for (polled, events) in [
+        (-1, libc::POLLIN),
+        (0, libc::POLLIN),
+        (2, libc::POLLIN),
+        (1, 0),
+        (1, libc::POLLHUP),
+        (1, libc::POLLRDNORM),
+        (1, libc::POLLIN | libc::POLLERR),
+        (1, libc::POLLIN | libc::POLLNVAL),
+        (1, libc::POLLIN | libc::POLLPRI),
+    ] {
+        assert!(
+            !pidfd_terminal_ready(polled, events),
+            "unknown readiness must remain signal-eligible"
+        );
+    }
+}
+
+fn terminal_signal_owned_no_direct_fd_preserves_pid_fallback() {
+    struct Restore(Option<OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                std::env::set_var("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD", value);
+            } else {
+                std::env::remove_var("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD");
+            }
+        }
+    }
+    let mut child = TerminalLocalChild::new("live");
+    let mut run = terminal_local_run(&child);
+    let pid = child.child.id() as i32;
+    assert!(!terminal_local_wait(&child.fd, 0));
+    run.child_fd = None;
+    let restore = Restore(std::env::var_os("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD"));
+    std::env::set_var("TAKOSUMI_GUARD_FAULT_CHILD_PIDFD", "always");
+    run.send(libc::SIGTERM);
+    drop(restore);
+    let proof = run.stop_observation.json();
+    assert!(proof["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["kind"] == "signal" && record["target"] == "direct_pid"));
+    terminal_local_finish(&mut run, &mut child, "owned-no-direct-fd");
+    assert!(run.forced.contains(&pid));
+}
+// TERMINAL_SIGNAL_EXTRA_CONTROL_END
+
+// TERMINAL_SIGNAL_V2_CONTROL_BEGIN
+fn terminal_signal_owned_fd_open_failure_cleans_partial_child() {
+    use std::sync::atomic::Ordering;
+    let before = TERMINAL_CTOR_CLEANUPS.load(Ordering::SeqCst);
+    for errno in [libc::EMFILE, libc::ENOMEM] {
+        let opened = std::cell::Cell::new(false);
+        let result = TerminalLocalChild::try_new_with_fd("live", |_pid| {
+            opened.set(true);
+            Err(io::Error::from_raw_os_error(errno))
+        });
+        let original = match result {
+            Err(error) => error,
+            Ok(_) => panic!("injected fd-open failure unexpectedly succeeded"),
+        };
+        assert!(opened.get());
+        assert_eq!(original.raw_os_error(), Some(errno));
+        println!("OWN_LOCAL_CHILD_FD_OPEN_ERROR original_errno={errno} preserved=true");
+    }
+    let original_panic = 0x5411_cafe_u64;
+    let caught = std::panic::catch_unwind(|| {
+        let _ = TerminalLocalChild::try_new_with_fd("live", |_pid| -> io::Result<OwnedFd> {
+            std::panic::panic_any(original_panic)
+        });
+    });
+    let payload = caught
+        .err()
+        .expect("the original injected panic must propagate");
+    assert_eq!(payload.downcast_ref::<u64>(), Some(&original_panic));
+    assert_eq!(TERMINAL_CTOR_CLEANUPS.load(Ordering::SeqCst), before + 3);
+    println!("OWN_LOCAL_CHILD_FD_OPEN_PANIC original_payload_preserved=true ctor_cleanups=3");
+}
+// TERMINAL_SIGNAL_V2_CONTROL_END
+
+// READINESS_OBSERVATION_CONTROL_BEGIN
+fn guard_readiness_observation_preserves_errno_optional_and_budget() {
+    struct RestoreErrno(i32);
+    impl Drop for RestoreErrno {
+        fn drop(&mut self) {
+            unsafe {
+                *libc::__errno_location() = self.0;
+            }
+        }
+    }
+    let _restore = RestoreErrno(unsafe { *libc::__errno_location() });
+    let polls = std::cell::Cell::new(0);
+    let failed = pidfd_readiness_with(-1, |entry| {
+        polls.set(polls.get() + 1);
+        assert_eq!(entry.events, libc::POLLIN | libc::POLLRDNORM);
+        assert_eq!(entry.revents, 0);
+        entry.revents = libc::POLLERR;
+        unsafe {
+            *libc::__errno_location() = libc::EINTR;
+        }
+        -1
+    });
+    assert_eq!(polls.get(), 1);
+    assert_eq!(failed.polled, -1);
+    assert_eq!(failed.revents, libc::POLLERR);
+    assert!(!failed.terminal);
+    assert_eq!(failed.poll_errno, Some(libc::EINTR));
+    // Later activity poisons TLS errno; both captured errors must remain distinct.
+    unsafe {
+        *libc::__errno_location() = libc::EINVAL;
+    }
+    let sent = Err(io::Error::from_raw_os_error(libc::EPERM));
+    unsafe {
+        *libc::__errno_location() = libc::ENOMEM;
+    }
+    let mut observation = StopObservation::default();
+    observation.begin();
+    observation.signal(
+        7,
+        Some(42),
+        false,
+        "retained_pidfd",
+        libc::SIGTERM,
+        &sent,
+        Some(failed),
+    );
+    let proof = observation.json();
+    assert_eq!(
+        proof["readinessFields"],
+        serde_json::json!(["polled", "revents", "terminal", "pollErrno"])
+    );
+    assert_eq!(
+        proof["records"][0]["readiness"],
+        serde_json::json!([-1, libc::POLLERR, false, libc::EINTR])
+    );
+    assert_eq!(proof["records"][0]["errno"], libc::EPERM);
+
+    let quiet = pidfd_readiness_with(-1, |_entry| {
+        unsafe {
+            *libc::__errno_location() = libc::EIO;
+        }
+        0
+    });
+    assert!(!quiet.terminal);
+    assert_eq!(quiet.poll_errno, None); // A successful poll never borrows stale errno.
+    let positive = pidfd_readiness_with(-1, |entry| {
+        entry.revents = libc::POLLIN;
+        1
+    });
+    assert!(positive.terminal);
+    assert_eq!(positive.poll_errno, None);
+    assert_eq!(observation.used, 1); // Capturing a skipped result creates no signal record.
+
+    let callbacks = std::cell::Cell::new(0);
+    let no_signal = signal_readiness(0, Some(&()), |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    let no_fd = signal_readiness(libc::SIGTERM, None::<&()>, |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    assert!(no_signal.is_none() && no_fd.is_none());
+    assert_eq!(callbacks.get(), 0);
+    let once = signal_readiness(libc::SIGTERM, Some(&()), |_| {
+        callbacks.set(callbacks.get() + 1);
+        quiet
+    });
+    assert_eq!(callbacks.get(), 1);
+    assert_eq!(once.unwrap().polled, 0);
+    observation.signal(8, None, true, "direct_pid", 0, &Ok(()), no_signal);
+    observation.reaped(7, false, 0);
+    let proof = observation.json();
+    assert_eq!(proof["records"][1]["readiness"], serde_json::Value::Null);
+    assert_eq!(proof["records"][2]["readiness"], serde_json::Value::Null);
+    assert_eq!(proof["records"].as_array().unwrap().len(), 3);
+
+    let worst = PidfdReadiness {
+        polled: i32::MIN,
+        revents: i16::MIN,
+        terminal: false,
+        poll_errno: Some(i32::MIN),
+    };
+    let failed_signal = Err(io::Error::from_raw_os_error(i32::MIN));
+    let mut full = StopObservation::default();
+    full.begin();
+    for _ in 0..STOP_OBSERVATION_CAP {
+        full.signal(
+            i32::MAX,
+            Some(u64::MAX),
+            false,
+            "retained_pidfd",
+            libc::SIGUSR1,
+            &failed_signal,
+            Some(worst),
+        );
+    }
+    full.reaped(1, false, 0);
+    let proof = full.json();
+    assert_eq!(
+        proof["records"].as_array().unwrap().len(),
+        STOP_OBSERVATION_CAP
+    );
+    assert_eq!(proof["truncated"], true);
+    let bytes = serde_json::to_vec(&proof).unwrap();
+    assert!(bytes.len() < 16 * 1024);
+    println!("READINESS_OBSERVATION pure=true cap={} bytes={} poll_errno_preserved=true signal_errno_separate=true", STOP_OBSERVATION_CAP, bytes.len());
+    assert_eq!(polls.get(), 1);
+    assert_eq!(callbacks.get(), 1); // Serialization never repeats either poll path.
+}
+// READINESS_OBSERVATION_CONTROL_END

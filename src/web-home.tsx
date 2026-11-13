@@ -1,11 +1,20 @@
-import { createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import {
   CONNECTIONS_KEY, connectionKey, loadWebConnections, newWebConnection, type WebConnection,
 } from "./web-connections.ts";
+import { BrowserRecoveryRequired } from "./web-profile-recovery.ts";
+import {
+  permissionLabels,
+  type PendingPermission,
+  type PermissionAnswer,
+  type WebPermissionPrompts,
+} from "./web-permissions.ts";
 
 export function WebHome(props: {
   readonly open: (connection: WebConnection) => Promise<void>;
   readonly clearData?: (connection: WebConnection) => Promise<void>;
+  readonly recover?: (connection: WebConnection, ticket: BrowserRecoveryRequired) => Promise<void>;
+  readonly permissionPrompts?: WebPermissionPrompts;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly allowLegacyMobile?: boolean;
 }) {
@@ -18,6 +27,45 @@ export function WebHome(props: {
   const [clearCandidate, setClearCandidate] = createSignal<WebConnection>();
   const [clearing, setClearing] = createSignal(false);
   const [status, setStatus] = createSignal("");
+  const [recovery, setRecovery] = createSignal<{ connection: WebConnection; ticket: BrowserRecoveryRequired }>();
+  const [pendingPermissions, setPendingPermissions] = createSignal<readonly PendingPermission[]>([]);
+  const [answering, setAnswering] = createSignal<string>();
+  let permissionRevision = 0;
+  createEffect(() => {
+    const prompts = props.permissionPrompts;
+    if (!prompts) {
+      setPendingPermissions([]);
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      // Subscribe before the snapshot, but do not let a delayed reply replace
+      // an event received since that request. A failed watch still gets a list.
+      try {
+        const release = await prompts.watch((list) => {
+          if (disposed) return;
+          permissionRevision += 1;
+          setPendingPermissions(list);
+        });
+        if (disposed) {
+          release();
+          return;
+        }
+        unlisten = release;
+      } catch { /* Live updates are unavailable; the snapshot still applies. */ }
+      try {
+        const revision = permissionRevision;
+        const list = await prompts.list();
+        if (!disposed && revision === permissionRevision) setPendingPermissions(list);
+      } catch { /* An unavailable surface shows no prompts. */ }
+    })();
+    onCleanup(() => {
+      disposed = true;
+      permissionRevision += 1;
+      unlisten?.();
+    });
+  });
   const busy = () => Boolean(opening()) || clearing();
   const locked = () => busy() || clearCandidate() !== undefined;
   try {
@@ -42,12 +90,36 @@ export function WebHome(props: {
     if (locked()) return;
     setError("");
     setStatus("");
+    setRecovery(undefined);
     setOpening(connectionKey(connection));
     try {
       await props.open(connection);
       setLastOpened(connectionKey(connection));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "接続先を開けませんでした。");
+      if (cause instanceof BrowserRecoveryRequired &&
+        cause.profile === connection.profile && cause.key === connectionKey(connection)) {
+        setRecovery({ connection, ticket: cause });
+      }
+    } finally {
+      setOpening(undefined);
+    }
+  }
+
+  async function recover() {
+    const candidate = recovery();
+    const action = props.recover;
+    if (!candidate || !action || locked() || !connections().some((item) =>
+      connectionKey(item) === connectionKey(candidate.connection))) return;
+    setRecovery(undefined);
+    setError("");
+    setStatus("");
+    setOpening(connectionKey(candidate.connection));
+    try {
+      await action(candidate.connection, candidate.ticket);
+      setLastOpened(connectionKey(candidate.connection));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "ブラウザを開き直せませんでした。");
     } finally {
       setOpening(undefined);
     }
@@ -57,6 +129,7 @@ export function WebHome(props: {
     event.preventDefault();
     if (locked()) return;
     setError("");
+    setRecovery(undefined);
     try {
       const connection = newWebConnection(connections(), url(), name());
       const next = connections();
@@ -78,6 +151,7 @@ export function WebHome(props: {
     setClearing(true);
     setError("");
     setStatus("");
+    setRecovery(undefined);
     try {
       await clear(target);
       if (lastOpened() === connectionKey(target)) setLastOpened(undefined);
@@ -87,6 +161,35 @@ export function WebHome(props: {
       setError(cause instanceof Error ? cause.message : "保存データを消去できませんでした。");
     } finally {
       setClearing(false);
+    }
+  }
+
+  async function answer(prompt: PendingPermission, decision: PermissionAnswer) {
+    const prompts = props.permissionPrompts;
+    if (!prompts || answering() !== undefined) return;
+    const revision = ++permissionRevision;
+    setAnswering(`${prompt.profile}:${prompt.promptId}`);
+    setError("");
+    try {
+      const list = await prompts.answer(prompt, decision);
+      if (revision === permissionRevision) setPendingPermissions(list);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "許可設定を登録できませんでした。");
+    } finally {
+      setAnswering(undefined);
+    }
+  }
+
+  function connectionNameOf(prompt: PendingPermission): string {
+    return connections().find((item) => item.profile === prompt.profile)?.name ??
+      "この接続先";
+  }
+
+  function originHost(origin: string): string {
+    try {
+      return new URL(origin).host;
+    } catch {
+      return origin;
     }
   }
 
@@ -113,12 +216,12 @@ export function WebHome(props: {
                 </button>
                 <button class="web-remove" type="button" disabled={locked()}
                   aria-label={`${connection.name}を接続先から外す`}
-                  onClick={() => { setError(""); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
+                  onClick={() => { setError(""); setRecovery(undefined); save(connections().filter((item) => connectionKey(item) !== connectionKey(connection))); }}>
                   接続先から外す
                 </button>
                 <Show when={props.clearData && connection.profile !== "shared"}>
                   <button class="web-remove" type="button" disabled={locked()}
-                    onClick={() => { setError(""); setStatus(""); setClearCandidate(connection); }}>
+                    onClick={() => { setError(""); setStatus(""); setRecovery(undefined); setClearCandidate(connection); }}>
                     保存データを消去…
                   </button>
                 </Show>
@@ -152,7 +255,36 @@ export function WebHome(props: {
           <button class="web-primary" type="submit" disabled={locked()}>保存して開く</button>
         </form>
       </section>
+      <Show when={pendingPermissions().length}>
+        <section aria-labelledby="permissions-heading">
+          <h2 id="permissions-heading">アクセスの許可</h2>
+          <For each={pendingPermissions()}>{(prompt) => (
+            <section class="web-clear"
+              aria-label={`${originHost(prompt.origin)}からのアクセスの要求`}>
+              <h3>{originHost(prompt.origin)}が{permissionLabels(prompt.permissions, prompt.kind).join("・")}を求めています</h3>
+              <p>接続先「{connectionNameOf(prompt)}」で開いているサイトだけに適用されます。</p>
+              <button type="button" disabled={answering() !== undefined}
+                onClick={() => void answer(prompt, "deny")}>許可しない</button>
+              <button type="button" disabled={answering() !== undefined}
+                onClick={() => void answer(prompt, "allow")}>
+                {answering() === `${prompt.profile}:${prompt.promptId}`
+                  ? "登録しています…" : "許可する"}
+              </button>
+            </section>
+          )}</For>
+        </section>
+      </Show>
       <Show when={error()}><p class="web-error" role="alert">{error()}</p></Show>
+      <Show when={props.recover && recovery()}>{(candidate) => (
+        <section aria-label="ブラウザの復帰">
+          <p class="web-note">{candidate().connection.name}を開き直します。保存データは消去しません。
+            直前の未保存の変更は戻らない場合があります。</p>
+          <button type="button" disabled={locked()} onClick={() => void recover()}>
+            保存データを保持して開き直す
+          </button>
+          <button type="button" disabled={locked()} onClick={() => setRecovery(undefined)}>今は開き直さない</button>
+        </section>
+      )}</Show>
       <Show when={status()}><p class="web-note" role="status">{status()}</p></Show>
       <Show when={props.allowLegacyMobile}>
         <details class="web-legacy">

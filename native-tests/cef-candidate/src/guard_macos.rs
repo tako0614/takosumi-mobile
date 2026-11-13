@@ -39,8 +39,12 @@
 //! ignored in the guard, which kqueue still records, and restored to their
 //! defaults in the browser.
 //!
-//! The drain then always runs, as on Windows: up to 0.5 s for the browser
-//! and every tracked process to end by themselves. Then the guard freezes
+//! The drain then always runs: up to 0.5 s for the browser
+//! and every tracked process to end by themselves. After an observed clean
+//! browser exit, allow 1.5 s instead: Chromium's clone-cleanup helper polls
+//! for its parent's exit once a second before deleting its temporary clone.
+//! This grants no process an exception or ownership based on its role.
+//! Then the guard freezes
 //! the tree before it kills anything: `SIGSTOP` to the unreaped browser, to
 //! each tracked process still the same (start time) and to every other
 //! running member of the group, each verified right before its signal; it
@@ -84,7 +88,8 @@
 //! manager is not), and a double fork faster than an observation: a process
 //! that leaves the group and whose parent ends before the guard's next look
 //! (the `NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen.
-//! CEF's helpers stay in the group (the M1 smoke's group check).
+//! M1 observed ordinary CEF helpers in the group. Chromium's code-sign-clone
+//! cleanup helper can leave it and relies on the descendant tracking above.
 //!
 //! Receipt, written once after the drain, with the other guards' fields:
 //! `{rootExit, complete, remaining, kernelNoChildren, observed, forcedCleanup,
@@ -108,6 +113,69 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
+#[path = "mac_cleanup_role.rs"]
+mod cleanup_role;
+
+/// Opt-in for native diagnostic fixtures only. Default runs never read argv.
+const ROLE_DIAGNOSTICS: &str = "TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS";
+
+/// Best-effort closed role from a bounded, complete KERN_PROCARGS2 response.
+/// XNU can return a suffix on a short successful read: query size before and
+/// after, require it below the cap, and account for the query's 4-byte round-up.
+/// Even then XNU permits stale data across same-PID execve. Never authority.
+fn read_cleanup_role(pid: i32) -> Option<&'static str> {
+    const CAP: usize = 64 * 1024;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let size = |mib: &mut [i32; 3]| -> Option<usize> {
+        let mut count = 0;
+        // SAFETY: three valid integer selectors, no output or new value.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (result == 0).then_some(count)
+    };
+    let expected = size(&mut mib)?;
+    if !(5..CAP).contains(&expected) {
+        return None;
+    }
+    let mut bytes = vec![0u8; CAP];
+    let mut count = bytes.len();
+    // SAFETY: the writable output allocation has `count` bytes; no new value.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut count,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0
+        || count >= CAP
+        || count.next_multiple_of(4) != expected
+        || size(&mut mib) != Some(expected)
+    {
+        return None;
+    }
+    cleanup_role::parse(&bytes[..count])
+}
+
+struct RoleObservation {
+    pid: i32,
+    start: u64,
+    role: Option<&'static str>,
+    identities_unchanged: bool,
+    elapsed_micros: u128,
+}
+
 /// While the browser runs, observe its processes on every event and at
 /// least this often.
 const RUNNING_TICK: Duration = Duration::from_millis(250);
@@ -116,6 +184,13 @@ const DRAIN_TICK: Duration = Duration::from_millis(20);
 /// Natural end, then the freeze and the kill, and this long (from the
 /// freeze) for everything to be gone.
 const NATURAL: Duration = Duration::from_millis(500);
+/// Chromium 154's ChromeCodeSignCloneCleanupMain polls getppid() once per
+/// second before deleting the code-sign clone. After a clean root exit,
+/// allow that poll plus the existing 500 ms scheduling/deletion margin.
+/// Stops/App death already observed before drain, nonzero exits and recorded
+/// observation failures keep NATURAL. The phase is fixed at drain entry;
+/// later events never restart/extend it. No role diagnostic selects a deadline.
+const CLEAN_EXIT_NATURAL: Duration = Duration::from_millis(1500);
 const FORCED: Duration = Duration::from_secs(2);
 /// The longest the freeze waits for its stopped processes to show stopped,
 /// within the forced window.
@@ -630,13 +705,25 @@ struct Run {
     parent: i32,
     child: Option<i32>,
     root_exit: Option<i32>,
+    /// A stop signal or changed App parent seen while supervising. A zero
+    /// browser exit in that same event batch is still a stop, not normal quit.
+    stop_observed: bool,
     /// Processes of the browser's still running, with their start times.
     tracked: BTreeMap<i32, u64>,
-    /// Every process seen, by pid and start time (the browser included).
-    observed: BTreeSet<(i32, u64)>,
+    /// Every process seen, by pid and start time (the browser included),
+    /// retaining its first parent edge before a later orphan becomes PPID 1.
+    observed: BTreeMap<(i32, u64), FirstObserved>,
     forced: u32,
     cleanup_errors: BTreeSet<String>,
     non_fatal: BTreeSet<String>,
+    role_diagnostics: bool,
+}
+
+struct FirstObserved {
+    parent: i32,
+    /// The parent's already-tracked birth, if available; no extra OS read.
+    tracked_parent_start: Option<u64>,
+    group: i32,
 }
 
 /// A process the freeze stopped: its start time, its parent (for the kill
@@ -650,6 +737,50 @@ struct Frozen {
 }
 
 impl Run {
+    /// One owned, orphaned process in its own group, before any SIGSTOP.
+    /// No raw arguments survive the read. This observation cannot affect
+    /// ownership, signals, forced count or receipt acceptance. A syscall has
+    /// no hard latency bound: opt-in runs are timing-perturbed diagnostics.
+    fn diagnose_cleanup_role(&self) -> Option<RoleObservation> {
+        if !self.role_diagnostics {
+            return None;
+        }
+        for (&pid, &start) in self.tracked.iter().take(32) {
+            let Some(before) = facts(pid).ok().flatten() else {
+                continue;
+            };
+            if before.start != start || before.zombie || before.ppid != 1 || before.pgid != pid {
+                continue;
+            }
+            let reading = Instant::now();
+            let role = read_cleanup_role(pid);
+            let unchanged = facts(pid).ok().flatten() == Some(before);
+            return Some(RoleObservation {
+                pid,
+                start,
+                role: role.filter(|_| unchanged),
+                identities_unchanged: unchanged,
+                elapsed_micros: reading.elapsed().as_micros(),
+            });
+        }
+        None
+    }
+
+    fn remember(&mut self, pid: i32, facts: Facts) {
+        let tracked_parent_start = self
+            .tracked
+            .get(&facts.ppid)
+            .copied()
+            .filter(|start| *start <= facts.start);
+        self.observed
+            .entry((pid, facts.start))
+            .or_insert(FirstObserved {
+                parent: facts.ppid,
+                tracked_parent_start,
+                group: facts.pgid,
+            });
+    }
+
     /// Record the browser's exit status once it has exited.
     fn reap(&mut self) {
         let Some(child) = self.child else {
@@ -677,7 +808,7 @@ impl Run {
         if pid == self.me || facts.zombie {
             return;
         }
-        self.observed.insert((pid, facts.start));
+        self.remember(pid, facts);
         if self.tracked.contains_key(&pid) {
             return;
         }
@@ -832,7 +963,8 @@ impl Run {
                     // its exit event be missed.
                     // SAFETY: getppid has no preconditions.
                     let orphaned = unsafe { libc::getppid() } != self.parent;
-                    if woke.stop || orphaned || woke.browser_exited || self.root_exit.is_some() {
+                    self.stop_observed |= woke.stop || orphaned;
+                    if self.stop_observed || woke.browser_exited || self.root_exit.is_some() {
                         return Ok(());
                     }
                 }
@@ -958,7 +1090,7 @@ impl Run {
                     continue;
                 };
                 if self.signal(pid, libc::SIGSTOP) {
-                    self.observed.insert((pid, now.start));
+                    self.remember(pid, now);
                     freezer.frozen.insert(
                         pid,
                         Frozen {
@@ -1053,12 +1185,15 @@ impl Run {
 
     /// The bounded drain every run takes. Returns whether it found no
     /// survivor among the observed processes.
-    fn drain(&mut self) -> bool {
-        if self.settle_until(Instant::now() + NATURAL) {
+    fn drain(&mut self, natural: Duration) -> bool {
+        if self.settle_until(Instant::now() + natural) {
             return true;
         }
         let freezing = Instant::now();
         let deadline = freezing + FORCED;
+        // Opt-in diagnostic IO is before SIGSTOP and charged to the existing
+        // deadline. It never extends the natural or forced cleanup windows.
+        let role_observation = self.diagnose_cleanup_role();
         // From the first SIGSTOP until the kill, nothing may leave the
         // stopped processes behind: the freezer kills them if this section
         // returns early or unwinds.
@@ -1087,7 +1222,7 @@ impl Run {
                     continue;
                 }
                 if self.signal(pid, libc::SIGKILL) {
-                    self.observed.insert((pid, found.start));
+                    self.remember(pid, found);
                     killed.insert((pid, found.start));
                 }
             }
@@ -1143,9 +1278,17 @@ impl Run {
                 .count(),
             freeze_ms
         ));
+        if let Some(observed) = role_observation {
+            note(format_args!(
+                "cleanup-role {}",
+                serde_json::json!({"pid":observed.pid,"start":observed.start,
+                    "role":observed.role,"identitiesUnchanged":observed.identities_unchanged,
+                    "elapsedMicros":observed.elapsed_micros,"diagnosticOnly":true})
+            ));
+        }
         // Diagnose only after every stopped process has been killed and
         // the drop guard disarmed. Neither IO nor serialization can delay
-        // the stop-to-kill section. Bound the log, and never collect argv.
+        // the stop-to-kill section. Bound the log, and never emit argv.
         for &(pid, start) in killed.iter().take(32) {
             let frozen = freezer
                 .frozen
@@ -1172,6 +1315,11 @@ impl Run {
                     // null means this identity was not retained by the freeze:
                     // it was found later or ended during the stop observation.
                     "freezeSnapshot": snapshot,
+                    "firstObserved": self.observed.get(&(pid, start)).map(|first| serde_json::json!({
+                        "parent": first.parent,
+                        "trackedParentStart": first.tracked_parent_start,
+                        "group": first.group,
+                    })),
                 })
             ));
         }
@@ -1225,11 +1373,13 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         parent,
         child: None,
         root_exit: None,
+        stop_observed: stopping,
         tracked: BTreeMap::new(),
-        observed: BTreeSet::new(),
+        observed: BTreeMap::new(),
         forced: 0,
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
+        role_diagnostics: std::env::var(ROLE_DIAGNOSTICS).as_deref() == Ok("1"),
     };
     let mut failure = None;
     if stopping {
@@ -1246,7 +1396,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
                 // the browser, and the receipt counts it once in any case.
                 if let Ok(Some(facts)) = facts(pid) {
                     run.tracked.insert(pid, facts.start);
-                    run.observed.insert((pid, facts.start));
+                    run.remember(pid, facts);
                 }
                 match run.queue.watch_browser(pid) {
                     Ok(()) => {}
@@ -1263,12 +1413,22 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
             Err(error) => failure = Some(fault(&error)),
         }
     }
-    let empty = run.drain();
+    let natural = if run.root_exit == Some(0)
+        && !run.stop_observed
+        && failure.is_none()
+        && run.non_fatal.is_empty()
+        && run.cleanup_errors.is_empty()
+    {
+        CLEAN_EXIT_NATURAL
+    } else {
+        NATURAL
+    };
+    let empty = run.drain(natural);
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     // The browser counts once, also when no look ever read its start time.
     let mut observed = run.observed.len();
     if let Some(child) = run.child {
-        if !run.observed.iter().any(|(pid, _)| *pid == child) {
+        if !run.observed.keys().any(|(pid, _)| *pid == child) {
             observed += 1;
         }
     }

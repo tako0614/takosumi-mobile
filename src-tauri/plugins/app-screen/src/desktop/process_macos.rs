@@ -4,6 +4,10 @@
 //! Linux. libproc (`proc_pidinfo`, `proc_pidpath`) through libc.
 use std::path::{Path, PathBuf};
 
+#[path = "process_image.rs"]
+mod image;
+pub(super) use image::Executable;
+
 /// What the kernel says about one process: its parent and start time
 /// (microseconds since the epoch); `None` when no such process exists.
 pub(super) fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
@@ -48,18 +52,99 @@ pub(super) fn image_of(pid: u32) -> Option<std::path::PathBuf> {
 
 /// The `opened` reply's native process is the guard's own child, started
 /// no earlier than the guard (a reused pid is older than its new parent's
-/// child could be), running exactly `program` (the bundle's
-/// `Contents/MacOS` executable, compared as the canonical path the App
-/// located).
-pub(super) fn native_owned(native_pid: u32, guard: &std::process::Child, program: &Path) -> bool {
-    let (Some((parent, started)), Some((_, guard_started))) =
-        (parent_and_start(native_pid), parent_and_start(guard.id()))
-    else {
-        return false;
-    };
-    parent == guard.id()
-        && started >= guard_started
-        && image_of(native_pid).as_deref() == Some(program)
+/// child could be). Its image must name the file held before spawn, including
+/// Chromium's hard-linked code-sign clone. Both process identities and the
+/// image path must remain stable across the file check. proc_pidpath + open
+/// is not an atomic running-vnode query; same-user concurrent file mutation
+/// and bundle authentication remain outside this child-ownership check.
+pub(super) fn native_owned(
+    native_pid: u32,
+    guard: &std::process::Child,
+    program: &Path,
+    executable: &Executable,
+) -> bool {
+    let native = parent_and_start(native_pid);
+    let parent = parent_and_start(guard.id());
+    let parent_matches = native.is_some_and(|(pid, _)| pid == guard.id());
+    let birth_order = native
+        .zip(parent)
+        .is_some_and(|((_, started), (_, guard_started))| started >= guard_started);
+    // Preserve the original short circuit, and report the very same reads
+    // used for admission. A second diagnostic read could hide a transient.
+    let image_checked = parent_matches && birth_order;
+    let image = image_checked.then(|| image_of(native_pid)).flatten();
+    let image_matches = image
+        .as_deref()
+        .is_some_and(|path| executable.matches(path));
+    let identities_unchanged = image_matches
+        && image_of(native_pid) == image
+        && parent_and_start(native_pid) == native
+        && parent_and_start(guard.id()) == parent;
+    let owned = image_checked && image_matches && identities_unchanged;
+    if !owned {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "takosumi-mac-native-rejected: {}",
+            serde_json::json!({
+                "nativeIdentityRead":native.is_some(),"guardIdentityRead":parent.is_some(),
+                "parentMatch":parent_matches,"birthOrder":birth_order,"imageChecked":image_checked,
+                "imageRead":image.is_some(),"imageMatch":image_matches,
+                "identitiesUnchanged":identities_unchanged,
+                "exactPathMatch":image.as_deref()==Some(program)
+            })
+        );
+        #[cfg(any(test, feature = "fixture-overrides"))]
+        describe_rejected_image(
+            native_pid,
+            guard.id(),
+            native,
+            parent,
+            image.as_deref(),
+            program,
+        );
+    }
+    owned
+}
+
+/// Anonymous native fixtures only: keep the exact paths from the failed
+/// comparison so a spelling difference can be distinguished from a different
+/// executable (non-UTF-8 paths are null, never a serialization panic).
+/// These later filesystem/process reads are diagnostic, never a
+/// fallback admission check. Product builds retain only the booleans above.
+#[cfg(any(test, feature = "fixture-overrides"))]
+fn describe_rejected_image(
+    native_pid: u32,
+    guard_pid: u32,
+    native: Option<(u32, u64)>,
+    parent: Option<(u32, u64)>,
+    image: Option<&Path>,
+    program: &Path,
+) {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let canonical = image.and_then(|path| path.canonicalize().ok());
+    let same_file = image
+        .and_then(|path| path.metadata().ok())
+        .zip(program.metadata().ok())
+        .map(|(actual, expected)| {
+            actual.is_file()
+                && expected.is_file()
+                && actual.dev() == expected.dev()
+                && actual.ino() == expected.ino()
+        });
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "takosumi-mac-fixture-image-rejected: {}",
+        serde_json::json!({
+            "nativePid":native_pid,"guardPid":guard_pid,
+            "expectedPathUtf8":program.to_str(),"observedPathUtf8":image.and_then(Path::to_str),
+            "canonicalMatch":canonical.as_deref().map(|path| path==program),
+            "sameFile":same_file,
+            "identitiesUnchanged":native.is_some() && parent.is_some()
+                && parent_and_start(native_pid)==native && parent_and_start(guard_pid)==parent
+        })
+    );
 }
 
 /// The cache path CEF reported is exactly the requested one (the browser

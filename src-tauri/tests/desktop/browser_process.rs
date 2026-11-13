@@ -1,6 +1,6 @@
 //! Actual bundled WebHome -> existing shell IPC -> owned CEF browser processes.
 //! Only the explicit fixture feature includes this driver. The flow below is
-//! the same on Linux and Windows; it reaches the home through `Shell`, whose
+//! the same on Linux, Windows and macOS; it reaches the home through `Shell`, whose
 //! backend finds the home view and evaluates scripts in it: the GTK WebKit
 //! view on the GTK main loop (`browser_process_linux.rs`) or the main window's
 //! WebView2 from a thread of its own (`browser_process_windows.rs`).
@@ -12,10 +12,15 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "macos")]
+#[path = "browser_process_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::create_home;
 #[cfg(target_os = "linux")]
 #[path = "browser_process_linux.rs"]
 mod shell;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[path = "browser_process_windows.rs"]
 mod shell;
 pub use shell::{run, start};
@@ -26,8 +31,10 @@ type Result<T> = std::result::Result<T, String>;
 /// Later launches on the same App data. Notifications and the native file
 /// chooser are inspected on Linux only.
 #[cfg(target_os = "linux")]
-const PHASES: &[&str] = &["restart", "reset", "notify", "files"];
+const PHASES: &[&str] = &["restart", "reset", "notify", "files", "recover"];
 #[cfg(windows)]
+const PHASES: &[&str] = &["restart", "reset", "recover"];
+#[cfg(target_os = "macos")]
 const PHASES: &[&str] = &["restart", "reset"];
 
 /// The home view the flow drives. `eval` returns the script's value as JSON
@@ -60,15 +67,24 @@ async fn eval(view: &impl Shell, script: &str) -> Result<Value> {
     view.eval(script).await
 }
 async fn ready(view: &impl Shell, condition: &str) -> Result<()> {
-    let end = Instant::now() + Duration::from_secs(20);
+    ready_within(view, condition, Duration::from_secs(20)).await
+}
+/// Polls a page condition up to the given bound, keeping the last poll
+/// outcome so an expiry reports whether the condition stayed false or the
+/// eval itself stalled, not merely that the deadline passed.
+async fn ready_within(view: &impl Shell, condition: &str, bound: Duration) -> Result<()> {
+    let end = Instant::now() + bound;
+    let mut last = String::from("no poll completed");
     while Instant::now() < end {
-        if eval(view, &format!("Boolean({condition})")).await == Ok(Value::Bool(true)) {
-            return Ok(());
+        match eval(view, &format!("Boolean({condition})")).await {
+            Ok(Value::Bool(true)) => return Ok(()),
+            Ok(value) => last = format!("poll saw {value}"),
+            Err(error) => last = format!("poll eval failed: {error}"),
         }
         view.pause(Duration::from_millis(75)).await;
     }
     Err(format!(
-        "Shell readiness expired: {}",
+        "Shell readiness expired ({last}): {}",
         eval(view, "document.body?.innerText")
             .await
             .unwrap_or(Value::Null)
@@ -103,10 +119,31 @@ fn local_site() -> Result<String> {
     Ok(format!("https://127.0.0.1:{port}"))
 }
 async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
+    let started = Instant::now();
     let label = serde_json::to_string(label).unwrap();
     let origin = serde_json::to_string(&app_origin()?).unwrap();
+    eprintln!("add {label}: submitting through home");
     eval(view,&format!("(()=>{{const url=document.querySelector('#connection-url'),name=document.querySelector('#connection-name');url.value={origin};url.dispatchEvent(new Event('input',{{bubbles:true}}));name.value={label};name.dispatchEvent(new Event('input',{{bubbles:true}}));document.querySelector('form').requestSubmit();return true}})()")).await?;
-    ready(view,&format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')")).await
+    eprintln!("add {label}: submit callback after {:?}", started.elapsed());
+    let condition = format!("document.querySelectorAll('.web-connection').length==={count} && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')");
+    // Report the home's actual open error immediately. The generic readiness
+    // helper is also used by cases that deliberately expect a visible error.
+    ready(
+        view,
+        &format!("({condition}) || document.querySelector('.web-error')"),
+    )
+    .await?;
+    if eval(view, &format!("Boolean({condition})")).await? != Value::Bool(true) {
+        return Err(format!(
+            "Home could not open {label} after {:?}: {}",
+            started.elapsed(),
+            eval(view, "document.querySelector('.web-error')?.textContent")
+                .await
+                .unwrap_or(Value::Null)
+        ));
+    }
+    eprintln!("add {label}: open ready after {:?}", started.elapsed());
+    Ok(())
 }
 /// How long the first launch waits for the observer's first checkpoint: 30 s,
 /// as on Linux. In the Windows real-site run (W4,
@@ -117,7 +154,7 @@ async fn add(view: &impl Shell, label: &str, count: usize) -> Result<()> {
 /// `real_site_first_checkpoint`), so the App waits 450 s; a unit test keeps
 /// the two in step.
 fn inspect_bound() -> Duration {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if shell::real_site() {
         return Duration::from_secs(450);
     }
@@ -193,18 +230,64 @@ async fn open_saved(view: &impl Shell, app: &AppHandle, name: &str, count: usize
         ))
     }
 }
+/// Answer a held site-permission prompt through the home's own row, as the
+/// person does: the enabled 許可する click resolves the browser's held
+/// callback and the answered prompt leaves the section. A wrong or
+/// unresolved answer keeps the row (and .web-error on a failed invoke), so a
+/// fake click can never read as a grant.
+async fn answer_permission(view: &impl Shell) -> Result<()> {
+    const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
+    // A second held prompt can land while this leg waits — the observer
+    // issues the media request as soon as the page records this answer, and
+    // run 43173821786 failed here because the media row kept the whole
+    // section alive: waiting for #permissions-heading to vanish asserts on
+    // every prompt, not just the answered one. Identify the row being
+    // answered by its heading and wait for THAT row to retire; other held
+    // prompts may coexist (the media leg then owns the remaining row).
+    let enabled_allow = format!("(()=>{{return [...document.querySelectorAll('{ROW}')].some(row=>[...row.querySelectorAll('button')].some(b=>b.textContent.trim()==='許可する'&&!b.disabled))}})()");
+    ready(view, &enabled_allow).await?;
+    let heading = eval(
+        view,
+        &format!("(()=>{{const row=[...document.querySelectorAll('{ROW}')].find(r=>[...r.querySelectorAll('button')].some(b=>b.textContent.trim()==='許可する'&&!b.disabled));if(!row)throw Error('An enabled allow row required');const heading=row.querySelector('h3')?.textContent??'';[...row.querySelectorAll('button')].find(b=>b.textContent.trim()==='許可する'&&!b.disabled).click();return heading}})()"),
+    )
+    .await?;
+    let gone = format!(
+        "![...document.querySelectorAll('{ROW} h3')].some(h=>h.textContent==={})",
+        serde_json::to_string(&heading).unwrap_or_else(|_| "null".into())
+    );
+    ready(
+        view,
+        &format!("{gone} || document.querySelector('.web-error')"),
+    )
+    .await?;
+    if eval(view, &format!("Boolean({gone})")).await? != Value::Bool(true) {
+        return Err(format!(
+            "The held prompt was not answered: {}",
+            eval(view, "document.querySelector('.web-error')?.textContent")
+                .await
+                .unwrap_or(Value::Null)
+        ));
+    }
+    Ok(())
+}
 /// Tap a button inside the saved connection's row, matched by its exact label.
 async fn tap_in_row(view: &impl Shell, name: &str, label: &str) -> Result<()> {
     let (name, label) = (
         serde_json::to_string(name).unwrap(),
         serde_json::to_string(label).unwrap(),
     );
+    // The clear button only exists after the capabilities invoke wires
+    // clearData (entry.tsx resolves it asynchronously), and any home lock
+    // disables every row button: wait for the unique enabled labeled button
+    // before clicking instead of racing the wire-up. A genuinely missing
+    // capability still fails at the same bound, now named honestly.
+    ready(view,&format!("(()=>{{const rows=[...document.querySelectorAll('.web-connections > li')].filter(row=>row.querySelector('.web-connection strong')?.textContent==={name});return rows.length===1 && [...rows[0].querySelectorAll('button')].filter(button=>button.textContent.trim()==={label}&&!button.disabled).length===1}})()")).await?;
     eval(view,&format!("(()=>{{const rows=[...document.querySelectorAll('.web-connections > li')].filter(row=>row.querySelector('.web-connection strong')?.textContent==={name});if(rows.length!==1)throw Error('Unique saved row required');const buttons=[...rows[0].querySelectorAll('button')].filter(button=>button.textContent.trim()==={label}&&!button.disabled);if(buttons.length!==1)throw Error('Unique enabled row button required');buttons[0].click();return true}})()")).await?;
     Ok(())
 }
 /// An identity of a profile's CEF cache root that a detach-and-recreate
 /// changes: its inode on Linux, its file ID on Windows.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn root_identity(root: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::symlink_metadata(root)
@@ -265,7 +348,7 @@ fn root_identity(root: &Path) -> Result<(u64, [u8; 16])> {
 /// the observer: the `SingletonLock` link target on Linux (it names the
 /// browser's pid); on Windows whether Chromium holds its `lockfile` (an
 /// exclusive open fails with a sharing violation).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn profile_lock(root: &Path) -> Value {
     std::fs::read_link(root.join("SingletonLock"))
         .map(|target| Value::String(target.to_string_lossy().into_owned()))
@@ -286,7 +369,7 @@ fn profile_lock(root: &Path) -> Value {
 /// Whether the refused clear left the running profile's liveness mark: on
 /// Windows Chromium must still hold its `lockfile`. (Linux records the
 /// `SingletonLock` target and the observer checks it.)
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn still_marked_live(_root: &Path) -> bool {
     true
 }
@@ -296,7 +379,7 @@ fn still_marked_live(root: &Path) -> bool {
 }
 /// Windows: the home's clear removed only Work's CEF cache root; Personal's
 /// stays. Both browsers are closed at this point of the relaunch.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn only_work_cleared(app: &AppHandle, connections: &Value) -> Result<()> {
     let data = app
         .path()
@@ -346,7 +429,7 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         tap_in_row(view, "Work", "保存データを消去").await?;
         ready(view,"document.body.innerText.includes('Workのサイトデータを消去しました。') && !document.querySelector('.web-error') && !document.querySelector('.web-clear')").await?;
         println!("reset: Work site data cleared through the home");
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             only_work_cleared(app, &connections)?;
             println!("reset: only Work's CEF profile was removed");
@@ -398,7 +481,7 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
         }
         println!("reset: clearing running Personal was refused; its data stayed on disk");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalSingleton":personal_lock});
     #[cfg(windows)]
     let marker = serde_json::json!({"connections":connections,"processes":opened,"runningClearRefused":running_clear_refused,"personalLockHeld":personal_lock});
@@ -412,8 +495,96 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
     // The files phase drives native OS dialogs with the standalone driver's
     // own per-step bounds (up to 25 s each). Wait up to the App watchdog (90 s
     // overall), so an observer failing one step reports it, not this wait.
-    let bound = Duration::from_secs(if kind == "files" { 80 } else { 30 });
+    let bound = if cfg!(target_os = "macos") {
+        inspect_bound()
+    } else {
+        Duration::from_secs(if kind == "files" { 80 } else { 30 })
+    };
     checkpoint_within(view, case, &format!("{kind}-inspected"), bound).await?;
+    #[cfg(target_os = "linux")]
+    if kind == "notify"
+        && std::env::var("TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET").as_deref() == Ok("1")
+    {
+        checkpoint(view, case, "notify-personal-retired").await?;
+        // The observer has read Personal's normal zero-forced-close receipt.
+        // Drive the real home confirmation; Work stays open throughout.
+        // status() includes ended entries until clear_profile's release_ended
+        // verifies/reaps them. Only the post-clear map must contain Work alone.
+        let work = Value::Array(
+            opened
+                .as_array()
+                .ok_or("Missing opened profiles")?
+                .iter()
+                .filter(|p| p["profile"] != personal)
+                .cloned()
+                .collect(),
+        );
+        if work.as_array().map(Vec::len) != Some(1)
+            || !browser_status(app)?
+                .as_array()
+                .is_some_and(|items| items.contains(&work[0]))
+        {
+            return Err("Notification reset must retain the original Work process".into());
+        }
+        let personal_root = personal_data.join("cef-profiles");
+        let metadata = personal_root
+            .symlink_metadata()
+            .map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_dir() {
+            return Err("Notification reset requires the original real Personal directory".into());
+        }
+        let personal_identity = root_identity(&personal_root)?;
+        let work_profile = work[0]["profile"].as_str().ok_or("Missing Work profile")?;
+        let work_root = personal_data
+            .parent()
+            .ok_or("Missing profile parent")?
+            .join(work_profile)
+            .join("cef-profiles");
+        let work_identity = root_identity(&work_root)?;
+        tap_in_row(view, "Personal", "保存データを消去…").await?;
+        ready(view, "document.querySelector('.web-clear')").await?;
+        tap_in_row(view, "Personal", "保存データを消去").await?;
+        ready(view,"document.body.innerText.includes('Personalのサイトデータを消去しました。') || document.querySelector('.web-error')").await?;
+        if let Value::String(error) = eval(
+            view,
+            "document.querySelector('.web-error')?.textContent ?? null",
+        )
+        .await?
+        {
+            return Err(format!(
+                "Notification reset of closed Personal was refused: {error}"
+            ));
+        }
+        ready(view, "!document.querySelector('.web-clear')").await?;
+        match personal_root.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err("Notification reset did not prove Personal's CEF profile absent".into())
+            }
+        }
+        if browser_status(app)? != work || root_identity(&work_root)? != work_identity {
+            return Err("Personal notification reset changed Work".into());
+        }
+        open_saved(view, app, "Personal", 2).await?;
+        if root_identity(&work_root)? != work_identity {
+            return Err("Reopening Personal changed Work's profile root".into());
+        }
+        let reopened_connections = eval(
+            view,
+            "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+        )
+        .await?;
+        if reopened_connections != connections {
+            return Err("Notification reset changed the saved connections".into());
+        }
+        let reopened = serde_json::json!({"connections":reopened_connections,"processes":browser_status(app)?,"personalRootBefore":personal_identity,"personalDataRemoved":true,"workRootBefore":work_identity,"workRootAfter":root_identity(&work_root)?});
+        std::fs::write(
+            case.join("app-browser-process-notify-reopened.json"),
+            serde_json::to_vec_pretty(&reopened).unwrap(),
+        )
+        .map_err(|error| error.to_string())?;
+        println!("notify: closed Personal cleared and reopened from the home; Work retained");
+    }
     checkpoint_within(view, case, &format!("{kind}-request-exit"), bound).await?;
     if kind == "reset" {
         // The observer closed Personal normally in this session: now it can be
@@ -447,6 +618,77 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
     println!("PASS {kind} App reopened both saved profiles");
     Ok(())
 }
+/// Actual home controls: normal open must offer recovery without reopening;
+/// only a subsequent explicit action may create a new native generation.
+#[cfg(any(target_os = "linux", windows))]
+async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
+    add(view, "Work", 1).await?;
+    add(view, "Personal", 2).await?;
+    let connections = eval(
+        view,
+        "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+    )
+    .await?;
+    let record = |name: &str, value: &Value| -> Result<()> {
+        std::fs::write(case.join(name), serde_json::to_vec_pretty(value).unwrap())
+            .map_err(|error| error.to_string())
+    };
+    record(
+        "app-browser-process-recover-initial.json",
+        &serde_json::json!({
+            "connections":connections,"processes":browser_status(app)?
+        }),
+    )?;
+    // The observer first saves and normally closes Work. Reopening it proves
+    // this case's data was durable before inducing the crash.
+    checkpoint(view, case, "recover-seeded").await?;
+    open_saved(view, app, "Work", 2).await?;
+    let before = browser_status(app)?;
+    record(
+        "app-browser-process-recover-before.json",
+        &serde_json::json!({
+            "connections":connections,"processes":before
+        }),
+    )?;
+    checkpoint(view, case, "recover-crashed").await?;
+    // Match the existing saved connection button by its own name, independent
+    // of whether this home still displays the resume hint.
+    eval(view,"(()=>{const buttons=[...document.querySelectorAll('.web-connection')].filter(b=>b.querySelector('strong').textContent==='Work');if(buttons.length!==1||buttons[0].disabled)throw Error('Unique enabled Work required');buttons[0].click();return true})()").await?;
+    ready(view,"document.querySelector('.web-error') && document.querySelector('section[aria-label=\"ブラウザの復帰\"]') && !document.querySelector('.web-connection:disabled')").await?;
+    if eval(view, "document.querySelector('section[aria-label=\"ブラウザの復帰\"] p').textContent.startsWith('Workを開き直します。')").await? != Value::Bool(true) {
+        return Err("Recovery confirmation must identify Work".into());
+    }
+    let offered = browser_status(app)?;
+    if offered != before {
+        return Err("Offering crash recovery must not change browser ownership".into());
+    }
+    record("app-browser-process-recover-offered.json", &offered)?;
+    checkpoint(view, case, "recover-consent").await?;
+    eval(view,"(()=>{const buttons=[...document.querySelectorAll('section[aria-label=\"ブラウザの復帰\"] button')].filter(b=>b.textContent.trim()==='保存データを保持して開き直す'&&!b.disabled);if(buttons.length!==1)throw Error('Unique explicit recovery action required');buttons[0].click();return true})()").await?;
+    ready(view,"!document.querySelector('.web-error') && !document.querySelector('section[aria-label=\"ブラウザの復帰\"]') && !document.querySelector('.web-connection:disabled')").await?;
+    let after_connections = eval(
+        view,
+        "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
+    )
+    .await?;
+    if connections != after_connections {
+        return Err("Crash recovery changed the saved connections".into());
+    }
+    record(
+        "app-browser-process-recover-open.json",
+        &serde_json::json!({
+            "connections":connections,"processes":browser_status(app)?,"explicitRecovery":true
+        }),
+    )?;
+    checkpoint(view, case, "recover-inspected").await?;
+    record(
+        "app-browser-process-recover-complete.json",
+        &serde_json::json!({"passed":true}),
+    )?;
+    println!("PASS same-App explicit crash recovery; both saved profiles retained");
+    Ok(())
+}
+
 async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     ready(
         view,
@@ -459,10 +701,24 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         }
         // Progress lines survive an outer timeout that kills the App mid-wait.
         println!("{kind}: shell ready");
+        #[cfg(any(target_os = "linux", windows))]
+        if kind == "recover" {
+            return recovery_flow(app, case, view).await;
+        }
         return relaunch_flow(app, view, case, &kind).await;
     }
     // Progress lines survive an outer timeout that kills the App mid-wait.
     println!("first: shell ready");
+    #[cfg(target_os = "macos")]
+    if eval(
+        view,
+        "localStorage.getItem('takosumi.web-connections.v2') === null",
+    )
+    .await?
+        != Value::Bool(true)
+    {
+        return Err("A new Mac fixture case must have a fresh home store".into());
+    }
     add(view, "Work", 1).await?;
     println!("first: Work added and opened");
     add(view, "Personal", 2).await?;
@@ -530,15 +786,43 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     )
     .map_err(|error| error.to_string())?;
     // Resume, download, the popup (load up to 25 s) and the external link
-    // (15 s) run before the observer asks to quit. The App watchdog (90 s)
-    // remains the overall bound; the observer's stage names a slow step.
+    // (15 s) run before the observer asks to quit. The App watchdog (90 s
+    // fixture, 540 s real site) remains the overall bound; the observer's
+    // stage names a slow step.
+    // A real site adds the observer's own starved reads before the request
+    // (two samples plus the beforeunload arming, each bounded read up to
+    // 60 s), so the wait carries the real-site inspect bound while keeping
+    // the 60 s floor the fixture's popup/link choreography was calibrated
+    // on.
     println!("first: Work reused; waiting for the quit request");
-    checkpoint_within(view, case, "request-exit", Duration::from_secs(60)).await?;
+    checkpoint_within(
+        view,
+        case,
+        "request-exit",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     // Sequential quit, oldest first: Work closes first, the observer cancels
     // its native beforeunload, and the quit stops with both profiles open.
     println!("first: quitting (Work's beforeunload expected)");
+    // Mac's observer sends the normal OS Quit to the owned browser app.
+    // Only its unsolicited intent may initiate this App's first two exits.
+    #[cfg(not(target_os = "macos"))]
     app.exit(0);
-    checkpoint(view, case, "cancel-inspected").await?;
+    // A busy real-site renderer can starve one DevTools reply; the
+    // observer's bounded cancel retry lives inside this wait: the first
+    // dialog window (10 s), renderer quiet + OS quit (~25 s), the
+    // starved-send loop (60 s + tail), then the close wait (10 s). The
+    // busy-renderer windows ahead of it can now add ~120 s more on a real
+    // site (four 30 s extras), so the wait carries the real-site inspect
+    // bound; the fixture keeps its deliberate 150 s calibration.
+    checkpoint_within(
+        view,
+        case,
+        "cancel-inspected",
+        inspect_bound().max(Duration::from_secs(150)),
+    )
+    .await?;
     let stopped = exit_cancelled(view, app, 0).await?;
     let kept = stopped.as_array().ok_or("Missing process array")?;
     let unchanged = kept.len() == 2
@@ -575,12 +859,26 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&retained).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    checkpoint(view, case, "request-partial-exit").await?;
+    // On a real site the observer's own transition to the second quit
+    // (listener removal, samples, arming on a starved channel) can take
+    // minutes — run 43007950291 burned ~116 s there — so this checkpoint
+    // takes the real-site bound, not the fixture's 30 s.
+    checkpoint_within(view, case, "request-partial-exit", inspect_bound()).await?;
     // Work now agrees to leave and closes first; Personal cancels, so the quit
     // stops with only Personal kept (the accepted sequential trade-off).
     println!("first: quitting again (Work closes, Personal cancels)");
+    #[cfg(not(target_os = "macos"))]
     app.exit(0);
-    checkpoint(view, case, "partial-inspected").await?;
+    // Same bounded observer retry room as the cancelled quit above.
+    // The partial phase spans quiet + dialog + cancel on the same starved
+    // channel, so it also takes the real-site observer bound.
+    checkpoint_within(
+        view,
+        case,
+        "partial-inspected",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     let partial = exit_cancelled(view, app, 1).await?;
     let personal_profile = connections
         .as_array()
@@ -605,9 +903,66 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
         serde_json::to_vec_pretty(&partial).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    println!("first: Work closed and Personal kept; waiting for the final quit");
+    println!("first: Work closed and Personal kept; the held permission prompt is next");
+    // The opted-in browser holds Personal's permission prompt for the App's
+    // own answer: the observer names this checkpoint after the page asks, and
+    // the home's own prompt row is the person's answer surface. Clicking
+    // 許可する resolves the held callback, which is the grant the observer
+    // records from the page itself.
+    // The observer's leg here (sample, removal, answer) is the same
+    // starved-retry work as the quit transitions, so the wait takes the
+    // real-site bound too (independent review on 479af73).
+    checkpoint_within(view, case, "permission-requested", inspect_bound()).await?;
+    answer_permission(view).await?;
+    println!("first: the held prompt was answered through the home; waiting for the final quit");
+    // A held media prompt has no runtime dismissal of its own: it retires
+    // with its document. Each observer drives the page side (media-requested
+    // -> held row seen -> reload -> media-navigated): the Linux mjs observer
+    // always does; the Windows/macOS flows do where their driver opted in
+    // with the same flag (packaged runs leave it off on both sides).
+    if std::env::var("TAKOSUMI_BROWSER_PROCESS_MEDIA_DISMISSAL").as_deref() == Ok("1") {
+        checkpoint_within(view, case, "media-requested", inspect_bound()).await?;
+        // The notification answer already retired its row, so exactly one
+        // held row now means the media prompt the page just raised; its
+        // heading text goes into the marker as evidence for the observer.
+        const ROW: &str = "section[aria-labelledby=\"permissions-heading\"] section.web-clear";
+        // A held prompt on macOS can outlive the shared 20 s floor before
+        // its row paints even though the hold worked, so this wait gets the
+        // same 30 s class as the driver's other page waits; an expiry also
+        // reports the live row count so a recurrence names 0 / 2+ / an eval
+        // stall rather than only the deadline.
+        let row_count = format!("document.querySelectorAll('{ROW}').length");
+        if let Err(error) =
+            ready_within(view, &format!("{row_count}===1"), Duration::from_secs(30)).await
+        {
+            let count = eval(view, &row_count).await.unwrap_or(Value::Null);
+            return Err(format!("{error}; held-row count at expiry: {count}"));
+        }
+        let label = eval(
+            view,
+            &format!("document.querySelector('{ROW} h3')?.textContent ?? ''"),
+        )
+        .await?;
+        let seen = serde_json::to_vec(&serde_json::json!({ "held": true, "label": label }))
+            .map_err(|error| error.to_string())?;
+        std::fs::write(case.join("media-held-seen.json"), seen)
+            .map_err(|error| error.to_string())?;
+        checkpoint_within(view, case, "media-navigated", inspect_bound()).await?;
+        // The same-site reload killed the document's held request: the
+        // App's row must be gone, proving retirement reached the held map
+        // rather than merely the browser.
+        ready(view, "!document.querySelector('#permissions-heading')").await?;
+        println!("first: the held media prompt retired with its document");
+    }
     // The observer first loads a popup in Personal (appearance 10 s, load 25 s).
-    checkpoint_within(view, case, "request-final-exit", Duration::from_secs(60)).await?;
+    // The 60 s fixture calibration stays as the floor.
+    checkpoint_within(
+        view,
+        case,
+        "request-final-exit",
+        inspect_bound().max(Duration::from_secs(60)),
+    )
+    .await?;
     std::fs::write(
         case.join("app-browser-process-complete.json"),
         b"{\"passed\":true}\n",

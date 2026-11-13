@@ -278,6 +278,22 @@ CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build
 CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo test --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-browser-guard
 ```
 
+`browser_process.py --recover` is a separate same-App crash-recovery case; do
+not combine it with restart/reset/files/notification scenarios. Pass the
+product Rust guard explicitly with `--guard /absolute/owned/target/debug/takosumi-browser-guard`
+(or use `--packaged` with that guard). The Python fixture guard lacks the complete
+incident schema required for recovery. With either `--app excalidraw` or
+`--app photopea`, the case saves distinct cookies/storage in Work and Personal,
+normally closes and reopens Work to prove its data was saved, then terminates
+only that exact native Work generation through a pidfd. It requires the guard's
+abnormal receipt with kernel-confirmed exhaustion, the home's explicit recovery
+action, unchanged UUID/cache-directory inodes and saved values, an immutable
+incident copy, and Personal's original process/document/data. Final live browser
+guards must still exit normally; the induced crash is never relabelled normal.
+The existing finite watchdogs, document-readiness predicate and source-hash
+checks remain unchanged. This Linux fixture is not Windows/macOS, power-loss,
+real login or unsaved-write qualification.
+
 The runner needs the existing Python pidfd/subreaper guard, Node, Xvfb, D-Bus,
 XRes, xdotool and ImageMagick; it installs nothing. It supplies fresh HOME/XDG
 directories and explicitly enables PID-attested loopback inspection ports.
@@ -1622,12 +1638,16 @@ removed them; the check now waits for all three). What remains is reported, not 
 directories (`%LOCALAPPDATA%\com.takosumi` with its WebView2 data, runtime
 root and browser profiles, and the fixture's per-case
 `com.takosumi.fixture.browserprocess.*`, plus `%APPDATA%` entries if any). The
-artifact keeps only reports, logs, the stage manifests, the packaged case
-and the installed browser's smoke case, gathered into one directory: text
-files only (`.json`, `.log`, `.txt`, `.html`, `.md`), never anything that is
-an executable, a library or an archive by its name or its first bytes (MZ,
-ELF, ZIP); each skipped file and failed copy is logged, and one failure does
-not stop the rest.
+artifact keeps reports, logs, stage manifests and packaged-case metadata in
+one directory. Browser profile directories are excluded, including database
+files named `.log`. The standalone smoke copier accepts only `boot.json`,
+`browser.log`, `cef-native.log` and `summary.json` directly under an owned
+smoke case: plain, single-link files, at most 8 MiB each, valid UTF-8 and no
+NUL bytes. It copies the inspected bytes and refuses links and a reused output
+directory. The general report copier permits `.json`, `.log`, `.txt`, `.html`
+and `.md`, rejects executables, libraries and archives by name or first bytes
+(MZ, ELF, ZIP), and logs its rejected files and copy errors. Profile-level logs
+are limited to the two native diagnostic names, without descending into site data.
 
 **Not shown by W6:** a signed or release installer, SmartScreen, an update
 over a running App, a machine-wide install, real devices, the Windows
@@ -2000,8 +2020,12 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   with the reason, when the executable is not in one), installs
   `TakosumiCefApplication` (`mac_front.rs`: the `NSApplication` subclass with
   CEF's protocols, the regular activation policy) and runs the browser. A
-  quit from the system (`terminate:`) is only reported: the App owns the
-  browser's lifetime. objc2 adds a protocol to the class only when the
+  quit from the system (`terminate:`) sends a profile-bound `quitRequested`
+  intent to the parent App. Its reply reader consumes the intent separately
+  from command replies and enters the App's ordinary sequential exit path.
+  The parent retains nonzero Shutdown IDs, beforeunload cancellation and the
+  ability to reopen a retained profile; the child does not call Cocoa exit
+  or overwrite an in-flight Shutdown ID. objc2 adds a protocol to the class only when the
   runtime knows it and skips a missing one silently, so
   `install_application` requires `CrAppProtocol` and `CrAppControlProtocol`
   to exist and the class to conform to both, and takes `sharedApplication`
@@ -2010,6 +2034,17 @@ the bundle is assembled by `scripts/bundle-macos-cef.mjs`:
   with a drop guard (also when an Objective-C exception unwinds through
   it), and the raise holds the NSWindow retained while it sends it
   messages.
+
+  The M3 fixture's first two quit requests use AppKit's
+  `NSRunningApplication.terminate()` on the already attested browser PID.
+  A fixture-only helper rechecks browser/guard PID, parent and birth before
+  sending the normal request; the observer also rechecks the pinned images.
+  Request acceptance is not completion: real beforeunload cancellation,
+  retained profiles/reopen and normal guard receipts remain required. The
+  final quit still comes from the Tauri host. This covers the OS quit API,
+  not physical Cmd-Q/Dock/menu input, and does not fix or mask the separate
+  Chromium teardown-watchdog failure. The API has no atomic PID/birth form;
+  the small race after the last identity check remains a fixture limitation.
 - `helper_main.rs` (new executable `takosumi-cef-browser-helper`): enters the
   seatbelt sandbox, loads the framework and runs the process type CEF asked
   for, as CEF's own helper and cef-rs's cefsimple helper do. No application
@@ -2156,8 +2191,8 @@ builds nothing); nothing is linked or run here. The second macOS step
 mirrors W2: `takosumi-browser-guard` for macOS, and the plugin's
 `desktop-process-experiment` (and so the App's `desktop-cef`) compiled for
 macOS, where it starts the guard and the bundled browser through the same
-`Process` code as on Linux and Windows. No App UI or fixture on macOS yet
-(M3).
+`Process` code as on Linux and Windows. M2 did not cover the App UI;
+the M3 fixture below adds that candidate scope.
 
 The later `6eacebe` run (42486555333) kept the same macOS implementation but
 failed ordinary adapter shutdown: browser exit 0, complete receipt, no
@@ -2170,7 +2205,45 @@ kernel process name and whether it showed stopped). A null snapshot means
 no retained freeze observation, not proof of a late spawn. Names may be
 truncated and are not CEF roles. No arguments or environment are logged.
 The shutdown bounds and `forcedCleanup == 0` qualification are unchanged.
-This diagnostic needs a new macOS run; the previous RED is retained.
+The diagnostic head `574cec4` passed all nine PR jobs (42488149912), including
+14 guard and 6 adapter cases. The same tree merged as `0d480b0`; its automatic
+main run (42489988073) failed ordinary shutdown again. The counted helper
+PID 6082 was born after the initial tree snapshot, and later had parent 1,
+its own process group 6082 and a stopped freeze snapshot. GPU errors named
+PID 6065 instead. The truncated kernel name does not identify helper 6082's
+role, and its start during page activity/reopen versus shutdown is still
+unknown. This is a surviving helper, not evidence that a forced kill should
+be accepted as normal.
+
+The next diagnostic records helper entry (after sandbox initialization),
+the return from CEF, and the point before helper exit, plus the browser's shutdown request and
+CEF shutdown begin/return. Each best-effort stderr line contains its own
+PID/start/parent/group, wall-clock microseconds, exit code when available,
+and only closed enums for recognized process/utility roles. Unknown switch
+values become `other`; no arbitrary argument, path or environment is logged.
+Failure to read its own start time records null, not a fabricated identity.
+This adds no work inside the guard's stop-to-kill interval and changes no
+shutdown bound or receipt acceptance. Abnormal closes have a distinct request
+label; the before-exit record is not proof of OS exit, and a missing best-effort
+line does not prove that a helper was absent. The main RED remains unresolved.
+The existing-browser reuse path also records focus begin/return, window-raise
+return and reply return with the same closed metadata. These stages distinguish
+a resume that stops inside focus, AppKit window raising or reply construction;
+they do not prove foreground activation or successful delivery of a reply.
+Missing lines can still be diagnostic loss. No operation or timeout is changed.
+The App adapter's opted-in Mac inspection also records dispatch/blocking/lock,
+send completion, reader enqueue, matching receive, native/cache confirmation
+and IPC return boundaries. Reader quit/permission callback begin/return stages
+distinguish an in-flight event callback from an unreceived open reply. Only
+stage names, App/guard PIDs, assigned request IDs, success flags and wall-clock
+microseconds are recorded; an unassigned guard or request has ID0. No key, profile URL,
+reply body, path, environment or page data enters these lines. The record is
+formatted before one best-effort stderr write. These are diagnostic candidates:
+none proves delivery beyond its own boundary or changes ownership/timeout rules.
+The first diagnostic run (`d32f18a`, 42491760278) passed its macOS component
+job, but concurrent helpers interleaved the JSON formatter's separate writes.
+Records are now formatted fully before one best-effort write. A failed or short
+write still loses evidence; it does not delay or change helper shutdown.
 
 **Guard** (`src/guard_macos.rs`, chosen by `src/guard_entry.rs`; the Linux
 and Windows guards are unchanged). Same command line
@@ -2220,8 +2293,16 @@ signal; a parent already gone when the guard starts is a stop before the
 browser starts, and a changed parent at any later look is the App's death
 too, should its exit event be missed).
 
-The drain then always runs, as on Windows: up to 0.5 s for the browser and
-every tracked process to end by themselves. Then the guard **freezes the
+The drain then always runs: up to 0.5 s for the browser and
+every tracked process to end by themselves. After observing a clean root
+exit with no supervision failure, the natural window is 1.5 s instead.
+Chromium's code-sign-clone cleanup polls for its parent's exit once a second
+before deleting the temporary clone; the longer normal-exit window allows
+one poll plus 0.5 s scheduling/deletion margin. Stops/App death observed before
+drain, recorded observation failures and abnormal exits retain 0.5 s. The phase
+is fixed at drain entry; later events never restart or extend it.
+No role or process is exempt, and the role diagnostic
+does not select this deadline. Then the guard **freezes the
 tree before it kills anything**: `SIGSTOP` to the unreaped browser
 (always), to each tracked process still the same (start time) and to
 every other running member of the group, each verified right before its
@@ -2276,16 +2357,24 @@ is not its descendant (as on Linux one started by a session manager is
 not), and a double fork faster than an observation: a process that leaves
 the group and whose parent ends before the guard's next look (the
 `NOTE_FORK` wake, or the next tick) is orphaned to launchd unseen. CEF's
-helpers stay in the group (the M1 smoke's group check). The App's checks
+renderers stay in the group in the M1 smoke. Its code-sign-clone cleanup
+instead starts its own group, and the guard tracks its observed browser
+parent and birth identity. The App's checks
 are unchanged (`require_normal_guard` states the same meaning).
 
 **Self-tests** (`src/guard_macos_tests.rs`, `harness = false`, like
 Windows'). The test binary re-executes itself as the guard, as stand-in
-browsers and as a stand-in App, and runs fourteen cases: a normal exit; a
+browsers and as a stand-in App, and runs fifteen cases: a normal exit; a
 non-zero exit; the browser keeps the pipes and gets the default stop
 signals with an empty mask; a lingering descendant is killed and counted;
 a descendant that left the group (`setsid`) is still killed; one that ends
-by itself is not forced; a tree forking as the kill begins (a `setsid`
+by itself is not forced; a self-grouped cleanup child that acknowledges a
+live browser parent, polls again after one second and deletes its owned clone
+fixture must finish with zero forced cleanup and an exact completion marker;
+the handshake models the upstream poll, but an unusually descheduled browser
+can shift its exit relative to that tick, so this case alone is not a
+deterministic reproduction of every old 0.5 s failure;
+a tree forking as the kill begins (a `setsid`
 breeder forking a child every 5 ms for 2 s, which reports on a pipe once
 its first child exists before the browser exits) is frozen, then killed,
 with no child left in the breeder's group, at least two forced and every
@@ -2383,7 +2472,7 @@ and at least one forced process: the guard's watch on the App ended it.
 
 **CI.** `cef-macos`: the product build also builds
 `takosumi-browser-guard`. After the product smoke, `cargo test --locked
---bin takosumi-browser-guard` must report `14 passed; 0 failed`; the
+--bin takosumi-browser-guard` must report `15 passed; 0 failed`; the
 plugin's lock is pruned from the App's (its own step, as in the Windows
 job); `cargo test ... --features desktop-process-experiment --lib --
 macos_tests --include-ignored --skip app_stand_in_for_the_death_case
@@ -2397,13 +2486,330 @@ Windows run does. The artifact `cef-macos-smoke` adds both test logs and
 each case's `browser.log`, `cef-native.log` and kept guard receipt: text
 only. Still seven jobs (nine runs).
 
-**Remains after M2:** the actual App fixture on macOS (M3: the App's home
-driving this adapter), packaging (the browser bundle and the guard inside
+**Remains after M2:** native qualification of the M3 actual App fixture below,
+packaging (the browser bundle and the guard inside
 the App's `.app`, a `.dmg`), Developer ID signing of every Mach-O file with
 the hardened runtime and the entitlements Chromium's helpers need, and
 notarization (release inputs), the login keychain decision, the shared
 per-user macOS state of the browser bundle (the `HOME` decision above),
 Intel Macs, older macOS versions and real devices.
+
+## macOS actual App fixture (M3)
+
+Candidate source, not a complete native PASS. The explicit
+`native-browser-process-fixture` feature now uses the same App flow on
+Linux, Windows and macOS. The Mac driver uses Tauri's `eval_with_callback`
+against the real WKWebView home, with no new dependency or product UI.
+`native-tests/desktop/macos_browser_process.py` runs anonymous Excalidraw
+and Photopea separately; it does not sign in or supply real account data.
+
+Each case selects a random persistent WK store UUID, refuses macOS below
+14, requires a fresh first home and restores its saved Work/Personal
+connections on two later launches. The pinned tauri-runtime 2.11.3 config
+conversion drops `data_store_identifier`, so the fixture disables automatic
+creation of `main` and explicitly calls the window builder's
+`data_store_identifier` before starting the driver. A configuration marker
+alone is not runtime proof: both distinct cases and their restarts must pass.
+
+The observer requires two separately guarded CEF profiles, separate synthetic
+cookie/localStorage values, same-document reuse through the home, sequential
+quit cancellation and partial quit, restart persistence, clearing only Work,
+refusing a clear while Personal runs, then clearing Personal after its normal
+close. It checks PID/birth, parent and executable identity, the exact loopback
+inspection listener and renderer sandbox. Every profile and the outer App
+guard must exit normally with zero forced cleanup and no remaining tracked
+process. A completed page or closed CDP socket never substitutes for a receipt.
+
+The existing `cef-macos` job builds the actual App after the M1/M2 steps and
+runs both sites once, each in three launches. Its text artifact also retains
+App/observer summaries, home-store requests, guard receipts and bounded tails
+of this case's browser logs. It includes no browser database or binary. The
+three portable rejection tests exercise listener/process ownership and abnormal
+receipts; Linux cross-Clippy with C/library stubs checks Rust only, not linking
+or native behavior.
+
+Mac lifecycle records also mark the existing control-packet read, UI-task post
+return value and UI-task entry, without parsing or logging packet contents.
+Run43297320017 cancelled quit successfully, then Work's reuse-focus began
+25.176 seconds after the App's successful send; its reply arrived after the
+App had already failed its wait. The new boundaries distinguish reader/post
+delay from UI-task delivery, with the existing command/focus markers covering
+dispatch and focus. Post return and task entry run on different threads and
+may be recorded in either order; FIFO packet order and positive command
+records must be correlated. A missing best-effort line proves no stop point.
+The synchronous diagnostic write retains the existing control-lock scope
+and can affect timing. No protocol, scheduling or timeout rule changes, and
+native collection of these boundaries remains unqualified.
+
+M3 uses CDP `Page.close` on relaunch. OS window switching, keyboard focus,
+real login/popup return, native files/downloads, site permissions, notifications,
+OS-managed WKWebView services outside the App's guarded tree, macOS packaging,
+signing and updates remain separate. The earlier ordinary-shutdown RED is
+retained; no grace period or receipt acceptance is relaxed for this fixture.
+
+The first M3 native run (42493648973 at `3ad4ca6`; CI's synthetic merge
+`b159ded` has the same tree) built and ran the actual Mac App. Both sites
+passed separate-profile synthetic cookie/storage and same-document reuse.
+Excalidraw's beforeunload opened and closed with `result:false`, then the
+browser threw `NSInvalidArgumentException`: `TakosumiCefApplication` lacked
+`cancelTerminate:`. Its guard recorded signal 5, zero forced cleanup. The
+application now implements that selector and forwards to the delegate's
+`stopTryingToTerminateApplication` when present, matching
+[the pinned Chromium 154.0.8037.98 cancel route](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/chrome_browser_application_mac.mm)
+without invoking AppKit termination. The real cancel/reuse/subsequent
+normal-close flow remains the regression gate, not just selector presence.
+
+Photopea instead timed out waiting for beforeunload opening; no dialog was
+recorded and no prior crash was established. Its outer forced cleanup was
+the runner's response to failure, not an ordinary exit. The Mac observer now
+keeps dialog events, target/receipt state, setup activation/visibility and
+checkpoint times before that cleanup. The original wait bounds and required
+open/cancel events remain unchanged.
+
+The next native run (42495346362 at `0c4013c`; synthetic merge `1ce6eab`
+has the same tree) passed all three Excalidraw launches: cancel/reuse,
+sequential quit, restart with persistent separated state and one-profile
+clear. All nine App/profile receipts had exit 0 and zero forced cleanup.
+Photopea passed its first launch, including both cancellations and normal
+exit, and verified the separated state after restart. Closing Personal on
+that restart entered `CefShutdown`, then printed `Teardown watchdog expired`
+and exited 2; the guard had to end the network-service helper. Reset was
+not reached. The watchdog's cause remains unknown; a surviving helper is
+not by itself proof of what blocked shutdown. This differs from both the
+earlier missing dialog and the old M2 exit-0/forced-1 failure.
+
+The same run's M2 adapter failed during its first creation confirmation,
+before reuse or shutdown. Its native window existed, but the exact failed
+reply predicate was not logged. These failures keep Mac native acceptance
+open despite the completed Excalidraw flow.
+
+The next diagnostic records only admission predicate booleans on a rejected
+Mac creation reply, including the exact libproc reads used for admission.
+It neither retries nor relaxes identity/path checks. Normal M3/M4 runs do not
+attach a sampler while the flow is in progress: the installed sample manual
+says it suspends the target at each interval. The explicit diagnostic option
+`--sample-shutdowns` retains the old in-flow watcher; summary and observation
+JSON record `shutdownSampling: true`, and its passing flow remains timing-
+perturbed evidence. CI's existing invocations omit the option. The actual UI
+operations, wait bounds and strict exit/receipt predicates remain unchanged.
+In this opt-in mode, an owned browser still inside `CefShutdown` after two seconds is sampled
+once for one second at 100 ms intervals, before Chromium's ten-second
+[teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
+PID/birth, guard ancestry and both executable paths are checked before and
+after; changed identity discards the output. The sample subprocess has a
+seven-second limit and passes `-mayDie` to collect symbol locations before a
+target exits during sampling. Earlier three- and five-second attempts expired
+before producing a report. Kernel-state collection runs first with separate
+tool bounds, so seven seconds is not a total diagnostic bound and does not
+guarantee completion before the teardown watchdog. Its retained stack text is
+capped at 4 MiB and stderr at
+8 KiB. A timeout retains any partial stack and stderr only after the same
+identity readback, and remains a failed diagnostic, never a native pass.
+The subprocess is reaped and the watcher joined before fixture cleanup.
+Filesystem/libproc reads have no hard IO deadline. A failed
+watcher-thread start still runs the close body; missing samples never change
+the receipt verdict. Sampling
+can perturb scheduling: a sampled pass is diagnostic, not an unsampled
+qualification. No heap, environment, page contents or binary crash dump is
+requested. Existing first-launch/restart/reset and zero-forced-cleanup
+requirements remain unchanged.
+
+After an M3/M4 observer flow has already failed, its failure callback also
+attempts the same owned sampler before cleanup for at most the two opened
+profiles. It uses only the registered PID/birth and guard identities, skips
+any PID already attempted by the shutdown watcher, and retains results under
+`evidence/failure-<phase>/` with closed `failureSamples` metadata. A missing
+identity, sampling error or unavailable stack cannot replace the original
+failure. A successful flow does not enter this path. Tool bounds and output
+caps are unchanged; collection can delay failure cleanup, and filesystem or
+libproc reads still have no hard IO deadline. This extends diagnosis to a
+failed Open whose browser never entered shutdown; native collection of that
+path remains unqualified.
+
+The CI also records the installed `/usr/bin/sample` usage (with no process
+argument) and its installed manual, each capped at 16 KiB, in
+`macos-sample-capabilities.json`. This read only identifies available diagnostic
+options: it attaches to no process and does not select a new flag or extend the
+sampling/shutdown deadlines. It is needed when symbol processing times out
+without leaving a stack, so the next diagnostic can use observed tool support.
+
+At `6a1f7ff` (run 42497100922), Photopea completed all three launches with
+normal receipts and no stack sampling. Excalidraw instead stopped at the
+partial quit: Work exited 0 but its guard forced one leftover process, so
+the App correctly kept Personal open. The leftover was born 10.3 ms before
+Work's `CefShutdown` returned; by the freeze it had parent 1 and its own
+process group, with no helper-entry record identifying its role. This is
+not evidence of a missing Personal beforeunload. The full run was 8/9,
+with only the Mac job failing; the earlier creation refusal did not recur.
+
+The guard now retains the first parent/group already observed for each
+PID/birth and includes it in forced-process diagnostics after kill/disarm.
+There are no new OS queries, argument captures, startup hooks or waits.
+`trackedParentStart` is the parent's stored observation, not a fresh
+simultaneous identity proof; a missing value stays unknown. The escaped
+descendant test checks that its first parent survives later orphaning,
+allowing the first group to be either side of `setsid()`. The fixture's
+existing stack watcher also covers Work's partial close and keeps both
+partial/final records. These changes do not resolve the residual process,
+the earlier Photopea watchdog or the creation refusal by themselves.
+
+At `48de24f` (run 42498855602), Excalidraw completed all three launches
+without sampling, and Photopea completed its first and restart launches
+with normal receipts. Photopea's reset removed only Work's profile, then
+failed to reopen it. The M2 App-death test also failed during creation.
+Both rejections had matching parent/birth, key, profile, cache and positive
+native IDs; the executable path read by `proc_pidpath` did not exactly
+match the expected canonical path. The earlier watchdog and late helper
+did not recur; the reset's outer forced cleanup is failure cleanup, not a
+normal-shutdown result.
+
+The rejection diagnostic at `a35a531` identified Chromium's code-sign clone:
+its main executable was a hard link of the selected browser (`sameFile=true`,
+stable PID/birth, different canonical path). The adapter now holds that
+executable open before spawn and compares regular-file device/inode, with
+process identity and image-path rechecks. Copies and replaced files fail;
+the observer and shutdown sampler also hold their expected executable files.
+This is not bundle/signature validation or an atomic running-vnode check
+against concurrent same-user filesystem mutation.
+
+At `fe1b913` (run 42502662408), all nine Mac adapter/image tests passed, and
+both anonymous sites completed all three App launches with nine normal
+receipts each. Photopea had no stack sampling. Excalidraw's first launch
+attempted one sample, then discarded it after the process identity changed;
+its timing may have been perturbed. The two Windows fixture jobs instead
+failed a stale CI-contract test that counted only the six adapter tests,
+excluding the three new image tests; that test now checks both exact sets.
+The earlier intermittent late helper and teardown watchdog remain unresolved.
+
+`TAKOSUMI_MACOS_GUARD_ROLE_DIAGNOSTICS=1` opts native diagnostics into one
+closed-role read for a tracked orphan in its own process group after natural
+drain expires, before any SIGSTOP. Default runs do not query arguments.
+The guard reads at most 64 KiB using KERN_PROCARGS2, checks the required size
+before/after, parses exactly the counted arguments (including exact 64-bit
+path padding and empty-argv boundaries), and discards raw bytes. It records
+only `none`, `other`, `code-sign-clone-cleanup` or null plus PID/birth, identity
+stability and elapsed time, after kill/disarm. No path, argv or environment
+value is logged. This does not grant any role an exception: the native
+escaped-helper test claims the cleanup type and must still be killed/count 1.
+
+Run 42504487318 at `ae375e4` passed the four native parser and fourteen guard
+tests, including the escaped helper's actual kernel role. Excalidraw passed all
+three App launches without stack sampling. Photopea's Work browser exited 0 but
+its guard forced one late own-group helper; the App retained the profile and
+did not advance to Personal's beforeunload. This is still a failed ordinary
+shutdown. The App cleared the diagnostic flag when launching profile guards,
+so that helper's role was not observed. The forwarding repair passes only
+literal `1`, only in an inspecting fixture build; normal product builds never
+read or forward it. It changes no cleanup/acceptance rule.
+
+The forced cleanup deadline starts before this optional read; the read itself
+never extends the selected natural or forced window. A sysctl has no hard latency bound and
+may return stale data across same-PID exec, so the result is observational.
+Opt-in runs are timing-perturbed evidence, not unsampled shutdown qualification.
+The pinned [XNU layout](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_exec.c#L5467-L5481)
+and [sysctl behavior](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.121.3/bsd/kern/kern_sysctl.c#L1335-L1592)
+explain the strict padding, size checks and exec-race limitation.
+
+Run 42506394284 at `06c3b94` then observed the late Excalidraw restart helper's
+actual `code-sign-clone-cleanup` role with stable PID/birth and the recorded
+browser parent. It was forced after the old 0.5 s natural window. Photopea
+completed all three launches. The [pinned Chromium cleanup loop](https://chromium.googlesource.com/chromium/src/+/154.0.8037.98/chrome/browser/mac/code_sign_clone_manager.mm#753)
+sleeps for one second after seeing its parent alive, then removes the clone
+only after reparenting. The normal-root-exit window above now accommodates
+that behavior; its native regression also requires the owned clone fixture
+to be removed. This repair still needs native execution and does not resolve
+the separate historical `CefShutdown` watchdog failure by itself.
+
+Run 42607719040 at `cc4f836` reproduced the historical watchdog under
+Photopea: after Personal's `system-quit-request`, the serialized quit sent
+Shutdown to Work, Work closed its windows and logged `cef-shutdown-begin`,
+then hung inside `CefShutdown` until Chromium's ten-second teardown
+watchdog killed it (rootExit=2). Personal therefore never received
+`shutdown-request` and its beforeunload never opened - a failed ordinary
+shutdown, not evidence of a missing handler. The hanging profile's
+`cef-native.log` recorded `Failed to post task from
+FlushAndNotifyInBackground to client_task_runner_` (a sqlite cookie-store
+flush post failing during teardown); Photopea writes cookies continuously,
+so a shutdown-ordering race is plausible but unproven and still needs a
+sampled stack. The run added the `-mayDie` sample flag so symbol locations
+are grabbed before the watchdog can kill the sampled browser.
+
+Run 42613143371 at `02ef39f` hung at the same CefShutdown stage on the
+second of three Photopea launches; the `-mayDie` symbol grab still exceeded
+the then-three-second subprocess bound, so `1a035be` raised it to five
+seconds, keeping detect (~+2 s) plus sample inside the ten-second kill
+window. The iOS job flaked on simulator boot, and native-plugins recovered
+its picker test, marking that failure intermittent.
+
+Run 42621435741 at `ceed2fe` then passed all nine Mac adapter/image tests
+and all three Photopea launches through all six phases with no stack
+sampling, so the five-second bound remains unexercised and the hang's root
+cause unresolved. The same run's Android job still failed at the Open tap
+stage (filePrompts=0); its retained screenshot proved the first paint gate
+accepted the site's own uniform Loading backdrop, corrected by 03b33c3.
+
+## macOS packaging (M4)
+
+The embedded product-browser sandbox smoke passed. The packaged fixture's
+anonymous Excalidraw and Photopea home/profile flows each passed all three
+launches with normal inner/outer receipts in
+[CI43202312305](https://github.com/tako0614/takosumi-mobile/actions/runs/43202312305).
+This is local debug bundle evidence. Intermittent unbundled Photopea helper
+retirement failures remain unresolved; these passes do not establish their
+repair or qualify signing/distribution. On a prepared Mac with at least
+8 GiB free, use the same CEF SDK and target as the M1 build:
+
+```bash
+CEF_PATH=/absolute/owned/sdk CARGO_TARGET_DIR=/absolute/owned/target cargo build --locked --manifest-path native-tests/cef-candidate/Cargo.toml --bin takosumi-cef-browser-process --bin takosumi-cef-browser-helper --bin takosumi-browser-guard
+node scripts/bundle-macos-cef.mjs --with-guard --cef /absolute/owned/cef_macos_aarch64 --bin /absolute/owned/target/debug --out src-tauri/target/macos-cef/cef
+CARGO_TARGET_DIR=/absolute/owned/target bunx tauri build --ci --debug --bundles app --features desktop-cef --config src-tauri/tauri.macos-cef.conf.json
+```
+
+The overlay maps this stage to `Takosumi.app/Contents/Resources/cef/`. The
+existing adapter resolves the browser at
+`cef/takosumi-cef-browser-process.app/Contents/MacOS/takosumi-cef-browser-process`
+and the adjacent `cef/takosumi-browser-guard` without executable overrides.
+The minimum macOS version is 14, as required by the shared home data stores.
+The `.app` is a local debug artifact; Developer ID signing, notarization,
+distribution and updates remain separate release work.
+
+The browser sets CEF's `main_bundle_path` to its own enclosing
+`Contents/MacOS` bundle. In this CEF version the empty default uses Chromium's
+outermost `.app`, which would select the Tauri App and search for the browser's
+framework and helpers there. CEF passes the explicit bundle path to its
+helpers. See [CEF's bundle lookup](https://github.com/chromiumembedded/cef/blob/14c5a08/libcef/common/util_mac.mm#L116)
+and [Chromium's outermost lookup](https://github.com/chromium/chromium/blob/154.0.8037.98/base/apple/foundation_util.mm#L154).
+The SDK-free `mac_bundle.rs` controls cover both standalone and nested paths;
+the embedded sandbox smoke and packaged App flow remain the native oracles.
+
+`--with-guard` checks the guard's thin Mach-O architecture against the browser
+before any copy, refuses a missing or linked guard, and never overwrites the
+output. `bundle.json` records the guard's own bytes/mode/hash separately from
+the nested browser app's entries. The existing framework link checks and
+fixture-inspection rejection still apply. These checks do not qualify a
+Mach-O's full linkability or native execution on a Linux test host.
+
+The explicit fixture overlay `tauri.macos-cef-fixture.conf.json` uses
+`src-tauri/target/macos-cef-fixture/cef`. A `--fixture` stage cannot be written
+to the product's stage directory or its descendants, including through existing parent links.
+The CI builds both `.app` artifacts, requires the same product guard in both
+stages, and runs the product browser from inside its packaged resources with
+the existing sandbox smoke. It then runs the packaged fixture's shared
+home/profile flow separately on anonymous Excalidraw and Photopea:
+
+```bash
+python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary <TakosumiFixture.app>/Contents/MacOS/<CFBundleExecutable> --work <owned evidence directory> --site excalidraw
+python3 -B native-tests/desktop/macos_browser_process.py --packaged --binary <TakosumiFixture.app>/Contents/MacOS/<CFBundleExecutable> --work <owned evidence directory> --site photopea
+```
+
+This mode accepts no `--browser` or `--guard`. It removes inherited browser
+executable/runtime overrides, lets the App choose its bundled resources and
+per-user runtime directory, and attests the opened browser and guard against
+those exact packaged executables. The same isolation, reuse, sequential quit,
+restart, clear and normal inner/outer receipt assertions still apply. The
+original unbundled M3 flows remain separate, so a packaging failure cannot
+replace their results. Ordinary product home rendering, OS focus,
+physical-device use and release signing remain unqualified.
 
 ## Observations and limits
 
@@ -2426,3 +2832,34 @@ return, other site permissions/revocation, Web Push delivery, sandboxing, other 
 updates and distribution remain unfinished. The runner
 uses `no_sandbox` in its disposable root test environment; it is not a release
 configuration or an engine-selection decision.
+
+## Windows same-App recovery fixture
+
+The synthetic-site, same-running-App Windows recovery case passed all six
+required cases in [CI43218039839](https://github.com/tako0614/takosumi-mobile/actions/runs/43218039839/job/131182189815).
+The W3 job runs a separate fresh case with `--recover`, the same sandboxed
+browser and the existing fixture TLS setup. It accepts no
+restart/reset, real-site, installed-package or unsandboxed mode combination.
+
+The actual home creates Work and Personal. The observer seeds both, normally
+closes Work and verifies the saved cookie/storage after reopening it, then
+terminates only Work's held native browser handle with a synthetic exit code.
+App/guard/browser image paths, creation times and direct ancestry are checked
+before that fault; the App and guard handles have no termination access. A
+failed identity/liveness check refuses the fault, with no kill-by-PID fallback.
+
+Ordinary open must only offer recovery; the actual confirmation button must
+create the replacement. The observer requires the same UUID/cache directory
+identities and saved connections, new native process generations, unchanged
+Personal document/processes/data, and one incident preserving the original
+abnormal receipt. Seed-normal, injected-abnormal and final-normal evidence
+remain separate. Recovered Work, Personal and the outer App job must all end
+with their original strict normal conditions; the injected failure cannot
+satisfy a final cleanup check. Six named cases and a nonempty passed summary
+are required.
+
+The SDK-free controls exercise fault refusal, PID reuse and case wiring.
+The held Win32 fault, actual Windows App recovery confirmation and final
+normal cleanup ran in that native case. This does not qualify whole-App/OS-crash
+recovery,
+unsaved writes, actual authentication or installed-package recovery.

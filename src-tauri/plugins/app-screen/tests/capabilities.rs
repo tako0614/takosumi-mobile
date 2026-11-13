@@ -61,7 +61,10 @@ fn only_the_bundled_shell_capabilities_grant_app_screen_commands() {
                 [
                     "app-screen:allow-open",
                     "app-screen:allow-capabilities",
-                    "app-screen:allow-clear-profile"
+                    "app-screen:allow-clear-profile",
+                    "app-screen:allow-recover-profile",
+                    "app-screen:allow-pending-permissions",
+                    "app-screen:allow-resolve-permission"
                 ]
             );
         } else {

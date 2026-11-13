@@ -13,26 +13,42 @@
 //! its own subprocesses there); it refuses to run.
 
 #[cfg(target_os = "macos")]
+mod mac_lifecycle;
+
+#[cfg(target_os = "macos")]
 fn main() {
     let args = cef::args::Args::new();
     let exe = std::env::current_exe().expect("The helper executable's path");
     let mut sandbox = cef::sandbox::Sandbox::new();
     sandbox.initialize(args.as_main_args());
+    let role = mac_lifecycle::role(
+        std::env::args_os()
+            .skip(1)
+            .filter_map(|value| value.into_string().ok()),
+    );
+    mac_lifecycle::record("helper-enter", role, None);
     let loader = cef::library_loader::LibraryLoader::new(&exe, true);
     if !loader.load() {
         eprintln!("takosumi-cef-browser-helper: the CEF framework did not load");
         std::process::exit(1);
     }
+    // A surviving helper-enter alone does not prove that CEF was entered:
+    // framework loading and API setup happen first. Keep these boundaries
+    // distinct when the root returns while an owned renderer remains.
+    mac_lifecycle::record("helper-framework-loaded", role, None);
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+    mac_lifecycle::record("helper-cef-enter", role, None);
     let code = cef::execute_process(
         Some(args.as_main_args()),
         None::<&mut cef::App>,
         std::ptr::null_mut(),
     );
+    mac_lifecycle::record("helper-cef-return", role, Some(code));
     // The framework is unloaded before the sandbox context ends, as their
     // scopes nest in CEF's helper.
     drop(loader);
     drop(sandbox);
+    mac_lifecycle::record("helper-before-exit", role, Some(code));
     std::process::exit(code);
 }
 

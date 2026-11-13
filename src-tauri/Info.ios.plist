@@ -3,7 +3,9 @@
 <plist version="1.0">
   <dict>
     <key>NSCameraUsageDescription</key>
-    <string>Takosumiへの接続QRコードを読み取ります。</string>
+    <string>接続QRコードの読み取りと、許可したサイトのビデオ通話にカメラを使います。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>許可したサイトの音声通話にマイクを使います。</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Takosumiの管理セッションを安全に開きます。</string>
   </dict>

@@ -48,6 +48,88 @@ deletion failures, engine-specific controls and unsigned SDK build limits are
 recorded in [native tests](../../../native-tests/README.md). Real IdP, files,
 notifications and distribution require their own checks.
 
+The macOS process adapter holds the selected browser executable open before
+launch. It accepts a reported image only when it names that same device/inode,
+with the guard/native parent and birth identities stable across the check.
+This allows Chromium's hard-linked code-sign clone; a copied or replaced
+executable does not match. It does not authenticate the surrounding bundle,
+verify signatures, or provide an atomic running-vnode check against concurrent
+same-user filesystem mutation. Packaging and staged updates need separate
+qualification. Native fixtures hold their executable identities before launch
+and retain the same process and normal-cleanup requirements.
+
+On iOS 15+, the adapter lets WebKit ask whether the requesting site may access the
+camera or microphone in an attached, visible HTTPS screen. It returns
+[`prompt`](https://developer.apple.com/documentation/webkit/wkpermissiondecision/prompt),
+never `grant`; WebKit's site/iframe policy and the system's camera/microphone
+decisions still apply. Background or detached screens and non-Web origins
+are refused. This delegate policy does not run on earlier iOS versions;
+their WebKit permission behavior is not qualified by these checks.
+Privacy descriptions cover video/audio calls and the existing
+QR scan. Policy tests and SDK builds do not prove the native prompt, OS
+consent or capture on a device.
+
+On Android, an attached, resumed Web-home screen asks for explicit site consent
+for each camera/microphone request, then requests any missing Android runtime
+permissions. The prompt names the requesting origin and, for an iframe, the
+top-level origin. OS consent is not a shared grant for all websites: completion
+requires the same view, profile generation, document and page, with the OS
+permissions still granted. Navigation, detachment, stopping the Activity and
+WebView cancellation invalidate the pending request. The system permission
+dialog may pause the Activity; its result waits for the same screen to resume.
+No site grant is persisted. Unknown protected resources and geolocation remain
+refused, as do camera/microphone requests in the preserved mobile adapter.
+The manifest marks camera/microphone hardware optional. State-machine tests
+do not qualify actual WebView capture, native permission UI or capture behavior
+after an already-granted screen goes into the background.
+
+Android file selection keeps one native picker outstanding. A second request
+is canceled without replacing the first callback. Returning files requires the
+same view, profile generation, document and page. Navigation, eviction,
+detachment or destruction cancels the callback; the old picker result is still
+consumed before another request may launch. Activity recreation preserves that
+pending-result barrier, not the old callback or selected files. Ordinary
+picker pause/stop does not cancel selection. The existing content-provider URI
+filter remains in force. Controller tests cover this result binding; native
+picker UI, upload completion and device recreation need separate runtime proof.
+
+### iOS Web-home downloads
+
+Web homes use the original WKDownload for explicit download actions and
+main-frame attachment/non-renderable responses. The existing isolated Web-home
+profile still requires iOS 17+. Blob handling is an explicit-download-only
+exception tied to WebKit's HTTPS frame origin; ordinary Blob navigation and
+local/shell/data URLs remain blocked. Legacy app screens keep their old path.
+The navigator retains one activity, bound to the exact WebView/session, through
+native confirmation, byte progress with Cancel, and OS export/Save to Files.
+An untrusted suggested name becomes a bounded basename inside a fresh private
+temporary directory. The page receives no filesystem bridge or cookie export.
+Redirects must stay on eligible HTTPS URLs and TLS uses system validation.
+Non-TLS HTTP authentication challenges are refused; cookie continuity still
+needs actual native proof.
+
+Page commits cancel an unconfirmed request. Session removal/switching,
+WebContent termination and backgrounding stop an unfinished transfer; partial
+files are removed after WebKit confirms cancellation. Once the file is handed
+to the OS activity, closing/switching the session leaves that activity and its
+input file alive until `completionWithItemsHandler` fires. The handler retains
+the download owner after the navigator releases it. Before requesting export,
+the presenter must be attached, idle and not dismissing. Once UIKit receives
+the presentation request, an immediate controller comparison cannot revoke
+that ownership: presentation can finish later or be forwarded in the hierarchy.
+The presentation completion is observation only; it does not release the file.
+If UIKit silently refuses an already-issued request without an activity
+completion, the owner/file remain retained; no timeout unlinks a possibly
+active provider's input. Dismissing a view controller alone is not an export-completion
+signal. OS export retains its
+file until completion/cancellation, including a file-provider handoff. Prompts
+keep a three-second cooldown, restarted by the person's cancellation. Cleanup
+only targets that activity's directory; failures are logged without URLs or
+paths. Process-crash cleanup and background/resumable downloads are not qualified.
+The policy tests and SDK build do not prove cookie/Blob bytes, native modal
+ordering, export completion or cleanup. Those require the
+[iOS runtime fixture](../../../native-tests/README.md#ios-download-runtime-qualification) described separately.
+
 ## Preserved mobile adapter
 
 The remaining sections describe the previous Android/iOS client with
@@ -252,5 +334,6 @@ which skip `shouldOverrideUrlLoading`) are refused before they load.
   reach the shell's deep-link handler, which resolves the URL to a known app.
 - Files picked for `<input type=file>` are passed on only as content URIs from
   other apps' providers, never this app's own files.
-- Camera, microphone and location requests from pages are refused for now
-  (on iOS too).
+- This preserved Android adapter refuses camera, microphone and location requests. iOS 15+ uses
+  the visible-screen media prompt policy described above for both adapters;
+  location remains outside this change.

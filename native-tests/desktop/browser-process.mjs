@@ -10,7 +10,7 @@ const data=process.argv[2], nonce=path.basename(data), proof={passed:false,scope
 const phase=process.env.TAKOSUMI_BROWSER_PROCESS_PHASE??'', suffix=phase?`-${phase}`:'';
 // Reads only this case's synthetic cookie; site cookies are not inspected.
 const cookieOf=key=>`(document.cookie.split('; ').find(c=>c.startsWith(${JSON.stringify(key+'=')}))?.slice(${key.length+1})??null)`;
-assert(['','restart','reset','notify','files'].includes(phase),'Unknown browser fixture phase');
+assert(['','restart','reset','notify','files','recover'].includes(phase),'Unknown browser fixture phase');
 const origin=({excalidraw:'https://excalidraw.com',photopea:'https://www.photopea.com'})[process.env.TAKOSUMI_BROWSER_PROCESS_APP];
 assert(origin,'Only an explicit anonymous app fixture is allowed');
 // The app's own document has rendered (not the initial about:blank of a new window).
@@ -89,7 +89,7 @@ async function normalReceipt(file,message) {
 }
 async function failureClient() {
   const live=[];
-  for(const c of clients) {
+  for(const c of [...clients,...attachments]) {
     if(!c.binding)continue;
     try{if(!(await guardEnded(c.binding.process.guardReceipt)))live.push(c);}
     catch(e){proof.snapshotTargetError=String(e);return undefined;}
@@ -102,8 +102,15 @@ async function failureSnapshot(client) {
   if(!binding||client.snapshotAttempted)return;
   client.snapshotAttempted=true;
   try {
+    const args=[];
+    if(phase==='recover') {
+      const selected=[['open',proof.reopened],['before',proof.before],['initial',proof.opened]]
+        .find(([,state])=>state?.processes.some(p=>p.pid===binding.process.pid&&p.opened.nativePid===binding.process.opened.nativePid));
+      assert(selected,'Recovery snapshot needs the exact recorded generation');
+      args.push('--binding',`app-browser-process-recover-${selected[0]}.json`);
+    }
     proof.processSnapshot=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('./browser_snapshot.py',import.meta.url)),
-      '--data',data,'--profile',binding.process.profile,'--native-start',binding.nativeStart,'--guard-start',binding.guardStart]));
+      '--data',data,'--profile',binding.process.profile,'--native-start',binding.nativeStart,'--guard-start',binding.guardStart,...args]));
   }catch(error){proof.snapshotError=String(error);}
   try {
     const owner=JSON.parse(desktop('python3',['-B',fileURLToPath(new URL('../cef-candidate/x11-owner.py',import.meta.url)),String(binding.process.opened.windowId)]));
@@ -121,18 +128,28 @@ async function attach(process) {
     throw new Error(`No inspection.json: build the browser with --features fixture-inspection (${error.code})`);
   }));
   assert.equal(inspection.pid,native.nativePid);
+  const binding={process,nativeStart:await startTime(native.nativePid),guardStart:await startTime(process.pid)};
   const rows=(await readFile('/proc/net/tcp','utf8')).split('\n').slice(1).map(line=>line.trim().split(/\s+/));
   const row=rows.find(r=>r[1]===`0100007F:${inspection.port.toString(16).toUpperCase().padStart(4,'0')}`&&r[3]==='0A');
   assert(row,'Only a loopback native inspection listener is allowed');
   const fds=await readdir(`/proc/${native.nativePid}/fd`);
   const links=await Promise.all(fds.map(fd=>readlink(`/proc/${native.nativePid}/fd/${fd}`).catch(()=>'')));
   assert(links.includes(`socket:[${row[9]}]`),'Attested native PID must own the endpoint');
+  assert.equal(await startTime(native.nativePid),binding.nativeStart,'Native generation changed while inspecting its listener');
+  assert.equal(await startTime(process.pid),binding.guardStart,'Guard generation changed while inspecting its listener');
+  // Keep the attested generation before the first HTTP/WebSocket operation.
+  // A failed attach has no Client yet, but still needs the existing validated
+  // kernel snapshot. This adds no connection retry or alternate endpoint.
+  const attaching={binding,events:[]};attachments.push(attaching);
+  proof.inspectionEndpoint={pid:native.nativePid,port:inspection.port,nativeStart:binding.nativeStart,guardStart:binding.guardStart};
   const info=await (await fetch(`http://127.0.0.1:${inspection.port}/json/version`,{signal:AbortSignal.timeout(5000)})).json();
   const endpoint=new URL(info.webSocketDebuggerUrl);assert.equal(endpoint.hostname,'127.0.0.1');assert.equal(endpoint.port,String(inspection.port));
   const socket=new WebSocket(endpoint);
+  attaching.socket=socket;
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('CDP handshake timeout')),5000);socket.onopen=()=>{clearTimeout(timer);resolve();};socket.onerror=()=>{clearTimeout(timer);reject(Error('CDP handshake error'));};});
   const c=new Client(socket);clients.push(c);
-  c.binding={process,nativeStart:await startTime(native.nativePid),guardStart:await startTime(process.pid)};
+  c.binding=binding;
+  attachments.splice(attachments.indexOf(attaching),1);
   const targets=(await c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
   assert.equal(targets.length,1,'Exactly one initial document per process');
   const target=targets[0], session=(await c.command('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId;
@@ -144,7 +161,16 @@ async function attach(process) {
   proof.stage={name:'external Page enable',pid:native.nativePid};
   await send('Page.enable');
   try {
-    await settled(()=>evaluate(`location.origin===${JSON.stringify(origin)} && document.readyState==='complete' && ${appContent}`),'Actual anonymous app document did not load');
+    let readiness;
+    await settled(async()=>{
+      readiness=await evaluate(`({sameOrigin:location.origin===${JSON.stringify(origin)},ready:document.readyState,content:${appContent},visibility:document.visibilityState,focused:document.hasFocus()})`);
+      return readiness.sameOrigin&&readiness.ready==='complete'&&readiness.content;
+    },'Actual anonymous app document did not load').catch(error=>{
+      // The later failure screenshot/DOM read may already show a loaded page.
+      // Retain the last completed predicate evaluation without changing its
+      // bound or result; an evaluation error may follow that observation.
+      proof.lastStartupReadiness={pid:native.nativePid,...readiness};throw error;
+    });
     if(origin.includes('photopea') && await evaluate("document.body.innerText.includes('Start using Photopea')")) {
       proof.stage={name:'Photopea landing button',pid:native.nativePid};
       // The site has more than one equivalent CTA. Use the first visible
@@ -229,6 +255,10 @@ async function relaunchFlow(kind) {
   proof.passed=true;
 }
 async function closePersonalAfterRelaunch(personal,kind) {
+  await retirePersonal(personal,kind);
+  await requestWorkExit(kind);
+}
+async function retirePersonal(personal,kind) {
   step(`Personal native close after ${kind}`,personal);
   desktop('xdotool',['windowraise',String(personal.native.windowId)]);
   await settled(()=>personal.evaluate("document.visibilityState==='visible'"),'Raised Personal window did not become visible');
@@ -241,6 +271,9 @@ async function closePersonalAfterRelaunch(personal,kind) {
     assert.equal(receipt.forcedCleanup,0);assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.equal(receipt.error,null);
     proof.personalClosed=receipt;return true;
   },`Personal guard did not finish after ${kind}`);
+  return proof.personalClosed;
+}
+async function requestWorkExit(kind) {
   step(`Work ordinary exit after ${kind}`);
   await writeFile(path.join(data,`${kind}-request-exit`),'ready',{flag:'wx'});
 }
@@ -259,8 +292,67 @@ async function startNotifier() {
   notifier=await startNotificationBackend({binary,data,nonce,env:process.env,desktop:desktopAsync});
   await writeFile(path.join(data,'notify-backend-ready'),'ready',{flag:'wx'});
 }
+// This is deliberately separate from the ordinary close probe. The fixture
+// seeds only its own nonce, then the real home's clear must remove it and the
+// native permission. No permission override or replacement page API is used.
+async function prepareNotificationReset(work,personal) {
+  const key=`sumi_notification_reset_${nonce.replaceAll('-','')}`;
+  const state=page=>page.evaluate(`(async()=>({storage:localStorage.getItem(${JSON.stringify(key)}),cookie:${cookieOf(key)},permission:Notification.permission,query:(await navigator.permissions.query({name:'notifications'})).state}))()`);
+  const reset={passed:false,scope:'Home clear and same saved Personal reopen; real permission revocation and bounded page/window routing; no direct onclick oracle for destroyed Notification objects'};
+  proof.notificationReset=reset;
+  for(const [i,page] of [work,personal].entries()) {
+    const value=`${i}:${nonce}`;
+    await page.evaluate(`(()=>{if(localStorage.getItem(${JSON.stringify(key)})!==null||${cookieOf(key)}!==null)throw Error('Fresh reset fixture key required');localStorage.setItem(${JSON.stringify(key)},${JSON.stringify(value)});document.cookie=${JSON.stringify(key+'='+value+'; Path=/; SameSite=Lax; Secure')};return true})()`);
+    assert.deepEqual(await state(page),{storage:value,cookie:value,permission:'granted',query:'granted'});
+  }
+  reset.workBefore=await state(work);reset.personalBefore=await state(personal);
+  reset.oldPersonal={process:personal.process,nativeStart:personal.c.binding.nativeStart,guardStart:personal.c.binding.guardStart};
+  return async()=>{
+    step('home clears and reopens closed Personal',work);
+    await writeFile(path.join(data,'notify-personal-retired'),'ready',{flag:'wx'});
+    reset.home=await marker('app-browser-process-notify-reopened.json');
+    assert.equal(reset.home.personalDataRemoved,true);
+    assert.equal(reset.home.workRootBefore,reset.home.workRootAfter);
+    const saved=reset.home.connections.find(c=>c.name==='Personal');
+    assert.equal(saved?.profile,personal.process.profile);
+    assert.equal(reset.home.processes.length,2);
+    assert.deepEqual(reset.home.processes.find(p=>p.profile===work.process.profile),work.process,'The original Work process must survive the home clear');
+    const process=reset.home.processes.find(p=>p.profile===saved.profile);assert(process);
+    assert.notEqual(process.guardReceipt,personal.process.guardReceipt,'Reopen must have its own guard receipt');
+    const reopened=await attach(process);
+    reset.newPersonal={process,nativeStart:reopened.c.binding.nativeStart,guardStart:reopened.c.binding.guardStart,target:reopened.target,context:reopened.context};
+    assert.notDeepEqual([process.pid,reopened.c.binding.guardStart],[personal.process.pid,personal.c.binding.guardStart]);
+    assert.notDeepEqual([reopened.native.nativePid,reopened.c.binding.nativeStart],[personal.native.nativePid,personal.c.binding.nativeStart]);
+    reset.personalAfter=await state(reopened);
+    assert.deepEqual(reset.personalAfter,{storage:null,cookie:null,permission:'default',query:'prompt'});
+    assert.deepEqual(await state(work),reset.workBefore,'Personal clear must retain Work permission and fixture data');
+    const witness=key+'_routing';
+    for(const page of [work,reopened])await page.evaluate(`(()=>{if(globalThis[${JSON.stringify(witness)}])throw Error('Fresh routing witness required');const s=globalThis[${JSON.stringify(witness)}]={focus:0,pageshow:0,visibility:0};window.addEventListener('focus',()=>s.focus++);window.addEventListener('pageshow',()=>s.pageshow++);document.addEventListener('visibilitychange',()=>s.visibility++);return true})()`);
+    const routeState=async page=>({state:await state(page),page:await page.evaluate(`({href:location.href,origin:location.origin,top:window===top,focused:document.hasFocus(),visibility:document.visibilityState,events:globalThis[${JSON.stringify(witness)}]})`),
+      targets:(await page.c.command('Target.getTargets')).targetInfos.filter(t=>t.type==='page').map(t=>({id:t.targetId,url:t.url,context:t.browserContextId??null,opener:t.openerId??null})).sort((a,b)=>a.id.localeCompare(b.id))});
+    reset.routingBefore=await Promise.all([work,reopened].map(routeState));
+    const live=async()=>{
+      for(const page of [work,reopened]) {
+        assert.equal(await startTime(page.native.nativePid),page.c.binding.nativeStart,'Native browser generation must stay live');
+        const guard=await guardState(page.process.pid);
+        assert(guard&&guard.start===page.c.binding.guardStart&&!['Z','X'].includes(guard.state),'Guard generation must stay live');
+        assert(!(await guardEnded(page.process.guardReceipt)));
+      }
+    };
+    await live();
+    step('old Personal alert with reopened Personal alive',reopened);
+    return {proof:reset,observe:async()=>{
+      await live();
+      reset.routingAfter=await Promise.all([work,reopened].map(routeState));
+      assert.deepEqual(reset.routingAfter,reset.routingBefore,'Old Personal alert must not reroute to Work or reopened Personal');
+    },finish:async()=>{
+      reset.newPersonalClose=await retirePersonal(reopened,'notify-reset');
+      reset.passed=true;
+    }};
+  };
+}
 async function notifyProbes(pages) {
-  const [,personal]=pages;
+  const [work,personal]=pages;
   await writeFile(path.join(data,'notify-inspected'),'ready',{flag:'wx'});
   const {probeNotifications}=await import('../cef-candidate/notifications.mjs');
   const {inspectPermissions}=await import('../cef-candidate/permissions.mjs');
@@ -273,10 +365,24 @@ async function notifyProbes(pages) {
       command:()=>{throw Error('Unscoped browser command is forbidden across processes');},
       notificationProbe:({pages,windows})=>probeNotifications({pages,windows,data,nonce,desktop:desktopAsync,backend})});
     assert(proof.permissions.permissionPassed&&proof.permissions.nativeNotifications.passed,'Native permission and notification probes must pass');
+    const {probePendingNotificationClose}=await import('./notification-close.mjs');
+    const workGuard=await guardState(work.process.pid);
+    assert(workGuard&&!['Z','X'].includes(workGuard.state),'Work guard must be live before Personal retirement');
+    const afterPersonalClose=process.env.TAKOSUMI_BROWSER_PROCESS_NOTIFICATION_RESET==='1'?await prepareNotificationReset(work,personal):null;
+    step('pending Personal notification across native close',personal);
+    proof.pendingNotificationClose=await probePendingNotificationClose({pages:probePages,data,nonce,desktop:desktopAsync,backend,
+      retirePersonal:()=>retirePersonal(personal,'notify'),afterPersonalClose,
+      workLive:async()=>{
+        const current=await guardState(work.process.pid);
+        assert(current&&current.start===workGuard.start&&!['Z','X'].includes(current.state),'The same Work guard must remain live');
+        assert(!(await guardEnded(work.process.guardReceipt)),'Work must not exit during pending notification inspection');
+        return current;
+      }});
+    assert(proof.pendingNotificationClose.passed,'Pending Personal notification retirement must pass');
   } finally {
     await backend.stop();
   }
-  await closePersonalAfterRelaunch(personal,'notify');
+  await requestWorkExit('notify');
   proof.passed=true;
 }
 // files (runner --files, Excalidraw only): the actual OS file chooser through
@@ -558,6 +664,86 @@ async function openExternalProbe(work,personal,expected,sample) {
   assert.deepEqual(await Promise.all([work,personal].map(sample)),expected,'Both documents must be unchanged');
   state.passed=true;return state;
 }
+async function recoverFlow() {
+  const initial=await marker('app-browser-process-recover-initial.json');proof.opened=initial;
+  const named=(state,name)=>{
+    const connection=state.connections.find(c=>c.name===name);assert(connection);
+    const record=state.processes.find(p=>p.profile===connection.profile);assert(record);return record;
+  };
+  const work=await attach(named(initial,'Work')),personal=await attach(named(initial,'Personal'));
+  const key=`sumi_recovery_${nonce}`,quoted=JSON.stringify(key);
+  const sample=page=>page.evaluate(`({document:globalThis[${quoted}]??null,storage:localStorage.getItem(${quoted}),cookie:${cookieOf(key)}})`);
+  for(const [index,page] of [work,personal].entries()) {
+    assert.deepEqual(await sample(page),{document:null,storage:null,cookie:null});
+    await page.evaluate(`(()=>{globalThis[${quoted}]=${JSON.stringify(`${index}:${nonce}`)};localStorage.setItem(${quoted},globalThis[${quoted}]);document.cookie=${JSON.stringify(`${key}=${index}:${nonce}; Max-Age=86400; Path=/; Secure; SameSite=Lax`)};return true})()`);
+  }
+  const expected=await Promise.all([work,personal].map(sample));proof.initial=expected;
+  assert.deepEqual(expected.map(p=>p.cookie),[`0:${nonce}`,`1:${nonce}`]);
+  step('save Work normally before inducing a crash',work);
+  desktop('xdotool',['windowraise',String(work.native.windowId)]);
+  desktop('xdotool',['windowfocus','--sync',String(work.native.windowId)]);
+  desktop('xdotool',['key','--clearmodifiers','ctrl+shift+w']);
+  proof.seedClosed=await normalReceipt(work.process.guardReceipt,'Work must save normally before the crash generation');
+  await writeFile(path.join(data,'recover-seeded'),'ready',{flag:'wx'});
+  const before=await marker('app-browser-process-recover-before.json');proof.before=before;
+  const crashed=await attach(named(before,'Work'));
+  const saved={...expected[0],document:null};
+  assert.deepEqual(await sample(crashed),saved,'Crash input must already be durable across normal reopen');
+  assert.deepEqual(await sample(personal),expected[1],'Personal must keep its exact live document');
+  const binding=crashed.c.binding;
+  const cacheRoot=path.join(crashed.process.directory,'cef-profiles');
+  const cacheIdentity=async()=>{
+    const root=await lstat(cacheRoot,{bigint:true}),cache=await lstat(path.join(cacheRoot,crashed.process.profile),{bigint:true});
+    assert(root.isDirectory()&&cache.isDirectory());
+    return {root:{device:String(root.dev),inode:String(root.ino)},cache:{device:String(cache.dev),inode:String(cache.ino)}};
+  };
+  proof.cacheBefore=await cacheIdentity();
+  step('terminate only the attested fixture-owned native browser',crashed);
+  // pidfd binds the signal to this generation. Check its start and direct
+  // guard parent after opening the handle; never signal the guard or scan.
+  proof.crashSignal=JSON.parse(desktop('python3',['-B','-c',
+    "import json,os,pathlib,signal,sys\npid,start,guard,gstart=sys.argv[1:]\nfd=os.pidfd_open(int(pid))\ntry:\n p=pathlib.Path('/proc/'+pid+'/stat').read_text().rsplit(') ',1)[1].split()\n g=pathlib.Path('/proc/'+guard+'/stat').read_text().rsplit(') ',1)[1].split()\n assert p[19]==start and p[1]==guard and p[0] not in ('Z','X')\n assert g[19]==gstart and g[0] not in ('Z','X')\n signal.pidfd_send_signal(fd,signal.SIGKILL)\n print(json.dumps({'nativePid':int(pid),'nativeStart':start,'guardPid':int(guard),'guardStart':gstart,'signal':'SIGKILL','pidfd':True}))\nfinally:\n os.close(fd)",
+    String(crashed.native.nativePid),binding.nativeStart,String(crashed.process.pid),binding.guardStart]));
+  await settled(()=>guardEnded(crashed.process.guardReceipt),'Crash guard must finish its exact descendants');
+  const receipt=JSON.parse(await readFile(crashed.process.guardReceipt,'utf8'));proof.crashReceipt=receipt;
+  assert.equal(receipt.rootExit,-9);assert.equal(receipt.complete,true);assert.equal(receipt.kernelNoChildren,true);
+  assert.deepEqual(receipt.remaining,[]);assert.deepEqual(receipt.cleanupErrors,[]);assert.deepEqual(receipt.nonFatalErrors,[]);assert.equal(receipt.error,null);
+  assert(Number.isSafeInteger(receipt.forcedCleanup)&&receipt.forcedCleanup>=0);
+  await settled(async()=>{const state=await guardState(crashed.process.pid);return !state||(state.start===binding.guardStart&&state.state==='Z');},'Original guard must be terminal before recovery');
+  await writeFile(path.join(data,'recover-crashed'),'ready',{flag:'wx'});
+  const offered=await marker('app-browser-process-recover-offered.json');
+  assert.deepEqual(offered,before.processes,'The first home open must not automatically recover');
+  assert.deepEqual(await sample(personal),expected[1]);
+  proof.explicitConsentRequired=true;
+  await writeFile(path.join(data,'recover-consent'),'ready',{flag:'wx'});
+  const reopened=await marker('app-browser-process-recover-open.json');proof.reopened=reopened;
+  assert.equal(reopened.explicitRecovery,true);
+  assert.deepEqual(reopened.connections,before.connections);
+  const fresh=named(reopened,'Work'),other=named(reopened,'Personal');
+  assert.deepEqual(other,named(before,'Personal'),'Personal native ownership must not change');
+  assert.equal(fresh.profile,crashed.process.profile);assert.equal(fresh.directory,crashed.process.directory);
+  assert.notEqual(fresh.pid,crashed.process.pid);assert.notEqual(fresh.opened.nativePid,crashed.native.nativePid);
+  const recovered=await attach(fresh);
+  assert.deepEqual(await sample(recovered),saved,'Explicit recovery must retain the already saved cookie/storage');
+  proof.cacheAfter=await cacheIdentity();
+  assert.deepEqual(proof.cacheAfter,proof.cacheBefore,'Recovery must reuse the same cache directories');
+  assert.deepEqual(await sample(personal),expected[1],'Other profile must keep its exact document and data');
+  assert.equal(await startTime(personal.native.nativePid),personal.c.binding.nativeStart);
+  assert.equal(await startTime(personal.process.pid),personal.c.binding.guardStart);
+  const incidents=path.join(fresh.directory,'recoveries'),entries=await readdir(incidents);
+  assert.equal(entries.length,1,'One durable recovery incident for this generation');
+  const incidentFile=path.join(incidents,entries[0]),info=await lstat(incidentFile);
+  assert(info.isFile()&&!info.isSymbolicLink());assert.equal(info.mode&0o777,0o600);
+  const incident=JSON.parse(await readFile(incidentFile,'utf8'));proof.incident=incident;
+  assert.equal(incident.schema,1);assert.equal(incident.profile,fresh.profile);
+  assert.equal(incident.guardPid,crashed.process.pid);assert.equal(incident.nativePid,crashed.native.nativePid);
+  assert.deepEqual(incident.receipt,receipt,'Original abnormal receipt must remain abnormal and unchanged');
+  proof.persisted=await Promise.all([recovered,personal].map(sample));
+  proof.bindings=[crashed,recovered,personal].map(page=>page.c.binding);
+  await writeFile(path.join(data,'recover-inspected'),'ready',{flag:'wx'});
+  proof.passed=true;
+}
+
 async function firstLaunch() {
   const opened=await marker('app-browser-process-open.json');proof.opened=opened;
   // A guard forked on a retiring blocking-pool thread ended ~10 s after the
@@ -697,6 +883,36 @@ async function firstLaunch() {
   proof.partial=await marker('app-browser-process-partial.json');
   assert.deepEqual(proof.partial.map(process=>process.profile),[personal.process.profile],'Only Personal remains after Work closed and Personal cancelled');
   await personal.evaluate("(()=>{removeEventListener('beforeunload',window.__sumiBeforeUnload);delete window.__sumiBeforeUnload;return true})()");
+  // The opted-in browser holds Personal's permission prompt for the App's
+  // own answer: the driver clicks the home's allow row, and the page's
+  // resolved grant is the round-trip evidence, never auto-answered here.
+  step('Notification permission answered through the App',personal);
+  const permissionRequested=await personal.evaluate('(()=>{const g=globalThis.__sumiPermissionProbe={result:null,error:null};g.promise=Notification.requestPermission().then(r=>g.result=r,e=>g.error=String(e));return {permission:Notification.permission}})()',true);
+  assert.equal(permissionRequested.permission,'default','A held prompt needs an undecided permission: '+JSON.stringify(permissionRequested));
+  await writeFile(path.join(data,'permission-requested'),'ready',{flag:'wx'});
+  {
+    const end=Date.now()+30000;
+    let answered;
+    while(Date.now()<end){
+      answered=await personal.evaluate('(()=>({permission:Notification.permission,result:globalThis.__sumiPermissionProbe.result,error:globalThis.__sumiPermissionProbe.error}))()');
+      if(answered.result||answered.error)break;
+      await delay(200);
+    }
+    proof.permissionAnswered=answered;
+    assert.equal(answered?.result,'granted',"The App's answer did not reach the held callback: "+JSON.stringify(answered));
+  }
+  // The same opted-in browser also holds media requests the runtime cannot
+  // dismiss itself: the App's row must appear, then die with the document —
+  // retirement is proven by the row's disappearance, not the promise.
+  step('Media permission held for the App then retired with its document',personal);
+  const mediaRequested=await personal.evaluate('(()=>{const g=globalThis.__sumiMediaProbe={stream:null,error:null,settled:false};g.promise=navigator.mediaDevices.getUserMedia({audio:true}).then(s=>{g.stream=s;g.settled=true;return s},e=>{g.error=String(e);g.settled=true});return {devices:typeof navigator.mediaDevices!=="undefined",secure:isSecureContext}})()',true);
+  assert.equal(mediaRequested?.devices,true,'A held media request needs navigator.mediaDevices: '+JSON.stringify(mediaRequested));
+  await writeFile(path.join(data,'media-requested'),'ready',{flag:'wx'});
+  // The App driver confirms the held media row before the document dies.
+  const heldSeen=await marker('media-held-seen.json');
+  await personal.evaluate("(()=>{location.reload();return true})()");
+  await writeFile(path.join(data,'media-navigated'),'ready',{flag:'wx'});
+  proof.mediaRetired={requested:true,secure:mediaRequested.secure,heldLabel:heldSeen.label};
   step('Personal popup open at the final quit',personal);
   proof.finalPopup=await openPopupForQuit(personal);
   step('Personal final exit',personal);
@@ -704,17 +920,19 @@ async function firstLaunch() {
   proof.passed=true;
 }
 const clients=[];
+const attachments=[];
 try {
-  if(phase)await relaunchFlow(phase);
+  if(phase==='recover')await recoverFlow();
+  else if(phase)await relaunchFlow(phase);
   else await firstLaunch();
 }catch(error){
   proof.error=String(error);
-  if(!proof.processSnapshot&&clients.length) {
+  if(!proof.processSnapshot&&(clients.length||attachments.length)) {
     const target=await failureClient();
     if(target)await failureSnapshot(target);
     else {
       // No live process to inspect, e.g. the stage page crashed: still keep its in-memory events.
-      const stage=clients.find(c=>c.binding?.process.opened.nativePid===proof.stage?.pid);
+      const stage=[...clients,...attachments].find(c=>c.binding?.process.opened.nativePid===proof.stage?.pid);
       if(stage)proof.failureEvents=diagnosticEvents(stage.events);
     }
   }
@@ -722,6 +940,7 @@ try {
 }
 finally {
   for(const c of clients)c.socket.close();
+  for(const c of attachments)c.socket?.close();
   if(notifier&&!notifier.proof.stopped)await notifier.stop().catch(e=>{proof.notifierStopError=String(e);});
   await writeFile(path.join(data,`browser-observation${suffix}.json`),JSON.stringify(proof,null,2)+'\n');
 }
