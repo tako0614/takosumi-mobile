@@ -44,6 +44,10 @@ public final class WebHomeOperationTest {
     private int connectionAttempts;
     private BackWaitObservation backHomeObservation;
     private boolean backObservationIncomplete;
+    // INITIAL_SAVE_OBSERVATION_FIELDS_BEGIN
+    private InitialSaveObservation initialSaveObservation;
+    private boolean initialSaveObservationIncomplete;
+    // INITIAL_SAVE_OBSERVATION_FIELDS_END
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
@@ -61,7 +65,11 @@ public final class WebHomeOperationTest {
         result.put("passed", false).put("cases", cases);
         device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
         launch();
-        one(By.text("保存して開く"));
+        // INITIAL_SAVE_OBSERVATION_WAIT_BEGIN
+        beginInitialSaveObservation();
+        try { one(By.text("保存して開く")); }
+        finally { if (initialSaveObservation != null) initialSaveObservation.waiting = false; }
+        // INITIAL_SAVE_OBSERVATION_WAIT_END
     }
 
     private UiObject2 one(BySelector selector) {
@@ -283,6 +291,7 @@ public final class WebHomeOperationTest {
     }
 
     private void observeHomeQuery(BackWaitObservation.Outcome outcome) {
+        observeInitialSaveQuery(outcome); // initial-save-observation:existing-outcome
         if (backHomeObservation == null || !backHomeObservation.waiting) return;
         try { backHomeObservation.sample(outcome, SystemClock.elapsedRealtime()); }
         catch (RuntimeException ignored) { backObservationIncomplete = true; }
@@ -292,6 +301,41 @@ public final class WebHomeOperationTest {
         try { diagnostic(result, key, SystemClock.elapsedRealtime()); }
         catch (RuntimeException ignored) { backObservationIncomplete = true; }
     }
+
+    // INITIAL_SAVE_OBSERVATION_METHODS_BEGIN
+    private void beginInitialSaveObservation() {
+        try {
+            initialSaveObservation = new InitialSaveObservation();
+            initialSaveObservation.waiting = true;
+        } catch (RuntimeException ignored) { initialSaveObservationIncomplete = true; }
+    }
+
+    private void observeInitialSaveQuery(BackWaitObservation.Outcome outcome) {
+        InitialSaveObservation value = initialSaveObservation;
+        if (value == null || !value.waiting) return;
+        if (!InitialSaveObservation.safely(() -> value.sample(outcome))) initialSaveObservationIncomplete = true;
+    }
+
+    private void saveInitialSaveObservation() {
+        try {
+            InitialSaveObservation value = initialSaveObservation;
+            if (value == null) {
+                diagnostic(result, "initialSaveObservationIncomplete", true);
+                return;
+            }
+            JSONObject metadata = new JSONObject();
+            if (value.writeTo((key, item) -> metadata.put(key, item), initialSaveObservationIncomplete)) {
+                diagnostic(result, "initialSaveWait", metadata);
+            } else {
+                initialSaveObservationIncomplete = true;
+                diagnostic(result, "initialSaveObservationIncomplete", true);
+            }
+        } catch (RuntimeException ignored) {
+            initialSaveObservationIncomplete = true;
+            diagnostic(result, "initialSaveObservationIncomplete", true);
+        }
+    }
+    // INITIAL_SAVE_OBSERVATION_METHODS_END
 
     private void saveBackObservation() {
         try {
@@ -507,6 +551,7 @@ public final class WebHomeOperationTest {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
         saveBackObservation();
+        saveInitialSaveObservation(); // initial-save-observation:result-delivery
         result.put("diagnosticsSaved", saved);
         try (FileOutputStream stream = new FileOutputStream(new File(files, "result.json"))) {
             stream.write(result.toString().getBytes(StandardCharsets.UTF_8));

@@ -138,6 +138,26 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: back wait metadata checks=[1-9][0-9]*")
 
+    # initial-save-observation-control-begin
+    def test_initial_save_outcomes_are_bounded_clock_free_and_failure_neutral(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the initial Save outcome control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the initial Save outcome control")
+        classes = self.root / "initial-save-outcome-classes"
+        classes.mkdir()
+        sources = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome"
+        back = sources / "BackWaitObservation.java"
+        helper = sources / "InitialSaveObservation.java"
+        control = runner.HERE / "label-controls/InitialSaveObservationTest.java"
+        built = subprocess.run([compiler, "-J-Xmx128m", "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(back), str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-Xmx64m", "-cp", str(classes), "com.takosumi.fixture.webhome.InitialSaveObservationTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: initial save outcome metadata checks=[1-9][0-9]*")
+    # initial-save-observation-control-end
+
     def test_app_screen_observation_helper_is_debug_only_bounded_and_failure_neutral(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the native observation helper control")
