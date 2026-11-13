@@ -229,6 +229,9 @@ class AppScreenActivity : AppCompatActivity() {
     override fun onStop() {
         visible = false
         mediaConsent.cancel()
+        entry?.takeIf { it.host === this && !it.destroyed }?.let {
+            AppScreenProfileData.persistCookies(applicationContext, it.cookies)
+        }
         super.onStop()
     }
 

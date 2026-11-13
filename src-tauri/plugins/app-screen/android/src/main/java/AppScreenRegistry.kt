@@ -38,6 +38,7 @@ internal object AppScreenRegistry {
         val context: MutableContextWrapper,
         val popup: Boolean,
         val profile: String,
+        val cookies: AppScreenCookiePersistence.Owner,
     ) {
         /** URL the screen was opened with; reopening with it keeps the state. */
         var launchUrl: String = ""
@@ -79,7 +80,8 @@ internal object AppScreenRegistry {
             return it
         }
         val wrapper = MutableContextWrapper(context.applicationContext)
-        val entry = Entry(key, createWebView(wrapper, profile), wrapper, popup, profile)
+        val (webView, cookies) = createWebView(wrapper, profile)
+        val entry = Entry(key, webView, wrapper, popup, profile, cookies)
         // A webview without a client hands navigations to other apps; keep the
         // policy from the first navigation (a popup loads before its activity).
         entry.webView.webViewClient = entry.detachedClient
@@ -153,6 +155,9 @@ internal object AppScreenRegistry {
 
     private fun destroy(entry: Entry, crashed: Boolean) {
         if (entry.destroyed) return
+        // Capture/selection happened at creation. Never ask a crashed or
+        // destroyed WebView for its profile from the I/O worker.
+        if (!crashed) AppScreenProfileData.persistCookies(entry.context.applicationContext, entry.cookies)
         entry.destroyed = true
         val webView = entry.webView
         (webView.parent as? ViewGroup)?.removeView(webView)
@@ -166,7 +171,7 @@ internal object AppScreenRegistry {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(context: MutableContextWrapper, profile: String): WebView {
+    private fun createWebView(context: MutableContextWrapper, profile: String): Pair<WebView, AppScreenCookiePersistence.Owner> {
         val webView = WebView(context)
         try {
             AppScreenProfiles.select(webView, profile)
@@ -194,6 +199,12 @@ internal object AppScreenRegistry {
             else WebViewCompat.getProfile(webView).cookieManager
         cookies.setAcceptCookie(true)
         cookies.setAcceptThirdPartyCookies(webView, false)
-        return webView
+        val owner = try {
+            AppScreenProfileData.cookieOwner(context.applicationContext, profile, cookies)
+        } catch (error: Exception) {
+            webView.destroy()
+            throw error
+        }
+        return webView to owner
     }
 }
