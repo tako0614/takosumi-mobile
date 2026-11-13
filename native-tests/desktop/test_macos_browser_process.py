@@ -346,6 +346,109 @@ os.open(sys.argv[3],os.O_RDONLY)
             process.wait.assert_not_called()
             reply.assert_not_called()
 
+        # retirement-settle-controls-begin (same owning method; no real helper)
+        for mode in ("eperm-then-missing", "permanent-eperm", "present", "wait-timeout",
+                     "late-missing", "other-error", "eperm-other", "clamp", "body-error"):
+            with self.subTest(settle=mode):
+                clock = [100.0]
+                probes, sleeps = [], []
+                process = mock.Mock(pid=246813579, returncode=-9, _diagnostic_nonblocking=True)
+                original = runner.Failure("original private body failure")
+
+                def wait(*, timeout):
+                    self.assertGreaterEqual(timeout, 0)
+                    self.assertLessEqual(timeout, sampler.RETIRE_BUDGET)
+                    if mode == "wait-timeout":
+                        clock[0] = 102.0
+                        raise subprocess.TimeoutExpired("private wait", timeout)
+                    if mode == "clamp":
+                        clock[0] = 101.995
+                    return -9
+
+                def send(group, signum):
+                    self.assertEqual(group, process.pid)
+                    if signum == signal.SIGKILL:
+                        return
+                    self.assertEqual(signum, 0, "A reaped leader cannot anchor another kill")
+                    probes.append(signum)
+                    if mode in ("permanent-eperm", "body-error") or (
+                            mode in ("eperm-then-missing", "eperm-other") and len(probes) == 1):
+                        raise PermissionError(errno.EPERM, "private probe detail")
+                    if mode in ("other-error", "eperm-other"):
+                        raise OSError(errno.EIO, "private unexpected probe detail")
+                    if mode == "late-missing":
+                        clock[0] = 102.001
+                    if mode in ("eperm-then-missing", "late-missing"):
+                        raise ProcessLookupError(errno.ESRCH, "private absent detail")
+
+                def sleep(seconds):
+                    self.assertGreater(seconds, 0)
+                    self.assertLessEqual(seconds, 0.01)
+                    self.assertLessEqual(seconds, max(0, 102.0 - clock[0]) + 1e-9)
+                    sleeps.append(seconds)
+                    clock[0] += seconds
+
+                process.wait.side_effect = wait
+                with mock.patch.object(sampler, "_active_diagnostic", process), \
+                        mock.patch.object(sampler.time, "monotonic", side_effect=lambda: clock[0]), \
+                        mock.patch.object(sampler.time, "sleep", side_effect=sleep), \
+                        mock.patch.object(sampler.os, "killpg", side_effect=send) as sent, \
+                        mock.patch.object(sampler, "_read_reply", return_value=[]):
+                    if mode == "body-error":
+                        observer = self.failed_observer(sample_shutdowns=True)
+                        page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})
+                        with mock.patch.object(sampler, "_launch", return_value=process), \
+                                self.assertRaises(runner.Failure) as caught:
+                            with sampler.watch_shutdowns(observer, [page]):
+                                raise original
+                        self.assertIs(caught.exception, original)
+                        self.assertIn("did not retire", original.__notes__[0])
+                        self.assertIs(observer._shutdown_diagnostic, process)
+                        receipt = observer.proof["shutdownDiagnosticRetirements"][0]
+                    else:
+                        _, receipt = sampler._retire(process)
+                    complete = mode == "eperm-then-missing"
+                    self.assertEqual(receipt["cleanupComplete"], complete)
+                    self.assertEqual(receipt["groupGone"], complete)
+                    self.assertEqual(receipt["leaderReaped"], mode != "wait-timeout")
+                    self.assertIs(sampler._active_diagnostic, None if complete else process)
+                    process.wait.assert_called_once()
+                    process.stdout.close.assert_called_once()
+                    self.assertEqual(sent.call_args_list[0], mock.call(process.pid, signal.SIGKILL))
+                    self.assertTrue(all(call == mock.call(process.pid, 0) for call in sent.call_args_list[1:]))
+                    if not complete:
+                        with mock.patch.object(sampler.subprocess, "Popen") as launch, \
+                                self.assertRaisesRegex(RuntimeError, "has not retired"):
+                            sampler._launch_command(["not executed"])
+                        launch.assert_not_called()
+                self.assertLessEqual(len(receipt["operationErrors"]), 3)
+                self.assertNotIn("private", json.dumps(receipt))
+                if mode in ("permanent-eperm", "present", "clamp", "body-error"):
+                    self.assertGreaterEqual(clock[0], 102.0)
+                if mode == "eperm-then-missing":
+                    self.assertEqual(len(probes), 2)
+                    self.assertEqual(receipt["operationErrors"][0]["errno"], errno.EPERM)
+                    self.assertEqual(receipt["errorType"], "PermissionError")
+                if mode in ("permanent-eperm", "body-error"):
+                    self.assertGreater(len(probes), 1)
+                    self.assertEqual(len(receipt["operationErrors"]), 1, "Repeated EPERM has fixed-size metadata")
+                if mode == "eperm-other":
+                    self.assertEqual([entry["errno"] for entry in receipt["operationErrors"]], [errno.EPERM, errno.EIO])
+                if mode == "wait-timeout":
+                    self.assertEqual(probes, [], "An unreaped leader must not enter post-reap probing")
+                if mode == "clamp":
+                    self.assertEqual(len(sleeps), 1)
+                    self.assertAlmostEqual(sleeps[0], 0.005)
+
+        held, foreign = mock.Mock(), mock.Mock()
+        with mock.patch.object(sampler, "_active_diagnostic", held), \
+                mock.patch.object(sampler.os, "killpg") as sent, \
+                self.assertRaisesRegex(ValueError, "currently owned"):
+            sampler._retire(foreign)
+        sent.assert_not_called()
+        foreign.wait.assert_not_called()
+        # retirement-settle-controls-end
+
     def test_nonblocking_setup_failure_never_reads_its_blocking_pipe_or_allows_normal_success(self):
         observer = self.failed_observer(sample_shutdowns=True)
         page = SimpleNamespace(native={"nativePid": 12}, process={"pid": 11, "directory": str(self.root)})

@@ -181,6 +181,28 @@ fn child_pidfd(pid: i32) -> io::Result<OwnedFd> {
     pidfd_open(pid)
 }
 
+// TERMINAL_SIGNAL_ELIGIBILITY_BEGIN
+/// Only a known terminal notification permits skipping a nonzero signal.
+/// These descriptors come from pidfd_open(flags=0), so readiness covers the
+/// whole thread group. Errors, invalid fds and unknown events stay eligible.
+fn pidfd_terminal_ready(polled: libc::c_int, events: libc::c_short) -> bool {
+    polled == 1
+        && events & libc::POLLIN != 0
+        && events & !(libc::POLLIN | libc::POLLRDNORM | libc::POLLHUP) == 0
+}
+
+fn pidfd_is_terminal(fd: &OwnedFd) -> bool {
+    let mut entry = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, a nonblocking timeout, and no ownership change.
+    let polled = unsafe { libc::poll(&mut entry, 1, 0) };
+    pidfd_terminal_ready(polled, entry.revents)
+}
+// TERMINAL_SIGNAL_ELIGIBILITY_END
+
 fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: a live owned pidfd, a null siginfo and no flags.
     let result = unsafe {
@@ -766,6 +788,9 @@ impl Run {
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
         for (pid, (start_tick, fd)) in &self.tracker.handles {
+            if signal != 0 && pidfd_is_terminal(fd) {
+                continue;
+            }
             let sent = pidfd_signal(fd, signal);
             self.stop_observation.signal(
                 *pid,
@@ -789,6 +814,9 @@ impl Run {
         if let (Some(pid), None) = (self.child, self.root_exit) {
             if self.child_fd.is_none() {
                 self.child_fd = child_pidfd(pid).ok(); // Retry a failed open.
+            }
+            if signal != 0 && self.child_fd.as_ref().is_some_and(pidfd_is_terminal) {
+                return;
             }
             let sent = match &self.child_fd {
                 Some(fd) => pidfd_signal(fd, signal),

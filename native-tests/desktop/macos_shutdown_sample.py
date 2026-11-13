@@ -5,6 +5,7 @@ receipt verdict and is not an unsampled qualification run. No process-name
 search, signals, heap dump, environment or page data is requested.
 """
 from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
@@ -271,7 +272,7 @@ def _retire(process):
     began = time.monotonic()
     end = began + RETIRE_BUDGET
     error = None
-    operation_errors = []  # At most one failure per existing operation; no exception text.
+    operation_errors = []  # At most three failures: kill/wait, first probe EPERM, terminal probe error.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError as failure:
@@ -292,18 +293,25 @@ def _retire(process):
         operation_errors.append({"operation": "leader-wait", "errorType": error, "errno": None,
                                  "atSeconds": round(time.monotonic() - began, 6)})
     gone = False
+    probe_eperm_recorded = False
     while reaped and time.monotonic() < end:
         try:
             os.killpg(process.pid, 0)
         except ProcessLookupError:
-            gone = True
+            gone = time.monotonic() <= end
             break
         except OSError as failure:
             error = type(failure).__name__
-            operation_errors.append({"operation": "group-probe", "errorType": error, "errno": failure.errno,
-                                     "atSeconds": round(time.monotonic() - began, 6)})
+            if failure.errno != errno.EPERM or not probe_eperm_recorded:
+                operation_errors.append({"operation": "group-probe", "errorType": error, "errno": failure.errno,
+                                         "atSeconds": round(time.monotonic() - began, 6)})
+            if failure.errno != errno.EPERM:
+                break
+            probe_eperm_recorded = True  # Unknown, never absence; retain the first failure only.
+        remaining = end - time.monotonic()
+        if remaining <= 0:
             break
-        time.sleep(0.01)
+        time.sleep(min(0.01, remaining))
     records = _read_reply(process)
     process.stdout.close()
     if reaped and gone:

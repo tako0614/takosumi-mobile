@@ -348,6 +348,72 @@ class Controls(unittest.TestCase):
         self.assertNotIn("finished", capped)
         self.assertNotIn("passed", capped)
 
+    def test_content_termination_witness_is_owner_bound_and_context_free(self):
+        header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+        def packet(event="content_terminated", target="unknown", seq=7, view=2, request=0,
+                   relation=0, same_view=1, flags="reused=0 kept=0 resume=0 initial=0"):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq={seq} event={event} view={view} "
+                             f"request={request} relation={relation} target={target} {flags} "
+                             f"sameView={same_view} timeMs=234\n").encode()
+        value = runner.navigation_witness(packet())
+        self.assertEqual(len(value["records"]), 1)
+        record = value["records"][0]
+        self.assertEqual((record["event"], record["target"], record["view"], record["request"], record["relation"]),
+                         ("content_terminated", "unknown", 2, 0, 0))
+        self.assertTrue(record["sameView"])
+        self.assertFalse(any(record[key] for key in ("reused", "kept", "resume", "initial")))
+        self.assertTrue(value["diagnosticOnly"] and value["absenceIsUnknown"])
+        for key in ("passed", "finished", "liveness", "ready", "terminated"):
+            self.assertNotIn(key, value)
+        for index, changes in enumerate(({"request": 1}, {"relation": 1}, {"relation": 2}, {"view": 0},
+                        {"view": 65536}, {"same_view": 0}, {"seq": 513},
+                        *({"flags": " ".join(f"{key}={int(key == chosen)}" for key in
+                                             ("reused", "kept", "resume", "initial"))}
+                          for chosen in ("reused", "kept", "resume", "initial")),
+                        *({"target": target} for target in ("instance", "editor", "other", "editor_page_two",
+                                                            "unknown_extra", "https://private.invalid/?sensitive=fixture")))):
+            with self.subTest(case=index):
+                rejected = runner.navigation_witness(packet(**changes))
+                self.assertEqual(rejected["records"], [])
+                self.assertEqual(rejected["malformed"], 1)
+                self.assertNotIn("sensitive", json.dumps(rejected))
+        for index, frame in enumerate((packet().split(header, 1)[1],
+                                      packet().replace(b".simulator.navigation:navigation", b".WebKit:Network"))):
+            with self.subTest(header=index):
+                rejected = runner.navigation_witness(frame)
+                self.assertEqual(rejected["records"], [])
+                self.assertEqual(rejected["malformed"], 1)
+        policy = packet(event="policy_allow", target="editor_page_two")
+        unknown = packet(event="commit")
+        matched = packet(event="commit", target="editor", request=9, relation=1,
+                         flags="reused=1 kept=0 resume=1 initial=1")
+        result = runner.navigation_witness(packet() + policy + unknown + matched)
+        self.assertEqual([r["event"] for r in result["records"]],
+                         ["content_terminated", "policy_allow", "commit", "commit"])
+        self.assertEqual((result["records"][1]["target"], result["records"][1]["request"], result["records"][1]["relation"]),
+                         ("editor_page_two", 0, 0))
+        self.assertEqual((result["records"][2]["target"], result["records"][2]["request"]), ("unknown", 0))
+        self.assertFalse(any(result["records"][2][key] for key in ("reused", "kept", "resume", "initial")))
+        self.assertEqual((result["records"][3]["target"], result["records"][3]["request"]), ("editor", 9))
+        self.assertTrue(result["records"][3]["reused"] and result["records"][3]["resume"] and result["records"][3]["initial"])
+        for relation in (0, 2):
+            rejected = runner.navigation_witness(packet() + packet(event="commit", target="editor", request=9,
+                                                                  relation=relation))
+            self.assertEqual([r["event"] for r in rejected["records"]], ["content_terminated"])
+            self.assertEqual(rejected["malformed"], 1)
+        other = runner.navigation_witness(packet() + packet().replace(b"Takosumi[42:ab]", b"Takosumi[43:cd]"))
+        self.assertEqual([r["pid"] for r in other["records"]], [42, 43], "Opaque view numbers do not join processes")
+        cap = packet(event="cap", seq=513, view=0, same_view=0)
+        capped = runner.navigation_witness(packet(seq=512) + cap)
+        self.assertEqual(capped["capStatus"], "observed")
+        self.assertEqual(capped["recordLimit"], 513)
+        self.assertTrue(capped["absenceIsUnknown"])
+        absent = runner.navigation_witness(b"")
+        self.assertEqual(absent["records"], [])
+        self.assertTrue(absent["absenceIsUnknown"])
+        self.assertNotIn("liveness", absent)
+
     def test_navigation_witness_cap_and_absence_never_grant_finish_or_pass(self):
         line = (b"2026-11-13 00:00:00.001 Df Takosumi[10:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
                 b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=provisional view=1 request=1 relation=1 "

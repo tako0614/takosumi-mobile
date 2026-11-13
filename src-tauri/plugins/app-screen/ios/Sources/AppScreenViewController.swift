@@ -11,6 +11,7 @@ private enum AppScreenNavigationWitness {
         case opened = "open", request, returned, provisional, commit, finish
         case failedProvisional = "fail_provisional", failed = "fail", cap
         case policyAllow = "policy_allow"
+        case contentTerminated = "content_terminated"
     }
     enum Target: String {
         case instance, editor, other, unknown
@@ -496,6 +497,12 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             resume: false, initial: false, sameView: true)
     }
 
+    private func witnessContentTerminated(_ webView: WKWebView) {
+        guard witnessView > 0, webView === witnessWebView else { return }
+        AppScreenNavigationWitness.record(.contentTerminated, view: witnessView, request: 0, relation: 0,
+            target: .unknown, reused: false, kept: false, resume: false, initial: false, sameView: true)
+    }
+
     private func witnessCallback(_ event: AppScreenNavigationWitness.Event, _ webView: WKWebView,
                                  _ navigation: WKNavigation?) {
         let relation: Int
@@ -668,6 +675,9 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+#if DEBUG
+        witnessContentTerminated(webView)
+#endif
         cancelDownloads()
         if screen != nil {
             webView.reload()
