@@ -59,6 +59,11 @@ pub(crate) fn record(event: &'static str, role: Role, code: Option<i32>) {
         io::Write,
         time::{SystemTime, UNIX_EPOCH},
     };
+    // Timestamp entry before diagnostic self-inspection; it is not an atomic identity snapshot.
+    let unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_micros());
     let pid = std::process::id();
     // SAFETY: a plain fixed-size libproc buffer for this process only.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -77,7 +82,7 @@ pub(crate) fn record(event: &'static str, role: Role, code: Option<i32>) {
     // SAFETY: these query only the calling process.
     let (parent, group) = unsafe { (libc::getppid(), libc::getpgrp()) };
     let record = serde_json::json!({"event":event,"pid":pid,"start":start,"parent":parent,"group":group,
-        "unixMicros":SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|time| time.as_micros()),
+        "unixMicros":unix_micros,
         "role":role.kind,"utility":role.utility,"code":code});
     // Format before touching the shared inherited descriptor: Display writes
     // JSON in many pieces, which interleaved across helpers in the native run.

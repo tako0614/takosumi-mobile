@@ -140,6 +140,7 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    stop_observation_is_bounded_and_uses_only_existing_results,
     normal_exit_writes_a_complete_normal_receipt,
     a_non_zero_browser_exit_is_reported_and_fails,
     a_detached_helper_is_reaped_and_counted_as_forced_cleanup,
@@ -458,6 +459,7 @@ impl Case {
             .as_object()
             .unwrap()
             .keys()
+            .filter(|name| name.as_str() != "stopObservation") // Optional diagnostics never change required receipt fields.
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
@@ -1231,3 +1233,41 @@ fn the_stat_parser_uses_the_final_name_delimiter() {
         Some(expected)
     );
 }
+
+// STOP_OBSERVATION_CONTROL_BEGIN
+fn stop_observation_is_bounded_and_uses_only_existing_results() {
+    let mut observation = StopObservation::default();
+    observation.reaped(6, false, 0);
+    assert!(observation.json()["records"].as_array().unwrap().is_empty());
+    observation.begin();
+    observation.signal(7, Some(42), true, "retained_pidfd", libc::SIGTERM, &Ok(()));
+    observation.signal(
+        8,
+        None,
+        true,
+        "direct_pid",
+        libc::SIGKILL,
+        &Err(io::Error::from_raw_os_error(libc::ESRCH)),
+    );
+    observation.reaped(7, true, 0);
+    let proof = observation.json();
+    let records = proof["records"].as_array().unwrap();
+    assert_eq!(records[0]["startTick"], 42);
+    assert_eq!(records[0]["result"], "ok");
+    assert_eq!(records[1]["startTick"], serde_json::Value::Null);
+    assert_eq!(records[1]["result"], "esrch");
+    assert_eq!(records[1]["errno"], libc::ESRCH);
+    assert_eq!(records[2]["startTick"], serde_json::Value::Null);
+    assert_eq!(records[2]["waitStatus"], 0);
+    for _ in 0..STOP_OBSERVATION_CAP {
+        observation.reaped(9, false, 0);
+    }
+    let proof = observation.json();
+    assert_eq!(
+        proof["records"].as_array().unwrap().len(),
+        STOP_OBSERVATION_CAP
+    );
+    assert_eq!(proof["truncated"], true);
+    assert!(serde_json::to_vec(&proof).unwrap().len() < 16 * 1024);
+}
+// STOP_OBSERVATION_CONTROL_END

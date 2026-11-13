@@ -10,8 +10,12 @@ private enum AppScreenNavigationWitness {
     enum Event: String {
         case opened = "open", request, returned, provisional, commit, finish
         case failedProvisional = "fail_provisional", failed = "fail", cap
+        case policyAllow = "policy_allow"
     }
-    enum Target: String { case instance, editor, other, unknown }
+    enum Target: String {
+        case instance, editor, other, unknown
+        case editorPageTwo = "editor_page_two"
+    }
     private static let enabled = Bundle.main.bundleIdentifier == "com.takosumi.fixture.simulator"
     private static let log = OSLog(subsystem: "com.takosumi.fixture.simulator.navigation", category: "navigation")
     private static var views = 0
@@ -28,6 +32,15 @@ private enum AppScreenNavigationWitness {
         if url.scheme == "https", url.host == "127.0.0.1" { return .instance }
         if url.scheme == "https", url.host == "localhost" { return .editor }
         return .other
+    }
+
+    static func policyTarget(_ url: URL?) -> Target {
+        guard let url = url else { return .unknown }
+        if url.scheme == "https", url.host == "localhost",
+           URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath == "/editor/page-two" {
+            return .editorPageTwo
+        }
+        return target(url)
     }
 
     static func record(_ event: Event, view: Int, request: Int, relation: Int, target: Target,
@@ -476,6 +489,13 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         witnessRecord(.returned, relation: navigation == nil ? 0 : 1, sameView: true)
     }
 
+    private func witnessPolicyAllowed(_ url: URL?, mainFrame: Bool, webView: WKWebView) {
+        guard mainFrame, witnessView > 0, webView === witnessWebView else { return }
+        AppScreenNavigationWitness.record(.policyAllow, view: witnessView, request: 0, relation: 0,
+            target: AppScreenNavigationWitness.policyTarget(url), reused: false, kept: false,
+            resume: false, initial: false, sameView: true)
+    }
+
     private func witnessCallback(_ event: AppScreenNavigationWitness.Event, _ webView: WKWebView,
                                  _ navigation: WKNavigation?) {
         let relation: Int
@@ -517,6 +537,9 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             url?.absoluteString ?? "", mainFrame: mainFrame, origins: origins)
         {
         case .inApp:
+#if DEBUG
+            witnessPolicyAllowed(url, mainFrame: mainFrame, webView: webView)
+#endif
             decisionHandler(.allow)
         case .block:
             decisionHandler(.cancel)

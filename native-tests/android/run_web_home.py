@@ -160,6 +160,57 @@ def receipt(value, normal):
                 "Successful UI qualification requires normal emulator exit")
 
 
+# stop-observation-begin
+STOP_OBSERVATION_CAP = 16
+
+
+def update_stop_observation(emulator, stage, *, phase=None, error=None, exit_code=None):
+    if stage == "start":
+        process = emulator.process
+        pid = process.pid if process is not None else None
+        birth = getattr(emulator, "birth", None)
+        emulator.stop_observation = {"schema": "takosumi.emulator-stop-observation@v1", "diagnosticOnly": True,
+            "guardPid": pid if type(pid) is int and pid > 0 else None,
+            "guardStartTick": birth if type(birth) is int and birth >= 0 else None,
+            "capacity": STOP_OBSERVATION_CAP, "truncated": False, "records": []}
+    value = emulator.stop_observation
+    if len(value["records"]) >= STOP_OBSERVATION_CAP:
+        value["truncated"] = True
+        return
+    record = {"stage": stage}
+    if phase is not None:
+        record["phase"] = phase
+    if exit_code is not None and type(exit_code) is int:
+        record["exitCode"] = exit_code
+    if error is not None:
+        record["errorCategory"] = ("command_timeout" if isinstance(error, subprocess.TimeoutExpired) else
+            "timeout" if isinstance(error, TimeoutError) else "missing" if isinstance(error, ProcessLookupError) else
+            "permission" if isinstance(error, PermissionError) else "os" if isinstance(error, OSError) else
+            "runtime" if isinstance(error, RuntimeError) else "other")
+        errno = error.errno if isinstance(error, OSError) else None
+        if type(errno) is int:
+            record["errno"] = errno
+    value["records"].append(record)
+
+
+def observe_stop(emulator, stage, **values):
+    try:
+        update_stop_observation(emulator, stage, **values)
+    except Exception:
+        pass  # Metadata never replaces the original stop/cleanup exception.
+
+
+def preserve_stop_observation(emulator, proof):
+    try:
+        value = emulator.stop_observation
+        proof["emulatorStopObservation"] = {name: value[name] for name in (
+            "schema", "diagnosticOnly", "guardPid", "guardStartTick", "capacity", "truncated")}
+        proof["emulatorStopObservation"]["records"] = [dict(record) for record in value["records"][:STOP_OBSERVATION_CAP]]
+    except Exception:
+        pass  # An unavailable observer/sink is not a cleanup or restoration result.
+# stop-observation-end
+
+
 class Emulator:
     def __init__(self, sdk, scratch, out, command):
         self.sdk, self.out, self.command = sdk, out, command
@@ -276,24 +327,46 @@ class Emulator:
                             "adb", timeout=timeout, binary=binary)
 
     def stop(self):
+        observe_stop(self, "start")
         if self.process is None:
+            observe_stop(self, "no_process")
             return None
+        phase = "guard_poll"
         try:
-            if self.process.poll() is None:
+            polled = self.process.poll()
+            observe_stop(self, "guard_poll_returned", exit_code=polled)
+            if polled is None:
                 try:
+                    phase = "emu_kill"
                     self.run("emu", "kill", timeout=15)
-                    self.process.wait(timeout=15)
-                except Exception:
+                    observe_stop(self, "emu_kill_returned")
+                    phase = "guard_wait_15"
+                    code = self.process.wait(timeout=15)
+                    observe_stop(self, "guard_wait_15_returned", exit_code=code)
+                except Exception as error:
+                    observe_stop(self, "fallback", phase=phase, error=error)
                     # The retained pidfd cannot address a recycled/foreign PID.
+                    phase = "pidfd_sigterm"
                     signal.pidfd_send_signal(self.fd, signal.SIGTERM)
-                    self.process.wait(timeout=10)
+                    observe_stop(self, "pidfd_sigterm_returned")
+                    phase = "guard_wait_10"
+                    code = self.process.wait(timeout=10)
+                    observe_stop(self, "guard_wait_10_returned", exit_code=code)
+            phase = "receipt_read"
             value = json.loads(self.proof.read_text())
+            observe_stop(self, "receipt_read_returned")
             receipt(value, normal=False)
+            observe_stop(self, "kernel_receipt_accepted")
             return value
+        except Exception as error:
+            observe_stop(self, "stop_error", phase=phase, error=error)
+            raise
         finally:
             self.output.close()
+            observe_stop(self, "output_closed")
             if self.fd is not None:
                 os.close(self.fd)
+                observe_stop(self, "pidfd_closed")
                 self.fd = None
 
 
@@ -647,6 +720,8 @@ def main():
                 proof["cleanup"] = True
             except Exception as error:
                 cleanup_errors.append("emulator:" + type(error).__name__)
+            finally:
+                preserve_stop_observation(emulator, proof)
         for server in servers:
             try:
                 server.stop()

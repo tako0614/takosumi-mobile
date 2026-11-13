@@ -109,8 +109,8 @@ def navigation_witness(data):
         result["errorType"] = "InputBoundExceeded"
         return result
     marker = b"com.takosumi.fixture.simulator.nav "
-    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap) "
-                         rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown) "
+    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap|policy_allow) "
+                         rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown|editor_page_two) "
                          rb"reused=([01]) kept=([01]) resume=([01]) initial=([01]) sameView=([01]) timeMs=([0-9]{1,15})")
     for line in data.splitlines():
         if marker not in line:
@@ -130,6 +130,13 @@ def navigation_witness(data):
                   "relation": int(match[5]), "target": match[6].decode("ascii"),
                   "reused": match[7] == b"1", "kept": match[8] == b"1", "resume": match[9] == b"1",
                   "initial": match[10] == b"1", "sameView": match[11] == b"1", "timeMs": int(match[12])}
+        policy = record["event"] == "policy_allow"
+        if ((policy and (record["seq"] == 513 or record["view"] == 0 or record["request"] != 0
+                         or record["relation"] != 0 or not record["sameView"]
+                         or any(record[key] for key in ("reused", "kept", "resume", "initial"))))
+                or (not policy and record["target"] == "editor_page_two")):
+            result["malformed"] = min(513, result["malformed"] + 1)
+            continue  # Policy metadata never supplies request or callback context.
         callback = record["event"] in ("provisional", "commit", "finish", "fail_provisional", "fail")
         matched = record["relation"] == 1 and record["sameView"]
         context = (record["request"] != 0 or record["target"] != "unknown"

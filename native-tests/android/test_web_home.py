@@ -177,6 +177,100 @@ class Controls(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 runner.receipt(dict(value, **{key: changed}), normal=True)
 
+        # stop-observation-controls-begin (existing owning method)
+        diagnostic = {"schema": "takosumi.guard-stop-observation@v1", "diagnosticOnly": True,
+                      "capacity": 64, "truncated": False, "records": []}
+        runner.receipt(dict(value, stopObservation=diagnostic), normal=True)
+        with self.assertRaises(RuntimeError):
+            runner.receipt(dict(value, forcedCleanup=1, stopObservation=diagnostic), normal=True)
+
+        class RefusingProof(dict):
+            def __setitem__(self, key, item):
+                raise OSError("private observation sink failure")
+
+        for mode in ("normal", "already-exited", "kill-timeout", "wait-timeout", "signal-error", "wait10-error", "observer", "sink"):
+            with self.subTest(stop=mode):
+                emulator = runner.Emulator.__new__(runner.Emulator)
+                emulator.process = Mock(pid=101)
+                emulator.process.poll.return_value = 0 if mode == "already-exited" else None
+                emulator.birth, emulator.fd = 42, 909
+                emulator.output = Mock()
+                emulator.proof = self.root / "guard.json"
+                emulator.proof.write_text(runner.json.dumps(dict(value, stopObservation=diagnostic)))
+                emulator.run = Mock(return_value="ACK private output")
+                original = PermissionError(1, "private signal failure")
+                kill_timeout = subprocess.TimeoutExpired(["private command"], 15)
+                wait_timeout = subprocess.TimeoutExpired(["private wait"], 15)
+                wait10_error = subprocess.TimeoutExpired(["private wait"], 10)
+                fallback = mode in ("kill-timeout", "wait-timeout", "signal-error", "wait10-error", "observer", "sink")
+                if fallback and mode != "wait-timeout":
+                    emulator.run.side_effect = kill_timeout
+                emulator.process.wait.side_effect = ([wait_timeout, 0] if mode == "wait-timeout" else
+                    [wait10_error] if mode == "wait10-error" else [0])
+                raised = None
+                proof = RefusingProof() if mode == "sink" else {}
+                with patch.object(runner.signal, "pidfd_send_signal",
+                                  side_effect=original if mode in ("signal-error", "observer", "sink") else None) as sent, \
+                        patch.object(runner.os, "close") as closed:
+                    if mode == "observer":
+                        observation = patch.object(runner, "update_stop_observation", side_effect=RuntimeError("private observer failure"))
+                    else:
+                        observation = patch.object(runner, "update_stop_observation", wraps=runner.update_stop_observation)
+                    with observation:
+                        try:
+                            returned = emulator.stop()
+                        except Exception as error:
+                            raised = error
+                        finally:
+                            runner.preserve_stop_observation(emulator, proof)
+                    emulator.process.poll.assert_called_once_with()
+                    emulator.output.close.assert_called_once_with()
+                    closed.assert_called_once_with(909)
+                    self.assertIsNone(emulator.fd)
+                    self.assertEqual(sent.call_count, int(fallback))
+                    if fallback:
+                        sent.assert_called_once_with(909, runner.signal.SIGTERM)
+                self.assertEqual(emulator.run.call_count, int(mode != "already-exited"))
+                if mode != "already-exited":
+                    emulator.run.assert_called_once_with("emu", "kill", timeout=15)
+                expected_waits = ([] if mode in ("already-exited", "signal-error", "observer", "sink") else
+                                  [15, 10] if mode == "wait-timeout" else
+                                  [10] if fallback else [15])
+                self.assertEqual([call.kwargs["timeout"] for call in emulator.process.wait.call_args_list], expected_waits)
+                if mode in ("signal-error", "observer", "sink"):
+                    self.assertIs(raised, original)
+                elif mode == "wait10-error":
+                    self.assertIs(raised, wait10_error)
+                else:
+                    self.assertIsNone(raised)
+                    self.assertEqual(returned, dict(value, stopObservation=diagnostic))
+                if mode in ("observer", "sink"):
+                    self.assertNotIn("emulatorStopObservation", proof)
+                else:
+                    trace = proof["emulatorStopObservation"]
+                    self.assertEqual((trace["guardPid"], trace["guardStartTick"]), (101, 42))
+                    self.assertNotIn("private", runner.json.dumps(trace))
+                    stages = [event["stage"] for event in trace["records"]]
+                    self.assertEqual("fallback" in stages, fallback)
+                    self.assertEqual("pidfd_sigterm_returned" in stages, fallback and mode != "signal-error")
+                    if fallback:
+                        branch = next(event for event in trace["records"] if event["stage"] == "fallback")
+                        self.assertEqual(branch["phase"], "guard_wait_15" if mode == "wait-timeout" else "emu_kill")
+                        self.assertEqual(branch["errorCategory"], "command_timeout")
+                    self.assertEqual(stages[-2:], ["output_closed", "pidfd_closed"])
+                    self.assertFalse(trace["truncated"])
+
+        absent = runner.Emulator.__new__(runner.Emulator)
+        absent.process = None
+        self.assertIsNone(absent.stop())
+        self.assertEqual([event["stage"] for event in absent.stop_observation["records"]], ["start", "no_process"])
+        self.assertIsNone(absent.stop_observation["guardPid"])
+        for _ in range(20):
+            runner.observe_stop(absent, "guard_poll_returned", exit_code=0)
+        self.assertEqual(len(absent.stop_observation["records"]), runner.STOP_OBSERVATION_CAP)
+        self.assertTrue(absent.stop_observation["truncated"])
+        # stop-observation-controls-end
+
     def test_failed_guest_anr_reads_are_owned_bounded_and_keep_raw_output_outside_evidence(self):
         scratch, out = self.root / "scratch", self.root / "evidence"
         scratch.mkdir(); out.mkdir()
