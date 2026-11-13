@@ -119,8 +119,8 @@ live documents across profiles, whole-App/OS-crash recovery or unsaved writes
 surviving eviction. Real IdP, physical devices, files/notifications, signing,
 distribution and updates remain separate.
 
-CI now moves the SDK build and this case into their own `macos-26-intel` job.
-The standalone download case remains in the desktop Mac job. GitHub-hosted
+CI runs the SDK build and this case in their own `macos-26` arm64 job.
+The standalone download case remains in the desktop Intel Mac job. GitHub-hosted
 [jobs use separate VMs](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners),
 so a preceding download case's interrupted CLI or CoreSimulator service state
 is not this case's setup. It builds the SDK once on the same host as its
@@ -129,7 +129,20 @@ compiler cache is restored read-only, with no additional cache writer.
 
 The 60-minute job, 25-minute SDK and 20-minute case caps remain unchanged, as
 do the boot/trust limits, ownership checks and strict UI/cleanup verdicts.
-This is a source candidate after run43279856761's whole-App boot failed
+The separate job was introduced after run43279856761's whole-App boot failed
 following a download case that passed but retained interrupted-setup scratch.
 The cause of that boot failure remains unknown. Separate hosts do not guarantee
 boot success. The SDK-free harness controls cannot qualify native behavior.
+
+Run43336528310 built the Intel SDK App, but bootstatus did not confirm normal
+CLI exit within the existing300-second readiness budget. Its native Finished
+line reported elapsed05:03; installation and XCTest were not reached, so the
+repaired clear-heading query remains unqualified. The whole-App job now uses
+the build script's existing `aarch64-apple-ios-sim` path on Apple Silicon.
+This selects the native arm64 SDK/UI qualification path; it does not establish the earlier
+boot failure's cause. The same fixture, owned fresh Simulator, installed-byte
+checks, UI actions, deadlines and cleanup verdict remain. No Intel fallback
+or same-head rerun is added. The standard arm64 runner has3 CPU cores and7GB
+RAM according to [GitHub's runner table](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job);
+the build/case caps are not increased, and actual arm64 build/runtime results
+are still pending.

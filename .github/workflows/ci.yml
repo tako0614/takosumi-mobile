@@ -707,10 +707,12 @@ jobs:
   # Keep whole-App qualification independent of a preceding Simulator case's
   # host service state. Build and install the SDK bytes on this same runner;
   # never transfer an App bundle or reuse a Simulator from the download case.
+  # Exercise the existing native arm64 Simulator build on Apple Silicon;
+  # the standalone download case keeps its Intel host in the desktop job.
   ios-whole-app:
     needs: [quality, native-plugins]
     if: ${{ !cancelled() && needs.quality.result == 'success' }}
-    runs-on: macos-26-intel
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

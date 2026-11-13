@@ -42,7 +42,7 @@ class Controls(unittest.TestCase):
         self.assertEqual(owners[0], owners[1], "The UI must bind the SDK built in its own job")
         self.assertNotEqual(owners[1], owners[2], "Whole App and download must not share a host/CoreSimulator service")
         body = jobs[owners[1][0]]
-        self.assertIn("runs-on: macos-26-intel", body)
+        self.assertRegex(body, r"(?m)^    runs-on: macos-26$", "Whole-App SDK/UI use the native arm64 host")
         self.assertNotRegex(body, r"(?m)^    strategy:", "A matrix must not repeat the whole-App case")
         self.assertLess(body.index(sdk), body.index(ui))
         self.assertIn("steps.ios-sdk.outcome == 'success'", body)
