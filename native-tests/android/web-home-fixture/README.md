@@ -58,16 +58,30 @@ delivery or the final name-field value. A late IME covering Save is consistent
 with these observations; it is separate from the earlier Personal Notes AX
 failure and does not establish that failure's cause.
 
-Only the post-input connection Save wait now reads the configured IME before
-and after locating its candidate. A visible IME consumes at most one Back;
-the old candidate is discarded and the same15-second wait continues until
-the IME is observed absent and Save is reacquired. A false Back return still
-consumes the request. The exact helper compiled into the driver also runs
-under the existing JDK: late appearance during selector lookup, delayed or
-immediate dismissal, false Back, reappearance and no-keyboard controls pass.
-These controls do not compile/run the Android framework integration. Native
-success is pending; input counts, one Save tap, form-scroll policy, deadlines
-and downstream profile/cold/reset assertions remain unchanged.
+Run43347875704 compiled that driver but failed at the same Personal Save
+boundary in77.474s. Its final pre-click IME read returned absent, Save
+readiness was recorded in the same millisecond, and the click wrapper took
+260ms. The final image again shows Gboard over the form. A second query alone
+did not establish a settled input state; actual pointer delivery is still
+unproven.
+
+The dedicated whole-App guest now explicitly disables its hardware keyboard
+in the fresh private AVD's `config.ini` (`hw.keyboard=no`), with a closed
+`keyboard-mode.json` readback. It does not change a host or existing AVD.
+Only the post-input Save wait requires the configured software IME to be
+observed before accepting absence. Its first positive observation consumes
+at most one Back; the candidate is discarded, then the same15-second wait
+requires actual disappearance and a reacquired Save. A false Back return
+still consumes the request. Early absence, including repeated absence or an
+IME that never appears, cannot authorize a Save tap. There is no additional
+show retry, Back, Save, fixed delay or deadline extension.
+
+The exact helper compiled into the driver also runs under the existing JDK:
+late appearance, repeated early absence, delayed/immediate dismissal, false
+Back, reappearance and a never-observed keyboard are covered. These controls
+do not compile/run the Android framework or the AVD configuration. Native
+success is pending; input counts, one Save tap, form-scroll policy and
+downstream profile/cold/reset assertions remain unchanged.
 
 Run43317859224 passed Work Web login/management, Notes/draft, saved-Work
 selection and background return with the same App PID/document. It then

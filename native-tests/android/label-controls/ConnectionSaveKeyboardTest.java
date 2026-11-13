@@ -22,9 +22,10 @@ public final class ConnectionSaveKeyboardTest {
     public static void main(String[] args) {
         ConnectionSaveKeyboard gate = new ConnectionSaveKeyboard();
         Probe probe = new Probe();
-        check(gate.ready(probe), "Hidden before finding Save");
-        probe.shown = true; // The selector/bounds read lets a late IME appear.
-        check(!gate.ready(probe), "A newly covered Save must be discarded");
+        check(!gate.ready(probe), "Absence before the requested IME appears is not readiness");
+        check(!gate.ready(probe) && probe.backs == 0, "Repeated early absence must not tap Save or send Back");
+        probe.shown = true; // The input-requested IME follows early empty reads.
+        check(!gate.ready(probe), "An observed IME must be dismissed before Save");
         check(probe.backs == 1, "One dismissal request");
         check(!gate.ready(probe), "Back returning does not prove IME disappearance");
         check(probe.backs == 1, "Settling must not send another Back");
@@ -52,8 +53,8 @@ public final class ConnectionSaveKeyboardTest {
 
         gate = new ConnectionSaveKeyboard();
         probe = new Probe();
-        check(gate.ready(probe) && gate.ready(probe), "No keyboard needs no dismissal");
-        check(probe.backs == 0 && probe.reads == 2, "Two readiness reads, no action");
+        check(!gate.ready(probe) && !gate.ready(probe), "An unobserved software keyboard must not authorize Save");
+        check(probe.backs == 0 && probe.reads == 2, "No observed keyboard means no Back");
         System.out.println("PASS: connection Save keyboard checks=" + checks);
     }
 }

@@ -89,7 +89,7 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: saved connection label checks=[1-9][0-9]*")
 
-    def test_actual_driver_save_keyboard_wait_handles_late_ime_and_one_back(self):
+    def test_actual_driver_save_wait_requires_observed_ime_and_one_back(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the driver keyboard control")
         self.assertIsNotNone(java, "Existing Java runtime required for the driver keyboard control")

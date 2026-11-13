@@ -181,6 +181,22 @@ class Emulator:
         self.command([str(self.sdk / "cmdline-tools/latest/bin/avdmanager"), "create", "avd",
                       "--name", self.name, "--package", "system-images;android-36;google_apis;x86_64",
                       "--device", "pixel_7"], "avd-create", env=self.env, timeout=60)
+        # This touch-input case must observe and dismiss the software IME.
+        # Change only the fresh private AVD, never a host keyboard setting.
+        config = Path(self.env["ANDROID_AVD_HOME"]) / (self.name + ".avd") / "config.ini"
+        require(config.is_file() and not config.is_symlink(), "Owned AVD keyboard config is missing")
+        rows = config.read_text().splitlines()
+        keyboard = [i for i, row in enumerate(rows) if row.split("=", 1)[0].strip() == "hw.keyboard"]
+        require(len(keyboard) <= 1, "Owned AVD keyboard config is ambiguous")
+        if keyboard:
+            rows[keyboard[0]] = "hw.keyboard=no"
+        else:
+            rows.append("hw.keyboard=no")
+        config.write_text("\n".join(rows) + "\n")
+        require(config.read_text().splitlines().count("hw.keyboard=no") == 1, "Owned AVD keyboard mode differs")
+        (self.out / "keyboard-mode.json").write_text(json.dumps({
+            "scope": "Fresh private whole-App AVD only", "hardwareKeyboard": False,
+        }) + "\n")
         guard = ROOT / "src-tauri/target/debug/sumi-android-emulator-guard"
         require(guard.is_file() and not guard.is_symlink(), "Build the existing-source emulator guard first")
         self.output = (self.out / "emulator.log").open("xb")

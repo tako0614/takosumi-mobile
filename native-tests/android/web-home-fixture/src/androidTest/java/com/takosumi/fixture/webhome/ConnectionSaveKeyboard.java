@@ -1,6 +1,6 @@
 package com.takosumi.fixture.webhome;
 
-/** One Save wait owns at most one Back and waits for observed IME absence. */
+/** A software-keyboard Save wait observes its IME, one Back, then absence. */
 final class ConnectionSaveKeyboard {
     interface Probe {
         boolean isShown();
@@ -10,7 +10,9 @@ final class ConnectionSaveKeyboard {
     private boolean backRequested;
 
     boolean ready(Probe probe) {
-        if (!probe.isShown()) return true;
+        // Input can return before its requested software IME appears. An
+        // initial empty query must not authorize Save under that pending show.
+        if (!probe.isShown()) return backRequested;
         if (!backRequested) {
             // A false return (or throw) does not authorize another Back.
             backRequested = true;
