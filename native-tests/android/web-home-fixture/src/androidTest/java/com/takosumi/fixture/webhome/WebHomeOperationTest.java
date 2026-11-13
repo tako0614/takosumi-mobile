@@ -182,6 +182,41 @@ public final class WebHomeOperationTest {
         } while (SystemClock.elapsedRealtime() < end);
         throw new AssertionError("Actual App action did not become ready: " + text);
     }
+    private List<ConnectionLabel.Node> connectionSnapshot() {
+        List<ConnectionLabel.Node> nodes = new ArrayList<>();
+        // Include every observed package so a foreign or contradictory child
+        // cannot disappear from the selected row's direct-child validation.
+        for (UiObject2 value : device.findObjects(By.pkg(Pattern.compile(".*")))) {
+            nodes.add(new ConnectionLabel.Node(value, value.getParent(), value.getClassName(), nameSnapshot(value)));
+        }
+        return nodes;
+    }
+
+    private void clearConnectionData(String name) {
+        long end = SystemClock.elapsedRealtime() + 15000;
+        do {
+            UiObject2 ready = null;
+            try {
+                ConnectionLabel.Selection held = ConnectionLabel.selectClear(connectionSnapshot(), TARGET, name, origin);
+                if (held != null) {
+                    // Reacquire and revalidate the card, named remove action,
+                    // clear action and actual direct-parent identities together.
+                    ConnectionLabel.Selection fresh = ConnectionLabel.rebind(
+                        held, connectionSnapshot(), TARGET, name, origin);
+                    if (fresh != null) ready = (UiObject2) fresh.clear.identity;
+                }
+            } catch (StaleObjectException ignored) {
+                // No gesture occurred. Reacquire within the same deadline.
+            }
+            if (ready != null && SystemClock.elapsedRealtime() < end) {
+                ready.click(); // A possibly delivered gesture is never retried.
+                return;
+            }
+            SystemClock.sleep(100);
+        } while (SystemClock.elapsedRealtime() < end);
+        throw new AssertionError("Actual App clear action did not remain profile-bound: " + name);
+    }
+
     private void nativeButton(String description) { one(By.desc(description)).click(); }
     private void menu(String text) { nativeButton("メニュー"); click(text); }
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }
@@ -347,7 +382,7 @@ public final class WebHomeOperationTest {
         menu("アプリホームへ"); expect("Fixture home Personal");
         cases.put("cold-process-and-profiles-restored");
         closeAndOpenMain(); reopen("Work"); closeAndOpenMain();
-        click("保存データを消去…"); expect("Workの保存データを消去しますか？");
+        clearConnectionData("Work"); expect("Workの保存データを消去しますか？");
         click("保存データを消去"); expect("Workのサイトデータを消去しました。");
         reopen("Work"); expect("Fixture signed out"); host(origin);
         click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("");

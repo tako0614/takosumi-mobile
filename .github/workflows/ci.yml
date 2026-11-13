@@ -784,7 +784,7 @@ jobs:
     if: ${{ !cancelled() && needs.quality.result == 'success' }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix:
         # Hosted arm64 acquisition failed before SDK execution; use the
         # standard Intel image for this compile lane, keeping all OS targets.
@@ -2003,7 +2003,7 @@ jobs:
         run: |
           python3 -B native-tests/desktop/test_macos_browser_process.py -v 2>&1 | tee "$RUNNER_TEMP/m3-runner-tests.log"
           test "${PIPESTATUS[0]}" = 0 || { echo 'M3 runner tests failed'; exit 1; }
-          grep -q '^Ran 34 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all thirty-four M3 runner tests ran'; exit 1; }
+          grep -q '^Ran 35 tests ' "$RUNNER_TEMP/m3-runner-tests.log" || { echo 'Not all thirty-five M3 runner tests ran'; exit 1; }
       - name: Locked CEF version
         id: cef
         run: |

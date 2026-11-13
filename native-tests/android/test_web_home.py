@@ -81,8 +81,9 @@ class Controls(unittest.TestCase):
         classes.mkdir()
         helper = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/ConnectionLabel.java"
         control = runner.HERE / "label-controls/ConnectionLabelTest.java"
+        generic = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/AccessibleName.java"
         built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
-                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+                                str(generic), str(helper), str(control)], capture_output=True, text=True, timeout=15)
         self.assertEqual(built.returncode, 0, built.stderr)
         checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.webhome.ConnectionLabelTest"],
                                  capture_output=True, text=True, timeout=10)

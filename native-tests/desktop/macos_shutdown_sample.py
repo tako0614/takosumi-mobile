@@ -257,20 +257,26 @@ def _retire(process):
     global _active_diagnostic
     if process is not _active_diagnostic:
         raise ValueError("Expected the currently owned diagnostic helper")
-    end = time.monotonic() + RETIRE_BUDGET
+    began = time.monotonic()
+    end = began + RETIRE_BUDGET
     error = None
+    operation_errors = []  # At most one failure per existing operation; no exception text.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     except OSError as failure:
         error = type(failure).__name__
+        operation_errors.append({"operation": "group-kill", "errorType": error, "errno": failure.errno,
+                                 "atSeconds": round(time.monotonic() - began, 6)})
     reaped = False
     try:
         process.wait(timeout=max(0, end - time.monotonic()))
         reaped = True
     except subprocess.TimeoutExpired:
         error = "TimeoutExpired"
+        operation_errors.append({"operation": "leader-wait", "errorType": error, "errno": None,
+                                 "atSeconds": round(time.monotonic() - began, 6)})
     gone = False
     while reaped and time.monotonic() < end:
         try:
@@ -280,6 +286,8 @@ def _retire(process):
             break
         except OSError as failure:
             error = type(failure).__name__
+            operation_errors.append({"operation": "group-probe", "errorType": error, "errno": failure.errno,
+                                     "atSeconds": round(time.monotonic() - began, 6)})
             break
         time.sleep(0.01)
     records = _read_reply(process)
@@ -289,6 +297,8 @@ def _retire(process):
     return records, {"diagnosticOnly": True, "status": "diagnostic-retired",
                      "cleanupComplete": reaped and gone, "leaderReaped": reaped,
                      "groupGone": gone, "exitCode": process.returncode, "errorType": error,
+                     "diagnosticGroup": process.pid, "operationErrors": operation_errors,
+                     "retirementSeconds": round(time.monotonic() - began, 6),
                      "replyNonblocking": getattr(process, "_diagnostic_nonblocking", None) is True}
 
 

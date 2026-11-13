@@ -4,6 +4,7 @@
 No native process, browser or site is started. Native Mac acceptance is separate.
 """
 import copy
+import errno
 import json
 import os
 from pathlib import Path
@@ -270,6 +271,47 @@ os.open(sys.argv[3],os.O_RDONLY)
                                 capture_output=True, timeout=2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"Expected the owned diagnostic session", result.stderr)
+
+    def test_retirement_receipt_preserves_each_failed_operation_without_private_messages(self):
+        cases = (
+            ("normal", [None, ProcessLookupError()], False, [], True, None),
+            ("signal", [PermissionError(errno.EPERM, "private signal detail"), ProcessLookupError()],
+             False, [("group-kill", errno.EPERM)], True, "PermissionError"),
+            ("probe", [None, PermissionError(errno.EACCES, "private probe detail")],
+             False, [("group-probe", errno.EACCES)], False, "PermissionError"),
+            ("both", [PermissionError(errno.EPERM, "private signal detail"),
+                      PermissionError(errno.EACCES, "private probe detail")],
+             False, [("group-kill", errno.EPERM), ("group-probe", errno.EACCES)], False, "PermissionError"),
+            ("wait", [PermissionError(errno.EPERM, "private signal detail")], True,
+             [("group-kill", errno.EPERM), ("leader-wait", None)], False, "TimeoutExpired"),
+        )
+        for name, signals, timeout, expected, complete, final_error in cases:
+            with self.subTest(name=name):
+                process = mock.Mock(pid=246813579, returncode=None if timeout else -9,
+                                    _diagnostic_nonblocking=True)
+                if timeout:
+                    process.wait.side_effect = subprocess.TimeoutExpired("private wait detail", 2)
+                with mock.patch.object(sampler, "_active_diagnostic", process), \
+                        mock.patch.object(sampler.os, "killpg", side_effect=signals) as send, \
+                        mock.patch.object(sampler, "_read_reply", return_value=[]):
+                    _, receipt = sampler._retire(process)
+                    self.assertEqual(receipt["cleanupComplete"], complete)
+                    self.assertEqual(receipt["errorType"], final_error)
+                    self.assertIs(sampler._active_diagnostic, None if complete else process)
+                    self.assertEqual(send.call_args_list,
+                                     [mock.call(process.pid, signal.SIGKILL)]
+                                     + ([] if timeout else [mock.call(process.pid, 0)]))
+                    process.wait.assert_called_once()
+                    self.assertLessEqual(process.wait.call_args.kwargs["timeout"], sampler.RETIRE_BUDGET)
+                    self.assertEqual(receipt["diagnosticGroup"], process.pid)
+                    self.assertEqual([(e["operation"], e["errno"]) for e in receipt["operationErrors"]], expected)
+                    self.assertLessEqual(len(receipt["operationErrors"]), 2)
+                    self.assertGreaterEqual(receipt["retirementSeconds"], 0)
+                    for event in receipt["operationErrors"]:
+                        self.assertGreaterEqual(event["atSeconds"], 0)
+                        self.assertLessEqual(event["atSeconds"], receipt["retirementSeconds"])
+                    self.assertNotIn("private", json.dumps(receipt))
+                    process.stdout.close.assert_called_once()
 
     def test_nonblocking_setup_failure_never_reads_its_blocking_pipe_or_allows_normal_success(self):
         observer = self.failed_observer(sample_shutdowns=True)
