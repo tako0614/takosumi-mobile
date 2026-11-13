@@ -348,6 +348,77 @@ class Controls(unittest.TestCase):
         self.assertNotIn("finished", capped)
         self.assertNotIn("passed", capped)
 
+    def test_policy_allow_returned_is_independent_closed_scalar_context(self):
+        header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+        def packet(event="policy_allow_returned", target="editor", seq=2, view=1, request=0,
+                   relation=0, same_view=1, flags="reused=0 kept=0 resume=0 initial=0", time_ms=260):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq={seq} event={event} view={view} "
+                             f"request={request} relation={relation} target={target} {flags} "
+                             f"sameView={same_view} timeMs={time_ms}\n").encode()
+        for target in ("instance", "editor", "editor_page_two", "other", "unknown"):
+            with self.subTest(target=target):
+                result = runner.navigation_witness(packet(target=target))
+                self.assertEqual(len(result["records"]), 1)
+                record = result["records"][0]
+                self.assertEqual((record["event"], record["target"], record["request"], record["relation"], record["timeMs"]),
+                                 ("policy_allow_returned", target, 0, 0, 260))
+                self.assertTrue(record["sameView"])
+                self.assertFalse(any(record[key] for key in ("reused", "kept", "resume", "initial")))
+                self.assertTrue(result["diagnosticOnly"] and result["absenceIsUnknown"])
+                for key in ("passed", "finished", "ready", "painted", "navigationIdentity", "handlerSucceeded"):
+                    self.assertNotIn(key, result)
+        for index, changes in enumerate(({"request": 1}, {"relation": 1}, {"relation": 2}, {"view": 0},
+                        {"view": 65536}, {"same_view": 0}, {"seq": 513}, {"time_ms": -1},
+                        *({"flags": " ".join(f"{key}={int(key == chosen)}" for key in
+                                             ("reused", "kept", "resume", "initial"))}
+                          for chosen in ("reused", "kept", "resume", "initial")),
+                        {"target": "editor_page_two_extra"}, {"target": "https://private.invalid/?sensitive=fixture"},
+                        {"event": "policy_allow_returned_extra"})):
+            with self.subTest(poison=index):
+                value = runner.navigation_witness(packet(**changes))
+                self.assertEqual(value["records"], [])
+                self.assertEqual(value["malformed"], 1)
+                self.assertNotIn("sensitive", json.dumps(value))
+        for index, data in enumerate((packet().split(header, 1)[1],
+                                     packet().replace(b".simulator.navigation:navigation", b".WebKit:Network"))):
+            with self.subTest(header=index):
+                value = runner.navigation_witness(data)
+                self.assertEqual(value["records"], [])
+                self.assertEqual(value["malformed"], 1)
+        before = packet(event="policy_allow", seq=1, time_ms=234)
+        after = packet()
+        unknown = packet(event="provisional", seq=3, target="unknown", time_ms=280)
+        matched = packet(event="commit", seq=4, target="editor", request=7, relation=1,
+                         flags="reused=1 kept=0 resume=1 initial=1", time_ms=300)
+        result = runner.navigation_witness(before + after + unknown + matched)
+        self.assertEqual([record["event"] for record in result["records"]],
+                         ["policy_allow", "policy_allow_returned", "provisional", "commit"])
+        self.assertEqual([record["timeMs"] for record in result["records"]], [234, 260, 280, 300])
+        self.assertEqual((result["records"][2]["request"], result["records"][2]["target"]), (0, "unknown"))
+        self.assertFalse(any(result["records"][2][key] for key in ("reused", "kept", "resume", "initial")))
+        self.assertEqual((result["records"][3]["request"], result["records"][3]["relation"]), (7, 1))
+        for relation in (0, 2):
+            with self.subTest(callback=relation):
+                value = runner.navigation_witness(after + packet(event="commit", target="editor", request=7, relation=relation))
+                self.assertEqual([record["event"] for record in value["records"]], ["policy_allow_returned"])
+                self.assertEqual(value["malformed"], 1)
+        for event in ("open", "request", "returned", "provisional", "commit", "finish", "content_terminated"):
+            with self.subTest(category=event):
+                value = runner.navigation_witness(packet(event=event, target="editor_page_two"))
+                self.assertEqual(value["records"], [], "Page two remains confined to the two policy events")
+                self.assertEqual(value["malformed"], 1)
+        other = runner.navigation_witness(after + after.replace(b"Takosumi[42:ab]", b"Takosumi[43:cd]"))
+        self.assertEqual([record["pid"] for record in other["records"]], [42, 43])
+        cap = packet(event="cap", target="unknown", seq=513, view=0, same_view=0)
+        value = runner.navigation_witness(packet(seq=512) + cap)
+        self.assertEqual(value["capStatus"], "observed")
+        self.assertEqual(value["recordLimit"], 513)
+        self.assertTrue(value["absenceIsUnknown"])
+        empty = runner.navigation_witness(b"")
+        self.assertEqual(empty["records"], [])
+        self.assertTrue(empty["absenceIsUnknown"])
+
     def test_content_termination_witness_is_owner_bound_and_context_free(self):
         header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
                   b"[com.takosumi.fixture.simulator.navigation:navigation] ")

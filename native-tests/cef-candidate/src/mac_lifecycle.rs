@@ -51,6 +51,26 @@ pub(crate) fn role(arguments: impl IntoIterator<Item = impl AsRef<str>>) -> Role
     found
 }
 
+// WATCHDOG_ARM_OBSERVATION_BEGIN
+#[allow(dead_code)] // only the browser consumes the shutdown spawn result
+pub(crate) fn observe_watchdog_arm<T, E, Observation>(
+    spawned: Result<T, E>,
+    enabled: impl FnOnce() -> bool,
+    observe: impl FnOnce(&'static str) -> Observation,
+) {
+    let armed = spawned.is_ok();
+    // Preserve the discarded Result's lifetime: detach/drop before diagnostic IO.
+    drop(spawned);
+    if enabled() {
+        let _ = observe(if armed {
+            "cef-shutdown-arm-ok"
+        } else {
+            "cef-shutdown-arm-error"
+        });
+    }
+}
+// WATCHDOG_ARM_OBSERVATION_END
+
 /// Best effort only: a closed stderr must not change the process exit.
 /// Called after helper sandbox initialization and outside any guard freeze.
 #[cfg(target_os = "macos")]
@@ -138,5 +158,69 @@ mod tests {
         assert_eq!(role(["--type=relauncher"]).kind, "relauncher");
         assert_eq!(role(["--type=crashpad-handler"]).kind, "crashpad-handler");
         assert_eq!(role(["--type=renderer"]).kind, "renderer");
+        // WATCHDOG_ARM_CONTROLS_BEGIN
+        use std::{cell::RefCell, rc::Rc};
+        struct Spawned(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for Spawned {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("spawn-result-dropped");
+            }
+        }
+        for (armed, enabled) in [(true, true), (false, true), (true, false), (false, false)] {
+            let order = Rc::new(RefCell::new(vec!["begin", "spawn-returned"]));
+            let spawned: Result<Spawned, Spawned> = if armed {
+                Ok(Spawned(order.clone()))
+            } else {
+                Err(Spawned(order.clone()))
+            };
+            let gate = order.clone();
+            let sink = order.clone();
+            observe_watchdog_arm(
+                spawned,
+                || {
+                    assert_eq!(gate.borrow().last(), Some(&"spawn-result-dropped"));
+                    gate.borrow_mut().push("inspection-opt-in");
+                    enabled
+                },
+                |event| {
+                    assert_eq!(
+                        event,
+                        if armed {
+                            "cef-shutdown-arm-ok"
+                        } else {
+                            "cef-shutdown-arm-error"
+                        }
+                    );
+                    sink.borrow_mut().push(event);
+                    // The observer's failed write never becomes a shutdown result.
+                    Err::<(), _>(std::io::Error::from_raw_os_error(32))
+                },
+            );
+            order.borrow_mut().push("shutdown");
+            let expected = if enabled {
+                vec![
+                    "begin",
+                    "spawn-returned",
+                    "spawn-result-dropped",
+                    "inspection-opt-in",
+                    if armed {
+                        "cef-shutdown-arm-ok"
+                    } else {
+                        "cef-shutdown-arm-error"
+                    },
+                    "shutdown",
+                ]
+            } else {
+                vec![
+                    "begin",
+                    "spawn-returned",
+                    "spawn-result-dropped",
+                    "inspection-opt-in",
+                    "shutdown",
+                ]
+            };
+            assert_eq!(*order.borrow(), expected);
+        }
+        // WATCHDOG_ARM_CONTROLS_END
     }
 }

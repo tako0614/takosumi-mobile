@@ -1677,15 +1677,21 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
     // could re-enter the wedged runtime; the guard still accounts for any
     // helper left running and the App retains the abnormal profile.
     #[cfg(target_os = "macos")]
-    let _ = std::thread::Builder::new()
-        .name("cef-shutdown-bound".into())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(15));
-            mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, Some(2));
-            // SAFETY: immediate process exit cannot unwind into the blocked
-            // runtime. An incomplete shutdown makes no flush guarantee.
-            unsafe { libc::_exit(2) };
-        });
+    // WATCHDOG_ARM_CALL_BEGIN
+    mac_lifecycle::observe_watchdog_arm(
+        std::thread::Builder::new()
+            .name("cef-shutdown-bound".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                mac_lifecycle::record("cef-shutdown-bound", mac_lifecycle::BROWSER, Some(2));
+                // SAFETY: immediate process exit cannot unwind into the blocked
+                // runtime. An incomplete shutdown makes no flush guarantee.
+                unsafe { libc::_exit(2) };
+            }),
+        inspection,
+        |event| mac_lifecycle::record(event, mac_lifecycle::BROWSER, None),
+    );
+    // WATCHDOG_ARM_CALL_END
     shutdown();
     #[cfg(target_os = "macos")]
     mac_lifecycle::record("cef-shutdown-return", mac_lifecycle::BROWSER, None);
