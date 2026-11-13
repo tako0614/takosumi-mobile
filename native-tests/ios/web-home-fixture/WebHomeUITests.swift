@@ -211,7 +211,8 @@ final class WebHomeUITests: XCTestCase {
         let clear = app.buttons["保存データを消去…"].firstMatch
         XCTAssertTrue(clear.waitForExistence(timeout: 15))
         clear.tap()
-        expect("Workの保存データを消去しますか？")
+        // WebKit exposes the full heading as Other, with split StaticText children.
+        XCTAssertTrue(app.webViews.otherElements["Workの保存データを消去しますか？"].firstMatch.waitForExistence(timeout: 15))
         app.buttons["保存データを消去"].tap()
         expect("Workのサイトデータを消去しました。")
         reopen("Work")

@@ -97,8 +97,20 @@ landed. Before its single Save tap, the driver now adds a ten-second exact
 value-readiness condition for each actual field. Missing input fails before
 Save. The keyboard remains present; there is no replacement input,
 keyboard-dismiss tap or Save retry. The separate fifteen-second Web-page
-deadline is unchanged. Native execution of this input-readiness repair
-remains pending.
+deadline is unchanged. Run43330943400 passed Work/Personal input, synthetic
+Web login, management/editor navigation, profile separation, warm return and
+actual process termination/cold restoration. It failed later at the Work
+clear-confirmation lookup, before the deletion tap.
+
+The saved screenshot and hierarchy show the correct Work confirmation.
+WebKit exposes its full heading as one `Other` node; its `StaticText` children
+split the connection name and the rest of the sentence. The old full-text
+`StaticText` query therefore matched nothing. The fixture now queries that
+exact full heading under `otherElements`, with the same15-second wait and
+single subsequent clear tap. It does not accept a partial heading or change
+product rendering. The repaired selector and actual reset/Personal survival
+still require native execution. Simulator deletion succeeded in that run;
+an interrupted target-log CLI required scratch retention.
 
 Current iOS retains only one non-popup App screen. Warm document-memory
 retention is checked before opening Personal; cross-profile reopening checks
