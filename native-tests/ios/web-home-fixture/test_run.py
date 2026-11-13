@@ -182,7 +182,8 @@ class Controls(unittest.TestCase):
         self.assertEqual((out / "target-app-exit.log").read_bytes(), b"native target event\n")
         argv, options = calls[1]
         self.assertEqual(argv[:5], ["xcrun", "simctl", "spawn", "owned", "log"])
-        self.assertEqual(argv[-1], '(process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")')
+        self.assertEqual(argv[-1], '((process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")) AND (subsystem != "com.apple.dt.xctest")')
+        self.assertEqual(result["excludedSubsystems"], ["com.apple.dt.xctest"])
         self.assertEqual(options["timeout"], 15)
         self.assertIs(options["read_output"], False)
 

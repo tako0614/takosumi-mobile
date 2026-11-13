@@ -12,13 +12,16 @@ import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.uiautomator.By;
 import androidx.test.uiautomator.BySelector;
 import androidx.test.uiautomator.Direction;
+import androidx.test.uiautomator.StaleObjectException;
 import androidx.test.uiautomator.UiDevice;
 import androidx.test.uiautomator.UiObject2;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
@@ -130,7 +133,55 @@ public final class WebHomeOperationTest {
     }
 
     private void expect(String text) { one(By.text(text)); }
-    private void click(String text) { one(By.text(text)).click(); }
+    private AccessibleName.Candidate nameSnapshot(UiObject2 value) {
+        Rect bounds = value.getVisibleBounds();
+        return new AccessibleName.Candidate(value.getApplicationPackage(), value.getText(),
+            value.getContentDescription(), value.isEnabled(), value.isClickable(), !bounds.isEmpty(),
+            AccessibleName.MISSING, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    }
+
+    private void click(String text) {
+        long end = SystemClock.elapsedRealtime() + 15000;
+        do {
+            UiObject2 ready = null;
+            try {
+                // One snapshot avoids counting a node twice when text and
+                // description both expose the same exact action name.
+                List<UiObject2> values = device.findObjects(By.pkg(TARGET).enabled(true));
+                List<AccessibleName.Candidate> names = new ArrayList<>();
+                for (UiObject2 value : values) names.add(nameSnapshot(value));
+                // UiObject2 equality/hash use the underlying accessibility
+                // node identity. Only an actual direct parent can own a label;
+                // matching strings or overlapping rectangles are insufficient.
+                Map<UiObject2, Integer> owners = new HashMap<>();
+                for (int n = 0; n < names.size(); n++) {
+                    if (names.get(n).clickable && AccessibleName.matches(names.get(n), TARGET, text)) {
+                        owners.put(values.get(n), n);
+                    }
+                }
+                for (int n = 0; n < names.size(); n++) {
+                    if (!names.get(n).clickable && AccessibleName.matches(names.get(n), TARGET, text)) {
+                        UiObject2 parent = values.get(n).getParent();
+                        Integer owner = parent == null ? null : owners.get(parent);
+                        if (owner != null) names.set(n, names.get(n).withParent(owner));
+                    }
+                }
+                int selected = AccessibleName.unique(names, TARGET, text);
+                assertTrue("Ambiguous actual App action: " + text, selected != AccessibleName.AMBIGUOUS);
+                if (selected >= 0 && AccessibleName.matches(nameSnapshot(values.get(selected)), TARGET, text)) {
+                    ready = values.get(selected);
+                }
+            } catch (StaleObjectException ignored) {
+                // No gesture occurred. Reacquire within the same deadline.
+            }
+            if (ready != null && SystemClock.elapsedRealtime() < end) {
+                ready.click(); // Never catch/retry a possibly delivered gesture.
+                return;
+            }
+            SystemClock.sleep(100);
+        } while (SystemClock.elapsedRealtime() < end);
+        throw new AssertionError("Actual App action did not become ready: " + text);
+    }
     private void nativeButton(String description) { one(By.desc(description)).click(); }
     private void menu(String text) { nativeButton("メニュー"); click(text); }
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }

@@ -103,7 +103,8 @@ def installed_app(out, udid, device, expected, suffix):
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
-              "scope": "Owned Simulator only; Takosumi process or private fixture bundle events"}
+              "scope": "Owned Simulator only; Takosumi process or private fixture bundle events",
+              "excludedSubsystems": ["com.apple.dt.xctest"]}
     try:
         # Recheck inventory before spawn. Never query a host-wide log store or
         # a Simulator selected by its display name alone.
@@ -114,7 +115,11 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
                 and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
         # No custom/remote process name or predicate input. The bundle is the
         # preinstalled private Tauri App, not the minimal XCTest driver.
-        predicate = '(process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")'
+        # XCTest's verbose AX traversal can consume the query's entire budget
+        # before it reaches the failure time. Its AX snapshots and diagnostics
+        # remain in xcodebuild.log and the separately exported test attachments.
+        predicate = ('((process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")) '
+                     'AND (subsystem != "com.apple.dt.xctest")')
         raw = scratch / "target-app-exit-raw.log"
     except Exception as error:
         result["errorType"] = type(error).__name__

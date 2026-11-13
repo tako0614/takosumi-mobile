@@ -89,6 +89,22 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: saved connection label checks=[1-9][0-9]*")
 
+    def test_actual_driver_exact_accessible_name_rejects_ambiguous_foreign_or_hidden_actions(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the accessible-name control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the accessible-name control")
+        classes = self.root / "accessible-name-classes"
+        classes.mkdir()
+        helper = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome/AccessibleName.java"
+        control = runner.HERE / "label-controls/AccessibleNameTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.webhome.AccessibleNameTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: exact accessible name checks=[1-9][0-9]*")
+
     def test_actual_driver_save_wait_requires_observed_ime_and_one_back(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the driver keyboard control")
