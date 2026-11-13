@@ -264,6 +264,27 @@ enum Wait {
     Rejected(String),
     Fault(Error),
 }
+/// A closed projection of an already-failed wait; never error or page data.
+fn mac_open_wait_record(guard: u32, request: u64, wait: &Wait) -> String {
+    let category = match wait {
+        Wait::TimedOut => "timed_out",
+        Wait::Closed => "closed",
+        Wait::Rejected(_) => "rejected",
+        Wait::Fault(_) => "fault",
+    };
+    format!(
+        "takosumi-mac-open-wait: {{\"guardPid\":{guard},\"requestId\":{request},\"category\":\"{category}\"}}\n"
+    )
+}
+/// This opted-in fixture write adds no clock read or browser operation. It can
+/// block on stderr or be lost; its return never changes the original result.
+fn mac_open_wait_trace(guard: u32, request: u64, wait: &Wait) {
+    if !cfg!(target_os = "macos") || !setup::inspection(&setup::environment) {
+        return;
+    }
+    let record = mac_open_wait_record(guard, request, wait);
+    let _ = std::io::stderr().lock().write_all(record.as_bytes());
+}
 impl From<Wait> for Error {
     fn from(wait: Wait) -> Self {
         match wait {
@@ -1651,7 +1672,11 @@ impl Process {
         deadline: std::time::Instant,
     ) -> Result<()> {
         self.opening = Some(key.to_owned());
-        let result = match self.receive(id, deadline) {
+        let reply = self.receive(id, deadline);
+        if let Err(wait) = &reply {
+            mac_open_wait_trace(self.child.id(), id, wait);
+        }
+        let result = match reply {
             Ok(reply) => self.confirm_opened(reply, key),
             // The browser refused this creation outright: nothing is pending.
             Err(Wait::Rejected(message)) => {
@@ -2194,6 +2219,66 @@ fn require_normal_guard(proof: &serde_json::Value) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn open_wait_record_is_closed_bounded_and_borrows_the_failure() {
+        for (wait, category) in [
+            (Wait::TimedOut, "timed_out"),
+            (Wait::Closed, "closed"),
+            (
+                Wait::Rejected("private rejected sentinel".repeat(1024)),
+                "rejected",
+            ),
+            (
+                Wait::Fault(Error::Desktop("private fault sentinel".repeat(1024))),
+                "fault",
+            ),
+        ] {
+            let record = mac_open_wait_record(u32::MAX, u64::MAX, &wait);
+            assert_eq!(record, format!(
+                "takosumi-mac-open-wait: {{\"guardPid\":4294967295,\"requestId\":18446744073709551615,\"category\":\"{category}\"}}\n"
+            ));
+            assert!(!record.contains("private"));
+            assert!(record.len() <= 128);
+            match wait {
+                Wait::Rejected(message) => {
+                    assert_eq!(message, "private rejected sentinel".repeat(1024))
+                }
+                Wait::Fault(Error::Desktop(message)) => {
+                    assert_eq!(message, "private fault sentinel".repeat(1024))
+                }
+                Wait::TimedOut | Wait::Closed => {}
+                _ => panic!("the original failure changed"),
+            }
+        }
+    }
+
+    #[test]
+    fn open_wait_observation_preserves_the_original_error_conversion() {
+        for (wait, expected) in [
+            (Wait::TimedOut, "Browser response timed out."),
+            (Wait::Closed, "Browser replies closed."),
+            (
+                Wait::Rejected("original rejection".into()),
+                "original rejection",
+            ),
+        ] {
+            let _ = mac_open_wait_record(17, 4, &wait);
+            let error: Error = wait.into();
+            assert_eq!(error.to_string(), expected);
+        }
+        let original = String::from("original owned fault");
+        let pointer = original.as_ptr();
+        let wait = Wait::Fault(Error::Desktop(original));
+        let _ = mac_open_wait_record(17, 4, &wait);
+        let error: Error = wait.into();
+        match error {
+            Error::Desktop(message) => {
+                assert_eq!(message, "original owned fault");
+                assert_eq!(message.as_ptr(), pointer);
+            }
+            _ => panic!("the original fault was replaced"),
+        }
+    }
     #[test]
     fn recovery_clearance_preserves_abnormality_and_requires_kernel_exhaustion() {
         let valid = serde_json::json!({"rootExit":-9,"complete":true,"kernelNoChildren":true,"remaining":[],"forcedCleanup":3,"error":null,"cleanupErrors":[],"nonFatalErrors":[]});

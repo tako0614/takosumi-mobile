@@ -3,6 +3,7 @@
 
 import argparse
 import http.server
+import json  # NATIVE_ROOT_EXIT_OBSERVATION
 import os
 from pathlib import Path
 import resource
@@ -78,6 +79,22 @@ def run_native_writer(command, env, path, markers):
             raise RuntimeError(f"Native writer did not report: {marker}")
 
 
+# NATIVE_ROOT_EXIT_OBSERVATION_BEGIN
+def observe_native_root_exit(child):
+    """Best-effort cached status, not a new process query or generation proof."""
+    try:
+        pid, code = child.pid, child.returncode
+        record = {"schema": "takosumi.native-root-exit-observation@v1", "diagnosticOnly": True,
+                  "historicalOnly": True, "scope": "held_popen_child", "stage": "before_engine_children",
+                  "pid": pid if type(pid) is int and 0 < pid <= 2**31 - 1 else None,
+                  "returncode": code if type(code) is int and -255 <= code <= 255 else None}
+        # This synchronous file write can delay cleanup; absence remains unknown.
+        print("NATIVE_ROOT_EXIT_OBSERVATION " + json.dumps(record, sort_keys=True), flush=True)
+    except Exception:
+        pass  # Observation failure must not replace the original cleanup/result.
+# NATIVE_ROOT_EXIT_OBSERVATION_END
+
+
 def run_native_generation(command):
     # This worker lives inside the owned Xvfb/D-Bus session. Preserve that
     # session until the native generation has shut down, including its helpers.
@@ -99,6 +116,7 @@ def run_native_generation(command):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+    observe_native_root_exit(child)  # NATIVE_ROOT_EXIT_OBSERVATION
     wait_engine_children(tracked, descriptions)
     print(f"Native fixture {child.pid} and {len(tracked)} observed engine children exited", flush=True)
     print(f"PASS: native generation shutdown completed, fixture status={child.returncode}", flush=True)

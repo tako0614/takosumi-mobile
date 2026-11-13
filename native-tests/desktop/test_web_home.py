@@ -135,6 +135,64 @@ print('PASS: full App Web-home flow, synthetic process control', flush=True)
 
 
 class ProcessLifecycleTests(unittest.TestCase):
+    def test_native_root_exit_observation_preserves_cleanup_result_and_io(self):
+        import run as native_runner
+        prefix = "NATIVE_ROOT_EXIT_OBSERVATION "
+        # The actual worker runs only against cached fake Popen attributes here.
+        # No native child, process lookup, clock, signal or storage operation runs.
+        for code in (0, 17, -6, None, True, "SYNTHETIC_PRIVATE_STATUS"):
+            for cleanup_fails in (False, True):
+                for sink_fails in (False, True):
+                    with self.subTest(code_type=type(code).__name__, cleanup=cleanup_fails, sink=sink_fails):
+                        child = mock.Mock(pid=1234, returncode=code)
+                        child.poll.return_value = 0
+                        records, markers, order = [], [], []
+                        original = RuntimeError("SYNTHETIC_PRIVATE_CLEANUP")
+                        def cleanup(*_args):
+                            order.append("cleanup")
+                            if cleanup_fails:
+                                raise original
+                            return {}
+                        def emit(*parts, **options):
+                            text = " ".join(map(str, parts))
+                            if text.startswith(prefix):
+                                order.append("observation")
+                                self.assertEqual(options, {"flush": True})
+                                if sink_fails:
+                                    raise OSError("SYNTHETIC_PRIVATE_SINK")
+                                records.append(json.loads(text.removeprefix(prefix)))
+                            else:
+                                order.append("marker")
+                                markers.append(text)
+                        with mock.patch.object(native_runner, "enable_child_subreaper") as subreaper, \
+                             mock.patch.object(native_runner.subprocess, "Popen", return_value=child) as spawn, \
+                             mock.patch.object(native_runner, "observe_children") as observe, \
+                             mock.patch.object(native_runner, "wait_engine_children", side_effect=cleanup) as wait, \
+                             mock.patch.object(native_runner.time, "monotonic", return_value=10.0) as clock, \
+                             mock.patch.object(native_runner.time, "sleep") as sleep, \
+                             mock.patch.object(native_runner, "print", side_effect=emit, create=True):
+                            if cleanup_fails:
+                                with self.assertRaises(RuntimeError) as raised:
+                                    native_runner.run_native_generation(["SYNTHETIC_PRIVATE_COMMAND"])
+                                self.assertIs(raised.exception, original)
+                            else:
+                                self.assertIs(native_runner.run_native_generation(["SYNTHETIC_PRIVATE_COMMAND"]), code)
+                        self.assertEqual(order[:2], ["observation", "cleanup"])
+                        self.assertEqual(len(records), 0 if sink_fails else 1)
+                        if not sink_fails:
+                            expected = code if type(code) is int and -255 <= code <= 255 else None
+                            self.assertEqual(records[0], {
+                                "schema": "takosumi.native-root-exit-observation@v1", "diagnosticOnly": True,
+                                "historicalOnly": True, "scope": "held_popen_child", "stage": "before_engine_children",
+                                "pid": 1234, "returncode": expected})
+                            self.assertNotIn("SYNTHETIC_PRIVATE", json.dumps(records))
+                        self.assertEqual(len(markers), 0 if cleanup_fails else 2)
+                        self.assertEqual(child.poll.call_count, 2, "No observation poll may be added")
+                        child.wait.assert_not_called(); child.terminate.assert_not_called(); child.kill.assert_not_called()
+                        subreaper.assert_called_once_with(); spawn.assert_called_once_with(["SYNTHETIC_PRIVATE_COMMAND"])
+                        observe.assert_not_called(); wait.assert_called_once_with({}, {})
+                        clock.assert_called_once_with(); sleep.assert_not_called()
+
     def test_reset_restart_requires_the_cleared_profile_identity(self):
         self.run_control("missing-reset-identity")
 
