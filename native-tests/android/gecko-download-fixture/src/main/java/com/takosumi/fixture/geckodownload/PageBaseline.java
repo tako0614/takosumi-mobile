@@ -1,6 +1,6 @@
 package com.takosumi.fixture.geckodownload;
 
-/** Initial editor admission only; all calls run on the session's main thread.
+/** Initial editor/gesture admission only; navigation and admission run on the main thread.
  * A completed navigation is not a document identity or a paint/AX guarantee. */
 final class PageBaseline {
     private final Object session;
@@ -25,9 +25,29 @@ final class PageBaseline {
     }
 
     Snapshot capture(Object selected, Object attached, int generation, String uri, boolean editorVisible) {
-        if (selected != session || attached != session || !editorVisible || generation <= 0
-                || started != generation || completed != generation || uri == null || !uri.startsWith(origin)) return null;
+        if (!editorVisible || !navigationComplete(selected, attached, generation, uri)) return null;
         return new Snapshot(generation, uri);
+    }
+
+    private boolean navigationComplete(Object selected, Object attached, int generation, String uri) {
+        return !(selected != session || attached != session || generation <= 0
+                || started != generation || completed != generation || uri == null || !uri.startsWith(origin));
+    }
+
+    /** Per-entry budget. A rejected navigation never consumes the one existing gesture. */
+    final class Entry {
+        private volatile boolean tapped;
+        private volatile boolean scrolled;
+
+        boolean tapped() { return tapped; }
+        boolean scrolled() { return scrolled; }
+
+        boolean admit(boolean tap, Object selected, Object attached, int generation, String uri) {
+            if (tapped || (!tap && scrolled) || !navigationComplete(selected, attached, generation, uri)) return false;
+            if (tap) tapped = true;
+            else scrolled = true;
+            return true;
+        }
     }
 
     static final class Snapshot {
