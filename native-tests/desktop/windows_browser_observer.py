@@ -638,7 +638,8 @@ def command_observation(record, stage, **values):
                 "sendReturned": False, "matchingReplies": 0, "otherReplies": 0, "events": 0,
                 "countsCapped": False, "channelClosed": False, "phase": "send", "outcome": "sending",
                 "lastReceive": None, "lastOtherReplyRelation": None,
-                "firstEventReceivedAt": None, "lastEventReceivedAt": None}
+                "firstEventReceivedAt": None, "lastEventReceivedAt": None,
+                "firstEventKind": None, "lastEventKind": None}
     if record is None:
         return None
     result = dict(record)
@@ -656,9 +657,15 @@ def command_observation(record, stage, **values):
             received_at = values["message"][RECEIVED_AT]
             if type(received_at) is not float or not 0 <= received_at < float("inf"):
                 raise ValueError("Invalid event receipt time")
+            kind = command_event_kind(values["message"].get("method"))
+            if type(kind) is not str or kind not in ("lifecycle", "navigation", "crash", "detach",
+                                                     "target_destroyed", "contexts_cleared", "other", "unknown"):
+                raise ValueError("Invalid closed event kind")
             if result["firstEventReceivedAt"] is None:
                 result["firstEventReceivedAt"] = received_at
+                result["firstEventKind"] = kind
             result["lastEventReceivedAt"] = received_at
+            result["lastEventKind"] = kind
         if values["other"]:
             relation = command_reply_relation(values["reply_id"], values["ident"])
             if type(relation) is not str or relation not in ("older", "future", "invalid", "unknown"):
@@ -675,6 +682,18 @@ def command_observation(record, stage, **values):
             result["outcome"] = "exception"
     return result
 
+
+
+
+def command_event_kind(method):
+    """Top-level method hint only; no params, session, target or lifecycle proof."""
+    if type(method) is not str:
+        return "unknown"
+    return {"Page.lifecycleEvent": "lifecycle", "Page.frameNavigated": "navigation",
+            "Page.frameStartedLoading": "navigation", "Inspector.targetCrashed": "crash",
+            "Target.targetCrashed": "crash", "Inspector.detached": "detach",
+            "Target.detachedFromTarget": "detach", "Target.targetDestroyed": "target_destroyed",
+            "Runtime.executionContextsCleared": "contexts_cleared"}.get(method, "other")
 
 
 def command_reply_relation(reply_id, ident):
