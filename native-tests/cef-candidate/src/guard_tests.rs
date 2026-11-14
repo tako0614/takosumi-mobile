@@ -140,6 +140,8 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    guard_comm_class_projection_is_private_optional_and_bounded,
+    guard_comm_class_owned_names_do_not_change_forced_cleanup,
     guard_readiness_observation_preserves_errno_optional_and_budget,
     terminal_signal_owned_fd_open_failure_cleans_partial_child,
     terminal_signal_readiness_unknown_keeps_eligibility,
@@ -1193,7 +1195,7 @@ fn the_tracker_retains_every_descendant_with_its_start_time() {
     let retained: Vec<(i32, u64)> = tracker
         .handles
         .iter()
-        .map(|(pid, (start, _))| (*pid, *start))
+        .map(|(pid, (start, _, _))| (*pid, *start))
         .collect();
     let mut expected = vec![shell, grandchild];
     expected.sort_unstable();
@@ -1291,6 +1293,10 @@ fn stop_observation_is_bounded_and_uses_only_existing_results() {
 const TERMINAL_LOCAL_CHILD: &str = r#"
 import os,signal,sys
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+if sys.argv[1].startswith("comm-"):
+    import ctypes
+    name = b"adb" if sys.argv[1] == "comm-adb" else b"private-label"
+    if ctypes.CDLL(None).prctl(15, name, 0, 0, 0) != 0: os._exit(93)
 print("ready", flush=True)
 sys.stdin.readline()
 os._exit(0 if sys.argv[1] == "exit" else 2)
@@ -1713,3 +1719,123 @@ fn guard_readiness_observation_preserves_errno_optional_and_budget() {
     assert_eq!(callbacks.get(), 1); // Serialization never repeats either poll path.
 }
 // READINESS_OBSERVATION_CONTROL_END
+
+// COMM_CLASS_OBSERVATION_CONTROL_BEGIN
+fn guard_comm_class_projection_is_private_optional_and_bounded() {
+    let mut fields = vec!["0"; 20];
+    fields[0] = "S";
+    fields[1] = "17";
+    fields[19] = "42";
+    let fields = fields.join(" ");
+    for (name, expected) in [
+        ("adb", CommClass::Adb),
+        ("emulator", CommClass::Emulator),
+        ("qemu-system-x86", CommClass::Qemu),
+        ("qemu-system-aar", CommClass::Qemu),
+        ("crashpad_handle", CommClass::Crashpad),
+        ("private label", CommClass::Other),
+        ("private) S 999 ", CommClass::Other),
+        ("", CommClass::Unknown),
+    ] {
+        let text = format!("9 ({name}) {fields}");
+        assert_eq!(parse_stat(&text), Some((42, 17)));
+        assert_eq!(comm_class(&text), expected);
+    }
+    assert_eq!(comm_class("not a stat; private label"), CommClass::Unknown);
+    assert_eq!(
+        comm_class("9 (unterminated private label"),
+        CommClass::Unknown
+    );
+
+    let mut observation = StopObservation::default();
+    observation.begin();
+    observation.signal_with_comm(
+        9,
+        Some(42),
+        false,
+        "retained_pidfd",
+        libc::SIGTERM,
+        &Ok(()),
+        None,
+        Some(CommClass::Adb),
+    );
+    observation.signal(9, None, true, "direct_pidfd", libc::SIGTERM, &Ok(()), None);
+    observation.reaped(9, false, 0);
+    let proof = observation.json();
+    assert_eq!(proof["commClasses"][CommClass::Adb as usize], "adb_name");
+    assert_eq!(proof["records"][0]["commClass"], CommClass::Adb as u8);
+    assert_eq!(proof["records"][1]["commClass"], Value::Null);
+    assert_eq!(proof["records"][2]["commClass"], Value::Null);
+    assert_eq!(proof["records"][2]["startTick"], Value::Null);
+    assert!(!serde_json::to_string(&proof).unwrap().contains("private"));
+
+    let mut full = StopObservation::default();
+    full.begin();
+    let worst = PidfdReadiness {
+        polled: i32::MIN,
+        revents: i16::MIN,
+        terminal: false,
+        poll_errno: Some(i32::MIN),
+    };
+    let error = Err(io::Error::from_raw_os_error(i32::MIN));
+    for _ in 0..STOP_OBSERVATION_CAP {
+        full.signal_with_comm(
+            i32::MAX,
+            Some(u64::MAX),
+            false,
+            "retained_pidfd",
+            libc::SIGUSR1,
+            &error,
+            Some(worst),
+            None,
+        );
+    }
+    full.reaped(9, false, 0);
+    let value = full.json();
+    assert_eq!(value["records"].as_array().unwrap().len(), 64);
+    assert_eq!(value["truncated"], true);
+    let bytes = serde_json::to_vec(&value).unwrap().len();
+    assert!(bytes < 16 * 1024, "existing observer byte budget: {bytes}");
+    println!("COMM_CLASS pure=true cap=64 bytes={bytes} raw_name_saved=false");
+}
+
+fn guard_comm_class_owned_names_do_not_change_forced_cleanup() {
+    for (mode, expected) in [
+        ("comm-adb", CommClass::Adb),
+        ("comm-private", CommClass::Other),
+    ] {
+        let mut child = TerminalLocalChild::new(mode);
+        let mut run = terminal_local_run(&child);
+        let pid = child.child.id() as i32;
+        let start = run.tracker.handles[&pid].0;
+        let captured = run.tracker.handles[&pid].2;
+        run.send(libc::SIGTERM);
+        // Reap before any payload assertions, including a failed assertion.
+        terminal_local_finish(&mut run, &mut child, "comm-class-owned-child");
+        assert_eq!(captured, expected);
+        let proof = run.stop_observation.json();
+        let records = proof["records"].as_array().unwrap();
+        let retained: Vec<_> = records
+            .iter()
+            .filter(|r| r["target"] == "retained_pidfd")
+            .collect();
+        assert!(!retained.is_empty());
+        for record in retained {
+            assert_eq!(record["pid"], pid);
+            assert_eq!(record["startTick"], start);
+            assert_eq!(record["commClass"], expected as u8);
+        }
+        for record in records
+            .iter()
+            .filter(|r| r["kind"] == "reap" || r["target"] == "direct_pidfd")
+        {
+            assert_eq!(record["commClass"], Value::Null);
+        }
+        assert_eq!(run.forced.len(), 1, "a name never exempts a live child");
+        assert!(!serde_json::to_string(&proof)
+            .unwrap()
+            .contains("private-label"));
+        println!("COMM_CLASS owned=true name_spoofable=true forced=1 reaped=true echild=true");
+    }
+}
+// COMM_CLASS_OBSERVATION_CONTROL_END

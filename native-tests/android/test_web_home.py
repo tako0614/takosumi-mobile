@@ -211,6 +211,34 @@ class Controls(unittest.TestCase):
             with self.subTest(defect=defect), self.assertRaises(RuntimeError):
                 runner.require_ui_pass(self.log(), result)
 
+    def test_guard_comm_name_metadata_is_optional_and_never_normal_close_authority(self):
+        base = {"complete": True, "kernelNoChildren": True, "remaining": [], "error": None,
+                "cleanupErrors": [], "nonFatalErrors": [], "rootExit": 0, "forcedCleanup": 0}
+        for code in ("legacy", None, 0, 1, 2, 3, 4, 5, 99):
+            with self.subTest(code=code):
+                value = dict(base)
+                if code != "legacy":
+                    value["stopObservation"] = {"diagnosticOnly": True, "capacity": 64,
+                        "commClasses": ["unknown", "other", "emulator_name", "qemu_name", "crashpad_name", "adb_name"],
+                        "records": [{"kind": "signal", "pid": 7, "startTick": 42, "commClass": code}]}
+                emulator = runner.Emulator.__new__(runner.Emulator)
+                emulator.process = Mock(pid=101)
+                emulator.process.poll.return_value = 0
+                emulator.birth, emulator.fd, emulator.output = 42, 909, Mock()
+                emulator.proof = self.root / "comm-class-guard.json"
+                emulator.proof.write_text(runner.json.dumps(value))
+                with patch.object(runner.os, "close") as closed, \
+                        patch.object(runner.signal, "pidfd_send_signal") as sent:
+                    returned = emulator.stop()
+                self.assertEqual(returned, value)
+                closed.assert_called_once_with(909)
+                sent.assert_not_called()
+                emulator.process.wait.assert_not_called()
+                emulator.output.close.assert_called_once_with()
+                runner.receipt(returned, normal=True)
+                with self.assertRaises(RuntimeError):
+                    runner.receipt(dict(returned, forcedCleanup=1), normal=True)
+
     def test_kernel_drain_and_normal_exit_are_separate_requirements(self):
         value = {"complete": True, "kernelNoChildren": True, "remaining": [], "error": None,
                  "cleanupErrors": [], "nonFatalErrors": [], "rootExit": 0, "forcedCleanup": 0}

@@ -94,15 +94,70 @@ fn parse_stat(text: &str) -> Option<(u64, i32)> {
     Some((fields.get(19)?.parse().ok()?, fields.get(1)?.parse().ok()?))
 }
 
+// COMM_CLASS_OBSERVATION_BEGIN
+/// A spoofable process-name class, never a role, ownership or signal policy.
+/// No raw comm is retained. Linux truncates comm to 15 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommClass {
+    Unknown = 0,
+    Other = 1,
+    Emulator = 2,
+    Qemu = 3,
+    Crashpad = 4,
+    Adb = 5,
+}
+
+const COMM_CLASSES: [&str; 6] = [
+    "unknown",
+    "other",
+    "emulator_name",
+    "qemu_name",
+    "crashpad_name",
+    "adb_name",
+];
+
+fn comm_class(text: &str) -> CommClass {
+    let Some((_, name)) = text.split_once(" (") else {
+        return CommClass::Unknown;
+    };
+    let Some((name, _)) = name.rsplit_once(") ") else {
+        return CommClass::Unknown;
+    };
+    match name {
+        "" => CommClass::Unknown,
+        "emulator" => CommClass::Emulator,
+        "qemu-system-x86" | "qemu-system-aar" => CommClass::Qemu,
+        "crashpad_handle" | "crashpad" => CommClass::Crashpad,
+        "adb" => CommClass::Adb,
+        _ => CommClass::Other,
+    }
+}
+
+struct StatSnapshot {
+    start: u64,
+    parent: i32,
+    comm: CommClass,
+}
+// COMM_CLASS_OBSERVATION_END
+
 /// (start time, parent pid), or None once the process is gone.
-fn ancestry(pid: i32) -> Result<Option<(u64, i32)>, String> {
+fn stat_snapshot(pid: i32) -> Result<Option<StatSnapshot>, String> {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(text) => parse_stat(&text)
+            .map(|(start, parent)| StatSnapshot {
+                start,
+                parent,
+                comm: comm_class(&text),
+            })
             .map(Some)
             .ok_or_else(|| "MalformedStat".to_string()),
         Err(error) if gone(&error) => Ok(None),
         Err(error) => Err(fault(&error)),
     }
+}
+
+fn ancestry(pid: i32) -> Result<Option<(u64, i32)>, String> {
+    Ok(stat_snapshot(pid)?.map(|stat| (stat.start, stat.parent)))
 }
 
 fn start_time(pid: i32) -> Result<Option<u64>, String> {
@@ -314,7 +369,9 @@ fn is_owned(pid: i32, owner: i32, owner_start: u64) -> Result<bool, String> {
 /// for that pidfd. Signals go through the pidfd, so a reused pid is never hit.
 #[derive(Default)]
 struct Tracker {
-    handles: BTreeMap<i32, (u64, OwnedFd)>,
+    // The class comes only from a matching-birth stat snapshot; it can become
+    // stale or be spoofed. It follows the pidfd's lifetime, never a reaped PID.
+    handles: BTreeMap<i32, (u64, OwnedFd, CommClass)>,
     /// Distinct owned processes retained so far; it only grows.
     observed: u64,
 }
@@ -327,17 +384,21 @@ impl Tracker {
         // renderers come and go. A gone process never reappears in a
         // snapshot, so it is never counted twice. The check uses the pidfd
         // itself, so pruning still works when no descriptor is free.
-        self.handles.retain(|_, (_, fd)| exists(fd));
+        self.handles.retain(|_, (_, fd, _)| exists(fd));
         if injected("OBSERVE") {
             return Err(fault(&injected_error()));
         }
         let owner_start = start_time(owner)?.ok_or("IdentityUnavailable")?;
         for pid in descendants(owner)? {
-            let Some(start) = start_time(pid)? else {
+            let Some(snapshot) = stat_snapshot(pid)? else {
                 continue;
             };
-            match self.handles.get(&pid) {
-                Some((known, _)) if *known == start => continue,
+            let start = snapshot.start;
+            match self.handles.get_mut(&pid) {
+                Some((known, _, class)) if *known == start => {
+                    *class = snapshot.comm;
+                    continue;
+                }
                 // A kept handle's process still exists and so still holds
                 // its pid; a different start time here can only mean a
                 // stale read. Replace the handle rather than trust either.
@@ -356,9 +417,11 @@ impl Tracker {
             // shows the start time read before opening (so the pidfd names
             // that same process) and that process still descends from this
             // exact live guard. Otherwise, or on a read error, `fd` closes.
-            if start_time(pid)? == Some(start) && is_owned(pid, owner, owner_start)? {
-                self.handles.insert(pid, (start, fd));
-                self.observed += 1;
+            if let Some(verified) = stat_snapshot(pid)? {
+                if verified.start == start && is_owned(pid, owner, owner_start)? {
+                    self.handles.insert(pid, (start, fd, verified.comm));
+                    self.observed += 1;
+                }
             }
         }
         Ok(())
@@ -368,7 +431,7 @@ impl Tracker {
     fn alive(&self) -> Vec<i32> {
         self.handles
             .iter()
-            .filter(|(_, (_, fd))| exists(fd))
+            .filter(|(_, (_, fd, _))| exists(fd))
             .map(|(pid, _)| *pid)
             .collect()
     }
@@ -655,6 +718,7 @@ struct StopEvent {
     errno: Option<i32>,
     status: Option<i32>,
     readiness: Option<PidfdReadiness>,
+    comm_class: Option<CommClass>,
 }
 
 struct StopObservation {
@@ -702,6 +766,20 @@ impl StopObservation {
         sent: &io::Result<()>,
         readiness: Option<PidfdReadiness>,
     ) {
+        self.signal_with_comm(pid, start_tick, root, target, signal, sent, readiness, None);
+    }
+
+    fn signal_with_comm(
+        &mut self,
+        pid: i32,
+        start_tick: Option<u64>,
+        root: bool,
+        target: &'static str,
+        signal: libc::c_int,
+        sent: &io::Result<()>,
+        readiness: Option<PidfdReadiness>,
+        comm_class: Option<CommClass>,
+    ) {
         let errno = sent.as_ref().err().and_then(io::Error::raw_os_error);
         let result = if sent.is_ok() {
             "ok"
@@ -728,6 +806,7 @@ impl StopObservation {
             errno,
             status: None,
             readiness,
+            comm_class,
         });
     }
 
@@ -744,6 +823,7 @@ impl StopObservation {
             errno: None,
             status: Some(status),
             readiness: None,
+            comm_class: None,
         });
     }
 
@@ -752,10 +832,13 @@ impl StopObservation {
             serde_json::json!({ "kind": event.kind, "pid": event.pid, "startTick": event.start_tick,
                 "root": event.root, "target": event.target, "signal": event.signal, "result": event.result,
                 "errno": event.errno, "waitStatus": event.status,
+                "commClass": event.comm_class.map(|class| class as u8),
                 "readiness": event.readiness.map(|ready| serde_json::json!([ready.polled, ready.revents, ready.terminal, ready.poll_errno])) })
         }).collect();
         serde_json::json!({ "schema": "takosumi.guard-stop-observation@v1", "diagnosticOnly": true,
-            "scope": "existing_drain", "readinessFields": ["polled", "revents", "terminal", "pollErrno"], "capacity": STOP_OBSERVATION_CAP, "truncated": self.truncated, "records": records })
+            "scope": "existing_drain", "readinessFields": ["polled", "revents", "terminal", "pollErrno"],
+            "commClasses": COMM_CLASSES, "commClassScope": "matching_birth_stat_snapshot",
+            "capacity": STOP_OBSERVATION_CAP, "truncated": self.truncated, "records": records })
     }
 }
 // STOP_OBSERVATION_END
@@ -832,13 +915,13 @@ impl Run {
     /// child while it is unreaped.
     fn send(&mut self, signal: libc::c_int) {
         self.safe_observe();
-        for (pid, (start_tick, fd)) in &self.tracker.handles {
+        for (pid, (start_tick, fd, class)) in &self.tracker.handles {
             let readiness = signal_readiness(signal, Some(fd), pidfd_readiness);
             if readiness.is_some_and(|ready| ready.terminal) {
                 continue;
             }
             let sent = pidfd_signal(fd, signal);
-            self.stop_observation.signal(
+            self.stop_observation.signal_with_comm(
                 *pid,
                 Some(*start_tick),
                 Some(*pid) == self.child && self.root_exit.is_none(),
@@ -846,6 +929,7 @@ impl Run {
                 signal,
                 &sent,
                 readiness,
+                Some(*class),
             );
             match sent {
                 Ok(()) => {
