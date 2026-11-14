@@ -843,6 +843,208 @@ impl StopObservation {
 }
 // STOP_OBSERVATION_END
 
+// LAUNCH_CONTEXT_BEGIN
+// Private Android fixture metadata. It never supplies signal eligibility,
+// ownership, drain budgets or a normal-exit verdict. No reads occur in drain.
+const LAUNCH_CONTEXT_ENV: &str = "TAKOSUMI_GUARD_LAUNCH_CONTEXT";
+const LAUNCH_CONTEXT_CAP: usize = 16;
+const LAUNCH_ARG_BYTES: usize = 8192;
+
+#[derive(Clone, Debug, PartialEq)]
+struct LaunchPoint {
+    start: u64,
+    parent: i32,
+    parent_start: u64,
+    image: [u64; 2],
+    argv: Vec<u8>, // Transient only: never serialized or logged.
+}
+
+fn launch_image(path: impl AsRef<Path>) -> Option<(File, [u64; 2])> {
+    use std::os::unix::fs::MetadataExt;
+    // O_PATH pins the image inode without reading executable contents. The
+    // identity is not a binary digest, SDK version or proof of purpose.
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_PATH).open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, [meta.dev(), meta.ino()]))
+}
+
+fn launch_argv(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    if bytes.is_empty() || bytes.len() > LAUNCH_ARG_BYTES || !bytes.ends_with(&[0]) {
+        return None;
+    }
+    let args: Vec<_> = bytes[..bytes.len() - 1].split(|b| *b == 0).collect();
+    (args.len() <= 64 && !args[0].is_empty()).then_some(args)
+}
+
+fn launch_options<'a>(args: &'a [&'a [u8]]) -> Option<(&'a [u8], &'a [u8])> {
+    let option = |name: &[u8]| {
+        let hits: Vec<_> = args.iter().enumerate().filter(|(_, arg)| **arg == name).collect();
+        if hits.len() != 1 { return None; }
+        args.get(hits[0].0 + 1).copied().filter(|v| !v.is_empty() && !v.starts_with(b"-"))
+    };
+    Some((option(b"-avd")?, option(b"-port")?))
+}
+
+// Parent lifetime must be the guard's actual birth or a retained owned tuple.
+// Missing parents, reparenting, PID reuse or a moving image/argv refuse a point.
+fn launch_point(pid: i32, start: u64, owner: i32, owner_start: Option<u64>,
+                tracker: &Tracker) -> Option<(LaunchPoint, File)> {
+    use std::io::Read;
+    let before = ancestry(pid).ok()??;
+    if before.0 != start { return None; }
+    let parent_before = ancestry(before.1).ok()??;
+    let parent_start = if before.1 == owner {
+        owner_start?
+    } else {
+        tracker.handles.get(&before.1)?.0
+    };
+    if parent_before.0 != parent_start { return None; }
+    let (image_file, image) = launch_image(format!("/proc/{pid}/exe"))?;
+    let mut argv = Vec::new();
+    File::open(format!("/proc/{pid}/cmdline")).ok()?
+        .take((LAUNCH_ARG_BYTES + 1) as u64).read_to_end(&mut argv).ok()?;
+    launch_argv(&argv)?;
+    if ancestry(pid).ok()?? != before || ancestry(before.1).ok()?? != parent_before {
+        return None;
+    }
+    Some((LaunchPoint { start, parent: before.1, parent_start, image, argv }, image_file))
+}
+
+// A point is accepted only if both full samples agree. This is bookending,
+// not an atomic snapshot: same-image exec or changes between reads may be lost.
+fn coherent_launch_points(start: u64, first: Option<&LaunchPoint>, last: Option<&LaunchPoint>)
+    -> Result<Option<LaunchPoint>, ()>
+{
+    match (first, last) {
+        (Some(a), Some(b)) if a.start == start && a == b => Ok(Some(a.clone())),
+        (Some(_), Some(_)) => Err(()),
+        _ => Ok(None),
+    }
+}
+
+struct LaunchRecord {
+    observation: u16,
+    last_attempt: u16,
+    last_attempt_unknown: bool,
+    point: Option<LaunchPoint>,
+    changed: bool,
+}
+
+impl LaunchRecord {
+    fn sample(&mut self, observation: u16, sampled: Result<Option<LaunchPoint>, ()>) {
+        self.last_attempt = observation;
+        self.last_attempt_unknown = true;
+        match sampled {
+            Err(()) => self.changed = true,
+            Ok(None) => {} // Missing later reads do not erase a dated historical snapshot.
+            Ok(Some(point)) => {
+                if let Some(old) = &self.point {
+                    if old.image != point.image || old.argv != point.argv
+                        || old.parent != point.parent || old.parent_start != point.parent_start {
+                        self.changed = true;
+                    }
+                }
+                if !self.changed { self.point = Some(point); self.observation = observation;
+                    self.last_attempt_unknown = false; }
+            }
+        }
+    }
+}
+
+struct LaunchContext {
+    guard: i32,
+    guard_start: Option<u64>,
+    // Keep the requested inode pinned through final serialization.
+    image: Option<(File, [u64; 2])>,
+    argv: Option<Vec<u8>>,
+    records: BTreeMap<(i32, u64), LaunchRecord>,
+    observation: u16,
+    cursor: usize,
+    truncated: bool,
+}
+
+impl LaunchContext {
+    fn enabled(value: Option<&std::ffi::OsStr>) -> bool {
+        value == Some(std::ffi::OsStr::new("android_fixture_sdk"))
+    }
+
+    fn new(guard: i32, program: &OsString, args: &[OsString]) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let mut argv = Vec::new();
+        for arg in std::iter::once(program).chain(args) {
+            if argv.len().saturating_add(arg.as_bytes().len() + 1) > LAUNCH_ARG_BYTES {
+                argv.clear();
+                break;
+            }
+            argv.extend_from_slice(arg.as_bytes());
+            argv.push(0);
+        }
+        let argv = launch_argv(&argv).is_some().then_some(argv);
+        Self { guard, guard_start: start_time(guard).ok().flatten(), image: launch_image(program),
+            argv, records: BTreeMap::new(), observation: 0, cursor: 0, truncated: false }
+    }
+
+    // At most one owned identity per running tick; never called by send/drain.
+    // IO/scheduling overhead can delay running observation and is not claimed zero.
+    fn capture(&mut self, tracker: &Tracker) {
+        if tracker.handles.is_empty() { return; }
+        let Some(next) = self.observation.checked_add(1) else {
+            self.truncated = true;
+            return;
+        };
+        self.observation = next;
+        let fresh = tracker.handles.iter().find(|(pid, (start, _, _))|
+            !self.records.contains_key(&(**pid, *start)));
+        let selected = fresh.or_else(|| tracker.handles.iter().nth(self.cursor % tracker.handles.len()));
+        self.cursor = self.cursor.wrapping_add(1);
+        let Some((&pid, &(start, _, _))) = selected else { return; };
+        if !self.records.contains_key(&(pid, start)) && self.records.len() >= LAUNCH_CONTEXT_CAP {
+            self.truncated = true;
+            // Retain the latest bounded history instead of permanently losing
+            // every later SDK child after the first sixteen lifetimes.
+            if let Some((&oldest, _)) = self.records.iter().min_by_key(|(_, r)| r.last_attempt) {
+                self.records.remove(&oldest);
+            }
+        }
+        // Hold both executable handles until comparison, preventing inode reuse
+        // between the samples from masquerading as equal image identities.
+        let first = launch_point(pid, start, self.guard, self.guard_start, tracker);
+        let last = launch_point(pid, start, self.guard, self.guard_start, tracker);
+        let sampled = coherent_launch_points(start, first.as_ref().map(|v| &v.0), last.as_ref().map(|v| &v.0));
+        let record = self.records.entry((pid, start)).or_insert(LaunchRecord {
+            observation: next, last_attempt: next, last_attempt_unknown: true, point: None, changed: false,
+        });
+        record.sample(next, sampled);
+    }
+
+    fn json(&self, root: Option<i32>) -> serde_json::Value {
+        let declared_image = self.image.as_ref().map(|v| v.1);
+        let declared_args = self.argv.as_deref().and_then(launch_argv);
+        let declared_options = declared_args.as_deref().and_then(launch_options);
+        let records: Vec<_> = self.records.iter().map(|(&(pid, start), record)| {
+            let point = record.point.as_ref().filter(|_| !record.changed);
+            let args = point.and_then(|p| launch_argv(&p.argv));
+            let options = args.as_deref().and_then(launch_options);
+            serde_json::json!({ "pid": pid, "startTick": start, "root": root == Some(pid),
+                "parentPid": point.map(|p| p.parent), "parentStartTick": point.map(|p| p.parent_start),
+                "observation": record.observation, "lastAttempt": record.last_attempt,
+                "lastAttemptUnknown": record.last_attempt_unknown,
+                "status": if record.changed { "changed" } else if point.is_some() { "observed" } else { "unknown" },
+                "execIdentity": point.map(|p| p.image),
+                "matchesDeclaredImage": point.and_then(|p| declared_image.map(|image| p.image == image)),
+                "matchesDeclaredArgv": point.and_then(|p| self.argv.as_ref().map(|argv| p.argv == *argv)),
+                "matchesDeclaredRunOptions": options.zip(declared_options).map(|(a, b)| a == b),
+            })
+        }).collect();
+        serde_json::json!({ "schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
+            "guardPid": self.guard, "guardStartTick": self.guard_start, "spawnedRootPid": root,
+            "declaredLaunch": { "imageIdentity": declared_image, "runOptionsPresent": declared_options.is_some() },
+            "capacity": LAUNCH_CONTEXT_CAP, "truncated": self.truncated,
+            "absenceIsUnknown": true, "signalTimeStateUnknown": true, "records": records })
+    }
+}
+// LAUNCH_CONTEXT_END
+
 struct Run {
     me: i32,
     tracker: Tracker,
@@ -854,6 +1056,7 @@ struct Run {
     cleanup_errors: BTreeSet<String>,
     non_fatal: BTreeSet<String>,
     stop_observation: StopObservation,
+    launch_context: Option<LaunchContext>, // Private opt-in; no cleanup authority.
 }
 
 fn exit_code(status: libc::c_int) -> i32 {
@@ -995,6 +1198,9 @@ impl Run {
             if let Err(error) = self.tracker.observe(self.me) {
                 self.non_fatal.insert(error);
             }
+            if let Some(context) = &mut self.launch_context {
+                context.capture(&self.tracker);
+            }
             // Neither may a failed reap or wait, unless it keeps failing: then
             // the guard can no longer see the browser end or a stop request,
             // and it drains after MAX_RUNNING_FAULTS consecutive ticks.
@@ -1096,7 +1302,11 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
         stop_observation: StopObservation::default(),
+        launch_context: None,
     };
+    if LaunchContext::enabled(std::env::var_os(LAUNCH_CONTEXT_ENV).as_deref()) {
+        run.launch_context = Some(LaunchContext::new(run.me, program, args));
+    }
     let mut failure = None;
     // A stop requested before the browser starts (a parent already gone, or a
     // pending SIGTERM or SIGINT) starts nothing.
@@ -1130,7 +1340,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     let normal =
         complete && run.root_exit == Some(0) && failure.is_none() && run.cleanup_errors.is_empty();
-    let proof = serde_json::json!({
+    let mut proof = serde_json::json!({
         "rootExit": run.root_exit,
         "complete": complete,
         "remaining": run.tracker.alive(),
@@ -1142,6 +1352,9 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         "nonFatalErrors": run.non_fatal,
         "stopObservation": run.stop_observation.json(),
     });
+    if let Some(context) = &run.launch_context {
+        proof["launchContext"] = context.json(run.child);
+    }
     // One write of the whole document, so a reader never sees a partial one
     // from a successful write.
     let written = serde_json::to_vec(&proof)

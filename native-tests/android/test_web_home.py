@@ -37,6 +37,86 @@ XMLTREE = """E: network-security-config (line=2)
 
 
 class Controls(unittest.TestCase):
+    # LAUNCH_CONTEXT_CONTROL_BEGIN
+    def test_launch_context_is_optional_bound_to_actual_guard_and_private(self):
+        import copy
+        record = {"pid": 12, "startTick": 34, "root": True, "parentPid": 10,
+                  "parentStartTick": 20, "observation": 1, "lastAttempt": 1, "lastAttemptUnknown": False, "status": "observed",
+                  "execIdentity": [1, 2], "matchesDeclaredImage": True,
+                  "matchesDeclaredArgv": True, "matchesDeclaredRunOptions": True}
+        context = {"schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
+                   "guardPid": 10, "guardStartTick": 20, "spawnedRootPid": 12,
+                   "declaredLaunch": {"imageIdentity": [1, 2], "runOptionsPresent": True},
+                   "capacity": 16, "truncated": False, "absenceIsUnknown": True,
+                   "signalTimeStateUnknown": True, "records": [record]}
+        valid = runner.guard_launch_context(context, 10, 20)
+        self.assertEqual(valid, context)
+        self.assertEqual(runner.guard_launch_context(None, 10, 20),
+                         {"diagnosticOnly": True, "status": "unknown", "absenceIsUnknown": True})
+        bad = []
+        for field, value in (("guardPid", 11), ("guardStartTick", 21),
+                             ("signalTimeStateUnknown", False), ("capacity", 17)):
+            changed = copy.deepcopy(context)
+            changed[field] = value
+            bad.append(changed)
+        for field, value in (("startTick", True), ("status", "sdk_helper"),
+                             ("matchesDeclaredImage", "private"), ("parentStartTick", None),
+                             ("pid", 2**31), ("lastAttempt", 0), ("lastAttemptUnknown", None),
+                             ("rawArgv", "private-token"), ("root", False)):
+            changed = copy.deepcopy(context)
+            changed["records"][0][field] = value
+            bad.append(changed)
+        changed = copy.deepcopy(context)
+        changed["records"] *= 2
+        bad.append(changed)
+        changed = copy.deepcopy(context)
+        changed["records"] *= 17
+        bad.append(changed)
+        changed = copy.deepcopy(context)
+        changed["declaredLaunch"]["rawExec"] = "private-path"
+        bad.append(changed)
+        for changed in bad:
+            with self.subTest(value=bad.index(changed)):
+                self.assertEqual(runner.guard_launch_context(changed, 10, 20)["status"], "unknown")
+        with patch.object(runner.json, "dumps", side_effect=RuntimeError("private-error")):
+            self.assertEqual(runner.guard_launch_context(context, 10, 20)["status"], "unknown")
+        changed = copy.deepcopy(context)
+        changed["truncated"] = True
+        changed["records"][0].update(status="changed", lastAttemptUnknown=True, parentPid=None, parentStartTick=None,
+            execIdentity=None, matchesDeclaredImage=None, matchesDeclaredArgv=None,
+            matchesDeclaredRunOptions=None)
+        self.assertEqual(runner.guard_launch_context(changed, 10, 20), changed)
+        proof = {"complete": True, "kernelNoChildren": True, "remaining": [], "error": None,
+                 "cleanupErrors": [], "nonFatalErrors": [], "rootExit": 0, "forcedCleanup": 1}
+        runner.receipt(proof, normal=False)
+        proof["launchContext"] = context
+        with self.assertRaises(RuntimeError):
+            runner.receipt(proof, normal=True)
+        # The actual stop return seam keeps both the original proof/verdict and guard binding.
+        emulator = object.__new__(runner.Emulator)
+        emulator.process = Mock(pid=10)
+        emulator.process.poll.return_value = 0
+        emulator.birth, emulator.fd = 20, None
+        emulator.output = io.BytesIO()
+        emulator.proof = self.root / "launch-context-receipt.json"
+        import json
+        emulator.proof.write_text(json.dumps(proof))
+        returned = emulator.stop()
+        self.assertEqual(returned, proof)
+        self.assertEqual(returned["forcedCleanup"], 1)
+        proof["launchContext"]["guardStartTick"] = 21
+        emulator.output = io.BytesIO()
+        emulator.proof.write_text(json.dumps(proof))
+        returned = emulator.stop()
+        self.assertEqual(returned["launchContext"]["status"], "unknown")
+        self.assertEqual(returned["forcedCleanup"], 1)
+        # Old receipts remain accepted without a new metadata requirement.
+        proof.pop("launchContext")
+        emulator.output = io.BytesIO()
+        emulator.proof.write_text(json.dumps(proof))
+        self.assertNotIn("launchContext", emulator.stop())
+    # LAUNCH_CONTEXT_CONTROL_END
+
     def setUp(self):
         parent = Path(os.environ.get("TMPDIR", "/root/dev/tmp"))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=parent)))

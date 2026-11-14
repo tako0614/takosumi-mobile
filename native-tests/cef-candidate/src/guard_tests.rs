@@ -140,6 +140,8 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    launch_context_refuses_reuse_exec_motion_and_private_poison,
+    launch_context_real_owned_root_keeps_receipt_and_cleanup_separate,
     guard_comm_class_projection_is_private_optional_and_bounded,
     guard_comm_class_owned_names_do_not_change_forced_cleanup,
     guard_readiness_observation_preserves_errno_optional_and_budget,
@@ -1411,6 +1413,7 @@ fn terminal_local_run(child: &TerminalLocalChild) -> Run {
         cleanup_errors: BTreeSet::new(),
         non_fatal: BTreeSet::new(),
         stop_observation: StopObservation::default(),
+        launch_context: None,
     };
     // The existing ownership observer retains this live child's genuine pidfd/start tick.
     run.safe_observe();
@@ -1839,3 +1842,116 @@ fn guard_comm_class_owned_names_do_not_change_forced_cleanup() {
     }
 }
 // COMM_CLASS_OBSERVATION_CONTROL_END
+
+// LAUNCH_CONTEXT_CONTROL_BEGIN
+fn launch_context_refuses_reuse_exec_motion_and_private_poison() {
+    assert!(!LaunchContext::enabled(None));
+    assert!(!LaunchContext::enabled(Some(OsStr::new("other"))));
+    assert!(LaunchContext::enabled(Some(OsStr::new("android_fixture_sdk"))));
+    let point = LaunchPoint { start: 34, parent: 10, parent_start: 20, image: [1, 2],
+        argv: b"private-exec\0-avd\0private-avd\0-port\05582\0".to_vec() };
+    assert_eq!(coherent_launch_points(34, Some(&point), Some(&point)).unwrap(), Some(point.clone()));
+    assert_eq!(coherent_launch_points(34, None, Some(&point)).unwrap(), None);
+    assert_eq!(coherent_launch_points(34, Some(&point), None).unwrap(), None);
+    assert!(coherent_launch_points(35, Some(&point), Some(&point)).is_err());
+    for changed in [LaunchPoint { parent: 11, ..point.clone() },
+        LaunchPoint { parent_start: 21, ..point.clone() },
+        LaunchPoint { image: [1, 3], ..point.clone() },
+        LaunchPoint { argv: b"changed-exec\0".to_vec(), ..point.clone() }] {
+        assert!(coherent_launch_points(34, Some(&point), Some(&changed)).is_err());
+    }
+    for bad in [vec![], b"partial".to_vec(), vec![b'x'; LAUNCH_ARG_BYTES + 1],
+        [b"arg\0".as_slice(); 65].concat()] {
+        assert!(launch_argv(&bad).is_none());
+    }
+    let args = launch_argv(&point.argv).unwrap();
+    assert_eq!(launch_options(&args), Some((b"private-avd".as_slice(), b"5582".as_slice())));
+    assert!(launch_options(&launch_argv(b"x\0-avd\0v\0-avd\0v\0-port\01\0").unwrap()).is_none());
+    assert!(launch_options(&launch_argv(b"x\0-avd\0v\0-port\0").unwrap()).is_none());
+    let mut context = LaunchContext::new(std::process::id() as i32,
+        &OsString::from("/usr/bin/python3"), &[OsString::from("private-token")]);
+    // A different actual SDK/image is a false equality hint, never a role match.
+    context.records.insert((12, 34), LaunchRecord { observation: 1, last_attempt: 1, last_attempt_unknown: false, point: Some(point.clone()), changed: false });
+    let proof = context.json(Some(12));
+    assert_eq!(proof["records"][0]["matchesDeclaredImage"], false);
+    assert_eq!(proof["records"][0]["matchesDeclaredArgv"], false);
+    assert_eq!(proof["records"][0]["matchesDeclaredRunOptions"], Value::Null);
+    let bytes = serde_json::to_string(&proof).unwrap();
+    assert!(!bytes.contains("private-"));
+    assert!(!bytes.contains("/usr/bin"));
+    assert!(bytes.len() < 16384);
+    context.records.get_mut(&(12, 34)).unwrap().changed = true;
+    let row = &context.json(Some(12))["records"][0];
+    assert_eq!(row["status"], "changed");
+    for field in ["parentPid", "parentStartTick", "execIdentity", "matchesDeclaredImage",
+        "matchesDeclaredArgv", "matchesDeclaredRunOptions"] {
+        assert_eq!(row[field], Value::Null);
+    }
+    let record = context.records.get_mut(&(12, 34)).unwrap();
+    record.changed = false;
+    record.sample(2, Ok(None));
+    assert!(record.last_attempt_unknown);
+    assert_eq!(record.observation, 1);
+    assert_eq!(record.last_attempt, 2);
+    record.sample(3, Ok(Some(LaunchPoint { image: [2, 9], ..point })));
+    assert!(record.changed && record.last_attempt_unknown, "exec across an unread gap must remain unknown");
+    // A real child binds its parent to our actual birth. Reused birth/foreign
+    // parent map and full record capacity refuse additional metadata only.
+    let mut child = TerminalLocalChild::new("exit");
+    let mut run = terminal_local_run(&child);
+    let pid = child.child.id() as i32;
+    let birth = run.tracker.handles[&pid].0;
+    let me = run.me;
+    assert!(launch_point(pid, birth, me, start_time(me).unwrap(), &run.tracker).is_some());
+    assert!(launch_point(pid, birth + 1, me, start_time(me).unwrap(), &run.tracker).is_none());
+    assert!(launch_point(pid, birth, me, Some(0), &run.tracker).is_none());
+    let mut context = LaunchContext::new(me, &OsString::from("/usr/bin/python3"), &[]);
+    for n in 0..LAUNCH_CONTEXT_CAP {
+        context.records.insert((100000 + n as i32, 1), LaunchRecord {
+            observation: 1, last_attempt: 1, last_attempt_unknown: true, point: None, changed: false,
+        });
+    }
+    context.capture(&run.tracker);
+    assert!(context.truncated);
+    assert_eq!(context.records.len(), LAUNCH_CONTEXT_CAP);
+    assert!(context.records.contains_key(&(pid, birth)));
+    assert!(serde_json::to_vec(&context.json(Some(pid))).unwrap().len() < 16384);
+    writeln!(child.child.stdin.as_mut().unwrap(), "exit").unwrap();
+    terminal_local_finish(&mut run, &mut child, "launch_context_cap");
+    assert!(run.forced.is_empty());
+    println!("LAUNCH_CONTEXT_CONTROL missing/reuse/parent/exec/argv/other_image/privacy/cap=true");
+}
+
+fn launch_context_real_owned_root_keeps_receipt_and_cleanup_separate() {
+    // Exercise the actual opt-in -> supervise -> running -> receipt path with
+    // one harmless held child, not an SDK or a mock ownership/OS supplier.
+    let case = Case::new("launch-context");
+    let mut command = Command::new(guard_executable());
+    command.env(AS_GUARD, "1").env(LAUNCH_CONTEXT_ENV, "android_fixture_sdk")
+        .arg(case.receipt()).args(["/usr/bin/python3", "-I", "-B", "-c", STANDIN])
+        .arg(&case.dir).arg("fds").stdin(Stdio::null());
+    let mut guard = case.spawn(command);
+    let root = guard.records.wait("fds");
+    // Allow one existing 250ms running tick while this child is held.
+    pause(300);
+    // The held child cannot exit before its owner explicitly releases it.
+    std::fs::write(case.path("release"), b"1").unwrap();
+    assert!(guard.wait(Duration::from_secs(5)).success());
+    let proof: Value = serde_json::from_slice(&std::fs::read(case.receipt()).unwrap()).unwrap();
+    assert!(clean(&proof));
+    let context = &proof["launchContext"];
+    assert_eq!(context["guardPid"], guard.child.id());
+    assert_eq!(context["spawnedRootPid"], root.0);
+    assert_eq!(context["signalTimeStateUnknown"], true);
+    let rows = context["records"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["pid"] == root.0 && row["startTick"] == root.1).unwrap();
+    assert_eq!(row["status"], "observed");
+    assert_eq!(row["parentPid"], context["guardPid"]);
+    assert_eq!(row["parentStartTick"], context["guardStartTick"]);
+    assert_eq!(row["matchesDeclaredImage"], true);
+    assert_eq!(row["matchesDeclaredArgv"], true);
+    assert_eq!(proof["forcedCleanup"], 0);
+    println!("LAUNCH_CONTEXT_JSON {}", serde_json::to_string(context).unwrap());
+    println!("OWN_LAUNCH_CONTEXT_CLEANUP root_exit=0 forced=0 echild=true");
+}
+// LAUNCH_CONTEXT_CONTROL_END
