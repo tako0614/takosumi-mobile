@@ -173,6 +173,15 @@ class Controls(unittest.TestCase):
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: native observation controls checks=[1-9][0-9]*")
+        packets = [line.removeprefix("NATIVE_BACK_PACKET ") for line in checked.stdout.splitlines()
+                   if line.startswith("NATIVE_BACK_PACKET ")]
+        self.assertEqual(len(packets), 4)
+        records, rejected, cut = runner.parse_native_observation(("\n".join(packets) + "\n").encode("ascii"))
+        self.assertEqual((len(records), rejected, cut), (4, 0, False))
+        self.assertEqual([record["backAction"] for record in records],
+                         ["NO_VIEW", "NO_HISTORY", "GO_BACK_RETURNED", None])
+        self.assertTrue(all(record["stage"] == "BACK_RETURN" and record["physical"] == "unknown"
+                            for record in records))
 
     def test_ui_result_requires_all_operations_and_actual_cold_replacement(self):
         for defect in ("no-pass", "missing-operation", "same-pid", "invalid-pid", "same-document", "no-diagnostics"):
@@ -519,6 +528,31 @@ class Controls(unittest.TestCase):
                 self.assertEqual(records, [])
                 self.assertEqual(rejected, 1)
                 self.assertFalse(cut)
+
+        # The existing Back return carries only its already-evaluated branch.
+        for action in ("NO_VIEW", "NO_HISTORY", "GO_BACK_RETURNED"):
+            with self.subTest(back_action=action):
+                packet = self.native_line(stage="BACK_RETURN").rstrip() + (" back=" + action + "\n").encode()
+                records, rejected, cut = runner.parse_native_observation(packet)
+                self.assertEqual((len(records), rejected, cut), (1, 0, False))
+                self.assertEqual(records[0]["backAction"], action)
+                self.assertEqual(records[0]["physical"], "unknown")
+        for stage in ("BACK_ENTER", "BACK_RETURN", "PAGE_COMMIT"):
+            with self.subTest(legacy_stage=stage):
+                records, rejected, cut = runner.parse_native_observation(self.native_line(stage=stage))
+                self.assertEqual((len(records), rejected, cut), (1, 0, False))
+                self.assertIsNone(records[0]["backAction"])
+        for suffix in (b" back=UNKNOWN", b" back=GO_BACK_CALLED", b" back=GO_BACK_RETURNED url=private",
+                       b" back=NO_HISTORY back=NO_HISTORY", b" back=\xff", b" back=NO_HIST"):
+            with self.subTest(poison_back=suffix):
+                records, rejected, cut = runner.parse_native_observation(
+                    self.native_line(stage="BACK_RETURN").rstrip() + suffix + b"\n")
+                self.assertEqual((records, rejected, cut), ([], 1, False))
+        for stage, seq, cap in (("BACK_ENTER", 1, 0), ("PAGE_FINISH", 1, 0), ("CAP_EXHAUSTED", 64, 1)):
+            with self.subTest(foreign_stage=stage):
+                records, rejected, cut = runner.parse_native_observation(
+                    self.native_line(seq, stage, cap).rstrip() + b" back=NO_VIEW\n")
+                self.assertEqual((records, rejected, cut), ([], 1, False))
 
     def test_native_observation_has_separate_prefix_record_and_saved_byte_caps(self):
         scratch, out = self.root / "scratch", self.root / "out"

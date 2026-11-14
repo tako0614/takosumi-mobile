@@ -169,11 +169,12 @@ class AppScreenActivity : AppCompatActivity() {
         subject: AppScreenRegistry.Entry? = entry,
         viewIdentity: Int = nativeBoundViewIdentity,
         logical: AppScreenObservation.Logical = AppScreenObservation.Logical.UNKNOWN,
+        backAction: AppScreenObservation.BackAction? = null,
     ) {
         val observer = nativeObservation ?: return
         try {
             observer.record(stage, viewIdentity, subject != null && subject === entry,
-                subject?.host === this, profileGeneration, visible, resumed, evicted, logical)
+                subject?.host === this, profileGeneration, visible, resumed, evicted, logical, backAction)
         } catch (_: Throwable) { /* No view dereference, fallback or retry. */ }
     }
 
@@ -1069,9 +1070,13 @@ class AppScreenActivity : AppCompatActivity() {
             val nativeViewId = nativeBoundViewIdentity
             nativeRecord(AppScreenObservation.Stage.BACK_ENTER, nativeSubject, nativeViewId)
             // native-observation-end:back-prefix
-            entry?.webView?.takeIf { it.canGoBack() }?.goBack()
+            var nativeCanGoBack: Boolean? = null
+            entry?.webView?.takeIf {
+                it.canGoBack().also { value -> nativeCanGoBack = value }
+            }?.goBack()
             // native-observation-begin:back-suffix
-            nativeRecord(AppScreenObservation.Stage.BACK_RETURN, nativeSubject, nativeViewId)
+            nativeRecord(AppScreenObservation.Stage.BACK_RETURN, nativeSubject, nativeViewId,
+                backAction = AppScreenObservation.backReturned(nativeCanGoBack))
             // native-observation-end:back-suffix
         }
         bar.addView(backButton)
