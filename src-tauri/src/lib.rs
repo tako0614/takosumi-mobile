@@ -1,5 +1,8 @@
 use tauri::Manager;
 
+#[cfg(all(debug_assertions, target_os = "ios"))]
+mod bootstrap_fixture;
+
 // The browser-process fixture drives the same flow on Linux (GTK WebKit home)
 // Windows (WebView2) and macOS (WKWebView); see tests/desktop/browser_process.rs.
 #[cfg(all(
@@ -47,6 +50,8 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            bootstrap_fixture::install(app);
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             app.handle().plugin(

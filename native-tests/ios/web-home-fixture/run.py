@@ -2,6 +2,7 @@
 """Actual installed Tauri App Web-home UI on one fresh, owned Simulator."""
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,8 @@ SOURCES = runtime.FROZEN_SOURCES + [HERE / name for name in (
 SOURCES += [ROOT / name for name in (
     "src/entry.tsx", "src/web-home.tsx", "src/web-home.css", "src/web-connections.ts",
     "src/web-profile-recovery.ts", "src/web-profile-data.ts", "src/web-permissions.ts", "index.html",
+    "src/fixture-bootstrap.ts", "tests/fixture-bootstrap.test.ts",
+    "src-tauri/src/lib.rs", "src-tauri/src/bootstrap_fixture.rs",
     "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json",
     "src-tauri/Info.ios.plist", "src-tauri/ios-project.yml", "native-tests/ios/build-simulator.sh",
     "native-tests/ios/swift_runtime.py", "native-tests/ios/test_swift_runtime.py", "bun.lock")]
@@ -229,6 +232,77 @@ def screen_witness(source, size, *, partial):
     return result
 
 
+def bootstrap_witness(data, size, *, partial):
+    """Closed fixture-event hints from the shared prefix; never a display verdict."""
+    result = {"diagnosticOnly": True, "clockDomain": "browser_performance_time_origin_ms",
+              "osLogClock": "ios_unified_log_header_delivery_time", "timestampsComparableAcrossDomains": False,
+              "sequenceMayRepeatAcrossRealms": True, "absenceIsUnknown": True, "records": [],
+              "recordLimit": 33, "scanLimitBytes": 2 * 1024 * 1024, "scanLineLimit": 8192,
+              "lineLimitBytes": 512, "savedByteLimit": 16 * 1024, "sourceBytes": size,
+              "partial": partial, "dropped": 0, "malformed": 0, "capStatus": "not_observed"}
+    if not isinstance(data, bytes) or len(data) > min(size, result["scanLimitBytes"]):
+        result["errorType"] = "InputBoundExceeded"
+        return result
+    result["readBytes"] = len(data)
+    result["scanTruncated"] = size > len(data)
+    lines = data.splitlines()
+    if (partial or result["scanTruncated"]) and data and not data.endswith((b"\n", b"\r")):
+        lines = lines[:-1]
+    result["lineTruncated"] = len(lines) > result["scanLineLimit"]
+    marker = b"com.takosumi.fixture.simulator.bootstrap "
+    header = re.compile(rb"([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{1,9})\s+Df\s+"
+                        rb"Takosumi\[([1-9][0-9]{0,9}):[0-9a-fA-Fx]+\]\s+"
+                        rb"\[com\.takosumi\.fixture\.simulator:app\]\s+\[stderr\] ")
+    packet = re.compile(rb"v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
+                        rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
+                        rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1")
+    anchor = None
+    for line in lines[:result["scanLineLimit"]]:
+        emitter = header.match(line)
+        inherited = False
+        if emitter:
+            anchor = None
+            payload = line[emitter.end():]
+            context = (emitter[1], emitter[2])
+        elif anchor and line.startswith(marker):
+            payload, context, inherited = line, anchor, True
+        else:
+            anchor = None
+            if marker in line:
+                result["malformed"] = min(33, result["malformed"] + 1)
+            continue
+        if not payload.startswith(marker):
+            continue
+        match = packet.fullmatch(payload[len(marker):]) if len(line) <= result["lineLimitBytes"] else None
+        valid = False
+        if match:
+            receipt, seq, stage, elapsed = int(match[1]), int(match[2]), match[3].decode("ascii"), int(match[4])
+            valid = (receipt <= 33 and elapsed <= 600_000 and
+                     ((stage in ("unknown", "cap") and seq == 0 and elapsed == -1
+                       and (stage == "cap" or receipt <= 32)) or
+                      (stage not in ("unknown", "cap") and receipt <= 32 and 1 <= seq <= 16)))
+        if not valid:
+            anchor = None
+            result["malformed"] = min(33, result["malformed"] + 1)
+            continue
+        # Only a complete valid first line anchors adjacent complete fixed lines
+        # in the same Logger packet. Never reconstruct a line across a cut/chunk.
+        anchor = context if stage not in ("unknown", "cap") else None
+        record = {"pid": int(context[1]), "receipt": receipt, "seq": seq, "stage": stage,
+                  "elapsedMs": None if elapsed == -1 else elapsed,
+                  "osLogTime": context[0].decode("ascii"), "inheritedHeader": inherited}
+        if len(result["records"]) < result["recordLimit"]:
+            result["records"].append(record)
+        else:
+            result["dropped"] = min(33, result["dropped"] + 1)
+        if stage == "cap":
+            result["capStatus"] = "observed"
+    if len(json.dumps({"targetAppExit": {"bootstrapWitness": result}}, indent=2).encode()) > result["savedByteLimit"]:
+        result["records"] = []
+        result["errorType"] = "ProjectionBoundExceeded"
+    return result
+
+
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
@@ -264,11 +338,18 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     try:
         with raw.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
+            prefix = None
             try:
-                result["screenWitness"] = screen_witness(source, size, partial=not result["queryReturned"])
+                prefix = source.read(min(size, 2 * 1024 * 1024))
+                result["screenWitness"] = screen_witness(io.BytesIO(prefix), size, partial=not result["queryReturned"])
             except Exception as error:
                 result["screenWitness"] = {"diagnosticOnly": True, "absenceIsUnknown": True,
                                            "errorType": type(error).__name__}
+            try:
+                result["bootstrapWitness"] = bootstrap_witness(prefix, size, partial=not result["queryReturned"])
+            except Exception as error:
+                result["bootstrapWitness"] = {"diagnosticOnly": True, "absenceIsUnknown": True,
+                                              "errorType": type(error).__name__}
             source.seek(max(0, size - 512 * 1024))
             # Freeze the size observed above even if an interrupted CLI's
             # descendant is still appending. This is not a drain receipt.

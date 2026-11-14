@@ -2,6 +2,7 @@
 import copy
 from contextlib import contextmanager, ExitStack
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -799,6 +800,95 @@ class Controls(unittest.TestCase):
                     self.assertEqual([r["stage"] for r in result["screenWitness"]["records"]], ["requested", "appeared", "finish"])
                     self.assertEqual(result["screenWitness"]["partial"], partial)
                     self.assertTrue(result["screenWitness"]["absenceIsUnknown"])
+
+    def test_bootstrap_hints_use_the_existing_capture_without_becoming_a_ui_verdict(self):
+        header = b"2026-11-14 00:00:01.123 Df Takosumi[41:ab] [com.takosumi.fixture.simulator:app] [stderr] "
+        marker = b"com.takosumi.fixture.simulator.bootstrap "
+        def packet(stage=b"entry", receipt=1, seq=1, elapsed=5):
+            return marker + b"v=1 receipt=%d seq=%d stage=%s elapsedMs=%d end=1\n" % (receipt, seq, stage, elapsed)
+        first = packet()
+        second = packet(b"connections_end", 2, 2, 8)
+        def parse(data, partial=False, size=None):
+            return runner.bootstrap_witness(data, len(data) if size is None else size, partial=partial)
+        decoded = parse(header + first + second)
+        self.assertEqual([v["stage"] for v in decoded["records"]], ["entry", "connections_end"])
+        self.assertEqual([v["inheritedHeader"] for v in decoded["records"]], [False, True])
+        self.assertEqual([v["elapsedMs"] for v in decoded["records"]], [5, 8])
+        self.assertTrue(decoded["absenceIsUnknown"])
+        self.assertFalse(decoded["timestampsComparableAcrossDomains"])
+        self.assertTrue(decoded["sequenceMayRepeatAcrossRealms"])
+        for bad in (second, header.replace(b":app]", b":foreign]") + first,
+                    header + first.replace(b"stage=entry", b"stage=SECRET"), header + first + b"\n" + second,
+                    header + first + b"unrelated\n" + second, header + packet(receipt=34),
+                    header + packet(seq=17), header + packet(elapsed=600001),
+                    header + first.rstrip() + b" SECRET\n", header + b"x" * 600 + first):
+            with self.subTest(malformed=hashlib.sha256(bad).hexdigest()):
+                saved = parse(bad)
+                self.assertLessEqual(len(saved["records"]), 1)
+                self.assertTrue(saved["absenceIsUnknown"])
+                self.assertNotIn("SECRET", json.dumps(saved))
+        self.assertEqual(parse(header + first[:-1], partial=True)["records"], [])
+        capped = parse(header + packet(b"cap", 33, 0, -1))
+        self.assertEqual(capped["capStatus"], "observed")
+        overflow = parse((header + first) * 40)
+        self.assertEqual((len(overflow["records"]), overflow["dropped"]), (33, 7))
+        self.assertLessEqual(len(json.dumps({"targetAppExit": {"bootstrapWitness": overflow}}, indent=2).encode()), 16 * 1024)
+        cut = parse(header + first, size=3 * 1024 * 1024)
+        self.assertTrue(cut["scanTruncated"])
+        line_limit = parse(b"unrelated\n" * 8192 + header + first)
+        self.assertEqual(line_limit["records"], [])
+        self.assertTrue(line_limit["lineTruncated"])
+        body = header + first + second + b"x" * (600 * 1024) + b"\n"
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        for partial, broken in ((False, False), (True, False), (False, True)):
+            with self.subTest(partial=partial, diagnostic_broken=broken):
+                out, scratch = self.root / f"bootstrap-out-{partial}-{broken}", self.root / f"bootstrap-scratch-{partial}-{broken}"
+                out.mkdir(); scratch.mkdir()
+                calls = []
+                original = subprocess.TimeoutExpired(["owned-query"], 15)
+                def command(argv, path, **kwargs):
+                    calls.append((argv, kwargs))
+                    if "spawn" not in argv:
+                        return json.dumps({"devices": {"runtime": [device]}})
+                    path.write_bytes(body)
+                    if partial:
+                        raise original
+                    return ""
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(runtime, "command", side_effect=command))
+                    if broken:
+                        stack.enter_context(patch.object(runner, "bootstrap_witness", side_effect=OSError("SECRET")))
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1][1], {"timeout": 15, "read_output": False})
+                self.assertEqual((out / "target-app-exit.log").read_bytes(), body[-512 * 1024:])
+                self.assertEqual((result["queryReturned"], result["partial"]), (not partial, partial))
+                self.assertNotIn("SECRET", json.dumps(result))
+                for field in ("passed", "ready", "hittable", "paint"):
+                    self.assertNotIn(field, result)
+                if partial:
+                    self.assertEqual(result["errorType"], "TimeoutExpired")
+                if broken:
+                    self.assertEqual(result["bootstrapWitness"]["errorType"], "OSError")
+                else:
+                    self.assertEqual([v["stage"] for v in result["bootstrapWitness"]["records"]], ["entry", "connections_end"])
+
+    def test_bootstrap_end_literal_rejects_numeric_prefixes_rewrapped_as_complete_log_lines(self):
+        header = b"2026-11-14 00:00:01.123 Df Takosumi[41:ab] [com.takosumi.fixture.simulator:app] [stderr] "
+        legacy = b"com.takosumi.fixture.simulator.bootstrap v=1 receipt=14 seq=14 stage=entry elapsedMs=600000"
+        def parse(body):
+            data = header + body + b"\n"  # Logger may supply a complete new OS-log line after cutting the body.
+            return runner.bootstrap_witness(data, len(data), partial=False)
+        self.assertEqual(parse(legacy[:-3])["records"], [], "600000 -> 600 is not a complete producer record")
+        complete = legacy + b" end=1"
+        decoded = parse(complete)
+        self.assertEqual((len(decoded["records"]), decoded["records"][0]["elapsedMs"]), (1, 600000))
+        for stop in range(len(complete)):
+            with self.subTest(proper_prefix=stop):
+                self.assertEqual(parse(complete[:stop])["records"], [])
+        self.assertEqual(parse(complete + b"0")["records"], [])
+        self.assertTrue(decoded["absenceIsUnknown"])
+        self.assertNotIn("passed", decoded)
 
     def test_existing_harness_server_import_is_not_poisoned_or_left_in_global_namespace(self):
         poison = types.ModuleType("server")

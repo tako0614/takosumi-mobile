@@ -3,6 +3,7 @@ import {
   CONNECTIONS_KEY, connectionKey, loadWebConnections, newWebConnection, type WebConnection,
 } from "./web-connections.ts";
 import { BrowserRecoveryRequired } from "./web-profile-recovery.ts";
+import type { BootstrapStage } from "./fixture-bootstrap.ts";
 import {
   permissionLabels,
   type PendingPermission,
@@ -17,7 +18,12 @@ export function WebHome(props: {
   readonly permissionPrompts?: WebPermissionPrompts;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly allowLegacyMobile?: boolean;
+  readonly observeBootstrap?: (stage: BootstrapStage) => void;
 }) {
+  const observe = (stage: BootstrapStage) => {
+    try { props.observeBootstrap?.(stage); } catch { /* Diagnostic only. */ }
+  };
+  observe("home_init");
   const [connections, setConnections] = createSignal<readonly WebConnection[]>([]);
   const [url, setUrl] = createSignal("");
   const [name, setName] = createSignal("");
@@ -68,10 +74,13 @@ export function WebHome(props: {
   });
   const busy = () => Boolean(opening()) || clearing();
   const locked = () => busy() || clearCandidate() !== undefined;
+  observe("connections_begin");
   try {
     setConnections(loadWebConnections(props.storage));
+    observe("connections_end");
   } catch {
     setError("接続先の保存内容を読み込めませんでした。");
+    observe("connections_failed");
   }
 
   function save(next: readonly WebConnection[]): boolean {
@@ -252,7 +261,8 @@ export function WebHome(props: {
           <input id="connection-name" type="text" maxlength={80} value={name()}
             placeholder="自分のTakosumi" disabled={locked()}
             onInput={(event) => setName(event.currentTarget.value)} />
-          <button class="web-primary" type="submit" disabled={locked()}>保存して開く</button>
+          <button class="web-primary" type="submit" disabled={locked()}
+            ref={() => observe("save_element")}>保存して開く</button>
         </form>
       </section>
       <Show when={pendingPermissions().length}>
