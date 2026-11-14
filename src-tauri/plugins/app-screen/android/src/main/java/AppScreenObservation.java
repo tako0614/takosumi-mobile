@@ -13,6 +13,14 @@ public final class AppScreenObservation {
         PAGE_START, PAGE_COMMIT, PAGE_FINISH, RENDER_GONE, CAP_EXHAUSTED
     }
     public enum Logical { UNKNOWN, ADD_RETURN, REMOVE_RETURN }
+    public enum BackAction { NO_VIEW, NO_HISTORY, GO_BACK_RETURNED }
+
+    /** Classify only after the existing conditional navigation returned. No view query. */
+    public static BackAction backReturned(Boolean canGoBack) {
+        return canGoBack == null ? BackAction.NO_VIEW
+            : canGoBack ? BackAction.GO_BACK_RETURNED : BackAction.NO_HISTORY;
+    }
+
     public interface Clock { long now(); }
     public interface Sink { void write(String line); }
     private final boolean enabled;
@@ -31,6 +39,12 @@ public final class AppScreenObservation {
     public void record(Stage stage, int view, boolean currentEntry, boolean host,
                        long generation, boolean visible, boolean resumed, boolean evicted,
                        Logical logical) {
+        record(stage, view, currentEntry, host, generation, visible, resumed, evicted, logical, null);
+    }
+
+    public void record(Stage stage, int view, boolean currentEntry, boolean host,
+                       long generation, boolean visible, boolean resumed, boolean evicted,
+                       Logical logical, BackAction backAction) {
         if (!enabled) return;
         int before = attempts.get();
         // One nonblocking attempt; contention drops metadata, never retries UI work.
@@ -47,7 +61,8 @@ public final class AppScreenObservation {
                 + " cur=" + (currentEntry ? 1 : 0) + " host=" + (host ? 1 : 0)
                 + " gen=" + generation + " vis=" + (visible ? 1 : 0)
                 + " res=" + (resumed ? 1 : 0) + " evict=" + (evicted ? 1 : 0)
-                + " logical=" + attachment.name() + " physical=unknown cap=" + (capped ? 1 : 0);
+                + " logical=" + attachment.name() + " physical=unknown cap=" + (capped ? 1 : 0)
+                + (!capped && stage == Stage.BACK_RETURN && backAction != null ? " back=" + backAction.name() : "");
             if (line.length() <= MAX_LINE) sink.write(line);
         } catch (Throwable ignored) {
             // Logging/clock/cap failure must never replace navigation or its exception.

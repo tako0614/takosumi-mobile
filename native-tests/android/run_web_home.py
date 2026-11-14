@@ -492,7 +492,7 @@ NATIVE_OBSERVATION_PACKET = re.compile(
     + "|".join(NATIVE_OBSERVATION_STAGES)
     + r") view=(-?[0-9]{1,10}) cur=([01]) host=([01]) gen=(-?[0-9]{1,19})"
       r" vis=([01]) res=([01]) evict=([01]) logical=(UNKNOWN|ADD_RETURN|REMOVE_RETURN)"
-      r" physical=unknown cap=([01])"
+      r" physical=unknown cap=([01])(?: back=(NO_VIEW|NO_HISTORY|GO_BACK_RETURNED))?"
 )
 
 
@@ -549,11 +549,12 @@ def parse_native_observation(data):
         if not match:
             rejected += 1
             continue
-        seq, pid, elapsed, stage, view, current, host, generation, visible, resumed, evicted, logical, cap = match.groups()
+        seq, pid, elapsed, stage, view, current, host, generation, visible, resumed, evicted, logical, cap, back = match.groups()
         seq, pid, elapsed, view, generation = map(int, (seq, pid, elapsed, view, generation))
         if not (1 <= seq <= 64 and 1 <= pid <= 2**31 - 1 and 0 <= elapsed <= 2**63 - 1
                 and -(2**31) <= view <= 2**31 - 1 and -(2**63) <= generation <= 2**63 - 1
-                and (cap == "1") == (stage == "CAP_EXHAUSTED") == (seq == 64)):
+                and (cap == "1") == (stage == "CAP_EXHAUSTED") == (seq == 64)
+                and (back is None or stage == "BACK_RETURN")):
             rejected += 1
             continue
         if len(records) >= 64:
@@ -563,7 +564,7 @@ def parse_native_observation(data):
                         "stage": stage, "viewIdentity": view, "currentEntry": current == "1",
                         "host": host == "1", "generation": generation, "visible": visible == "1",
                         "resumed": resumed == "1", "evicted": evicted == "1",
-                        "logical": logical, "physical": "unknown", "capExhausted": cap == "1"})
+                        "logical": logical, "physical": "unknown", "capExhausted": cap == "1", "backAction": back})
     return records, rejected, cut
 
 

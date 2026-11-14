@@ -53,6 +53,49 @@ public final class AppScreenObservationTest {
         Throwable caught = null;
         try { try { throw original; } finally { emit(badSink); } } catch (Throwable error) { caught = error; }
         check(caught == original);
+
+        check(AppScreenObservation.backReturned(null) == AppScreenObservation.BackAction.NO_VIEW);
+        check(AppScreenObservation.backReturned(false) == AppScreenObservation.BackAction.NO_HISTORY);
+        check(AppScreenObservation.backReturned(true) == AppScreenObservation.BackAction.GO_BACK_RETURNED);
+        List<String> wire = new ArrayList<>();
+        AtomicInteger wireClocks = new AtomicInteger();
+        AppScreenObservation branch = new AppScreenObservation(true, 7, wireClocks::incrementAndGet, wire::add);
+        for (Boolean eligible : new Boolean[] {null, false, true}) {
+            branch.record(AppScreenObservation.Stage.BACK_RETURN, 99, true, true, 0,
+                          true, true, false, AppScreenObservation.Logical.UNKNOWN,
+                          AppScreenObservation.backReturned(eligible));
+        }
+        branch.record(AppScreenObservation.Stage.BACK_RETURN, 99, true, true, 0,
+                      true, true, false, AppScreenObservation.Logical.UNKNOWN);
+        check(wire.size() == 4 && wireClocks.get() == 4);
+        check(wire.get(0).endsWith(" back=NO_VIEW"));
+        check(wire.get(1).endsWith(" back=NO_HISTORY"));
+        check(wire.get(2).endsWith(" back=GO_BACK_RETURNED"));
+        check(!wire.get(3).contains(" back=")); // Legacy absence is unknown, not NO_VIEW.
+        check(wire.stream().allMatch(line -> line.length() <= AppScreenObservation.MAX_LINE));
+        branch.record(AppScreenObservation.Stage.PAGE_COMMIT, 99, true, true, 0,
+                      true, true, false, AppScreenObservation.Logical.UNKNOWN,
+                      AppScreenObservation.BackAction.GO_BACK_RETURNED);
+        check(!wire.get(4).contains(" back="));
+        List<String> capped = new ArrayList<>();
+        AtomicInteger capClocks = new AtomicInteger();
+        AppScreenObservation last = new AppScreenObservation(true, 7, capClocks::incrementAndGet, capped::add);
+        for (int i = 0; i < 63; i++) emit(last);
+        for (int i = 0; i < 3; i++) {
+            last.record(AppScreenObservation.Stage.BACK_RETURN, Integer.MIN_VALUE, true, true, Long.MIN_VALUE,
+                        true, true, false, AppScreenObservation.Logical.UNKNOWN,
+                        AppScreenObservation.BackAction.GO_BACK_RETURNED);
+        }
+        check(capClocks.get() == 64 && capped.size() == 64);
+        check(capped.get(63).contains("stage=CAP_EXHAUSTED") && !capped.get(63).contains(" back="));
+        List<String> maximumBack = new ArrayList<>();
+        AppScreenObservation backEdge = new AppScreenObservation(true, Integer.MAX_VALUE, () -> Long.MAX_VALUE,
+                                                               maximumBack::add);
+        backEdge.record(AppScreenObservation.Stage.BACK_RETURN, Integer.MIN_VALUE, true, true, Long.MIN_VALUE,
+                        true, true, true, AppScreenObservation.Logical.REMOVE_RETURN,
+                        AppScreenObservation.BackAction.GO_BACK_RETURNED);
+        check(maximumBack.size() == 1 && maximumBack.get(0).length() <= AppScreenObservation.MAX_LINE);
+        for (int i = 0; i < 4; i++) System.out.println("NATIVE_BACK_PACKET " + wire.get(i));
         System.out.println("PASS: native observation controls checks=" + checks);
     }
 }
