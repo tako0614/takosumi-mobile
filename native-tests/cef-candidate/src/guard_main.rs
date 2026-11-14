@@ -885,6 +885,31 @@ fn launch_options<'a>(args: &'a [&'a [u8]]) -> Option<(&'a [u8], &'a [u8])> {
     Some((option(b"-avd")?, option(b"-port")?))
 }
 
+// ARGUMENT_SHAPE_BEGIN
+// Syntax hints from the already accepted historical point. They do not attest
+// an SDK parser/role, actual dispatch, exec-at-signal or signal necessity.
+fn launch_argument_shape(args: Option<&[&[u8]]>, declared_exact: Option<bool>, parent: Option<i32>)
+    -> (Option<&'static str>, Option<i32>, Option<&'static str>)
+{
+    let (Some(args), Some(parent)) = (args, parent.filter(|pid| *pid > 0)) else {
+        return (None, None, None);
+    };
+    let positive = |value: &[u8]| -> Option<i32> {
+        if value.is_empty() || value.len() > 10 || !matches!(value[0], b'1'..=b'9')
+            || !value.iter().all(u8::is_ascii_digit) { return None; }
+        std::str::from_utf8(value).ok()?.parse::<i32>().ok().filter(|n| *n > 0)
+    };
+    if args.len() == 5 && args[1] == b"-kill" && args[3] == b"-sleep" {
+        if let (Some(target), Some(wait)) = (positive(args[2]), positive(args[4])) {
+            return (Some("canonical_kill_sleep"), Some(wait), Some(if target == parent {
+                "same_retained_parent_pid"
+            } else { "different_pid" }));
+        }
+    }
+    (Some(if declared_exact == Some(true) { "declared_exact" } else { "other_complete" }), None, None)
+}
+// ARGUMENT_SHAPE_END
+
 // Parent lifetime must be the guard's actual birth or a retained owned tuple.
 // Missing parents, reparenting, PID reuse or a moving image/argv refuse a point.
 fn launch_point(pid: i32, start: u64, owner: i32, owner_start: Option<u64>,
@@ -1025,6 +1050,8 @@ impl LaunchContext {
             let point = record.point.as_ref().filter(|_| !record.changed);
             let args = point.and_then(|p| launch_argv(&p.argv));
             let options = args.as_deref().and_then(launch_options);
+            let declared_exact = point.and_then(|p| self.argv.as_ref().map(|argv| p.argv == *argv));
+            let shape = launch_argument_shape(args.as_deref(), declared_exact, point.map(|p| p.parent));
             serde_json::json!({ "pid": pid, "startTick": start, "root": root == Some(pid),
                 "parentPid": point.map(|p| p.parent), "parentStartTick": point.map(|p| p.parent_start),
                 "observation": record.observation, "lastAttempt": record.last_attempt,
@@ -1032,8 +1059,9 @@ impl LaunchContext {
                 "status": if record.changed { "changed" } else if point.is_some() { "observed" } else { "unknown" },
                 "execIdentity": point.map(|p| p.image),
                 "matchesDeclaredImage": point.and_then(|p| declared_image.map(|image| p.image == image)),
-                "matchesDeclaredArgv": point.and_then(|p| self.argv.as_ref().map(|argv| p.argv == *argv)),
+                "matchesDeclaredArgv": declared_exact,
                 "matchesDeclaredRunOptions": options.zip(declared_options).map(|(a, b)| a == b),
+                "dispatchArgKind": shape.0, "helperWaitSeconds": shape.1, "killTargetRelation": shape.2,
             })
         }).collect();
         serde_json::json!({ "schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
