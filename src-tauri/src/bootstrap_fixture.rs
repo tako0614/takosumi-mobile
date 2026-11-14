@@ -104,6 +104,79 @@ impl Recorder {
     }
 }
 
+// Guest kernel start ticks, not a document clock, host PID or authority proof.
+fn process_start_tick(data: &[u8], pid: u32) -> Option<u64> {
+    if pid == 0 || pid > i32::MAX as u32 || data.len() > 4096 || !data.ends_with(b"\n") {
+        return None;
+    }
+    if !data.starts_with(format!("{pid} (").as_bytes()) || data.contains(&0) {
+        return None;
+    }
+    let end = data.iter().rposition(|b| *b == b')')?;
+    let fields: Vec<_> = data.get(end + 1..)?.strip_prefix(b" ")?
+        .split(|b| b.is_ascii_whitespace()).filter(|s| !s.is_empty()).collect();
+    if fields.len() < 20 || fields.len() > 64 || matches!(fields[0], b"Z" | b"X") || fields[0].len() != 1 {
+        return None;
+    }
+    let field = fields[19]; // /proc/pid/stat field22, after state (field3).
+    if field.is_empty() || field.len() > 19 || field[0] == b'0' || !field.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(field).ok()?.parse::<u64>().ok()
+        .filter(|n| *n > 0 && *n <= i64::MAX as u64)
+}
+
+fn kernel_boot_id(data: &[u8]) -> Option<String> {
+    if data.len() != 37 || data[36] != b'\n' { return None; }
+    for (i, byte) in data[..36].iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *byte != b'-' { return None; }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte) { return None; }
+    }
+    Some(data[..36].iter().filter(|b| **b != b'-').map(|b| *b as char).collect())
+}
+
+fn android_packet(pid: u32, start_tick: u64, boot: &str, line: &str) -> String {
+    format!("v=1 phase=ROOT_MAIN pid={pid} startTick={start_tick} boot={boot} {line} rootEnd=1")
+}
+
+#[cfg(target_os = "android")]
+pub fn install_android<R: tauri::Runtime>(app: &tauri::App<R>) {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    use tauri::Listener;
+
+    if !cfg!(debug_assertions) || app.config().identifier != "com.takosumi.fixture.android" {
+        return;
+    }
+    let pid = std::process::id();
+    let mut stat = Vec::new();
+    let Some(start_tick) = std::fs::File::open("/proc/self/stat").ok()
+        .and_then(|file| file.take(4097).read_to_end(&mut stat).ok())
+        .and_then(|_| process_start_tick(&stat, pid)) else { return };
+    let mut boot = Vec::new();
+    let Some(boot) = std::fs::File::open("/proc/sys/kernel/random/boot_id").ok()
+        .and_then(|file| file.take(38).read_to_end(&mut boot).ok())
+        .and_then(|_| kernel_boot_id(&boot)) else { return };
+    let recorder = Arc::new(Mutex::new(Recorder::new(true)));
+    app.listen("takosumi-fixture-bootstrap", move |event| {
+        let line = recorder.lock().ok().and_then(|mut r| r.record(event.payload()));
+        if let Some(line) = line {
+            let packet = android_packet(pid, start_tick, &boot, &line);
+            if let Ok(message) = std::ffi::CString::new(packet) {
+                // Private diagnostic only. Log loss/blocking must not alter the
+                // Root event or UI verdict; no new invoke command/permission.
+                #[link(name = "log")]
+                unsafe extern "C" {
+                    fn __android_log_write(priority: i32, tag: *const std::ffi::c_char,
+                                           text: *const std::ffi::c_char) -> i32;
+                }
+                unsafe { __android_log_write(4, c"TakosRootBootstrap".as_ptr(), message.as_ptr()); }
+            }
+        }
+    });
+}
+
 #[cfg(target_os = "ios")]
 pub fn install<R: tauri::Runtime>(app: &tauri::App<R>) {
     use std::io::Write;
@@ -130,6 +203,42 @@ pub fn install<R: tauri::Runtime>(app: &tauri::App<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_birth_and_envelope_reuse_the_closed_formatter() {
+        let mut fields = vec!["S", "1"];
+        fields.extend(["0"; 17]); fields.push("1234"); fields.extend(["0"; 8]);
+        let data = format!("42 (fixture (root)) {}\n", fields.join(" "));
+        assert_eq!(process_start_tick(data.as_bytes(), 42), Some(1234));
+        assert_eq!(process_start_tick(data.as_bytes(), 43), None);
+        assert_eq!(process_start_tick(data.trim_end().as_bytes(), 42), None);
+        assert_eq!(process_start_tick(&vec![b'x'; 4097], 42), None);
+        for bad in [data.replace("1234", "0"), data.replace("1234", "SECRET"),
+                    data.replace("1234", "01234"), data.replace("1234", "9223372036854775808"),
+                    data.replace(") S ", ") Z ")] {
+            assert_eq!(process_start_tick(bad.as_bytes(), 42), None);
+        }
+        let raw_boot = b"01234567-89ab-cdef-0123-456789abcdef\n";
+        let boot = kernel_boot_id(raw_boot).unwrap();
+        assert_eq!(boot, "0123456789abcdef0123456789abcdef");
+        assert_eq!(kernel_boot_id(&raw_boot[..36]), None);
+        assert_eq!(kernel_boot_id(b"SECRET"), None);
+        for (i, stage) in STAGES.iter().enumerate() {
+            let line = Recorder::new(true).record(&format!("[1,1,\"{stage}\",600000]")).unwrap();
+            let packet = android_packet(42, 1234, &boot, &line);
+            assert!(packet.ends_with(" end=1 rootEnd=1"));
+            assert!(packet.len() < 320);
+            println!("{packet}");
+            assert!(i < 16);
+        }
+        let unknown = Recorder::new(true).record("[1,1,\"SECRET\",0]").unwrap();
+        assert!(!unknown.contains("SECRET"));
+        println!("{}", android_packet(42, 1234, &boot, &unknown));
+        let mut recorder = Recorder::new(true);
+        let cap = (0..33).filter_map(|_| recorder.record("[1,1,\"entry\",null]")).last().unwrap();
+        assert!(cap.contains("stage=cap"));
+        println!("{}", android_packet(42, 1234, &boot, &cap));
+    }
 
     #[test]
     fn closed_payloads_and_browser_clock_do_not_serialize_private_input() {

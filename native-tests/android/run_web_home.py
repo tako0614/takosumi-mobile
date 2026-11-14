@@ -636,6 +636,171 @@ def preserve_native_observation(emulator, scratch, out, prior):
 # native-observation-end:collector
 
 
+# root-bootstrap-begin
+ROOT_BOOTSTRAP_TAG = "TakosRootBootstrap"
+ROOT_BOOTSTRAP_PACKET = re.compile(
+    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
+    rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
+    rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
+    rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1 rootEnd=1")
+
+
+def root_activity_pid(data, *, truncated=False):
+    """Separate Main phase, never an alias for AppScreen's custody predicate."""
+    if truncated or len(data) > 128 * 1024:
+        return None
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    # ComponentName may abbreviate this exact class with a leading dot.
+    component = re.escape(PACKAGE) + r"/(?:\.MainActivity|" + re.escape(PACKAGE) + r"\.MainActivity)"
+    record = r"ActivityRecord\{([0-9a-f]+) u([0-9]+) " + component + r" t([0-9]+)\}"
+    top = [line.strip() for line in lines if "topResumedActivity=" in line]
+    if len(top) != 1:
+        return None
+    resumed = re.fullmatch(r"topResumedActivity=" + record, top[0])
+    if not resumed:
+        return None
+    histories = [(index, re.fullmatch(r"([ ]*)\* Hist +#[0-9]+: " + record, line))
+                 for index, line in enumerate(lines)]
+    matching = [(index, match) for index, match in histories
+                if match and match.groups()[1:] == resumed.groups()]
+    if len(matching) != 1:
+        return None
+    index, header = matching[0]
+    indentation = len(header[1])
+    block = []
+    for line in lines[index + 1:]:
+        if line.strip() and len(line) - len(line.lstrip(" ")) <= indentation:
+            break
+        block.append(line.strip())
+    else:
+        return None
+    fields = {key: [line for line in block if line.startswith(key + "=")]
+              for key in ("packageName", "app", "mActivityComponent")}
+    if (fields["packageName"] != ["packageName=" + PACKAGE + " processName=" + PACKAGE]
+            or len(fields["mActivityComponent"]) != 1
+            or not re.fullmatch("mActivityComponent=" + component, fields["mActivityComponent"][0])
+            or len(fields["app"]) != 1):
+        return None
+    process = re.fullmatch(r"app=ProcessRecord\{[0-9a-f]+ ([1-9][0-9]{0,9}):"
+                           + re.escape(PACKAGE) + r"/u([0-9]+)a[0-9]+\}", fields["app"][0])
+    if not process or process[2] != resumed[2]:
+        return None
+    pid = int(process[1])
+    return pid if pid <= 2**31 - 1 else None
+
+
+def root_guest_identity(data, pid):
+    """One bounded stat+cmdline read of the guest fixture's main process."""
+    if type(pid) is not int or not 1 <= pid <= 2**31 - 1 or len(data) > 8192 or b"\0" not in data:
+        return None
+    before_boot, boot = data.rsplit(b"\0", 1)
+    if not re.fullmatch(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n", boot) or b"\n" not in before_boot:
+        return None
+    proc_stat, cmdline = before_boot.rsplit(b"\n", 1)
+    if cmdline.rstrip(b"\0") != PACKAGE.encode("ascii") or len(proc_stat) > 4095:
+        return None
+    if not proc_stat.startswith(str(pid).encode() + b" (") or b"\0" in proc_stat:
+        return None
+    end = proc_stat.rfind(b")")
+    if end < 0 or proc_stat[end + 1:end + 2] != b" ":
+        return None
+    fields = proc_stat[end + 2:].split()
+    if not 20 <= len(fields) <= 64 or len(fields[0]) != 1 or fields[0] in (b"Z", b"X"):
+        return None
+    tick = fields[19]
+    if not re.fullmatch(rb"[1-9][0-9]{0,18}", tick) or int(tick) > 2**63 - 1:
+        return None
+    return {"pid": pid, "startTick": int(tick), "bootId": boot.rstrip(b"\n").replace(b"-", b"").decode("ascii")}
+
+
+def parse_root_bootstrap(data, identity):
+    records, rejected, cut = [], 0, False
+    for line in data.splitlines():
+        match = ROOT_BOOTSTRAP_PACKET.fullmatch(line) if len(line) <= 384 else None
+        if match:
+            pid, tick, receipt, seq = (int(match[v]) for v in (1, 2, 4, 5))
+            stage, elapsed = match[6].decode("ascii"), int(match[7])
+            valid = (pid == identity["pid"] and tick == identity["startTick"]
+                     and match[3].decode("ascii") == identity["bootId"] and receipt <= 33
+                     and elapsed <= 600_000 and
+                     ((stage in ("unknown", "cap") and seq == 0 and elapsed == -1
+                       and (stage == "cap" or receipt <= 32)) or
+                      (stage not in ("unknown", "cap") and receipt <= 32 and 1 <= seq <= 16)))
+            if valid:
+                if len(records) == 33:
+                    cut = True
+                    break
+                records.append({"receipt": receipt, "seq": seq, "stage": stage,
+                                "elapsedMs": None if elapsed == -1 else elapsed})
+                continue
+        rejected = min(65, rejected + 1)
+    return records, rejected, cut
+
+
+def preserve_root_bootstrap(emulator, scratch, out, prior):
+    """Failure-only Root phase. Birth bookends do not prove AX/paint/authority."""
+    result = {"diagnosticOnly": True, "phase": "root_main_snapshot", "absenceIsUnknown": True,
+              "clockDomain": "browser_performance_time_origin_ms", "birthDomain": "guest_kernel_start_ticks",
+              "timestampsComparableAcrossDomains": False, "sequenceMayRepeatAcrossRealms": True,
+              "coverage": "unknown", "records": [], "queryReturned": False, "identityBookendsMatch": False,
+              "commandWaitSeconds": 10, "packetTailCount": 64, "rawReadCapBytes": 65536,
+              "recordLimit": 33, "lineLimitBytes": 384, "savedByteLimit": 16384}
+    entry = prior.get("queries", {}).get("guest-activity-state", {}) if isinstance(prior, dict) else {}
+    if not isinstance(entry, dict) or entry.get("queryReturned") is not True or entry.get("truncated") is not False:
+        result["skipped"] = "main_snapshot_unknown"
+        return result
+    def read(path, cap):
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+            info = os.fstat(source.fileno())
+            require(stat.S_ISREG(info.st_mode), "Plain Root diagnostic required")
+            data = source.read(cap + 1)
+        require(len(data) <= cap and info.st_size == len(data), "Root diagnostic exceeds bound")
+        return data
+    try:
+        snapshot = read(out / "guest-activity-state.log", 128 * 1024)
+        require(entry.get("sourceBytes") == entry.get("keptBytes") == len(snapshot)
+                and entry.get("sha256") == hashlib.sha256(snapshot).hexdigest(), "Root snapshot changed")
+        pid = root_activity_pid(snapshot)
+        if pid is None:
+            result["skipped"] = "not_exact_main_snapshot"
+            return result
+        def query(label, argv, cap):
+            raw = scratch / ("root-bootstrap-" + label + ".log")
+            require(not raw.exists() and not raw.is_symlink(), "Existing Root diagnostic refused")
+            emulator.owned()
+            runtime.command([str(emulator.adb), "-s", SERIAL, "shell", *argv], raw,
+                            timeout=10, read_output=False)
+            emulator.owned()
+            return read(raw, cap)
+        identity_query = ("cat", f"/proc/{pid}/stat", f"/proc/{pid}/cmdline", "/proc/sys/kernel/random/boot_id")
+        before = root_guest_identity(query("before", identity_query, 8192), pid)
+        require(before is not None, "Root guest identity unavailable")
+        data = query("packets", (*NATIVE_OBSERVATION_QUERY, "--pid=" + str(pid),
+                                 "-s", ROOT_BOOTSTRAP_TAG + ":I", "*:S"), 65536)
+        after = root_guest_identity(query("after", identity_query, 8192), pid)
+        require(after == before, "Root guest identity changed")
+        records, rejected, cut = parse_root_bootstrap(data, before)
+        result.update(guestIdentity=before, identityBookendsMatch=True, queryReturned=True,
+                      records=records, rejectedPackets=rejected, recordLimitReached=cut,
+                      sourceBytes=len(data), nativeCapSeen=any(row["stage"] == "cap" for row in records))
+    except BaseException as error:
+        result["records"] = []
+        result["error"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "capture_or_identity_refused"
+    try:
+        payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("ascii")
+        require(len(payload) <= result["savedByteLimit"], "Root projection bound")
+        fd = os.open(out / "guest-root-bootstrap.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            target.write(payload)
+    except BaseException:
+        result["collectionError"] = "output_refused"
+    return result
+# root-bootstrap-end
+
+
 def installed(emulator, expected):
     paths = emulator.run("shell", "pm", "path", PACKAGE).strip().splitlines()
     require(len(paths) == 1 and paths[0].startswith("package:"), "One installed base APK required")
@@ -714,7 +879,7 @@ def main():
         overlay.apply()
         command(["bunx", "tauri", "android", "build", "--ci", "--debug", "--target", "x86_64", "--apk",
                  "--config", '{"identifier":"com.takosumi.fixture.android"}', "--", "--locked"],
-                "fixture-app-build", timeout=600)
+                "fixture-app-build", timeout=600, env={**os.environ, "VITE_TAKOSUMI_FIXTURE_BOOTSTRAP": "1"})
         variant = verify_app(ROOT, fixture_ca=ca)
         variant_custody = FileCustody(apk, ROOT / "src-tauri/gen/android")
         require(variant["cargoAppSha256"] == baseline["cargoAppSha256"], "Fixture rebuild changed the Cargo App library")
@@ -769,6 +934,13 @@ def main():
             except BaseException:
                 proof["nativeObservation"] = {"diagnosticOnly": True, "error": "collector_failed", "coverage": "unknown"}
             # native-observation-end:failure-call
+            # root-bootstrap-begin:failure-call
+            try:
+                proof["rootBootstrap"] = preserve_root_bootstrap(emulator, scratch, out, proof["guestANR"])
+            except BaseException:
+                proof["rootBootstrap"] = {"diagnosticOnly": True, "absenceIsUnknown": True,
+                                          "records": [], "error": "collector_failed"}
+            # root-bootstrap-end:failure-call
     finally:
         cleanup_errors = []
         if emulator is not None:
