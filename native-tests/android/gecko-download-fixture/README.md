@@ -44,6 +44,13 @@ fresh contexts. A new owned Downloads PNG contains a 128x96 red/blue image.
 Each fresh profile enters through the visible `Start using Photopea` button if
 the ordinary landing page is shown. There is at most one real tap per profile,
 and the same 60-second wait still requires the editor's File menu before Open.
+Before recording Personal's initial generation/URI baseline, that same wait
+also requires a positive navigation start and successful stop on its exact
+attached session and a current site URI. The snapshot is read together on the
+main thread. Work's released File accessibility node alone cannot admit a zero
+baseline. A successful stop is not a paint or accessibility identity guarantee;
+the original File check, return-to-Personal generation/URI equality, Work
+retention and exported-byte/pixel assertions remain required.
 When the first entry button is below the actual GeckoView viewport, one native
 upward swipe reveals it. Offscreen accessibility bounds authorize that scroll
 only: the tap still requires a visible action wholly inside the viewport.
