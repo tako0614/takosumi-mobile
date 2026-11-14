@@ -407,8 +407,9 @@ public final class WebAppOperationTest {
     }
 
     private PageBaseline.Snapshot enterEditor(String profile, WebAppProbeActivity.Page expected) {
-        boolean[] entryTapped = {false};
-        boolean[] entryScrolled = {false};
+        WebAppProbeActivity.Page entryPage = expected == null ? activity.selected : expected;
+        assertNotNull(entryPage);
+        PageBaseline.Entry entry = entryPage.baseline.new Entry();
         PageBaseline.Snapshot[] baseline = {null};
         long deadline = SystemClock.elapsedRealtime() + 60000;
         await("Actual anonymous Photopea File menu did not load for " + profile, () -> {
@@ -417,22 +418,22 @@ public final class WebAppOperationTest {
                 baseline[0] = initialBaseline(expected, deadline);
                 return baseline[0] != null;
             }
-            if (!entryTapped[0]) {
+            if (!entry.tapped()) {
                 Rect viewport = visibleWebViewport(deadline);
                 Rect start = bounds("Start using Photopea", false, false);
                 // The landing CTA re-lays out like the other panels; defer the
                 // tap until its rect survives half a second unchanged.
-                if (start != null && viewport.contains(start) && stable("cta", start) != null) {
-                    entryTapped[0] = true;
+                if (start != null && viewport.contains(start) && stable("cta", start) != null
+                        && admitEntryGesture(entryPage, entry, true, deadline)) {
                     activity.trace("landing tap " + profile + " viewport=" + viewport.toShortString() + " action=" + start.toShortString());
                     tap(start);
-                } else if (!entryScrolled[0]) {
+                } else if (!entry.scrolled()) {
                     // The original 320x640 capture places the first CTA below
                     // the WebView. Its offscreen bounds authorize only a native
                     // scroll, never a tap or a synthesized page action.
                     Rect below = bounds("Start using Photopea", false, false, false);
-                    if (below != null && below.top >= viewport.top && below.bottom > viewport.bottom) {
-                        entryScrolled[0] = true;
+                    if (below != null && below.top >= viewport.top && below.bottom > viewport.bottom
+                            && admitEntryGesture(entryPage, entry, false, deadline)) {
                         activity.trace("landing scroll " + profile + " viewport=" + viewport.toShortString() + " action=" + below.toShortString());
                         swipeUp(viewport);
                     }
@@ -441,6 +442,27 @@ public final class WebAppOperationTest {
             return false;
         }, 60);
         return baseline[0];
+    }
+
+    private boolean admitEntryGesture(WebAppProbeActivity.Page expected, PageBaseline.Entry entry,
+            boolean tap, long deadline) {
+        Handler main = new Handler(Looper.getMainLooper());
+        FutureTask<Boolean> read = new FutureTask<>(() -> entry.admit(tap,
+            activity.selected == expected && activity.pages.get(expected.context) == expected ? expected.session : null,
+            activity.view.getSession(), expected.generation, expected.uri));
+        try {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            assertTrue("Photopea entry deadline expired", remaining > 0);
+            assertTrue("Main thread rejected the entry navigation read", main.post(read));
+            return read.get(Math.min(1000, remaining), TimeUnit.MILLISECONDS);
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new AssertionError("Entry navigation unavailable before the entry deadline", error);
+        } finally {
+            // A late callback can only consume a budget; it never injects input.
+            main.removeCallbacks(read);
+            read.cancel(false);
+        }
     }
 
     private PageBaseline.Snapshot initialBaseline(WebAppProbeActivity.Page expected, long deadline) {

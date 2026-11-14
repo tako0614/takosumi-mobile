@@ -10,6 +10,10 @@ public final class PageBaselineTest {
     }
 
     public static void main(String[] args) {
+        if (args.length == 1 && args[0].equals("entry")) {
+            entryAdmission();
+            return;
+        }
         Object personal = new Object(), work = new Object();
         PageBaseline baseline = new PageBaseline(personal, ORIGIN);
         // The failed native cohort had a zero initial baseline even with File
@@ -60,5 +64,68 @@ public final class PageBaselineTest {
         baseline.stopped(personal, 2, false);
         check(baseline.capture(personal, personal, 2, ORIGIN, true) == null);
         System.out.println("PASS: Gecko initial page baseline checks=" + checks);
+        entryAdmission();
+    }
+
+    private static void entryAdmission() {
+        int before = checks;
+        Object personal = new Object(), work = new Object();
+        PageBaseline page = new PageBaseline(personal, ORIGIN);
+        PageBaseline.Entry entry = page.new Entry();
+        // The saved ordering: an offscreen CTA exists before this same Page's
+        // successful stop. Rejecting that early scroll must leave its budget.
+        page.started(personal, 2);
+        check(!entry.admit(false, personal, personal, 2, ORIGIN));
+        check(!entry.scrolled() && !entry.tapped());
+        page.stopped(personal, 2, true);
+        check(entry.admit(false, personal, personal, 2, ORIGIN));
+        check(entry.scrolled() && !entry.tapped());
+        check(!entry.admit(false, personal, personal, 2, ORIGIN));
+        check(page.capture(personal, personal, 2, ORIGIN, false) == null);
+        check(entry.admit(true, personal, personal, 2, ORIGIN));
+        check(!entry.admit(true, personal, personal, 2, ORIGIN));
+        check(!entry.admit(false, personal, personal, 2, ORIGIN));
+        check(page.capture(personal, personal, 2, ORIGIN, true) != null);
+
+        // Ordinary Work entry retains one scroll then one tap, and a direct
+        // visible CTA may consume its tap without requiring an extra scroll.
+        PageBaseline workPage = new PageBaseline(work, ORIGIN);
+        workPage.started(work, 3);
+        workPage.stopped(work, 3, true);
+        PageBaseline.Entry normal = workPage.new Entry();
+        check(normal.admit(false, work, work, 3, ORIGIN));
+        check(normal.admit(true, work, work, 3, ORIGIN));
+        check(!normal.admit(false, work, work, 3, ORIGIN));
+        check(!normal.admit(true, work, work, 3, ORIGIN));
+        PageBaseline.Entry direct = workPage.new Entry();
+        check(direct.admit(true, work, work, 3, ORIGIN));
+        check(!direct.admit(false, work, work, 3, ORIGIN));
+
+        PageBaseline.Entry denied = page.new Entry();
+        check(!denied.admit(false, work, personal, 2, ORIGIN));
+        check(!denied.admit(false, personal, work, 2, ORIGIN));
+        check(!denied.admit(false, null, personal, 2, ORIGIN));
+        check(!denied.admit(false, personal, null, 2, ORIGIN));
+        check(!denied.admit(false, personal, personal, 0, ORIGIN));
+        check(!denied.admit(false, personal, personal, 2, "about:blank"));
+        check(!denied.admit(false, personal, personal, 2, null));
+        page.stopped(personal, 2, false);
+        check(!denied.admit(false, personal, personal, 2, ORIGIN));
+        check(!denied.scrolled() && !denied.tapped());
+        page.started(personal, 3);
+        page.stopped(personal, 2, true);
+        check(!denied.admit(false, personal, personal, 3, ORIGIN));
+        page.stopped(personal, 3, true);
+        check(denied.admit(false, personal, personal, 3, ORIGIN));
+        // A later identity/navigation change cannot authorize the remaining tap.
+        check(!denied.admit(true, work, personal, 3, ORIGIN));
+        check(!denied.admit(true, personal, work, 3, ORIGIN));
+        page.started(personal, 4);
+        check(!denied.admit(true, personal, personal, 4, ORIGIN));
+        check(!denied.tapped());
+        page.stopped(personal, 4, true);
+        check(denied.admit(true, personal, personal, 4, ORIGIN));
+        check(!denied.admit(false, personal, personal, 4, ORIGIN));
+        System.out.println("PASS: Gecko entry gesture admission checks=" + (checks - before));
     }
 }
