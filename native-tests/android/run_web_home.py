@@ -160,6 +160,80 @@ def receipt(value, normal):
                 "Successful UI qualification requires normal emulator exit")
 
 
+# launch-context-begin
+# Optional diagnostic metadata: a historical running sample, never a role,
+# current exec-at-signal witness, signal policy or normal-cleanup requirement.
+def guard_launch_context(value, guard_pid, guard_birth):
+    unknown = {"diagnosticOnly": True, "status": "unknown", "absenceIsUnknown": True}
+    def number(v, positive=False):
+        return type(v) is int and (1 if positive else 0) <= v <= 2**64 - 1
+    def pid(v):
+        return type(v) is int and 1 <= v <= 2**31 - 1
+    def image(v):
+        return v is None or (type(v) is list and len(v) == 2 and all(number(n) for n in v))
+    try:
+        if type(value) is not dict:
+            return unknown
+        if set(value) != {"schema", "source", "guardPid", "guardStartTick", "spawnedRootPid",
+                          "declaredLaunch", "capacity", "truncated", "absenceIsUnknown",
+                          "signalTimeStateUnknown", "records"}:
+            return unknown
+        if (value["schema"] != "takosumi.guard-launch-context@v1"
+                or value["source"] != "owned_running_bookends"
+                or not pid(guard_pid) or not number(guard_birth)
+                or type(value["guardPid"]) is not int or value["guardPid"] != guard_pid
+                or type(value["guardStartTick"]) is not int or value["guardStartTick"] != guard_birth
+                or value["capacity"] != 16 or type(value["capacity"]) is not int
+                or type(value["truncated"]) is not bool or value["absenceIsUnknown"] is not True
+                or value["signalTimeStateUnknown"] is not True):
+            return unknown
+        root = value["spawnedRootPid"]
+        if root is not None and not pid(root):
+            return unknown
+        launch = value["declaredLaunch"]
+        if (type(launch) is not dict or set(launch) != {"imageIdentity", "runOptionsPresent"}
+                or not image(launch["imageIdentity"]) or type(launch["runOptionsPresent"]) is not bool):
+            return unknown
+        rows, seen = value["records"], set()
+        if type(rows) is not list or len(rows) > 16 or (rows and root is None):
+            return unknown
+        for row in rows:
+            if type(row) is not dict or set(row) != {"pid", "startTick", "root", "parentPid",
+                    "parentStartTick", "observation", "lastAttempt", "lastAttemptUnknown",
+                    "status", "execIdentity", "matchesDeclaredImage",
+                    "matchesDeclaredArgv", "matchesDeclaredRunOptions"}:
+                return unknown
+            key = row["pid"], row["startTick"]
+            if (not pid(key[0]) or not number(key[1]) or key in seen
+                    or type(row["root"]) is not bool or row["root"] != (key[0] == root)
+                    or type(row["observation"]) is not int or not 1 <= row["observation"] <= 65535
+                    or type(row["lastAttempt"]) is not int or not row["observation"] <= row["lastAttempt"] <= 65535
+                    or type(row["lastAttemptUnknown"]) is not bool
+                    or row["status"] not in ("observed", "unknown", "changed")):
+                return unknown
+            seen.add(key)
+            fields = ("parentPid", "parentStartTick", "execIdentity", "matchesDeclaredImage",
+                      "matchesDeclaredArgv", "matchesDeclaredRunOptions")
+            if row["status"] != "observed":
+                if row["lastAttemptUnknown"] is not True or any(row[f] is not None for f in fields):
+                    return unknown
+                continue
+            if (not pid(row["parentPid"]) or not number(row["parentStartTick"])
+                    or row["execIdentity"] is None or not image(row["execIdentity"])
+                    or any(row[f] is not None and type(row[f]) is not bool for f in fields[3:])
+                    or (row["parentPid"] == guard_pid and row["parentStartTick"] != guard_birth)
+                    or (row["matchesDeclaredImage"] is not None and
+                        (launch["imageIdentity"] is None or row["matchesDeclaredImage"] !=
+                         (row["execIdentity"] == launch["imageIdentity"])))
+                    or (row["matchesDeclaredRunOptions"] is not None and not launch["runOptionsPresent"])):
+                return unknown
+        return value if len(json.dumps(value, ensure_ascii=True)) <= 16384 else unknown
+    except Exception:
+        # Optional metadata cannot replace the original cleanup result/error.
+        return unknown
+# launch-context-end
+
+
 # stop-observation-begin
 STOP_OBSERVATION_CAP = 16
 
@@ -310,7 +384,8 @@ class Emulator:
         self.process = subprocess.Popen([str(guard), str(self.proof), str(self.sdk / "emulator/emulator"),
             "-avd", self.name, "-port", "5582", "-memory", "4096", "-no-window", "-no-audio",
             "-gpu", "swiftshader_indirect", "-no-boot-anim", "-no-snapshot", "-wipe-data"],
-            env=self.env, stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True)
+            env=dict(self.env, TAKOSUMI_GUARD_LAUNCH_CONTEXT="android_fixture_sdk"),
+            stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True)
         self.fd = os.pidfd_open(self.process.pid)
         parent, self.birth = identity(self.process.pid)
         require(parent == os.getpid(), "Guard is not our direct child")
@@ -414,6 +489,8 @@ class Emulator:
             observe_stop(self, "receipt_read_returned")
             receipt(value, normal=False)
             observe_stop(self, "kernel_receipt_accepted")
+            if "launchContext" in value:
+                value["launchContext"] = guard_launch_context(value["launchContext"], self.process.pid, self.birth)
             return value
         except Exception as error:
             observe_stop(self, "stop_error", phase=phase, error=error)
