@@ -122,6 +122,22 @@ class Controls(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertRegex(checked.stdout, r"PASS: connection Save keyboard checks=[1-9][0-9]*")
 
+    def test_gecko_initial_editor_baseline_requires_its_own_completed_navigation(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the Gecko baseline control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the Gecko baseline control")
+        classes = self.root / "gecko-baseline-classes"
+        classes.mkdir()
+        helper = runner.HERE / "gecko-download-fixture/src/main/java/com/takosumi/fixture/geckodownload/PageBaseline.java"
+        control = runner.HERE / "label-controls/PageBaselineTest.java"
+        built = subprocess.run([compiler, "-J-Xmx128m", "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-Xmx64m", "-cp", str(classes), "com.takosumi.fixture.geckodownload.PageBaselineTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: Gecko initial page baseline checks=[1-9][0-9]*")
+
     def test_actual_driver_back_wait_metadata_is_bounded_and_never_a_ready_oracle(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the back wait metadata control")

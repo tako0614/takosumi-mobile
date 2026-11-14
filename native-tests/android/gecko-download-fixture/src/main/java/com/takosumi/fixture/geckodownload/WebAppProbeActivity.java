@@ -82,11 +82,13 @@ public final class WebAppProbeActivity extends Activity {
     final class Page {
         final String context;
         final GeckoSession session;
+        final PageBaseline baseline;
         volatile int generation;
         volatile String uri;
         Page(String context) {
             this.context = context;
             session = new GeckoSession(new GeckoSessionSettings.Builder().contextId(context).build());
+            baseline = new PageBaseline(session, ORIGIN);
             session.setNavigationDelegate(new GeckoSession.NavigationDelegate() {
                 @Override public GeckoResult<AllowOrDeny> onLoadRequest(GeckoSession owner, LoadRequest request) {
                     boolean allowed = site(request.uri) || blob(request.uri);
@@ -104,6 +106,7 @@ public final class WebAppProbeActivity extends Activity {
             session.setProgressDelegate(new GeckoSession.ProgressDelegate() {
                 @Override public void onPageStart(GeckoSession owner, String uri) {
                     generation++;
+                    baseline.started(owner, generation);
                     if (pendingFile != null && pendingFile.page == Page.this) dismissFile();
                     if (pendingExport != null && pendingExport.page == Page.this) cancelPendingExport();
                 }
@@ -111,6 +114,7 @@ public final class WebAppProbeActivity extends Activity {
                 // "document still loading" from "loaded but no DOM"; record
                 // the real page-stop so the next failure names which one.
                 @Override public void onPageStop(GeckoSession owner, boolean success) {
+                    baseline.stopped(owner, generation, success);
                     trace("page stop success=" + success + " uri=" + uri + " generation=" + generation);
                 }
             });

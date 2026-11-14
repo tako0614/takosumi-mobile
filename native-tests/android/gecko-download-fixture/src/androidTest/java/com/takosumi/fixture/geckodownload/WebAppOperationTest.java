@@ -403,11 +403,20 @@ public final class WebAppOperationTest {
     }
 
     private void enterEditor(String profile) {
+        enterEditor(profile, null);
+    }
+
+    private PageBaseline.Snapshot enterEditor(String profile, WebAppProbeActivity.Page expected) {
         boolean[] entryTapped = {false};
         boolean[] entryScrolled = {false};
+        PageBaseline.Snapshot[] baseline = {null};
         long deadline = SystemClock.elapsedRealtime() + 60000;
         await("Actual anonymous Photopea File menu did not load for " + profile, () -> {
-            if (bounds("File", false, false) != null) return true;
+            if (bounds("File", false, false) != null) {
+                if (expected == null) return true;
+                baseline[0] = initialBaseline(expected, deadline);
+                return baseline[0] != null;
+            }
             if (!entryTapped[0]) {
                 Rect viewport = visibleWebViewport(deadline);
                 Rect start = bounds("Start using Photopea", false, false);
@@ -431,6 +440,26 @@ public final class WebAppOperationTest {
             }
             return false;
         }, 60);
+        return baseline[0];
+    }
+
+    private PageBaseline.Snapshot initialBaseline(WebAppProbeActivity.Page expected, long deadline) {
+        Handler main = new Handler(Looper.getMainLooper());
+        FutureTask<PageBaseline.Snapshot> read = new FutureTask<>(() -> expected.baseline.capture(
+            activity.selected == expected && activity.pages.get(expected.context) == expected ? expected.session : null,
+            activity.view.getSession(), expected.generation, expected.uri, true));
+        try {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            assertTrue("Photopea entry deadline expired", remaining > 0);
+            assertTrue("Main thread rejected the initial page baseline", main.post(read));
+            return read.get(Math.min(1000, remaining), TimeUnit.MILLISECONDS);
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new AssertionError("Initial page baseline unavailable before the entry deadline", error);
+        } finally {
+            main.removeCallbacks(read);
+            read.cancel(false);
+        }
     }
 
     private Rect visibleWebViewport(long deadline) {
@@ -787,13 +816,16 @@ public final class WebAppOperationTest {
         // neither the tap nor enterEditor proves Personal is displayed.
         await("Personal editor did not settle after the native switch",
             () -> switchedWithoutTab(activity.personal), 30);
-        enterEditor("Personal");
-        assertNull("The imported Work document leaked to Personal", anyBounds(tabName));
         WebAppProbeActivity.Page personal = activity.pages.get(activity.personal);
         assertNotNull(personal);
         assertNotSame(work.session, personal.session);
-        int personalDocument = personal.generation;
-        String personalUri = personal.uri;
+        // File can outlive Work's released surface. Admit the initial baseline
+        // only after this exact attached Personal session has completed a
+        // successful site navigation, within the original editor-entry wait.
+        PageBaseline.Snapshot personalBaseline = enterEditor("Personal", personal);
+        assertNull("The imported Work document leaked to Personal", anyBounds(tabName));
+        int personalDocument = personalBaseline.generation;
+        String personalUri = personalBaseline.uri;
         tap("Work");
         await("Work editor was lost on native reattach", () -> tabOpened(tabName), 15);
         assertEquals(document, work.generation);
