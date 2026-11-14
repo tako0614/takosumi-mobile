@@ -432,6 +432,77 @@ class CdpTests(unittest.TestCase):
         self.assertEqual((fresh["firstEventReceivedAt"], fresh["lastEventReceivedAt"]), (None, None))
         self.assertIsNone({}.get("firstEventReceivedAt"), "Absence in earlier metadata is unknown")
 
+    def test_event_kind_is_closed_and_preserves_received_command_flow(self):
+        cases = (("Page.lifecycleEvent", "lifecycle"), ("Page.frameNavigated", "navigation"),
+                 ("Page.frameStartedLoading", "navigation"), ("Inspector.targetCrashed", "crash"),
+                 ("Target.targetCrashed", "crash"), ("Inspector.detached", "detach"),
+                 ("Target.detachedFromTarget", "detach"), ("Target.targetDestroyed", "target_destroyed"),
+                 ("Runtime.executionContextsCleared", "contexts_cleared"),
+                 ("sensitive https://private.invalid/", "other"), ("Page.lifecycleEvent.sensitive", "other"),
+                 (None, "unknown"), (True, "unknown"), (7, "unknown"), ([], "unknown"), ({}, "unknown"))
+        reply = server_frame(1, b'{"id":1,"result":{"ok":true}}')
+        def event(method):
+            return server_frame(1, json.dumps({"method": method, "params": {"url": "https://private.invalid/"},
+                                             "sessionId": "sensitive session"}).encode())
+        for index, (method, kind) in enumerate(cases):
+            with self.subTest(kind=index):
+                client, _, trace, functional, caught = _cdp_receive_control(observer, [event(method) + reply])
+                record = client.last_command_observation
+                self.assertIsNone(caught)
+                self.assertEqual(functional["result"], {"ok": True})
+                self.assertEqual((record["firstEventKind"], record["lastEventKind"], record["events"],
+                                  record["matchingReplies"], record["otherReplies"]), (kind, kind, 1, 1, 0))
+                self.assertFalse(client.command_observation_error)
+                self.assertEqual([sum(v[0] == name for v in trace) for name in ("send", "recv", "clock")], [1, 1, 3])
+                self.assertNotIn("sensitive", json.dumps(record))
+                self.assertNotIn("private.invalid", json.dumps(record))
+        wire = event("Page.lifecycleEvent") + event("Inspector.targetCrashed")
+        client, _, _, _, _ = _cdp_receive_control(observer, [wire + reply], [10.0, 10.1, 10.2, 10.3])
+        record = client.last_command_observation
+        self.assertEqual((record["firstEventKind"], record["firstEventReceivedAt"], record["lastEventKind"],
+                          record["lastEventReceivedAt"], record["events"]), ("lifecycle", 10.2, "crash", 10.3, 2))
+        for index, ending in enumerate((TimeoutError("sensitive timeout"), RuntimeError("sensitive original"))):
+            with self.subTest(failure=index):
+                client, _, _, functional, caught = _cdp_receive_control(observer, [wire, ending])
+                self.assertEqual((client.last_command_observation["firstEventKind"],
+                                  client.last_command_observation["lastEventKind"]), ("lifecycle", "crash"))
+                self.assertEqual(functional["errorType"], "Failure" if index == 0 else "RuntimeError")
+                if index:
+                    self.assertIs(caught, ending)
+        for index, (helper, effect) in enumerate((("command_event_kind", {"side_effect": ValueError("sensitive classifier")}),
+                                                ("command_event_kind", {"return_value": "sensitive poison"}),
+                                                ("command_event_kind", {"return_value": []}),
+                                                ("command_observation", {"side_effect": ValueError("sensitive sink")}))):
+            for fails in (False, True):
+                with self.subTest(poison=index, original_fails=fails):
+                    original = RuntimeError("sensitive original")
+                    chunks = [wire, original] if fails else [wire + reply]
+                    with mock.patch.object(observer, helper, **effect):
+                        client, _, _, functional, caught = _cdp_receive_control(observer, chunks)
+                    self.assertTrue(caught is original if fails else caught is None)
+                    self.assertEqual(functional["result"], None if fails else {"ok": True})
+                    self.assertTrue(client.command_observation_error)
+                    self.assertNotIn("sensitive", json.dumps(client.last_command_observation))
+        client, _, _, functional, _ = _cdp_receive_control(observer, [wire + reply], seed=4096)
+        self.assertEqual((functional["events"], functional["base"]), (3074, 1024))
+        self.assertEqual((client.last_command_observation["firstEventKind"], client.last_command_observation["lastEventKind"]),
+                         ("lifecycle", "crash"))
+        record = observer.command_observation(None, "start", ident=1)
+        record["events"] = 2**31 - 1
+        saved = dict(record)
+        first = observer.command_observation(record, "message", matching=False, other=False, event=True,
+                                            message={observer.RECEIVED_AT: 12.0, "method": "Page.lifecycleEvent"})
+        last = observer.command_observation(first, "message", matching=False, other=False, event=True,
+                                           message={observer.RECEIVED_AT: 13.0, "method": "Inspector.detached"})
+        self.assertEqual((last["firstEventKind"], last["lastEventKind"], last["events"]), ("lifecycle", "detach", 2**31 - 1))
+        self.assertTrue(last["countsCapped"])
+        self.assertEqual(record, saved)
+        self.assertEqual(first["lastEventKind"], "lifecycle", "Saved snapshot remains independent")
+        client, _, _, _, _ = _cdp_receive_control(observer, [reply])
+        self.assertEqual((client.last_command_observation["firstEventKind"],
+                          client.last_command_observation["lastEventKind"]), (None, None))
+        self.assertIsNone({}.get("firstEventKind"), "Absent older metadata is unknown")
+
     def test_a_command_returns_its_own_reply_and_keeps_events(self):
         cdp = observer.Cdp(FakeSocket([{"method": "Page.frameNavigated", "params": {}},
                                        {"id": 1, "result": {"ok": True}}]), "work")
