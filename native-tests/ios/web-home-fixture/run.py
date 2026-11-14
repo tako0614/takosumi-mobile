@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Actual installed Tauri App Web-home UI on one fresh, owned Simulator."""
 import argparse
+from datetime import datetime, timezone
+import gzip
 import hashlib
 import io
 import json
@@ -11,7 +13,13 @@ import plistlib
 import re
 import shutil
 import stat
+import struct
+import subprocess
+import tarfile
+import zipfile
 import uuid
+
+from contextlib import ExitStack
 
 from harness import runtime
 from web_site import Site
@@ -303,6 +311,445 @@ def bootstrap_witness(data, size, *, partial):
     return result
 
 
+# watchdog-diagnostics-begin
+WATCHDOG_REPORT_BYTES = 4 * 1024**2
+
+
+def watchdog_time(value, *, explicit_utc=False):
+    if not isinstance(value, str) or len(value) > 48:
+        raise ValueError("Unknown native timestamp")
+    if explicit_utc:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+    result = datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f %z")
+    return result.astimezone(timezone.utc)
+
+
+def _watchdog_witness(prefix, tail, *, explicit_utc, partial):
+    """One original-process scene watchdog, from the existing native log query."""
+    if (explicit_utc is not True or partial is not False or type(prefix) is not bytes or type(tail) is not bytes
+            or len(prefix) > 2 * 1024**2 or len(tail) > 512 * 1024):
+        return None
+    native, watchdogs, exits = {}, {}, {}
+    header = re.compile(rb"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3,6})\s+(?:Df|E|D|I|F|A)\s+(.+)$")
+    app = re.compile(rb"app<com\.takosumi\.fixture\.simulator(?:\(\(null\)\))?>:([1-9][0-9]{0,8})")
+    for chunk, data in enumerate((prefix, tail)):
+        # A cut chunk cannot acquire a previous line's header or identity.
+        for index, line in enumerate(data.splitlines(keepends=True)[:16384]):
+            if (chunk == 1 and index == 0) or not line.endswith(b"\n") or len(line) > 4096:
+                continue
+            match = header.fullmatch(line.rstrip(b"\r\n"))
+            if not match:
+                continue
+            stamp, text = match[1].decode("ascii"), match[2]
+            emitted = re.match(rb"Takosumi\[([1-9][0-9]{0,8}):[0-9a-f]+\]\s+\[com\.takosumi\.fixture\.simulator(?::app|\.navigation:navigation)\]\s+", text)
+            if emitted:
+                pid = int(emitted[1]); native[pid] = min(stamp, native.get(pid, stamp))
+            if (re.match(rb"SpringBoard\[[0-9]+:[0-9a-f]+\]\s+\[com\.apple\.FrontBoard:Watchdog\]", text)
+                    and b"Watchdog termination request provided:" in text and b"scene-update" in text
+                    and b"0x8badf00d" in text.lower()):
+                pids = {int(v) for v in app.findall(text)}
+                if len(pids) == 1:
+                    watchdogs.setdefault(pids.pop(), set()).add(stamp)
+            if (re.match(rb"launchd_sim\[[1-9][0-9]{0,8}:[0-9a-fA-Fx]+\]\s+", text)
+                    and b"exited with exit reason (namespace: 10 code: 0x8badf00d)" in text.lower()):
+                found = re.search(rb"UIKitApplication:com\.takosumi\.fixture\.simulator\[[0-9a-f]+\]\[rb-legacy\] \[([1-9][0-9]{0,8})\]:\]", text)
+                if found:
+                    exits.setdefault(int(found[1]), set()).add(stamp)
+    if len(watchdogs) != 1:
+        return None
+    pid, times = next(iter(watchdogs.items()))
+    if len(times) != 1 or pid not in native or len(exits.get(pid, ())) != 1:
+        return None
+    first, event, ended = native[pid], next(iter(times)), next(iter(exits[pid]))
+    if not watchdog_time(first, explicit_utc=True) <= watchdog_time(event, explicit_utc=True) <= watchdog_time(ended, explicit_utc=True):
+        return None
+    return {"pid": pid, "firstNativeUTC": first, "watchdogUTC": event, "exitUTC": ended,
+            "clockDomain": "owned_simulator_os_log_explicit_UTC", "snapshotOnly": True}
+
+
+def watchdog_witness(prefix, tail, *, explicit_utc, partial):
+    try:
+        return _watchdog_witness(prefix, tail, explicit_utc=explicit_utc, partial=partial)
+    except Exception:
+        return None  # This sibling projection cannot suppress old nav/screen retention.
+
+
+def watchdog_install_context(container, data, udid, executable, load_commands):
+    try:
+        if str(uuid.UUID(udid)).upper() != udid or data.parent.name != udid or data.name != "data":
+            return None
+        relative = str((container / executable).relative_to(data))
+        if not re.fullmatch(r"Containers/Bundle/Application/[A-Fa-f0-9-]{36}/[^/]+\.app/[^/]+", relative):
+            return None
+        if not isinstance(load_commands, str) or len(load_commands) > 65536:
+            return None
+        blocks = re.split(r"(?m)^Load command [0-9]+\n", load_commands)
+        values = [re.findall(r"(?m)^\s+uuid ([A-Fa-f0-9-]{36})\s*$", b)
+                  for b in blocks if re.search(r"(?m)^\s+cmd LC_UUID\s*$", b)]
+        if len(values) != 1 or len(values[0]) != 1:
+            return None
+        if Path(executable).name != executable or not executable:
+            return None
+        uuid.UUID(Path(relative).parts[3])
+        image = str(uuid.UUID(values[0][0]))
+        return {"udid": udid, "bundleIdentifier": BUNDLE, "executable": executable,
+                "relativeExecutableSHA256": hashlib.sha256(relative.encode()).hexdigest(), "imageUUID": image}
+    except (ValueError, TypeError):
+        return None
+
+
+def watchdog_context_from_saved_install(path, device, udid, executable, load_commands):
+    # Consume only the stdout already validated by installed_app. No extra
+    # get_app_container or guest call, and no raw path survives the projection.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 4096:
+                return None
+            raw = source.read(4097)
+            after = os.fstat(source.fileno())
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return None
+        text = raw.decode("utf-8").strip()
+        if "\n" in text or "\r" in text or not text.startswith("/") or any(p in (".", "..") for p in text.split("/")):
+            return None
+        return watchdog_install_context(Path(text), Path(device["dataPath"]), udid, executable, load_commands)
+    except Exception:
+        return None
+
+
+def watchdog_report(raw, context, witness, rejections=None):
+    """Closed snapshot projection; never retain raw report/ASI/registers/paths."""
+    def reject(category):
+        if rejections is not None:
+            rejections[category] = min(33, rejections.get(category, 0) + 1)
+        return None
+    if not context or not witness or type(raw) is not bytes or len(raw) > WATCHDOG_REPORT_BYTES:
+        return reject("unavailable_or_bound")
+    try:
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("Duplicate report key")
+                value[key] = item
+            return value
+        first, rest = raw.decode("utf-8").split("\n", 1)
+        head = json.loads(first, object_pairs_hook=unique); body = json.loads(rest, object_pairs_hook=unique)
+        if head.get("bundleID") != BUNDLE or body.get("bundleInfo", {}).get("CFBundleIdentifier") != BUNDLE:
+            return reject("other_bundle")
+        if type(body.get("pid")) is int and body["pid"] != witness["pid"]:
+            return reject("other_pid")
+        if (head.get("bug_type") != "309" or head.get("bundleID") != BUNDLE
+                or body.get("bundleInfo", {}).get("CFBundleIdentifier") != BUNDLE
+                or context["bundleIdentifier"] != BUNDLE or body.get("procName") != context["executable"]
+                or type(body.get("pid")) is not int or body["pid"] != witness["pid"]
+                or str(uuid.UUID(head["incident_id"])) != str(uuid.UUID(body["incident"]))):
+            return reject("unsupported_or_inconsistent")
+        launch, captured = watchdog_time(body["procLaunch"]), watchdog_time(body["captureTime"])
+        if not (launch <= watchdog_time(witness["firstNativeUTC"], explicit_utc=True)
+                <= watchdog_time(witness["watchdogUTC"], explicit_utc=True) <= captured
+                <= watchdog_time(witness["exitUTC"], explicit_utc=True)):
+            return reject("generation_or_interval")
+        path = body["procPath"]
+        if not isinstance(path, str) or len(path) > 2048 or not path.startswith("/") or any(v in (".", "..") for v in path.split("/")):
+            return reject("unsupported_or_inconsistent")
+        needle = "/Devices/" + context["udid"] + "/data/"
+        if path.count(needle) != 1:
+            return reject("other_device")
+        relative = path.split(needle, 1)[1]
+        if hashlib.sha256(relative.encode()).hexdigest() != context["relativeExecutableSHA256"]:
+            return reject("other_install")
+        termination = body.get("termination", {})
+        code = termination.get("code")
+        if type(code) is not int or code != 0x8badf00d or termination.get("namespace") not in ("FRONTBOARD", "SPRINGBOARD"):
+            return reject("unsupported_or_inconsistent")
+        if not isinstance(termination.get("indicator"), str) or len(termination["indicator"]) > 4096 or "scene-update" not in termination["indicator"]:
+            return reject("unsupported_or_inconsistent")
+        images = body.get("usedImages")
+        if not isinstance(images, list) or not 1 <= len(images) <= 512:
+            return reject("unsupported_or_inconsistent")
+        main = [i for i, image in enumerate(images) if image.get("path") == path and
+                str(uuid.UUID(image.get("uuid", ""))) == context["imageUUID"]]
+        if len(main) != 1:
+            return reject("other_binary")
+        threads = body.get("threads")
+        if not isinstance(threads, list) or len(threads) > 256:
+            return reject("unsupported_or_inconsistent")
+        selected = [t for t in threads if t.get("queue") == "com.apple.main-thread"]
+        report = {"pid": body["pid"], "incident": str(uuid.UUID(body["incident"])),
+                  "imageUUID": context["imageUUID"], "reportSHA256": hashlib.sha256(raw).hexdigest(),
+                  "association": "native_watchdog_generation_and_owned_install", "snapshotOnly": True,
+                  "threadRole": "unknown", "stackStatus": "unknown", "frames": [], "framesTruncated": False}
+        if len(selected) != 1:
+            return report
+        frames = selected[0].get("frames")
+        if not isinstance(frames, list) or not frames or len(frames) > 4096:
+            return report
+        report["threadRole"] = "main_queue"
+        report["framesTruncated"] = len(frames) > 32
+        for frame in frames[:32]:
+            index, offset = frame.get("imageIndex"), frame.get("imageOffset")
+            if type(index) is not int or not 0 <= index < len(images) or type(offset) is not int or not 0 <= offset < 2**64:
+                return reject("unsupported_or_inconsistent")
+            symbol = frame.get("symbol")
+            if (not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z_$\[<+\-][A-Za-z0-9_.$<>\[\](): +,*&~\-]{0,239}", symbol)
+                    or re.search(r"(?i)authorization|cookie|token|secret|password|bearer", symbol)):
+                symbol = None
+            report["frames"].append({"image": "app" if index == main[0] else "other",
+                                     "imageOffset": offset, "symbol": symbol})
+        report["stackStatus"] = "reported_main_queue_snapshot"
+        return report
+    except Exception:
+        return reject("unsupported_or_inconsistent")
+
+
+def watchdog_archive_name(name):
+    if name.startswith("./"):
+        name = name[2:]  # Standard relative tar/zip prefix; never a filesystem extraction.
+    parts = name.replace("\\", "/").split("/")
+    if (not name or len(name) > 1024 or name.startswith(("/", "\\")) or "\\" in name
+            or any(p in (".", "..") for p in parts) or len(parts) > 13):
+        raise ValueError("Diagnostic member path")
+    return name.rstrip("/")
+
+
+def watchdog_report_bytes(source, name, budget, deadline):
+    """Direct IPS or one ZIP/tar/gzip container; selected bytes only, never extractall."""
+    def admit(size):
+        if runtime.time.monotonic() > deadline or not 0 <= size <= WATCHDOG_REPORT_BYTES or budget[0] <= 0 or budget[1] < size:
+            raise ValueError("Diagnostic selection bound")
+        budget[0] -= 1; budget[1] -= size
+    if name.endswith(".ips"):
+        source.seek(0, os.SEEK_END); admit(source.tell()); source.seek(0)
+        data = source.read(WATCHDOG_REPORT_BYTES + 1)
+        if len(data) > WATCHDOG_REPORT_BYTES:
+            raise ValueError("Diagnostic report bound")
+        yield data
+        return
+    class TimedInput:
+        def read(self, count=-1):
+            if runtime.time.monotonic() > deadline:
+                raise ValueError("Diagnostic parse budget")
+            if count < 0:
+                position = source.tell(); source.seek(0, os.SEEK_END)
+                count = source.tell() - position; source.seek(position)
+            if count > 256 * 1024**2:
+                raise ValueError("Diagnostic archive read bound")
+            return source.read(count)
+        def seek(self, *args):
+            if runtime.time.monotonic() > deadline:
+                raise ValueError("Diagnostic parse budget")
+            return source.seek(*args)
+        def tell(self):
+            return source.tell()
+        def seekable(self):
+            return True
+    archive_source = TimedInput()
+    archive_suffixes = (".zip", ".tar", ".tgz", ".tar.gz")
+    if name.endswith(".zip"):
+        # Bound central metadata before zipfile allocates its member table.
+        source.seek(0, os.SEEK_END); size = source.tell()
+        source.seek(max(0, size - 65557)); tail = source.read(65557)
+        position = tail.rfind(b"PK\x05\x06")
+        if position < 0 or len(tail) - position < 22:
+            raise ValueError("Diagnostic ZIP header")
+        _, disk, central_disk, disk_count, count, central_size, offset, comment = struct.unpack("<4s4H2LH", tail[position:position+22])
+        if (disk or central_disk or disk_count != count or count > 4096 or central_size > 2 * 1024**2
+                or offset + central_size > size or position + 22 + comment != len(tail)):
+            raise ValueError("Diagnostic ZIP metadata bound")
+        eocd_offset = size - len(tail) + position
+        if eocd_offset >= 20:
+            source.seek(eocd_offset - 20)
+            if source.read(4) == b"PK\x06\x07":
+                raise ValueError("ZIP64 diagnostic metadata unknown")
+        # ZipFile may otherwise overwrite the classic bounds from ZIP64, or
+        # build more entries than the EOCD declares. Walk the small classic
+        # central region first; do not let table construction own this bound.
+        if offset + central_size != eocd_offset:
+            raise ValueError("Diagnostic ZIP central offset")
+        source.seek(offset)
+        central = source.read(central_size)
+        if len(central) != central_size:
+            raise ValueError("Partial diagnostic ZIP central metadata")
+        position, actual_count = 0, 0
+        while position < len(central):
+            if runtime.time.monotonic() > deadline:
+                raise ValueError("Diagnostic parse budget")
+            if len(central) - position < 46 or central[position:position+4] != b"PK\x01\x02":
+                raise ValueError("Diagnostic ZIP central framing")
+            name_bytes, extra_bytes, comment_bytes = struct.unpack_from("<3H", central, position + 28)
+            position += 46 + name_bytes + extra_bytes + comment_bytes
+            actual_count += 1
+            if position > len(central) or actual_count > 4096:
+                raise ValueError("Diagnostic ZIP actual member bound")
+        if actual_count != count:
+            raise ValueError("Diagnostic ZIP declared count mismatch")
+        source.seek(0)
+        with zipfile.ZipFile(archive_source) as archive:
+            members = archive.infolist()
+            if len(members) != count:
+                raise ValueError("Diagnostic ZIP member count")
+            seen, total = set(), 0
+            for member in members:
+                if runtime.time.monotonic() > deadline:
+                    raise ValueError("Diagnostic parse budget")
+                name = watchdog_archive_name(member.filename); mode = stat.S_IFMT(member.external_attr >> 16)
+                total += member.file_size
+                if (name in seen or member.flag_bits & 1 or mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+                        or member.file_size > 256 * 1024**2 or total > 512 * 1024**2):
+                    raise ValueError("Diagnostic ZIP member bound/type")
+                seen.add(name)
+                if not member.is_dir() and name.endswith(archive_suffixes):
+                    raise ValueError("Nested diagnostic archive unknown")
+                if not member.is_dir() and name.endswith(".ips"):
+                    admit(member.file_size)
+                    yield archive.read(member)  # CRC checked only for selected IPS members.
+        return
+    if name.endswith((".tar", ".tgz", ".tar.gz")):
+        class DecodedBudget:
+            def __init__(self, stream):
+                self.stream, self.remaining = stream, 512 * 1024**2
+            def read(self, count):
+                if count < 0:
+                    raise ValueError("Unbounded diagnostic stream read")
+                if runtime.time.monotonic() > deadline:
+                    raise ValueError("Diagnostic parse budget")
+                data = self.stream.read(min(count, self.remaining + 1))
+                self.remaining -= len(data)
+                if self.remaining < 0:
+                    raise ValueError("Diagnostic decoded bound")
+                return data
+        decoded = gzip.GzipFile(fileobj=archive_source) if name.endswith((".tgz", ".tar.gz")) else archive_source
+        limited = DecodedBudget(decoded)
+        try:
+            with tarfile.open(fileobj=limited, mode="r|") as archive:
+                seen, total = set(), 0
+                for count, member in enumerate(archive, 1):
+                    if count > 4096:
+                        raise ValueError("Diagnostic tar member bound")
+                    if member.isdir() and member.name in (".", "./"):
+                        continue
+                    name = watchdog_archive_name(member.name); total += member.size
+                    if (count > 4096 or name in seen or not (member.isdir() or member.isfile())
+                            or member.size > 256 * 1024**2 or total > 512 * 1024**2):
+                        raise ValueError("Diagnostic tar member bound/type")
+                    seen.add(name)
+                    if member.isfile() and name.endswith(archive_suffixes):
+                        raise ValueError("Nested diagnostic archive unknown")
+                    if member.isfile() and name.endswith(".ips"):
+                        admit(member.size)
+                        report = archive.extractfile(member)
+                        if report is None:
+                            raise ValueError("Missing diagnostic report")
+                        yield report.read(WATCHDOG_REPORT_BYTES + 1)
+            # Consume bounded padding/trailer too, so a gzip CRC/size failure
+            # cannot be hidden by tar's end marker after a selected report.
+            while limited.read(65536):
+                pass
+        finally:
+            if decoded is not archive_source:
+                decoded.close()
+        return
+    raise ValueError("Unknown diagnostic container")
+
+
+def preserve_watchdog_diagnostics(out, scratch, original, context):
+    value = {"diagnosticOnly": True, "status": "unknown", "absenceIsUnknown": True,
+             "snapshotOnly": True, "exportEntryLimit": 4096, "exportByteLimit": 512 * 1024**2,
+             "reportByteLimit": WATCHDOG_REPORT_BYTES, "reportLimit": 32}
+    try:
+        value["stage"] = "eligibility"
+        witness = original.get("targetAppExit", {}).get("watchdogWitness")
+        if original.get("functionalPassed") is not False or not witness or not context:
+            return value
+        if any(v["log"] == str(out / "xcodebuild.log") for v in runtime.INTERRUPTED_COMMANDS) or runtime.UNREAPED_COMMANDS:
+            return value
+        bundle = out / "Tests.xcresult"
+        runtime.diagnostic_export_tree(bundle, entry_limit=16384, byte_limit=1024**3)
+        directory = scratch / ("watchdog-export-" + uuid.uuid4().hex)
+        directory.mkdir(mode=0o700)
+        anchor = directory.stat()
+        value["stage"] = "export"
+        deadline = runtime.time.monotonic() + 60
+        runtime.command(["xcrun", "xcresulttool", "export", "diagnostics", "--path", str(bundle),
+                         "--output-path", str(directory / "diagnostics")], directory / "export.log",
+                        timeout=60, read_output=False, diagnostic_export_root=directory)
+        if runtime.UNREAPED_COMMANDS:
+            return value
+        files = runtime.diagnostic_export_tree(directory)
+        value["containers"] = {"ips": 0, "zip": 0, "tar": 0, "tar_gzip": 0}
+        reports, total, count, rejections = {}, 0, 0, {}
+        budget = [32, 32 * 1024**2]
+        value["stage"] = "read"
+        for parts, identity in files:
+            if not parts[-1].endswith((".ips", ".zip", ".tar", ".tgz", ".tar.gz")):
+                if parts[-1].endswith((".gz", ".xz", ".bz2", ".zst", ".7z", ".crash")):
+                    value["outcome"] = "unsupported_container_or_report"
+                    return value
+                continue
+            kind = ("ips" if parts[-1].endswith(".ips") else "zip" if parts[-1].endswith(".zip") else
+                    "tar" if parts[-1].endswith(".tar") else "tar_gzip")
+            value["containers"][kind] += 1
+            # Reopen each component without following links; bind the stream
+            # to the scan inode. No archive member becomes a filesystem path.
+            with ExitStack() as stack:
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                stack.callback(os.close, fd)
+                if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != (anchor.st_dev, anchor.st_ino):
+                    return value
+                for part in parts[:-1]:
+                    fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    stack.callback(os.close, fd)
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                stack.callback(os.close, fd)
+                before = os.fstat(fd)
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != identity or before.st_nlink != 1:
+                    return value
+                with os.fdopen(os.dup(fd), "rb") as source:
+                    for raw in watchdog_report_bytes(source, parts[-1], budget, deadline):
+                        count += 1; total += len(raw)
+                        if count > 32 or len(raw) > WATCHDOG_REPORT_BYTES or total > 32 * 1024**2:
+                            return value
+                        report = watchdog_report(raw, context, witness, rejections)
+                        if report:
+                            previous = reports.get(report["incident"])
+                            if previous is not None and previous != report:
+                                return value
+                            reports[report["incident"]] = report
+                after = os.fstat(fd)
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
+                    return value
+        if runtime.time.monotonic() > deadline:
+            return value
+        value.update(ipsReportsRead=count, rejections=rejections)
+        unsafe = set(rejections) - {"other_bundle", "other_pid", "other_device", "other_install", "other_binary", "generation_or_interval"}
+        if len(reports) != 1 or unsafe:
+            return value
+        value.update(status="retained", report=next(iter(reports.values())))
+        data = (json.dumps(value, indent=2) + "\n").encode()
+        if len(data) > 32768:
+            return {"diagnosticOnly": True, "status": "unknown", "absenceIsUnknown": True}
+        # The existing final result.json save owns delivery; no duplicate report
+        # file, raw IPS, SDK archive or stdout is copied into evidence.
+        return value
+    except Exception as error:
+        value["outcome"] = ({"Nested diagnostic archive unknown": "unsupported_nested_container",
+                             "ZIP64 diagnostic metadata unknown": "unsupported_zip64",
+                             "Unknown diagnostic container": "unsupported_container"}.get(str(error), "invalid_or_bound")
+                            if isinstance(error, ValueError) else
+                            "timeout" if isinstance(error, subprocess.TimeoutExpired) else
+                            "io" if isinstance(error, OSError) else
+                            "export_rejected" if isinstance(error, RuntimeError) else "unknown")
+        # Optional export/parse/storage failures never replace the original UI
+        # failure. Existing command retirement/scratch retention still applies.
+        value["status"] = "unknown"
+        value.pop("report", None)
+        return value
+# watchdog-diagnostics-end
+
+
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
@@ -329,7 +776,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
         return result
     try:
         runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
-                         "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
+                         "--timezone", "UTC", "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
         result["queryReturned"] = True
     except Exception as error:
         # command() handles its direct child before raising. A retained tail
@@ -356,6 +803,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
             data = source.read(min(size, 512 * 1024))
         with (out / "target-app-exit.log").open("xb") as target:
             target.write(data)
+        result["watchdogWitness"] = watchdog_witness(prefix, data, explicit_utc=True, partial=not result["queryReturned"])
         result.update(sourceBytes=size, keptBytes=len(data), truncated=size > len(data),
                       sha256=hashlib.sha256(data).hexdigest(), partial=not result["queryReturned"])
         try:
@@ -525,6 +973,7 @@ def main():
     result = {"passed": False, "scope": "Whole installed Tauri App, synthetic Web UI only",
               "source": source_hashes(), "app": app_proof, "installBudgetSeconds": INSTALL_WAIT,
               "cleanup": False, "functionalPassed": False}
+    diagnostic_context = {}
     udid, created, servers, failure = None, None, [], None
     with runtime.owned_scratch(scratch_parent) as (scratch, scratch_state):
         try:
@@ -554,6 +1003,8 @@ def main():
             runtime.command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log", trust_trace=True)
             runtime.command(["xcrun", "simctl", "install", udid, str(app)], out / "install.log", timeout=INSTALL_WAIT)
             result["installedBefore"] = installed_app(out, udid, created, app_proof, "before")
+            diagnostic_context = watchdog_context_from_saved_install(out / "installed-before.log", created,
+                udid, app_proof["executable"], images[0].get("loadCommands", ""))
             for kind in ("instance", "editor"):
                 server = Site(cert, key, kind)
                 servers.append(server)
@@ -602,6 +1053,8 @@ def main():
                 except Exception as error:
                     failure = failure or error
                     result["cleanupError"] = type(error).__name__
+            if failure is not None:
+                result["watchdogDiagnostics"] = preserve_watchdog_diagnostics(out, scratch, result, diagnostic_context)
             live = [{"pid": item["process"].pid, "log": item["log"]} for item in runtime.UNREAPED_COMMANDS
                     if item["process"].poll() is None]
             if live:

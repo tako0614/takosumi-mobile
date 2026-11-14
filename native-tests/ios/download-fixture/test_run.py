@@ -20,6 +20,54 @@ from server import BLOB_BYTES, COOKIE_BYTES, SENTINEL_BYTES, FixtureServer
 
 
 class HarnessTests(unittest.TestCase):
+    # diagnostic-budget-control-begin
+    def test_diagnostic_export_budget_refuses_links_and_reaps_owned_stub(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            root = Path(raw).resolve(); export = root / "export"; export.mkdir()
+            (export / "linked").symlink_to(root / "private-unowned")
+            with self.assertRaises(ValueError):
+                fixture_runner.diagnostic_export_tree(export)
+            (export / "linked").unlink()
+            private = root / "private"; private.write_text("unselected")
+            os.link(private, export / "hardlinked")
+            with self.assertRaises(ValueError):
+                fixture_runner.diagnostic_export_tree(export)
+            (export / "hardlinked").unlink()
+            self.assertEqual(fixture_runner.diagnostic_export_tree(export), [])
+            (export / "vanishing").write_bytes(b"")
+            original_stat = os.stat
+            def moving_stat(path, *args, **kwargs):
+                if path == "vanishing" and kwargs.get("dir_fd") is not None:
+                    raise FileNotFoundError("SDK atomic rename")
+                return original_stat(path, *args, **kwargs)
+            with patch.object(fixture_runner.os, "stat", side_effect=moving_stat):
+                self.assertEqual(fixture_runner.diagnostic_export_tree(export, moving=True), [])
+                with self.assertRaises(FileNotFoundError):
+                    fixture_runner.diagnostic_export_tree(export)
+            (export / "vanishing").unlink()
+            original_popen = subprocess.Popen
+            children = []
+            def launch(*args, **kwargs):
+                child = original_popen([sys.executable, "-I", "-S", "-c",
+                    "import pathlib,sys,time; p=pathlib.Path(sys.argv[1])/'oversize'; "
+                    "p.open('wb').truncate(256*1024*1024+1); time.sleep(30)", str(export)], **kwargs)
+                children.append(child); return child
+            argv = ["xcrun", "xcresulttool", "export", "diagnostics", "--path", str(root / "Tests.xcresult"),
+                    "--output-path", str(export / "diagnostics")]
+            started = time.monotonic()
+            with patch.object(fixture_runner.subprocess, "Popen", side_effect=launch):
+                with self.assertRaises(ValueError):
+                    fixture_runner.command(argv, export / "export.log", timeout=60, read_output=False,
+                                           diagnostic_export_root=export)
+            self.assertLess(time.monotonic() - started, 5, "Budget must interrupt the live producer, not just inspect its final output")
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertTrue(fixture_runner.INTERRUPTED_COMMANDS[-1]["reaped"])
+            self.assertEqual(fixture_runner.INTERRUPTED_COMMANDS[-1]["originalErrorType"], "ValueError")
+            self.assertFalse(fixture_runner.UNREAPED_COMMANDS)
+            print("PASS owned harmless export stub: bound refusal, direct child retired/reaped; no SDK")
+    # diagnostic-budget-control-end
+
     def setUp(self):
         for name in ("UNREAPED_COMMANDS", "INTERRUPTED_COMMANDS"):
             reset = patch.object(fixture_runner, name, [])

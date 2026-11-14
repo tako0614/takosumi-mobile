@@ -214,7 +214,81 @@ def owned_scratch(parent):
                 state["cleanupError"] = type(error).__name__
 
 
-def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=False, read_output=True):
+# diagnostic-export-budget-begin
+def diagnostic_export_tree(root, *, entry_limit=4096, byte_limit=512 * 1024**2, moving=False):
+    """Metadata-only budget. It detects overrun; it is not an instant disk quota."""
+    if not root.is_absolute() or root.resolve(strict=True) != root:
+        raise ValueError("Diagnostic export root alias")
+    files, count, total = [], 0, 0
+    def scan(fd, parts):
+        nonlocal count, total
+        if len(parts) > 12:
+            raise ValueError("Diagnostic export depth bound")
+        with os.scandir(fd) as entries:
+            for item in entries:
+                count += 1
+                if count > entry_limit:
+                    raise ValueError("Diagnostic export entry bound")
+                try:
+                    before = os.stat(item.name, dir_fd=fd, follow_symlinks=False)
+                    relative = parts + (item.name,)
+                    if stat.S_ISDIR(before.st_mode):
+                        child = os.open(item.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                        try:
+                            opened = os.fstat(child)
+                            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                                raise ValueError("Diagnostic directory changed")
+                            scan(child, relative)
+                        finally:
+                            os.close(child)
+                    elif stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
+                        total += before.st_size
+                        if before.st_size > 256 * 1024**2 or total > byte_limit:
+                            raise ValueError("Diagnostic export byte bound")
+                        files.append((relative, (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)))
+                    else:
+                        raise ValueError("Diagnostic export links/special files refused")
+                except FileNotFoundError:
+                    if not moving:
+                        raise
+                    # The live SDK may atomically rename its temporary files.
+                    # A final strict scan is still required after its exit.
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        scan(fd, ())
+        after = root.lstat()
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("Diagnostic root changed")
+    finally:
+        os.close(fd)
+    return files
+
+
+def diagnostic_export_wait(process, timeout, root):
+    # Only the dedicated diagnostic command takes this path. The original
+    # command waiter, boot/trust deadlines and retirement remain unchanged.
+    deadline = time.monotonic() + timeout
+    anchor = root.lstat()
+    while True:
+        current = root.lstat()
+        if (anchor.st_dev, anchor.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("Diagnostic root replaced")
+        diagnostic_export_tree(root, moving=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            code = process.wait(timeout=min(0.05, remaining))
+            diagnostic_export_tree(root)
+            return code
+        except subprocess.TimeoutExpired:
+            pass
+# diagnostic-export-budget-end
+
+
+def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=False, read_output=True,
+            diagnostic_export_root=None):
     """Preserve the original failure even if retiring our own CLI also fails."""
     if boot_status and (len(argv) != 5 or argv[:3] != ["xcrun", "simctl", "bootstatus"] or
                         argv[4] != "-b" or timeout != 180):
@@ -222,6 +296,13 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
     if trust_trace and (len(argv) != 6 or argv[:3] != ["xcrun", "simctl", "keychain"] or
                         argv[4] != "add-root-cert" or timeout != 60 or boot_status):
         raise ValueError("Trust trace is only for the single Simulator CA import")
+    if diagnostic_export_root is not None:
+        if (len(argv) != 8 or argv[:5] != ["xcrun", "xcresulttool", "export", "diagnostics", "--path"]
+                or argv[6] != "--output-path" or Path(argv[7]) != diagnostic_export_root / "diagnostics"
+                or path.parent != diagnostic_export_root or timeout != 60 or read_output
+                or boot_status or trust_trace):
+            raise ValueError("Only the exact private diagnostic export may use an output budget")
+        diagnostic_export_tree(diagnostic_export_root)
     boot_started = time.monotonic() if boot_status else None
     trust = {"diagnosticOnly": True, "configuredWaitSeconds": timeout,
              "startedUnixSeconds": time.time()} if trust_trace else None
@@ -234,7 +315,10 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
         failure = None
         try:
             try:
-                code = process.wait(timeout=timeout)
+                if diagnostic_export_root is None:
+                    code = process.wait(timeout=timeout)
+                else:
+                    code = diagnostic_export_wait(process, timeout, diagnostic_export_root)
             except subprocess.TimeoutExpired as original:
                 if not boot_status:
                     raise
