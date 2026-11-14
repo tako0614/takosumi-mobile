@@ -204,7 +204,9 @@ def guard_launch_context(value, guard_pid, guard_birth):
             # Optional syntax hints only. Older rows omit all three; partial
             # or poisoned new shapes fail closed without changing cleanup.
             shape_fields = {"dispatchArgKind", "helperWaitSeconds", "killTargetRelation"}
-            if type(row) is not dict or set(row) not in (fields, fields | shape_fields):
+            history_fields = {"change", "historicalArg"}
+            if type(row) is not dict or set(row) not in (
+                    fields, fields | shape_fields, fields | history_fields, fields | shape_fields | history_fields):
                 return unknown
             if shape_fields <= set(row):
                 kind, wait, relation = (row[k] for k in ("dispatchArgKind", "helperWaitSeconds", "killTargetRelation"))
@@ -231,6 +233,31 @@ def guard_launch_context(value, guard_pid, guard_birth):
                     or type(row["lastAttemptUnknown"]) is not bool
                     or row["status"] not in ("observed", "unknown", "changed")):
                 return unknown
+            # A sampled difference and a dated old argument hint are a pair.
+            # Neither can restore the rejected current point or grant a role.
+            if history_fields <= set(row):
+                change, historical = row["change"], row["historicalArg"]
+                if (row["status"] != "changed" or type(change) is not list or len(change) != 3
+                        or any(type(v) is not int for v in change)
+                        or not row["observation"] <= change[0] <= row["lastAttempt"]
+                        or not 0 <= change[1] <= 63 or not 0 <= change[2] <= 63
+                        or change[2] & 16 or not (change[1] | change[2])):
+                    return unknown
+                if historical is not None:
+                    if (type(historical) is not list or len(historical) != 6
+                            or type(historical[0]) is not int or historical[0] != row["observation"]
+                            or historical[0] >= change[0] or not pid(historical[1]) or not number(historical[2])
+                            or (historical[1] == guard_pid and historical[2] != guard_birth)):
+                        return unknown
+                    kind, wait, relation = historical[3:]
+                    if kind == "canonical_kill_sleep":
+                        if not pid(wait) or relation not in ("same_retained_parent_pid", "different_pid"):
+                            return unknown
+                    elif kind in ("declared_exact", "other_complete"):
+                        if wait is not None or relation is not None:
+                            return unknown
+                    else:
+                        return unknown
             seen.add(key)
             fields = ("parentPid", "parentStartTick", "execIdentity", "matchesDeclaredImage",
                       "matchesDeclaredArgv", "matchesDeclaredRunOptions")
@@ -735,6 +762,10 @@ def preserve_native_observation(emulator, scratch, out, prior):
 
 # root-bootstrap-begin
 ROOT_BOOTSTRAP_TAG = "TakosRootBootstrap"
+# -t limits the PID's logd input before tag filtering. Count only matching
+# messages from the retained main buffer; unrelated later noise cannot spend
+# this budget. -d stays finite and the existing read/identity bounds still apply.
+ROOT_BOOTSTRAP_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-m", "64")
 ROOT_BOOTSTRAP_PACKET = re.compile(
     rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
     rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
@@ -843,7 +874,8 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
               "clockDomain": "browser_performance_time_origin_ms", "birthDomain": "guest_kernel_start_ticks",
               "timestampsComparableAcrossDomains": False, "sequenceMayRepeatAcrossRealms": True,
               "coverage": "unknown", "records": [], "queryReturned": False, "identityBookendsMatch": False,
-              "commandWaitSeconds": 10, "packetTailCount": 64, "rawReadCapBytes": 65536,
+              "commandWaitSeconds": 10, "matchingPacketLimit": 64,
+              "captureWindow": "pid_main_closed_tag_then_first64", "rawReadCapBytes": 65536,
               "recordLimit": 33, "lineLimitBytes": 384, "savedByteLimit": 16384}
     entry = prior.get("queries", {}).get("guest-activity-state", {}) if isinstance(prior, dict) else {}
     if not isinstance(entry, dict) or entry.get("queryReturned") is not True or entry.get("truncated") is not False:
@@ -875,7 +907,7 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
         identity_query = ("cat", f"/proc/{pid}/stat", f"/proc/{pid}/cmdline", "/proc/sys/kernel/random/boot_id")
         before = root_guest_identity(query("before", identity_query, 8192), pid)
         require(before is not None, "Root guest identity unavailable")
-        data = query("packets", (*NATIVE_OBSERVATION_QUERY, "--pid=" + str(pid),
+        data = query("packets", (*ROOT_BOOTSTRAP_QUERY, "--pid=" + str(pid),
                                  "-s", ROOT_BOOTSTRAP_TAG + ":I", "*:S"), 65536)
         after = root_guest_identity(query("after", identity_query, 8192), pid)
         require(after == before, "Root guest identity changed")
