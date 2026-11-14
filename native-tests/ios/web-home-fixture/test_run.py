@@ -26,6 +26,214 @@ from web_site import Handler, Site
 
 
 class Controls(unittest.TestCase):
+    # watchdog-diagnostics-controls-begin
+    def watchdog_fixture(self):
+        udid = "7F0B0D20-C07F-4BED-ABA8-B7C316ED4BAD"
+        relative = "Containers/Bundle/Application/609105A8-68B2-4EB1-888D-C411B22215F5/Takosumi.app/Takosumi"
+        context = {"udid": udid, "bundleIdentifier": runner.BUNDLE, "executable": "Takosumi",
+                   "relativeExecutableSHA256": hashlib.sha256(relative.encode()).hexdigest(),
+                   "imageUUID": "11111111-2222-4333-8444-555555555555"}
+        native = (b"2026-11-14 17:34:08.000 Df Takosumi[48862:abc] "
+                  b"[com.takosumi.fixture.simulator:app] com.takosumi.fixture.simulator.bootstrap v=1\n")
+        watchdog = (b"2026-11-14 17:36:09.517 E  SpringBoard[43861:abc] [com.apple.FrontBoard:Watchdog] "
+                    b"[app<com.takosumi.fixture.simulator((null))>:48862] Watchdog termination request provided: "
+                    b"scene-update Watchdog Violation (0x8BADF00D)\n")
+        exited = (b"2026-11-14 17:36:09.877 Df launchd_sim[43851:abc] "
+                  b"[user/501/UIKitApplication:com.takosumi.fixture.simulator[41f1][rb-legacy] [48862]:] "
+                  b"exited with exit reason (namespace: 10 code: 0x8badf00d) - OS_REASON_SPRINGBOARD\n")
+        self.watchdog_native = native + watchdog + exited
+        witness = runner.watchdog_witness(self.watchdog_native, b"", explicit_utc=True, partial=False)
+        path = "/Users/USER/Library/Developer/CoreSimulator/Devices/" + udid + "/data/" + relative
+        header = {"bug_type": "309", "bundleID": runner.BUNDLE,
+                  "incident_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}
+        body = {"incident": header["incident_id"], "pid": 48862, "procName": "Takosumi", "procPath": path,
+                "procLaunch": "2026-11-14 17:34:06.000 +0000", "captureTime": "2026-11-14 17:36:09.520 +0000",
+                "bundleInfo": {"CFBundleIdentifier": runner.BUNDLE},
+                "termination": {"namespace": "FRONTBOARD", "code": 0x8badf00d,
+                                "indicator": "scene-update watchdog transgression"},
+                "usedImages": [{"path": path, "uuid": context["imageUUID"]},
+                               {"path": "/System/Library/Frameworks/UIKitCore.framework/UIKitCore",
+                                "uuid": "22222222-3333-4444-8555-666666666666"}],
+                "threads": [{"queue": "com.apple.main-thread", "frames": [
+                    {"imageIndex": 0, "imageOffset": 100, "symbol": "AppScreenViewController.viewDidAppear(_:)"},
+                    {"imageIndex": 1, "imageOffset": 200, "symbol": "https://secret.invalid/token"}]}],
+                "asi": {"ignored": ["Authorization: Bearer private-token"]}, "secret": "private-token"}
+        return context, witness, header, body
+
+    def test_watchdog_report_matches_original_generation_and_redacts(self):
+        context, witness, header, body = self.watchdog_fixture()
+        # A quoted launchd message is not an OS-emitted exit. Only the real
+        # compact-header emitter may supply this half of the association.
+        for emitter in (b"Takosumi[48862:abc] [com.takosumi.fixture.simulator:app]", b"OtherProcess[43851:abc] [private:app]"):
+            quoted = self.watchdog_native.replace(b"Df launchd_sim[", b"Df " + emitter + b" quoted launchd_sim[")
+            with self.subTest(quoted_emitter=emitter):
+                self.assertIsNone(runner.watchdog_witness(quoted, b"", explicit_utc=True, partial=False))
+        encode = lambda a, b: (json.dumps(a) + "\n" + json.dumps(b)).encode()
+        result = runner.watchdog_report(encode(header, body), context, witness)
+        self.assertEqual(result["pid"], 48862)
+        data = self.root / "Devices" / context["udid"] / "data"
+        container = data / "Containers/Bundle/Application/609105A8-68B2-4EB1-888D-C411B22215F5/Takosumi.app"
+        log = self.root / "installed-before.log"; log.write_text(str(container) + "\n")
+        commands = "binary:\nLoad command 0\n      cmd LC_UUID\n  cmdsize 24\n     uuid " + context["imageUUID"] + "\n"
+        self.assertEqual(runner.watchdog_context_from_saved_install(log, {"dataPath": str(data)}, context["udid"], "Takosumi", commands), context)
+        self.assertIsNone(runner.watchdog_context_from_saved_install(log, {"dataPath": str(data)}, context["udid"], "Takosumi", commands + commands))
+        linked = self.root / "linked-install.log"; linked.symlink_to(log)
+        self.assertIsNone(runner.watchdog_context_from_saved_install(linked, {"dataPath": str(data)}, context["udid"], "Takosumi", commands))
+        self.assertEqual(result["threadRole"], "main_queue")
+        logs, scratch = self.root / "producer", self.root / "producer-scratch"; logs.mkdir(); scratch.mkdir()
+        device = {"udid": context["udid"], "name": "owned", "state": "Booted",
+                  "dataPath": str(data), "logPath": str(self.root / "native-logs")}
+        def native_command(argv, path, **options):
+            if argv[:4] == ["xcrun", "simctl", "list", "devices"]:
+                return json.dumps({"devices": {"fixture-runtime": [device]}})
+            self.assertIn("--timezone", argv)
+            self.assertEqual(argv[argv.index("--timezone") + 1], "UTC")
+            self.assertEqual(options["timeout"], 15)
+            self.assertIs(options["read_output"], False)
+            path.write_bytes(self.watchdog_native)
+            return ""
+        with patch.object(runtime, "command", side_effect=native_command):
+            delivered = runner.preserve_app_exit(logs, scratch, context["udid"], device, "owned", "fixture-runtime")
+        self.assertEqual(delivered["watchdogWitness"], witness)
+        self.assertEqual((logs / "target-app-exit.log").read_bytes(), self.watchdog_native)
+        self.assertEqual(result["frames"][0]["symbol"], "AppScreenViewController.viewDidAppear(_:)")
+        self.assertIsNone(result["frames"][1]["symbol"])
+        self.assertNotRegex(json.dumps(result), "private-token|Authorization|secret.invalid|Users|Containers")
+        for key, value in (("pid", 53417), ("procLaunch", "2026-11-14 17:36:00.000 +0000"),
+                           ("captureTime", "2026-11-14 17:30:00.000 +0000"),
+                           ("procPath", body["procPath"].replace(context["udid"], "00000000-0000-4000-8000-000000000000")),
+                           ("procPath", body["procPath"].replace("609105A8", "709105A8")),
+                           ("incident", "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee"), ("pid", True)):
+            changed = copy.deepcopy(body); changed[key] = value
+            with self.subTest(key=key, value=value):
+                self.assertIsNone(runner.watchdog_report(encode(header, changed), context, witness))
+        changed = copy.deepcopy(body); changed["usedImages"][0]["uuid"] = "33333333-3333-4444-8555-666666666666"
+        self.assertIsNone(runner.watchdog_report(encode(header, changed), context, witness))
+        for raw in (b"{}", b"{}\n{", encode(header, body)[:-1], b"x" * (runner.WATCHDOG_REPORT_BYTES + 1)):
+            with self.subTest(size=len(raw)):
+                self.assertIsNone(runner.watchdog_report(raw, context, witness))
+        self.assertIsNone(runner.watchdog_witness(b"", b"", explicit_utc=True, partial=False))
+        self.assertIsNone(runner.watchdog_witness(None, b"", explicit_utc=True, partial=False))
+        self.assertIsNone(runner.watchdog_witness(b"2026-99-99 17:36:09.517 E x\n", b"", explicit_utc=True, partial=False))
+        self.assertIsNone(runner.watchdog_witness(b"", b"", explicit_utc=False, partial=False))
+        # The native text is only interpreted under its explicit query timezone.
+        native = (b"2026-11-14 17:34:08.000 Df Takosumi[48862:abc] [com.takosumi.fixture.simulator:app] x\n")
+        self.assertIsNone(runner.watchdog_witness(native, b"", explicit_utc=True, partial=True))
+
+    def test_failure_diagnostic_export_is_bounded_optional_and_preserves_verdict(self):
+        context, witness, header, body = self.watchdog_fixture()
+        out, scratch = self.root / "out", self.root / "scratch"; out.mkdir(); scratch.mkdir()
+        (out / "Tests.xcresult").mkdir()
+        result = {"passed": False, "functionalPassed": False, "cleanup": True,
+                  "errorType": "RuntimeError", "targetAppExit": {"watchdogWitness": witness}}
+        original = copy.deepcopy(result)
+        reports = [(header, body)]
+        container_format = "direct"
+        def export(argv, log, **options):
+            self.assertEqual(argv[:4], ["xcrun", "xcresulttool", "export", "diagnostics"])
+            self.assertEqual(argv[4:6], ["--path", str(out / "Tests.xcresult")])
+            self.assertEqual(options["timeout"], 60)
+            self.assertIs(options["read_output"], False)
+            destination = Path(argv[-1]); destination.mkdir()
+            payloads = [(str(i) + ".ips", (json.dumps(a) + "\n" + json.dumps(b)).encode()) for i, (a, b) in enumerate(reports)]
+            if container_format == "direct":
+                for name, data in payloads:
+                    (destination / name).write_bytes(data)
+            elif container_format in ("zip", "zip-foreign", "zip-corrupt"):
+                with runner.zipfile.ZipFile(destination / "diagnostics.zip", "w") as archive:
+                    for name, data in payloads:
+                        archive.writestr(("../" if container_format == "zip-foreign" else "CrashReports/") + name, data)
+                if container_format == "zip-corrupt":
+                    path = destination / "diagnostics.zip"; raw = bytearray(path.read_bytes())
+                    index = raw.index(b"private-token"); raw[index] ^= 1; path.write_bytes(raw)
+            else:
+                with runner.tarfile.open(destination / "diagnostics.tar.gz", "w:gz") as archive:
+                    root_entry = runner.tarfile.TarInfo("."); root_entry.type = runner.tarfile.DIRTYPE; archive.addfile(root_entry)
+                    for name, data in payloads:
+                        entry = runner.tarfile.TarInfo("./CrashReports/" + name); entry.size = len(data)
+                        archive.addfile(entry, io.BytesIO(data))
+                if container_format == "tar-corrupt":
+                    path = destination / "diagnostics.tar.gz"; raw = bytearray(path.read_bytes())
+                    raw[-8] ^= 1; path.write_bytes(raw)
+            return ""
+        with patch.object(runtime, "command", side_effect=export):
+            value = runner.preserve_watchdog_diagnostics(out, scratch, result, context)
+        self.assertEqual(value["status"], "retained")
+        self.assertEqual(value["report"]["pid"], 48862)
+        self.assertEqual(result, original)
+        for container_format in ("zip", "tar-gzip"):
+            with self.subTest(container=container_format), patch.object(runtime, "command", side_effect=export):
+                self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "retained")
+        for container_format in ("zip-foreign", "zip-corrupt", "tar-corrupt"):
+            with self.subTest(container=container_format), patch.object(runtime, "command", side_effect=export):
+                self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "unknown")
+        container_format = "direct"
+        with patch.object(runtime, "command", side_effect=subprocess.TimeoutExpired("xcrun", 60)):
+            self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "unknown")
+        with patch.object(runtime, "UNREAPED_COMMANDS", [{"log": "private"}]), patch.object(runtime, "command") as command:
+            self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "unknown")
+            command.assert_not_called()
+        with patch.object(runtime, "command", side_effect=OSError("private-token")):
+            self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "unknown")
+        self.assertEqual(result, original)
+        raw = io.BytesIO()
+        with runner.tarfile.open(fileobj=raw, mode="w") as archive:
+            for _ in range(4097):
+                entry = runner.tarfile.TarInfo("."); entry.type = runner.tarfile.DIRTYPE; archive.addfile(entry)
+        raw.seek(0)
+        with self.assertRaises(ValueError):
+            list(runner.watchdog_report_bytes(raw, "diagnostics.tar", [32, 32 * 1024**2], runtime.time.monotonic() + 60))
+        second = copy.deepcopy(body); second["incident"] = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        h2 = dict(header, incident_id=second["incident"]); reports.append((h2, second))
+        with patch.object(runtime, "command", side_effect=export):
+            self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, result, context)["status"], "unknown")
+        with patch.object(runtime, "command") as command:
+            self.assertEqual(runner.preserve_watchdog_diagnostics(out, scratch, dict(result, functionalPassed=True), context)["status"], "unknown")
+            command.assert_not_called()
+        self.assertEqual(result, original)
+    def test_watchdog_zip_preflight_bounds_before_member_table(self):
+        import struct
+        import zipfile
+        import time
+        def zipped(count):
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, "w") as archive:
+                for i in range(count):
+                    archive.writestr(f"entry{i}.txt", b"")
+            return data.getvalue()
+        normal = zipped(1)
+        eocd = normal.rfind(b"PK\x05\x06")
+        central_size, offset = struct.unpack_from("<LL", normal, eocd + 12)
+        def zip64(size):
+            # Structurally present locator + effective ZIP64 metadata precedes
+            # a small classic EOCD. The library must never interpret it first.
+            record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, 1, 1, size, offset)
+            locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, eocd, 1)
+            return normal[:eocd] + record + locator + normal[eocd:]
+        too_many = bytearray(zipped(4097))
+        end = too_many.rfind(b"PK\x05\x06")
+        struct.pack_into("<2H", too_many, end + 8, 1, 1)
+        fewer = bytearray(zipped(2))
+        end = fewer.rfind(b"PK\x05\x06")
+        struct.pack_into("<2H", fewer, end + 8, 1, 1)
+        cases = {"zip64_oversize": zip64(2 * 1024**2 + 1), "zip64_bounded_unknown": zip64(central_size),
+                 "classic_4097_understated": bytes(too_many), "classic_mismatched_count": bytes(fewer)}
+        for label, data in cases.items():
+            with self.subTest(label=label):
+                error = None
+                with patch.object(runner.zipfile, "ZipFile", side_effect=RuntimeError("Member table entered")) as constructor:
+                    try:
+                        list(runner.watchdog_report_bytes(io.BytesIO(data), "diagnostics.zip", [32, 32 * 1024**2], time.monotonic() + 5))
+                    except Exception as caught:
+                        error = caught
+                    self.assertEqual(constructor.call_count, 0, "Untrusted metadata reached table construction")
+                    self.assertIsInstance(error, ValueError)
+        # A normal bounded classic ZIP still traverses the actual standard
+        # library; it contains no IPS and therefore yields no report bytes.
+        self.assertEqual(list(runner.watchdog_report_bytes(io.BytesIO(normal), "diagnostics.zip", [32, 32 * 1024**2], time.monotonic() + 5)), [])
+
+    # watchdog-diagnostics-controls-end
+
     def setUp(self):
         parent = Path(os.environ.get("TMPDIR", "/root/dev/tmp")).resolve()
         self.assertFalse(parent.is_relative_to(runner.ROOT), "Private mock material belongs outside the repository")
