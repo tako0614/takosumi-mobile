@@ -698,6 +698,108 @@ class Controls(unittest.TestCase):
         self.assertEqual(result["errorType"], "TimeoutExpired")
         self.assertNotIn("passed", result)
 
+    def test_screen_witness_projects_only_closed_native_stages_and_bounded_existing_clocks(self):
+        header = b"2026-11-14 00:00:01.123456 Df Takosumi[41:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+        def packet(stage="requested", seq=1, screen=2, view=3):
+            return header + f"com.takosumi.fixture.simulator.screen v=1 seq={seq} stage={stage} screen={screen} view={view}\n".encode()
+        def navigation(same_view=1, event="commit"):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq=4 event={event} view=3 request=0 "
+                             f"relation=0 target=unknown reused=0 kept=0 resume=0 initial=0 sameView={same_view} timeMs=456\n").encode()
+        def parse(data, partial=False):
+            return runner.screen_witness(io.BytesIO(data), len(data), partial=partial)
+        value = parse(packet() + navigation() + packet("appeared", 2))
+        self.assertEqual([r["stage"] for r in value["records"]], ["requested", "commit", "appeared"])
+        self.assertEqual([r["screen"] for r in value["records"]], [2, 0, 2])
+        self.assertEqual([r["view"] for r in value["records"]], [3, 3, 3])
+        self.assertEqual([r["sameView"] for r in value["records"]], [None, True, None])
+        self.assertEqual({r["osLogTime"] for r in value["records"]}, {"2026-11-14 00:00:01.123456"})
+        self.assertEqual(value["clockDomain"], "ios_native_os_log_header")
+        self.assertTrue(value["absenceIsUnknown"] and value["diagnosticOnly"])
+        self.assertNotIn("timeMs", json.dumps(value))
+        self.assertNotIn("ready", value)
+        self.assertNotIn("passed", value)
+        unknown = parse(navigation(same_view=0))
+        self.assertEqual(unknown["records"][0]["view"], 0, "A foreign callback cannot acquire the selected-view binding")
+        bad = [packet(stage="ready"), packet(seq=66), packet(screen=0), packet(view=65_536),
+               packet("cap", 65, 1, 0), packet("appeared", 65),
+               packet().replace(b"Takosumi[", b"WebKit["),
+               packet().replace(b"navigation:navigation", b"foreign:navigation"),
+               b"page text " + packet(), packet().replace(b"\n", b" url=SECRET\n"),
+               packet().replace(b"\n", b" timeMs=9\n"), packet().replace(b"\n", b" " + b"SECRET" * 100 + b"\n")]
+        for data in bad:
+            with self.subTest(data=data[:30]):
+                rejected = parse(data)
+                self.assertEqual(rejected["records"], [])
+                self.assertEqual(rejected["malformed"], 1)
+                self.assertNotIn("SECRET", json.dumps(rejected))
+        absent = parse(b"")
+        self.assertEqual(absent["records"], [])
+        self.assertTrue(absent["absenceIsUnknown"])
+        capped = parse(packet("cap", 65, 0, 0))
+        self.assertEqual(capped["capStatus"], "observed")
+        self.assertEqual(capped["records"][0]["view"], 0)
+        overflow = parse(packet() * 70)
+        self.assertEqual(len(overflow["records"]), 65)
+        self.assertEqual(overflow["dropped"], 5)
+        self.assertTrue(overflow["absenceIsUnknown"])
+        prefix = parse(packet() + b"x" * (2 * 1024 * 1024) + packet("appeared", 2))
+        self.assertEqual([r["stage"] for r in prefix["records"]], ["requested"])
+        self.assertTrue(prefix["scanTruncated"])
+        lines = parse(b"unrelated\n" * 8192 + packet())
+        self.assertEqual(lines["records"], [])
+        self.assertTrue(lines["lineTruncated"])
+        wide = navigation(event="fail_provisional").replace(b"[41:ab]", b"[9999999999:ab]").replace(
+            b".123456 ", b".123456789 ").replace(b"view=3 ", b"view=65535 ")
+        bounded = parse(wide * 65)
+        self.assertEqual(len(bounded["records"]), 65)
+        self.assertLessEqual(len(json.dumps({"targetAppExit": {"screenWitness": bounded}}, indent=2).encode()), 32 * 1024)
+
+    def test_screen_witness_uses_existing_query_prefix_and_keeps_original_tail_and_partial_failure(self):
+        header = b"2026-11-14 00:00:01.123 Df Takosumi[41:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+        requested = header + b"com.takosumi.fixture.simulator.screen v=1 seq=1 stage=requested screen=2 view=3\n"
+        appeared = header + b"com.takosumi.fixture.simulator.screen v=1 seq=2 stage=appeared screen=2 view=3\n"
+        finished = header + (b"com.takosumi.fixture.simulator.nav v=1 seq=4 event=finish view=3 request=0 "
+                             b"relation=0 target=unknown reused=0 kept=0 resume=0 initial=0 sameView=1 timeMs=456\n")
+        data = requested + appeared + b"x" * (600 * 1024) + b"\n" + finished
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        for partial, broken_projection in ((False, False), (True, False), (False, True)):
+            with self.subTest(partial=partial, broken_projection=broken_projection):
+                out = self.root / f"screen-out-{partial}-{broken_projection}"
+                scratch = self.root / f"screen-scratch-{partial}-{broken_projection}"
+                out.mkdir(); scratch.mkdir()
+                failure = subprocess.TimeoutExpired(["owned-query"], 15)
+                calls = []
+                def command(argv, path, **kwargs):
+                    calls.append((argv, kwargs))
+                    if "spawn" not in argv:
+                        return json.dumps({"devices": {"runtime": [device]}})
+                    path.write_bytes(data)
+                    if partial:
+                        raise failure
+                    return ""
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(runtime, "command", side_effect=command))
+                    if broken_projection:
+                        stack.enter_context(patch.object(runner, "screen_witness", side_effect=OSError("SECRET")))
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+                self.assertEqual(len(calls), 2, "Reuse the original inventory and one log query")
+                self.assertEqual(calls[1][1], {"timeout": 15, "read_output": False})
+                self.assertEqual(calls[1][0][-1], '((process == "Takosumi") OR (eventMessage CONTAINS "com.takosumi.fixture.simulator")) AND (subsystem != "com.apple.dt.xctest")')
+                self.assertEqual((out / "target-app-exit.log").read_bytes(), data[-512 * 1024:])
+                self.assertEqual(result["navigationWitness"]["records"][0]["event"], "finish")
+                self.assertEqual(result["partial"], partial)
+                self.assertEqual(result["queryReturned"], not partial)
+                self.assertNotIn("passed", result)
+                self.assertNotIn("SECRET", json.dumps(result))
+                if partial:
+                    self.assertEqual(result["errorType"], "TimeoutExpired")
+                if broken_projection:
+                    self.assertEqual(result["screenWitness"]["errorType"], "OSError")
+                else:
+                    self.assertEqual([r["stage"] for r in result["screenWitness"]["records"]], ["requested", "appeared", "finish"])
+                    self.assertEqual(result["screenWitness"]["partial"], partial)
+                    self.assertTrue(result["screenWitness"]["absenceIsUnknown"])
+
     def test_existing_harness_server_import_is_not_poisoned_or_left_in_global_namespace(self):
         poison = types.ModuleType("server")
         path = Path(__file__).parent / "harness.py"

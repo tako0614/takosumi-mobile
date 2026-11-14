@@ -18,10 +18,30 @@ private enum AppScreenNavigationWitness {
         case instance, editor, other, unknown
         case editorPageTwo = "editor_page_two"
     }
+    enum PresentationStage: String { case requested, appeared, cap }
     private static let enabled = Bundle.main.bundleIdentifier == "com.takosumi.fixture.simulator"
     private static let log = OSLog(subsystem: "com.takosumi.fixture.simulator.navigation", category: "navigation")
     private static var views = 0
     private static var emitted = 0
+    private static var screens = 0
+    private static var presentationEmitted = 0
+
+    static func nextScreen() -> Int {
+        guard enabled, screens < 65_535 else { return 0 }
+        screens += 1
+        return screens
+    }
+
+    static func recordPresentation(_ stage: PresentationStage, screen: Int, view: Int) {
+        guard enabled, screen > 0, view > 0, presentationEmitted <= 64 else { return }
+        let capped = presentationEmitted == 64
+        presentationEmitted += 1
+        // The existing OS log header supplies the clock; do not read another one.
+        os_log("com.takosumi.fixture.simulator.screen v=1 seq=%{public}d stage=%{public}@ screen=%{public}d view=%{public}d",
+               log: log, type: .default, Int32(presentationEmitted),
+               (capped ? PresentationStage.cap : stage).rawValue,
+               Int32(capped ? 0 : screen), Int32(capped ? 0 : view))
+    }
 
     static func nextView() -> Int {
         guard enabled, views < 65_535 else { return 0 }
@@ -323,6 +343,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     private var witnessReused = false
     private var witnessResume = false
     private var witnessInitial = false
+    fileprivate var witnessIdentity: Int { witnessView }
 #endif
     private var observations: [NSKeyValueObservation] = []
 
@@ -938,6 +959,11 @@ final class AppScreenCoordinator {
             controller.loadViewIfNeeded()
             screen = controller
             topmost(from: presenter).present(controller, animated: true)
+#if DEBUG
+            // The UIKit invocation returned, not its presentation completion.
+            AppScreenNavigationWitness.recordPresentation(.requested, screen: controller.witnessScreen,
+                                                          view: session.navigator.witnessIdentity)
+#endif
         }
         evict(keeping: session.key)
     }
@@ -1045,6 +1071,9 @@ final class AppScreenViewController: UIViewController {
     private static let barColor = BrowserView.barColor
     private static let promptCooldown: TimeInterval = 5
     private static let browserViewCooldown: TimeInterval = 3
+#if DEBUG
+    fileprivate let witnessScreen = AppScreenNavigationWitness.nextScreen()
+#endif
 
     private let coordinator: AppScreenCoordinator
     private(set) var session: AppScreenSession
@@ -1089,7 +1118,14 @@ final class AppScreenViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+#if DEBUG
+        let appearedView = session.navigator.witnessIdentity
+#endif
         session.navigator.resumeDownloadPresentation()
+#if DEBUG
+        // Bind the actual callback's selected session, without claiming paint or AX readiness.
+        AppScreenNavigationWitness.recordPresentation(.appeared, screen: witnessScreen, view: appearedView)
+#endif
     }
 
     override func viewDidDisappear(_ animated: Bool) {
