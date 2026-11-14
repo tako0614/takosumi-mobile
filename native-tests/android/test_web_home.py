@@ -37,6 +37,72 @@ XMLTREE = """E: network-security-config (line=2)
 
 
 class Controls(unittest.TestCase):
+
+    # ARGUMENT_SHAPE_CONTROL_BEGIN
+    def test_launch_argument_shape_is_optional_closed_and_has_no_cleanup_authority(self):
+        import copy
+        import json
+        row = {"pid": 12, "startTick": 34, "root": True, "parentPid": 10,
+               "parentStartTick": 20, "observation": 1, "lastAttempt": 1, "lastAttemptUnknown": False,
+               "status": "observed", "execIdentity": [1, 2], "matchesDeclaredImage": True,
+               "matchesDeclaredArgv": False, "matchesDeclaredRunOptions": None}
+        context = {"schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
+                   "guardPid": 10, "guardStartTick": 20, "spawnedRootPid": 12,
+                   "declaredLaunch": {"imageIdentity": [1, 2], "runOptionsPresent": True},
+                   "capacity": 16, "truncated": False, "absenceIsUnknown": True,
+                   "signalTimeStateUnknown": True, "records": [row]}
+        self.assertEqual(runner.guard_launch_context(context, 10, 20), context)
+        for kind, wait, relation, exact in [("canonical_kill_sleep", 10, "same_retained_parent_pid", False),
+                ("canonical_kill_sleep", 2**31-1, "different_pid", True),
+                ("declared_exact", None, None, True), ("other_complete", None, None, False),
+                (None, None, None, False)]:
+            valid = copy.deepcopy(context)
+            valid["records"][0].update(dispatchArgKind=kind, helperWaitSeconds=wait,
+                killTargetRelation=relation, matchesDeclaredArgv=exact)
+            with self.subTest(kind=kind, relation=relation):
+                self.assertEqual(runner.guard_launch_context(valid, 10, 20), valid)
+        valid = copy.deepcopy(context)
+        valid["records"][0].update(dispatchArgKind="canonical_kill_sleep", helperWaitSeconds=10,
+                                  killTargetRelation="same_retained_parent_pid")
+        bad = []
+        for key, value in [("dispatchArgKind", "sdk_helper"), ("dispatchArgKind", "private-token"),
+                ("helperWaitSeconds", 0), ("helperWaitSeconds", -1), ("helperWaitSeconds", True),
+                ("helperWaitSeconds", "10"), ("helperWaitSeconds", 2**31),
+                ("killTargetRelation", "same_lifetime"), ("parentStartTick", 21),
+                ("rawArgv", "private-token"), ("status", "changed")]:
+            changed = copy.deepcopy(valid); changed["records"][0][key] = value; bad.append(changed)
+        partial = copy.deepcopy(context); partial["records"][0]["dispatchArgKind"] = "other_complete"; bad.append(partial)
+        for kind, exact, wait in [("other_complete", True, None), ("declared_exact", False, None),
+                                  ("other_complete", False, 10), (None, False, 10)]:
+            changed = copy.deepcopy(valid)
+            changed["records"][0].update(dispatchArgKind=kind, matchesDeclaredArgv=exact,
+                                          helperWaitSeconds=wait, killTargetRelation=None)
+            bad.append(changed)
+        for n, changed in enumerate(bad):
+            with self.subTest(invalid=n):
+                self.assertEqual(runner.guard_launch_context(changed, 10, 20)["status"], "unknown")
+        unknown = copy.deepcopy(valid)
+        unknown["records"][0].update(status="unknown", lastAttemptUnknown=True, parentPid=None, parentStartTick=None,
+            execIdentity=None, matchesDeclaredImage=None, matchesDeclaredArgv=None, matchesDeclaredRunOptions=None,
+            dispatchArgKind=None, helperWaitSeconds=None, killTargetRelation=None)
+        self.assertEqual(runner.guard_launch_context(unknown, 10, 20), unknown)
+        # Metadata survives the real optional stop-return consumer, while the
+        # original forced1 normal-close refusal remains unchanged.
+        proof = {"complete": True, "kernelNoChildren": True, "remaining": [], "error": None,
+                 "cleanupErrors": [], "nonFatalErrors": [], "rootExit": 0, "forcedCleanup": 1,
+                 "launchContext": valid}
+        emulator = object.__new__(runner.Emulator); emulator.process = Mock(pid=10)
+        emulator.process.poll.return_value = 0
+        emulator.birth, emulator.fd, emulator.output = 20, None, io.BytesIO()
+        emulator.proof = self.root / "argument-shape-receipt.json"
+        emulator.proof.write_text(json.dumps(proof))
+        returned = emulator.stop()
+        self.assertEqual(returned, proof)
+        with self.assertRaises(RuntimeError):
+            runner.receipt(returned, normal=True)
+        runner.receipt(returned, normal=False)
+    # ARGUMENT_SHAPE_CONTROL_END
+
     # LAUNCH_CONTEXT_CONTROL_BEGIN
     def test_launch_context_is_optional_bound_to_actual_guard_and_private(self):
         import copy

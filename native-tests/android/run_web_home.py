@@ -198,11 +198,31 @@ def guard_launch_context(value, guard_pid, guard_birth):
         if type(rows) is not list or len(rows) > 16 or (rows and root is None):
             return unknown
         for row in rows:
-            if type(row) is not dict or set(row) != {"pid", "startTick", "root", "parentPid",
-                    "parentStartTick", "observation", "lastAttempt", "lastAttemptUnknown",
-                    "status", "execIdentity", "matchesDeclaredImage",
-                    "matchesDeclaredArgv", "matchesDeclaredRunOptions"}:
+            fields = {"pid", "startTick", "root", "parentPid", "parentStartTick", "observation",
+                      "lastAttempt", "lastAttemptUnknown", "status", "execIdentity",
+                      "matchesDeclaredImage", "matchesDeclaredArgv", "matchesDeclaredRunOptions"}
+            # Optional syntax hints only. Older rows omit all three; partial
+            # or poisoned new shapes fail closed without changing cleanup.
+            shape_fields = {"dispatchArgKind", "helperWaitSeconds", "killTargetRelation"}
+            if type(row) is not dict or set(row) not in (fields, fields | shape_fields):
                 return unknown
+            if shape_fields <= set(row):
+                kind, wait, relation = (row[k] for k in ("dispatchArgKind", "helperWaitSeconds", "killTargetRelation"))
+                if kind is None:
+                    if wait is not None or relation is not None:
+                        return unknown
+                elif row["status"] != "observed":
+                    return unknown
+                elif kind == "canonical_kill_sleep":
+                    if (not pid(wait) or relation not in ("same_retained_parent_pid", "different_pid")):
+                        return unknown
+                elif kind in ("declared_exact", "other_complete"):
+                    if (wait is not None or relation is not None
+                            or (kind == "declared_exact" and row["matchesDeclaredArgv"] is not True)
+                            or (kind == "other_complete" and row["matchesDeclaredArgv"] is True)):
+                        return unknown
+                else:
+                    return unknown
             key = row["pid"], row["startTick"]
             if (not pid(key[0]) or not number(key[1]) or key in seen
                     or type(row["root"]) is not bool or row["root"] != (key[0] == root)

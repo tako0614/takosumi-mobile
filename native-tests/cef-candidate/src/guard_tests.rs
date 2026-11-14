@@ -140,6 +140,7 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    launch_argument_shape_projection_is_bounded_and_historical,
     launch_context_refuses_reuse_exec_motion_and_private_poison,
     launch_context_real_owned_root_keeps_receipt_and_cleanup_separate,
     guard_comm_class_projection_is_private_optional_and_bounded,
@@ -1955,3 +1956,87 @@ fn launch_context_real_owned_root_keeps_receipt_and_cleanup_separate() {
     println!("OWN_LAUNCH_CONTEXT_CLEANUP root_exit=0 forced=0 echild=true");
 }
 // LAUNCH_CONTEXT_CONTROL_END
+
+// ARGUMENT_SHAPE_CONTROL_BEGIN
+fn launch_argument_shape_projection_is_bounded_and_historical() {
+    let declared = b"private-exec\0-avd\0private-slot\0-port\05582\0";
+    let context = |argv: &[u8], requested: &[u8], parent: i32| LaunchContext {
+        guard: 10, guard_start: Some(20), image: None, argv: Some(requested.to_vec()),
+        records: BTreeMap::from([((12, 34), LaunchRecord { observation: 1, last_attempt: 1,
+            last_attempt_unknown: false, changed: false,
+            point: Some(LaunchPoint { start: 34, parent, parent_start: 20,
+                image: [1, 2], argv: argv.to_vec() }) })]),
+        observation: 1, cursor: 0, truncated: false,
+    };
+    let cases: Vec<(&[u8], Option<&str>, Option<i32>, Option<&str>)> = vec![
+        (declared, Some("declared_exact"), None, None),
+        (b"private-exec\0-kill\010\0-sleep\010\0", Some("canonical_kill_sleep"), Some(10), Some("same_retained_parent_pid")),
+        (b"private-exec\0-kill\011\0-sleep\01\0", Some("canonical_kill_sleep"), Some(1), Some("different_pid")),
+        (b"private-exec\0-kill\02147483647\0-sleep\02147483647\0", Some("canonical_kill_sleep"), Some(i32::MAX), Some("different_pid")),
+        (b"private-exec\0-kill\010\0-sleep\010\0extra\0", Some("other_complete"), None, None),
+        (b"private-exec\0-kill\010\0-kill\010\0-sleep\01\0", Some("other_complete"), None, None),
+        (b"private-exec\0-sleep\010\0-kill\010\0", Some("other_complete"), None, None),
+        (b"private-exec\0-kill\0\0-sleep\01\0", Some("other_complete"), None, None),
+        (b"private-exec\0-kill\010\0-sleep\0", Some("other_complete"), None, None),
+        (b"private-exec\0-kill\010\0-sleep\01", None, None, None),
+        (b"", None, None, None),
+    ];
+    for (argv, kind, wait, relation) in cases {
+        let json = context(argv, declared, 10).json(Some(12));
+        let row = &json["records"][0];
+        assert_eq!(row["dispatchArgKind"], serde_json::json!(kind));
+        assert_eq!(row["helperWaitSeconds"], serde_json::json!(wait));
+        assert_eq!(row["killTargetRelation"], serde_json::json!(relation));
+        assert!(!serde_json::to_string(&json).unwrap().contains("private-"));
+    }
+    for number in ["0", "01", "+1", "-1", " 1", "1 ", "1.0", "2147483648", "999999999999", "１"] {
+        for slot in [2, 4] {
+            let mut args = vec!["private-exec", "-kill", "10", "-sleep", "1"];
+            args[slot] = number;
+            let bytes: Vec<u8> = args.iter().flat_map(|s| s.as_bytes().iter().copied().chain([0])).collect();
+            let json = context(&bytes, declared, 10).json(Some(12));
+            assert_eq!(json["records"][0]["dispatchArgKind"], "other_complete");
+            assert_eq!(json["records"][0]["helperWaitSeconds"], Value::Null);
+        }
+    }
+    for bad in [vec![b'x'; LAUNCH_ARG_BYTES + 1], [b"x\0".as_slice(); 65].concat()] {
+        assert_eq!(context(&bad, declared, 10).json(Some(12))["records"][0]["dispatchArgKind"], Value::Null);
+    }
+    let canonical = b"private-exec\0-kill\010\0-sleep\010\0";
+    // Shape is independent of intent equality, not an SDK-mode attestation.
+    let both = context(canonical, canonical, 10).json(Some(12));
+    assert_eq!(both["records"][0]["matchesDeclaredArgv"], true);
+    assert_eq!(both["records"][0]["dispatchArgKind"], "canonical_kill_sleep");
+    let different = context(canonical, declared, 11).json(Some(12));
+    assert_eq!(different["records"][0]["killTargetRelation"], "different_pid");
+    let mut unknown = context(canonical, declared, 10);
+    let old = unknown.records[&(12, 34)].point.clone().unwrap();
+    let moved = LaunchPoint { parent: 11, ..old.clone() };
+    unknown.records.get_mut(&(12, 34)).unwrap().sample(2,
+        coherent_launch_points(34, Some(&old), Some(&moved)));
+    assert_eq!(unknown.json(Some(12))["records"][0]["dispatchArgKind"], Value::Null);
+    unknown.records.get_mut(&(12, 34)).unwrap().point = None;
+    assert_eq!(unknown.json(Some(12))["records"][0]["helperWaitSeconds"], Value::Null);
+    let mut historical = context(canonical, declared, 10);
+    historical.records.get_mut(&(12, 34)).unwrap().sample(2, Ok(None));
+    let json = historical.json(Some(12));
+    assert_eq!(json["records"][0]["lastAttemptUnknown"], true);
+    assert_eq!(json["records"][0]["dispatchArgKind"], "canonical_kill_sleep");
+    assert_eq!(json["signalTimeStateUnknown"], true);
+    println!("ARGUMENT_SHAPE_JSON {}", serde_json::to_string(&json).unwrap());
+    let mut max = context(canonical, declared, i32::MAX);
+    max.records.clear();
+    for n in 0..LAUNCH_CONTEXT_CAP {
+        max.records.insert((1000 + n as i32, u64::MAX), LaunchRecord { observation: u16::MAX,
+            last_attempt: u16::MAX, last_attempt_unknown: false, changed: false,
+            point: Some(LaunchPoint { start: u64::MAX, parent: i32::MAX, parent_start: u64::MAX,
+                image: [u64::MAX, u64::MAX],
+                argv: b"private-exec\0-kill\02147483647\0-sleep\02147483647\0".to_vec() }) });
+    }
+    max.truncated = true;
+    let json = max.json(Some(1000));
+    assert!(serde_json::to_vec(&json).unwrap().len() < 16384);
+    println!("ARGUMENT_SHAPE_JSON {}", serde_json::to_string(&json).unwrap());
+    println!("ARGUMENT_SHAPE pure=true new_io=0 mode_authority=false signal_state_unknown=true");
+}
+// ARGUMENT_SHAPE_CONTROL_END
