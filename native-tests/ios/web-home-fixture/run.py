@@ -227,6 +227,83 @@ def require_ui_pass(log):
     return {"method": METHOD, "tests": 1, "failures": 0, "seconds": float(passed[0])}
 
 
+def failure_job_summary(data):
+    """Closed projection of an existing bounded XCTest log, never a verdict."""
+    result = {"kind": "takosumi.ios-web-home-failure@v1", "category": "unknown",
+              "sourceLine": None, "started": None, "failed": None, "passed": None}
+    if type(data) is not bytes or not data or len(data) > 256 * 1024:
+        return result
+    try:
+        text = data.decode("utf-8")
+    except UnicodeError:
+        return result
+    if "\x00" in text:
+        return result
+    identity = f"-[WebHomeUITests.WebHomeUITests {METHOD}]"
+    cases = []
+    for line in text.splitlines():
+        if not line.startswith("Test Case '"):
+            continue
+        match = re.fullmatch(r"Test Case '([^']+)' (started\.|(?:passed|failed) \([0-9]{1,6}(?:\.[0-9]{1,6})? seconds\)\.)", line)
+        if not match or match[1] != identity:
+            return result
+        cases.append(match[2].split()[0].rstrip("."))
+    counts = {key: cases.count(key) for key in ("started", "failed", "passed")}
+    result.update({key: min(value, 2) for key, value in counts.items()})
+    if not cases:
+        result["category"] = "xctest_not_started"
+    elif cases == ["started", "failed"]:
+        result["category"] = "xctest_failure"
+        # Only current public fixture assertion/call sites, never arbitrary
+        # filenames, messages, titles, URLs or values from XCTest diagnostics.
+        allowed = {"15", "18", "22", "30", "44", "51", "60", "67", "71", "82", "89", "95", "100",
+                   "107", "111", "127", "129", "161", "165", "187", "189", "190", "195", "204", "207",
+                   "212", "215", "226", "233"}
+        sources = []
+        for line in text.splitlines():
+            location, separator, _ = line.partition(f": error: {identity} : ")
+            if separator:
+                source, _, number = location.rpartition(":")
+                if (source == "WebHomeUITests.swift" or source.endswith(
+                        "/native-tests/ios/web-home-fixture/WebHomeUITests.swift")) and number in allowed:
+                    sources.append(int(number))
+                else:
+                    sources.append(None)
+        if len(sources) == 1:
+            result["sourceLine"] = sources[0]
+    elif cases == ["started", "passed"]:
+        result["category"] = "post_xctest"
+    return result
+
+
+def emit_failure_job_summary(out, result):
+    """One optional line after final result/cleanup; failures cannot replace refusal."""
+    try:
+        if type(result) is not dict or result.get("passed") is not False:
+            return
+        data = b""
+        summary = None
+        known = result.get("xctest")
+        if (type(known) is dict and known.get("method") == METHOD and
+                type(known.get("tests")) is int and known["tests"] == 1 and
+                type(known.get("failures")) is int and known["failures"] == 0):
+            summary = failure_job_summary(b"")
+            summary.update(category="post_xctest", started=1, failed=0, passed=1)
+        try:
+            if summary is None and result.get("interruptedCommands") == [] and not result.get("activeOwnedCommands"):
+                fd = os.open(out / "xcodebuild.log", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as source:
+                    if stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        data = source.read(256 * 1024 + 1)
+        except Exception:
+            pass  # Missing, linked, partial or oversized input stays unknown.
+        line = "IOS_WEB_HOME_FAILURE " + json.dumps(summary or failure_job_summary(data), separators=(",", ":"))
+        if len(line.encode("ascii")) <= 512:
+            print(line, flush=True)
+    except Exception:
+        pass  # Diagnostic read/serialization/sink errors never replace the original verdict.
+
+
 def require_site_events(instance, editor):
     for user in ("Work", "Personal"):
         require(any(e["path"] == "/sign-in/" + user and e["user"] is None for e in instance),
@@ -384,6 +461,7 @@ def main():
     if scratch_state["retain"]:
         result["scratchRetained"] = str(scratch)
     runtime.save(out / "result.json", result)
+    emit_failure_job_summary(out, result)
     require(result["passed"], "Whole App iOS Web-home fixture failed; inspect its original result.json")
     print("PASS: whole installed Tauri App connection, synthetic Web login/home, app, Back, profile switch, resume and reset")
     print("Disposable Simulator only; real IdP, physical devices, files/notifications and distribution remain separate")

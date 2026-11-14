@@ -1,5 +1,6 @@
 """Harness/protocol controls only; these do not execute or qualify the iOS App."""
 import copy
+from contextlib import contextmanager, ExitStack
 import importlib.util
 import io
 import json
@@ -124,6 +125,178 @@ class Controls(unittest.TestCase):
                     valid + "Test Case '-[Other other]' started.\n"):
             with self.assertRaises(RuntimeError):
                 runner.require_ui_pass(log)
+
+    def test_failure_job_relay_is_after_final_save_and_never_replaces_refusal(self):
+        identity = f"-[WebHomeUITests.WebHomeUITests {runner.METHOD}]"
+        log = (f"Test Case '{identity}' started.\n"
+               f"/private/token/native-tests/ios/web-home-fixture/WebHomeUITests.swift:127: error: {identity} : private-value\n"
+               f"Test Case '{identity}' failed (171.686 seconds).\n")
+        app, build, _ = self.app()
+        proof = runner.bundle_proof(app, build)
+        head, tree = "1" * 40, "2" * 40
+        (build / "swift-runtime-proof.json").write_text(json.dumps({
+            "passed": True, "bundleIdentifier": runner.BUNDLE, "head": head, "tree": tree,
+            "images": [{"path": proof["executable"], "sha256": proof["executableSHA256"]}]}))
+        udid = "11111111-1111-4111-8111-111111111111"
+        for mode in ("normal", "sink", "serializer"):
+            with self.subTest(mode=mode), ExitStack() as stack:
+                out, scratch = self.root / mode, self.root / (mode + "-scratch")
+                scratch.mkdir()
+                project = scratch / "WebHomeDriver.xcodeproj"
+                project.mkdir(); (project / "project.pbxproj").write_text("synthetic project")
+                events, lines, retired = [], [], []
+                original = RuntimeError("original outer refusal")
+                inner = RuntimeError("original xcode65 private-token")
+                saved_require = runner.require
+                def require(condition, message):
+                    if message == "Whole App iOS Web-home fixture failed; inspect its original result.json":
+                        events.append("refuse")
+                        self.assertIs(condition, False)
+                        raise original
+                    saved_require(condition, message)
+                @contextmanager
+                def owned_scratch(_):
+                    state = {"retain": False}
+                    try:
+                        yield scratch, state
+                    finally:
+                        events.append("scratch-cleanup")
+                        state["removed"] = True
+                def save(path, value):
+                    events.append("final-save" if "interruptedCommands" in value else "save")
+                    with path.open("w") as output:
+                        json.dump(value, output)
+                def command(argv, path, **kwargs):
+                    if argv[0] == "git":
+                        return head + "\n" + tree + "\n"
+                    if argv[:3] == ["xcrun", "simctl", "create"]:
+                        return udid
+                    if argv[:3] == ["xcrun", "simctl", "list"]:
+                        return "{}"
+                    if argv[0] == "xcodebuild":
+                        path.write_text(log)
+                        raise inner
+                    return ""
+                class Site:
+                    def __init__(self, cert, key, kind):
+                        self.kind, self.url, self.events = kind, "https://127.0.0.1:1", []
+                    def start(self):
+                        pass
+                    def stop(self):
+                        events.append("server-stop")
+                def emit(line, **kwargs):
+                    events.append("relay")
+                    lines.append(line)
+                    if mode == "sink":
+                        raise OSError("private sink failure")
+                for target, name, value in (
+                        (runner, "BUILD", build), (runner, "product_app", lambda: (app, proof)),
+                        (runner, "source_hashes", lambda: {}), (runner, "installed_app", lambda *args: proof),
+                        (runner, "Site", Site), (runner, "retire_device", lambda *args: retired.append(args)),
+                        (runner, "preserve_app_exit", lambda *args: {}), (runner, "require", require),
+                        (runner.platform, "system", lambda: "Darwin"), (runner.shutil, "which", lambda _: "/mock/tool"),
+                        (runtime, "owned_scratch", owned_scratch), (runtime, "command", command),
+                        (runtime, "select_runtime", lambda _: ("runtime", "type")),
+                        (runtime, "owned_device", lambda *args: {"udid": udid}),
+                        (runtime, "certificate", lambda *args, **kwargs: (scratch / "ca", scratch / "cert", scratch / "key")),
+                        (runtime, "preserve_device_logs", lambda *args: {}),
+                        (runtime, "export_test_attachments", lambda *args: {}), (runtime, "save", save),
+                        (runtime, "UNREAPED_COMMANDS", []), (runtime, "INTERRUPTED_COMMANDS", [])):
+                    stack.enter_context(patch.object(target, name, value))
+                stack.enter_context(patch.object(sys, "argv", ["run.py", "--out", str(out)]))
+                stack.enter_context(patch("builtins.print", side_effect=emit))
+                if mode == "serializer":
+                    stack.enter_context(patch.object(runner.json, "dumps", side_effect=OSError("private serialization")))
+                with self.assertRaises(RuntimeError) as caught:
+                    runner.main()
+                self.assertIs(caught.exception, original)
+                saved = json.loads((out / "result.json").read_text())
+                self.assertIs(saved["passed"], False)
+                self.assertIs(saved["functionalPassed"], False)
+                self.assertEqual(saved["error"], str(inner))
+                self.assertTrue(saved["cleanup"] and saved["scratchCleanup"]["removed"])
+                self.assertEqual(saved["interruptedCommands"], [])
+                self.assertEqual(len(retired), 1)
+                self.assertEqual(events.count("scratch-cleanup"), 1)
+                self.assertEqual(events.count("server-stop"), 2)
+                self.assertLess(events.index("scratch-cleanup"), events.index("final-save"))
+                self.assertEqual(events[-1], "refuse")
+                if mode == "serializer":
+                    self.assertEqual(lines, [])
+                else:
+                    self.assertEqual(len(lines), 1)
+                    self.assertEqual(events[-3:], ["final-save", "relay", "refuse"])
+                    record = json.loads(lines[0].split(" ", 1)[1])
+                    self.assertEqual((record["category"], record["sourceLine"], record["started"], record["failed"], record["passed"]),
+                                     ("xctest_failure", 127, 1, 1, 0))
+                    self.assertNotIn("private", lines[0])
+
+    def test_failure_job_projection_is_closed_bounded_and_optional(self):
+        identity = f"-[WebHomeUITests.WebHomeUITests {runner.METHOD}]"
+        started = f"Test Case '{identity}' started.\n"
+        failed = f"Test Case '{identity}' failed (1.000 seconds).\n"
+        location = f"/private/secret/native-tests/ios/web-home-fixture/WebHomeUITests.swift:127: error: {identity} : "
+        secret = "https://private.invalid/?token=secret UUID=11111111-1111-4111-8111-111111111111\n"
+        data = (started + location + secret + failed).encode()
+        known = runner.failure_job_summary(data)
+        self.assertEqual((known["category"], known["sourceLine"], known["started"], known["failed"]),
+                         ("xctest_failure", 127, 1, 1))
+        self.assertNotIn("secret", json.dumps(known))
+        for bad in (None, "secret", b"", b"\xff", b"\x00", b"x" * (256 * 1024 + 1),
+                    (started + failed.replace("1.000", "1..0")).encode(),
+                    (started + failed.replace(runner.METHOD, "foreign")).encode()):
+            with self.subTest(bad=type(bad).__name__):
+                unknown = runner.failure_job_summary(bad)
+                self.assertEqual(unknown["category"], "unknown")
+                self.assertIsNone(unknown["sourceLine"])
+        for bad in (location.replace(":127:", ":999:"), location.replace("WebHomeUITests.swift", "Other.swift"),
+                    location + secret + location):
+            record = runner.failure_job_summary((started + bad + secret + failed).encode())
+            self.assertIsNone(record["sourceLine"])
+        repeated = runner.failure_job_summary((started + started + failed).encode())
+        self.assertEqual((repeated["category"], repeated["started"]), ("unknown", 2))
+        out = self.root / "relay-input"
+        out.mkdir(); log = out / "xcodebuild.log"
+        result = {"passed": False, "interruptedCommands": []}
+        for mode in ("valid", "missing", "oversized", "linked", "interrupted", "active", "structured"):
+            with self.subTest(mode=mode):
+                if log.exists() or log.is_symlink():
+                    log.unlink()
+                value = copy.deepcopy(result)
+                if mode == "oversized":
+                    log.write_bytes(b"x" * (256 * 1024 + 1))
+                elif mode == "linked":
+                    private = self.root / "private-log"
+                    private.write_bytes(data)
+                    log.symlink_to(private)
+                elif mode != "missing":
+                    log.write_bytes(data)
+                if mode == "interrupted":
+                    value["interruptedCommands"] = [{"log": "private"}]
+                if mode == "active":
+                    value["activeOwnedCommands"] = [{"pid": 1}]
+                if mode == "structured":
+                    value["xctest"] = {"method": runner.METHOD, "tests": 1, "failures": 0}
+                stdout = io.StringIO()
+                with patch.object(sys, "stdout", stdout):
+                    runner.emit_failure_job_summary(out, value)
+                output = stdout.getvalue()
+                self.assertEqual(len(output.splitlines()), 1)
+                self.assertLessEqual(len(output.encode()), 512)
+                self.assertNotIn("private", output)
+                record = json.loads(output.split(" ", 1)[1])
+                if mode == "valid":
+                    self.assertEqual(record["sourceLine"], 127)
+                elif mode == "structured":
+                    self.assertEqual((record["category"], record["started"], record["failed"], record["passed"]),
+                                     ("post_xctest", 1, 0, 1))
+                else:
+                    self.assertEqual(record["category"], "unknown")
+        with patch.object(runner.os, "open", side_effect=AssertionError("must not read")) as opened, \
+                patch("builtins.print") as printed:
+            for value in ({"passed": True}, {"passed": "secret"}, None):
+                runner.emit_failure_job_summary(out, value)
+            self.assertEqual((opened.call_count, printed.call_count), (0, 0))
 
     def test_server_oracle_requires_authenticated_profiles_and_no_cookie_at_other_host(self):
         instance = [{"path": "/", "user": None} for _ in range(3)]
