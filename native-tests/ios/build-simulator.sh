@@ -70,7 +70,7 @@ assert len(entitlements) == 1, "Expected the generated App entitlements"
 with entitlements[0].open("rb") as source:
     assert plistlib.load(source).get("aps-environment") == "development", "Missing normal push wiring"
 PY
-bunx tauri ios build --ci --debug --no-sign --target "$simulator_target" \
+VITE_TAKOSUMI_FIXTURE_BOOTSTRAP=1 bunx tauri ios build --ci --debug --no-sign --target "$simulator_target" \
   --config "$simulator_config" -- --locked
 
 python3 - <<'PY'

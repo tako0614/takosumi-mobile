@@ -7,16 +7,37 @@ import { WebHome } from "./web-home.tsx";
 import { clearWebProfileData } from "./web-profile-data.ts";
 import { createWebPermissionPrompts, type WebPermissionPrompts } from "./web-permissions.ts";
 import { openWebConnection, recoverWebProfile } from "./web-profile-recovery.ts";
+import { BOOTSTRAP_EVENT, createBootstrapObserver } from "./fixture-bootstrap.ts";
 import "./web-home.css";
+
+// Static dependencies have already evaluated. Times stay in this document's
+// browser Performance domain; neither this event nor a JSX ref proves paint/AX.
+const observeBootstrap = createBootstrapObserver({
+  enabled: (import.meta as ImportMeta & { readonly env?: Readonly<Record<string, unknown>> })
+    .env?.VITE_TAKOSUMI_FIXTURE_BOOTSTRAP === "1",
+  send: (payload) => invoke("plugin:event|emit", { event: BOOTSTRAP_EVENT, payload }),
+  now: () => performance.now(),
+});
+observeBootstrap("entry");
 
 // Keep the old native client and its saved credentials intact during migration.
 // It is never initialized by the Web path (including its native fetch hook).
 let storage: Storage | undefined;
-try { storage = localStorage; } catch { /* The UI reports saving unavailable. */ }
+observeBootstrap("storage_begin");
+try {
+  storage = localStorage;
+  observeBootstrap("storage_end");
+} catch {
+  /* The UI reports saving unavailable. */
+  observeBootstrap("storage_unavailable");
+}
+observeBootstrap("selection_begin");
 const web = webClientSelected(location.search, storage);
+observeBootstrap("selection_end");
 const legacyNavigation = document.getElementById("legacy-navigation");
 if (legacyNavigation) legacyNavigation.hidden = web;
 if (!web) {
+  observeBootstrap("legacy");
   legacyNavigation?.querySelector("a")?.addEventListener("click", (event) => {
     event.preventDefault();
     location.replace("?web-client=1");
@@ -43,7 +64,7 @@ if (!web) {
       allowLegacyMobile = os === "android" || os === "ios";
     } catch { /* An unavailable OS hint must not prevent opening Web home. */ }
   }
-  render(() => <WebHome storage={storage} allowLegacyMobile={allowLegacyMobile}
+  render(() => <WebHome storage={storage} allowLegacyMobile={allowLegacyMobile} observeBootstrap={observeBootstrap}
     clearData={canClearData() ? (connection) => clearWebProfileData(connection, invoke) : undefined}
     recover={canRecover() ? (connection, ticket) => recoverWebProfile(connection, ticket, invoke) : undefined}
     permissionPrompts={permissionPrompts()}
@@ -58,4 +79,5 @@ if (!web) {
       location.assign(`${connection.origin}/`);
     }
   }} />, document.getElementById("root")!);
+  observeBootstrap("render_returned");
 }
