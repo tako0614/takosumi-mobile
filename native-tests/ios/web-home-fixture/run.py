@@ -160,6 +160,75 @@ def navigation_witness(data):
     return result
 
 
+def screen_witness(source, size, *, partial):
+    """Closed prefix projection from the existing query, never a readiness receipt."""
+    result = {"diagnosticOnly": True, "clockDomain": "ios_native_os_log_header", "records": [],
+              "recordLimit": 65, "scanLimitBytes": 2 * 1024 * 1024, "scanLineLimit": 8192,
+              "lineLimitBytes": 512, "savedByteLimit": 32 * 1024, "sourceBytes": size,
+              "partial": partial, "absenceIsUnknown": True, "dropped": 0, "malformed": 0,
+              "capStatus": "not_observed", "navigationCapObserved": False}
+    data = source.read(min(size, result["scanLimitBytes"]))
+    result["readBytes"] = len(data)
+    result["scanTruncated"] = size > len(data)
+    lines = data.splitlines()
+    # A cut packet cannot acquire a binding from an unobserved suffix.
+    if (partial or result["scanTruncated"]) and data and not data.endswith((b"\n", b"\r")):
+        lines = lines[:-1]
+    result["lineTruncated"] = len(lines) > result["scanLineLimit"]
+    marker = b"com.takosumi.fixture.simulator.screen "
+    nav_marker = b"com.takosumi.fixture.simulator.nav "
+    header = re.compile(rb"([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{1,9})\s+Df\s+"
+                        rb"Takosumi\[([1-9][0-9]{0,9}):[0-9a-fA-Fx]+\]\s+"
+                        rb"\[com\.takosumi\.fixture\.simulator\.navigation:navigation\]\s+")
+    packet = re.compile(rb"v=1 seq=([1-9][0-9]?) stage=(requested|appeared|cap) screen=([0-9]{1,5}) view=([0-9]{1,5})")
+    callbacks = {"provisional", "commit", "finish", "fail_provisional", "fail", "content_terminated"}
+    for line in lines[:result["scanLineLimit"]]:
+        if marker not in line and nav_marker not in line:
+            continue
+        if len(line) > result["lineLimitBytes"]:
+            result["malformed"] = min(65, result["malformed"] + 1)
+            continue
+        prefix, payload = line.split(marker if marker in line else nav_marker, 1)
+        emitter = header.fullmatch(prefix)
+        record = None
+        if emitter and marker in line:
+            match = packet.fullmatch(payload)
+            if match:
+                seq, stage, screen, view = int(match[1]), match[2].decode("ascii"), int(match[3]), int(match[4])
+                valid = ((stage == "cap" and seq == 65 and screen == view == 0) or
+                         (stage != "cap" and seq <= 64 and 0 < screen <= 65_535 and 0 < view <= 65_535))
+                if valid:
+                    record = {"kind": "presentation", "seq": seq, "stage": stage, "screen": screen,
+                              "view": view, "sameView": None}
+                    if stage == "cap":
+                        result["capStatus"] = "observed"
+        elif emitter:
+            # Reuse the old strict decoder; do not supply its unknown callback context.
+            decoded = navigation_witness(line)
+            if len(decoded["records"]) == 1 and not decoded["malformed"]:
+                nav = decoded["records"][0]
+                if nav["event"] == "cap":
+                    result["navigationCapObserved"] = True
+                    continue
+                if nav["event"] not in callbacks:
+                    continue
+                record = {"kind": "navigation", "seq": nav["seq"], "stage": nav["event"], "screen": 0,
+                          "view": nav["view"] if nav["sameView"] else 0, "sameView": nav["sameView"]}
+        if record is None:
+            result["malformed"] = min(65, result["malformed"] + 1)
+            continue
+        record.update(pid=int(emitter[2]), osLogTime=emitter[1].decode("ascii"))
+        if len(result["records"]) == result["recordLimit"]:
+            result["dropped"] = min(65, result["dropped"] + 1)
+        else:
+            result["records"].append(record)
+    # Include embedding indentation in the explicit saved projection bound.
+    if len(json.dumps({"targetAppExit": {"screenWitness": result}}, indent=2).encode()) > result["savedByteLimit"]:
+        result["records"] = []
+        result["errorType"] = "ProjectionBoundExceeded"
+    return result
+
+
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
@@ -195,6 +264,11 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     try:
         with raw.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
+            try:
+                result["screenWitness"] = screen_witness(source, size, partial=not result["queryReturned"])
+            except Exception as error:
+                result["screenWitness"] = {"diagnosticOnly": True, "absenceIsUnknown": True,
+                                           "errorType": type(error).__name__}
             source.seek(max(0, size - 512 * 1024))
             # Freeze the size observed above even if an interrupted CLI's
             # descendant is still appending. This is not a drain receipt.
