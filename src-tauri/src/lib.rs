@@ -1,6 +1,6 @@
 use tauri::Manager;
 
-#[cfg(all(debug_assertions, target_os = "ios"))]
+#[cfg(all(debug_assertions, any(target_os = "ios", target_os = "android")))]
 mod bootstrap_fixture;
 
 // The browser-process fixture drives the same flow on Linux (GTK WebKit home)
@@ -52,6 +52,8 @@ pub fn run() {
         .setup(|app| {
             #[cfg(all(debug_assertions, target_os = "ios"))]
             bootstrap_fixture::install(app);
+            #[cfg(all(debug_assertions, target_os = "android"))]
+            bootstrap_fixture::install_android(app);
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             app.handle().plugin(

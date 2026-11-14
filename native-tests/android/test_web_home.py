@@ -1046,5 +1046,107 @@ class Controls(unittest.TestCase):
         self.assertEqual(apk.read_bytes(), b"variant")
 
 
+    def root_snapshot(self):
+        return self.activity_snapshot().replace(
+            b"com.takosumi.appscreen.AppScreenActivity", b".MainActivity")
+
+    def root_identity(self, pid=3169, tick=1234, package=runner.PACKAGE,
+                      boot=b"01234567-89ab-cdef-0123-456789abcdef\n"):
+        fields = [b"S", b"1"] + [b"0"] * 17 + [str(tick).encode()] + [b"0"] * 8
+        return str(pid).encode() + b" (fixture (root)) " + b" ".join(fields) + b"\n" + package.encode() + b"\0" + boot
+
+    def root_packet(self, *, pid=3169, tick=1234, stage="entry", receipt=1, seq=1, elapsed=600000):
+        return (f"v=1 phase=ROOT_MAIN pid={pid} startTick={tick} "
+                "boot=0123456789abcdef0123456789abcdef "
+                f"com.takosumi.fixture.simulator.bootstrap v=1 receipt={receipt} seq={seq} "
+                f"stage={stage} elapsedMs={elapsed} end=1 rootEnd=1\n").encode()
+
+    def test_root_bootstrap_identity_and_closed_packets_refuse_reuse_and_prefixes(self):
+        self.assertEqual(runner.root_activity_pid(self.root_snapshot()), 3169)
+        self.assertEqual(runner.root_activity_pid(self.root_snapshot().replace(
+            b"/.MainActivity", b"/com.takosumi.fixture.android.MainActivity")), 3169)
+        for component in (b".OtherActivity", b".MainActivityExtra", b"foreign.MainActivity"):
+            self.assertIsNone(runner.root_activity_pid(self.root_snapshot().replace(b".MainActivity", component)))
+        self.assertIsNone(runner.native_activity_pid(self.root_snapshot()))
+        self.assertIsNone(runner.root_activity_pid(self.activity_snapshot()))
+        identity = runner.root_guest_identity(self.root_identity(), 3169)
+        self.assertEqual(identity, {"pid": 3169, "startTick": 1234, "bootId": "0123456789abcdef0123456789abcdef"})
+        for raw in (self.root_identity(pid=3170), self.root_identity(tick=0),
+                    self.root_identity(package="foreign"), self.root_identity(boot=b"SECRET"), self.root_identity() + b"SECRET",
+                    b"x" * 8193):
+            with self.subTest(raw=raw[:20]):
+                self.assertIsNone(runner.root_guest_identity(raw, 3169))
+        packet = self.root_packet()
+        rows, rejected, cut = runner.parse_root_bootstrap(packet, identity)
+        self.assertEqual((len(rows), rejected, cut), (1, 0, False))
+        self.assertEqual(rows[0]["elapsedMs"], 600000)
+        for raw in (self.root_packet(pid=3170), self.root_packet(tick=1235),
+                    self.root_packet(stage="SECRET"), self.root_packet(seq=17), self.root_packet(receipt=34),
+                    self.root_packet(elapsed=600001), packet.replace(b"boot=0", b"boot=1"),
+                    packet.rstrip() + b" SECRET\n"):
+            with self.subTest(raw=raw[:25]):
+                self.assertEqual(runner.parse_root_bootstrap(raw, identity)[0], [])
+        for length in range(len(packet.rstrip())):
+            with self.subTest(prefix=length):
+                self.assertEqual(runner.parse_root_bootstrap(packet[:length] + b"\n", identity)[0], [])
+        rows, _, cut = runner.parse_root_bootstrap(packet * 34, identity)
+        self.assertEqual(len(rows), 33); self.assertTrue(cut)
+        rows, rejected, _ = runner.parse_root_bootstrap(
+            self.root_packet(stage="unknown", seq=0, elapsed=-1)
+            + self.root_packet(stage="cap", seq=0, elapsed=-1, receipt=33), identity)
+        self.assertEqual([row["stage"] for row in rows], ["unknown", "cap"])
+        self.assertEqual(rejected, 0)
+
+    def test_root_bootstrap_capture_binds_main_package_and_birth_without_changing_verdict(self):
+        scratch, out = self.root / "scratch", self.root / "out"
+        scratch.mkdir(); out.mkdir()
+        snapshot = self.root_snapshot()
+        (out / "guest-activity-state.log").write_bytes(snapshot)
+        prior = self.native_prior()
+        prior["queries"]["guest-activity-state"].update(
+            sourceBytes=len(snapshot), keptBytes=len(snapshot), truncated=False,
+            sha256=hashlib.sha256(snapshot).hexdigest())
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        calls = []
+        def capture(argv, path, **options):
+            calls.append(argv)
+            path.write_bytes(self.root_packet() if "logcat" in argv else self.root_identity())
+        with patch.object(runner.runtime, "command", side_effect=capture):
+            value = runner.preserve_root_bootstrap(emulator, scratch, out, prior)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][-4:], ["cat", "/proc/3169/stat", "/proc/3169/cmdline", "/proc/sys/kernel/random/boot_id"])
+        self.assertEqual(calls[-1], calls[0])
+        self.assertIn("--pid=3169", calls[1]); self.assertIn("TakosRootBootstrap:I", calls[1])
+        self.assertEqual(value["guestIdentity"], {"pid": 3169, "startTick": 1234, "bootId": "0123456789abcdef0123456789abcdef"})
+        self.assertTrue(value["identityBookendsMatch"])
+        self.assertEqual(len(value["records"]), 1)
+        self.assertTrue(value["absenceIsUnknown"])
+        self.assertNotIn("passed", value)
+        self.assertLessEqual((out / "guest-root-bootstrap.json").stat().st_size, 16384)
+        # A later same numeric PID cannot validate records from the old birth.
+        for defect in ("reused", "reboot", "foreign", "incomplete", "sink"):
+            with self.subTest(defect=defect):
+                local_scratch, local_out = self.root / (defect + "-scratch"), self.root / (defect + "-out")
+                local_scratch.mkdir(); local_out.mkdir()
+                (local_out / "guest-activity-state.log").write_bytes(snapshot)
+                if defect == "sink": (local_out / "guest-root-bootstrap.json").write_bytes(b"unchanged")
+                count = 0
+                def invalid(argv, path, **options):
+                    nonlocal count
+                    count += 1
+                    path.write_bytes(self.root_packet() if "logcat" in argv else
+                                     self.root_identity(tick=1235 if defect == "reused" and count == 3 else 1234,
+                                                        package="foreign" if defect == "foreign" else runner.PACKAGE,
+                                                        boot=b"11234567-89ab-cdef-0123-456789abcdef\n" if defect == "reboot" and count == 3 else b"01234567-89ab-cdef-0123-456789abcdef\n"))
+                    if defect == "incomplete": raise TimeoutError("SECRET")
+                with patch.object(runner.runtime, "command", side_effect=invalid):
+                    rejected = runner.preserve_root_bootstrap(emulator, local_scratch, local_out, prior)
+                if defect != "sink": self.assertEqual(rejected["records"], [])
+                self.assertNotIn("SECRET", str(rejected)); self.assertNotIn("passed", rejected)
+                if defect == "sink": self.assertEqual((local_out / "guest-root-bootstrap.json").read_bytes(), b"unchanged")
+        with patch.object(runner.runtime, "command") as query:
+            refused = runner.preserve_root_bootstrap(emulator, scratch, out, {})
+        query.assert_not_called(); self.assertEqual(refused["records"], [])
+
 if __name__ == "__main__":
     unittest.main()
