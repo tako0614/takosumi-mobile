@@ -40,7 +40,7 @@ rustup target add x86_64-linux-android
 fixture_config='{"identifier":"com.takosumi.fixture.android"}'
 bun ../mobile-kit/scripts/init-tauri-mobile-native.mjs --platform android \
   -- --ci --skip-targets-install --config "$fixture_config"
-bunx tauri android build --ci --debug --target x86_64 --apk \
+VITE_TAKOSUMI_FIXTURE_BOOTSTRAP=1 bunx tauri android build --ci --debug --target x86_64 --apk \
   --config "$fixture_config" -- --locked
 
 python3 -B native-tests/android/verify_app.py
