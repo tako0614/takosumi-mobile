@@ -1398,9 +1398,39 @@ class Observer:
     def site_settled(self, page, test, message):
         """Until the real site's `test` holds in `page` (REAL_SITE_WAIT); a
         failure records the document the page was on."""
+        # Only already-performed primary reads: the first 1024 outcomes and
+        # the latest category. Later failure diagnostics must not replace it.
+        primary = {"schema": "takosumi.site-settled-primary@v1", "limit": 1024,
+                   "polls": 0, "truthy": 0, "falsey": 0, "failure": 0,
+                   "lastOutcome": "none", "countsCapped": False, "observationError": False}
+
+        def note(outcome):
+            try:
+                primary["lastOutcome"] = outcome
+                if primary["polls"] < primary["limit"]:
+                    primary["polls"] += 1
+                    primary[outcome] += 1
+                else:
+                    primary["countsCapped"] = True
+            except Exception:
+                primary["observationError"] = True
+
+        def poll():
+            try:
+                accepted = bool(page.evaluate(test))
+            except Failure:
+                note("failure")
+                raise
+            note("truthy" if accepted else "falsey")
+            return accepted
+
         try:
-            self.settled(lambda: page.evaluate(test), message, REAL_SITE_WAIT, tolerate=True)
+            self.settled(poll, message, REAL_SITE_WAIT, tolerate=True)
         except Failure:
+            try:
+                self.proof["siteSettlePrimary"] = dict(primary)
+            except Exception:
+                pass
             try:
                 # The origin only: a real site's URL can carry keys (e.g.
                 # Excalidraw's #room= and #json= fragments).

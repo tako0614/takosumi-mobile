@@ -2282,6 +2282,141 @@ class RunnerTests(unittest.TestCase):
                       "!document.querySelector('.ErrorSplash')", probe)
         self.assertNotIn("Boolean(document.querySelector('.excalidraw'))", probe)
 
+    def test_site_settled_primary_outcomes_are_separate_from_later_diagnostics(self):
+        secret = "synthetic-private-script-url-body-error-profile"
+        script, message = secret + "-predicate", secret + "-primary"
+
+        def run(outcomes, diagnostic_failure=True, proof=None, advance=30.0, endless=False):
+            values = iter(outcomes)
+            stats = {"primaryReads": 0, "diagnosticReads": 0, "clocks": 0,
+                     "sleeps": 0, "sleepArgsCorrect": True, "now": 0.0}
+            propagated, tolerated = [], []
+            owner = mock.Mock()
+            owner.proof = {} if proof is None else proof
+            page = mock.Mock()
+            page.process = {"profile": secret}
+
+            def evaluate(expression):
+                if expression == script:
+                    stats["primaryReads"] += 1
+                    value = False if endless else next(values)
+                    if isinstance(value, BaseException):
+                        raise value
+                    return value
+                stats["diagnosticReads"] += 1
+                if diagnostic_failure:
+                    raise Failure(secret + "-diagnostic")
+                return {"body": secret, "origin": secret}
+
+            page.evaluate.side_effect = evaluate
+
+            def settled(poll, supplied_message, bound, tolerate=False):
+                self.assertEqual(supplied_message, message)
+                self.assertEqual(bound, 60)
+                self.assertIs(tolerate, True)
+
+                def observed():
+                    try:
+                        return poll()
+                    except Failure as error:
+                        tolerated.append(error)
+                        raise
+
+                try:
+                    return observer.Observer.settled(observed, supplied_message, bound, tolerate)
+                except BaseException as error:
+                    propagated.append(error)
+                    raise
+
+            owner.settled.side_effect = settled
+
+            def now():
+                stats["clocks"] += 1
+                return stats["now"]
+
+            def sleep(seconds):
+                stats["sleeps"] += 1
+                stats["sleepArgsCorrect"] &= seconds == 0.05
+                stats["now"] += advance
+
+            with mock.patch.object(observer.time, "monotonic", side_effect=now), \
+                    mock.patch.object(observer.time, "sleep", side_effect=sleep):
+                try:
+                    result = observer.Observer.site_settled(owner, page, script, message)
+                except BaseException as error:
+                    return owner.proof, stats, error, propagated, tolerated
+            return owner.proof, stats, result, propagated, tolerated
+
+        for outcomes, falsey, failures, last in (([False, False], 2, 0, "falsey"),
+                                                 ([Failure(secret), False], 1, 1, "falsey"),
+                                                 ([False, Failure(secret)], 1, 1, "failure")):
+            for diagnostic_failure in (False, True):
+                with self.subTest(last=last, failures=failures, diagnostic=diagnostic_failure):
+                    proof, stats, error, propagated, tolerated = run(outcomes, diagnostic_failure)
+                    self.assertIs(error, propagated[0])
+                    self.assertIsInstance(error, Failure)
+                    self.assertEqual((stats["primaryReads"], stats["diagnosticReads"],
+                                      stats["clocks"], stats["sleeps"]), (2, 1, 4, 2))
+                    self.assertTrue(stats["sleepArgsCorrect"])
+                    self.assertEqual(tolerated, [x for x in outcomes if isinstance(x, Failure)])
+                    self.assertIn("siteSettlePrimary", proof)
+                    primary = proof["siteSettlePrimary"]
+                    self.assertEqual((primary["polls"], primary["truthy"], primary["falsey"],
+                                      primary["failure"], primary["lastOutcome"]),
+                                     (2, 0, falsey, failures, last))
+                    self.assertFalse(primary["countsCapped"])
+                    self.assertFalse(primary["observationError"])
+                    self.assertNotIn(secret, json.dumps(primary))
+                    frozen = dict(primary)
+                    proof["cdpBeforeFailureCleanup"] = {"lastCommand": secret}
+                    self.assertEqual(proof["siteSettlePrimary"], frozen)
+
+        class Truthy:
+            calls = 0
+            def __bool__(self):
+                self.calls += 1
+                return True
+
+        value = Truthy()
+        proof, stats, result, propagated, _ = run([value])
+        self.assertIsNone(result)
+        self.assertEqual(value.calls, 1)
+        self.assertEqual((stats["primaryReads"], stats["diagnosticReads"],
+                          stats["clocks"], stats["sleeps"]), (1, 0, 2, 0))
+        self.assertNotIn("siteSettlePrimary", proof)
+        self.assertEqual(propagated, [])
+
+        original = ValueError(secret)
+        proof, stats, error, _, _ = run([original])
+        self.assertIs(error, original)
+        self.assertEqual((stats["primaryReads"], stats["diagnosticReads"],
+                          stats["clocks"], stats["sleeps"]), (1, 0, 2, 0))
+        self.assertNotIn("siteSettlePrimary", proof)
+
+        class FailedSink(dict):
+            def __setitem__(self, key, value):
+                if key == "siteSettlePrimary":
+                    raise RuntimeError(secret)
+                return super().__setitem__(key, value)
+
+        proof, stats, error, propagated, _ = run([False, False], proof=FailedSink())
+        self.assertIs(error, propagated[0])
+        self.assertEqual(stats["diagnosticReads"], 1)
+        self.assertNotIn("siteSettlePrimary", proof)
+
+        proof, stats, error, propagated, _ = run([], advance=0.05, endless=True)
+        self.assertIs(error, propagated[0])
+        self.assertTrue(stats["sleepArgsCorrect"])
+        self.assertGreater(stats["primaryReads"], 1024)
+        self.assertEqual(stats["clocks"], stats["primaryReads"] + 2)
+        self.assertEqual(stats["sleeps"], stats["primaryReads"])
+        self.assertIn("siteSettlePrimary", proof)
+        primary = proof["siteSettlePrimary"]
+        self.assertEqual(primary["limit"], 1024)
+        self.assertEqual((primary["polls"], primary["falsey"], primary["failure"]), (1024, 1024, 0))
+        self.assertTrue(primary["countsCapped"])
+        self.assertEqual(primary["lastOutcome"], "falsey")
+
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.
         file = Path(__file__)
