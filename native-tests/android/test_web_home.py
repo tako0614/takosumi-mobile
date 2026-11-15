@@ -438,6 +438,22 @@ class Controls(unittest.TestCase):
         self.assertRegex(checked.stdout, r"PASS: initial save outcome metadata checks=[1-9][0-9]*")
     # initial-save-observation-control-end
 
+    def test_original_export_io_operation_preserves_stream_results_and_exceptions(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the export I/O control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the export I/O control")
+        classes = self.root / "export-io-classes"
+        classes.mkdir()
+        helper = runner.HERE / "gecko-download-fixture/src/main/java/com/takosumi/fixture/geckodownload/ExportIoOperation.java"
+        control = runner.HERE / "label-controls/ExportIoOperationTest.java"
+        built = subprocess.run([compiler, "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(helper), str(control)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        checked = subprocess.run([java, "-cp", str(classes), "com.takosumi.fixture.geckodownload.ExportIoOperationTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: original export I/O operation checks=[1-9][0-9]*")
+
     def test_app_screen_observation_helper_is_debug_only_bounded_and_failure_neutral(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the native observation helper control")

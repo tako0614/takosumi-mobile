@@ -286,6 +286,9 @@ public final class WebAppProbeActivity extends Activity {
         volatile boolean started;
         volatile boolean closed;
         volatile String error;
+        volatile String errorOperation;
+        volatile String errorBodyKind;
+        volatile String errorOrigin;
         Export(Page page, WebResponse response, int code) {
             this.page = page; generation = page.generation; this.response = response; this.code = code;
             response.setReadTimeoutMillis(1000);
@@ -298,30 +301,40 @@ public final class WebAppProbeActivity extends Activity {
             catch (IOException e) { error = "Original stream close failed"; }
             finally { finished.countDown(); }
         }
+        private void noteFailure(ExportIoOperation operation, Exception e) {
+            operation.observeFailure(e, response.body);
+            errorOperation = operation.failedOperation();
+            errorBodyKind = operation.bodyKind();
+            errorOrigin = operation.origin();
+        }
         @Override public void run() {
+            ExportIoOperation operation = new ExportIoOperation();
             try (InputStream input = response.body;
-                 OutputStream out = getContentResolver().openOutputStream(output, "w")) {
+                 OutputStream out = operation.openOutput(() -> getContentResolver().openOutputStream(output, "w"))) {
+                operation.beforeValidation();
                 if (input == null || out == null) throw new IOException("Missing original body or OS output");
                 if (response.statusCode != 200 && !(blob(response.uri) && response.statusCode == 0)) throw new IOException("Unexpected response status");
                 byte[] buffer = new byte[8192];
                 while (!cancelled) {
-                    int count = input.read(buffer);
+                    int count = operation.read(input, buffer);
                     if (count < 0) break;
+                    operation.beforeValidation();
                     if (bytes + count > MAX_EXPORT_BYTES) throw new IOException("Export exceeds fixture bound");
-                    out.write(buffer, 0, count);
+                    operation.write(out, buffer, 0, count);
                     bytes += count;
                 }
+                operation.beforeResourceClose();
             } catch (IOException | RuntimeException e) {
-                // Carry the stall position: run 43173821786 hit "Timed out"
-                // inside this copy loop once, and whether bytes was 0 or
-                // mid-export decides between a never-started stream and a
-                // contended mid-copy gap without widening the 1 s bound.
-                error = e.getClass().getSimpleName() + ": " + e.getMessage() + " after " + bytes + "B";
+                // Keep the legacy error and post-write counter. The closed
+                // operation/origin metadata describes the caught failure,
+                // not why data stopped or whether an OS file is empty.
+                error = operation.error(e, bytes);
+                noteFailure(operation, e);
             }
             finally {
                 // Verify original closure independently of output close failure.
-                try { if (response.body != null) { response.body.close(); closed = true; } }
-                catch (IOException e) { error = "Original stream close failed"; }
+                try { if (response.body != null) { operation.closeOriginalFinally(response.body); closed = true; } }
+                catch (IOException e) { error = "Original stream close failed"; noteFailure(operation, e); }
                 finished.countDown();
             }
         }
