@@ -973,6 +973,84 @@ os.open(sys.argv[3],os.O_RDONLY)
         self.assertIn("already exited", str(raised.exception))
         self.assertEqual(len(calls), 1)
 
+        # Drive the actual first_launch caller: a ready abnormal Work receipt
+        # must prevent futile extra Personal waits, while pending/normal Work
+        # cannot turn a missing Personal event into success.
+        def first_launch_with_preceding_receipt(receipt):
+            work_receipt = self.root / "preceding-work.json"
+            if receipt is None:
+                work_receipt.unlink(missing_ok=True)
+            else:
+                work_receipt.write_text(json.dumps(receipt))
+            personal_receipt = self.root / "preceding-personal.json"
+            personal_receipt.unlink(missing_ok=True)
+            work = SimpleNamespace(native={"nativePid": 101}, window=201,
+                                   process={"profile": "work", "guardReceipt": str(work_receipt)},
+                                   target={"targetId": "work-target"})
+            work.pages = lambda: ["work-target"]
+            personal = SimpleNamespace(native={"nativePid": 102}, window=202,
+                                       process={"profile": "personal", "guardReceipt": str(personal_receipt)},
+                                       cdp=mock.Mock())
+            personal.cdp.since.return_value = []
+            observer = mock.Mock()
+            observer.proof = {}
+            observer.key, observer.nonce = "synthetic-key", "synthetic-nonce"
+            observer.real = {"fixture": True}
+            observer.process_of.side_effect = lambda opened, name: work if name == "Work" else personal
+            observer.attach.side_effect = lambda page: page
+            state = {id(work): {"storage": None, "cookie": None},
+                     id(personal): {"storage": None, "cookie": None}}
+
+            def seed(page, script, *args):
+                value = ("0:" if page is work else "1:") + observer.nonce
+                state[id(page)] = {"storage": value, "cookie": value, "origin": "fixture"}
+                return True
+
+            observer.read_evaluate.side_effect = seed
+            observer.sample.side_effect = lambda page: state[id(page)].copy()
+            observer.contended_sample.side_effect = lambda page, mark: state[id(page)].copy()
+            observer.marker.side_effect = lambda name: ({"after": [None, None]}
+                                                        if name == "app-browser-process.json"
+                                                        else [None, None])
+            observer.raise_refusals.return_value = []
+            observer.guard_ended = runner.MacObserver.guard_ended
+            observer.check_normal_receipt = runner.MacObserver.check_normal_receipt
+            observer.cancel_dialog.return_value = "observer"
+            observer.busy_dialog = lambda *args, **kwargs: runner.MacObserver.busy_dialog(observer, *args, **kwargs)
+            waits, errors = [], []
+
+            def dialog(page, mark, kind, what, bound=runner.SETTLE_WAIT):
+                if page is work:
+                    return {"fixtureDialog": True}
+                waits.append((mark, kind, bound))
+                error = runner.Failure(what)
+                errors.append(error)
+                raise error
+
+            observer.dialog.side_effect = dialog
+            with mock.patch.object(runner, "watch_shutdowns", return_value=mock.MagicMock()):
+                try:
+                    runner.MacObserver.first_launch(observer)
+                except runner.Failure as error:
+                    return error, waits, errors
+            self.fail("The missing Personal event must remain a failure")
+
+        normal = {"rootExit": 0, "complete": True, "kernelNoChildren": True,
+                  "forcedCleanup": 0, "remaining": [], "cleanupErrors": [], "error": None}
+        for receipt in (dict(normal, rootExit=2), dict(normal, forcedCleanup=1)):
+            with self.subTest(precedingReceipt=receipt):
+                error, waits, _ = first_launch_with_preceding_receipt(receipt)
+                self.assertIn("Work did not close normally before Personal", str(error))
+                self.assertEqual(len(waits), 1)
+                self.assertEqual(waits[0][1:], ("beforeunload", 30))
+        for receipt in (None, normal):
+            with self.subTest(precedingReceipt=receipt):
+                error, waits, errors = first_launch_with_preceding_receipt(receipt)
+                self.assertIs(error, errors[-1])
+                self.assertIn("after 4 busy-renderer windows", str(error))
+                self.assertEqual(len(waits), 5)
+                self.assertTrue(all(wait[1:] == ("beforeunload", 30) for wait in waits))
+
     def test_quiet_renderer_waits_for_one_frame_silent_window_then_asks_anyway(self):
         page = mock.Mock()
         page.process = {"profile": "profile-id"}

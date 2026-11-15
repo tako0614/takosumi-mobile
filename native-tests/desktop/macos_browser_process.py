@@ -218,7 +218,18 @@ class MacObserver(Observer):
             self.dialog_native_state(page)
             raise
 
-    def busy_dialog(self, page, mark, kind, what, bound=SETTLE_WAIT):
+    def busy_dialog(self, page, mark, kind, what, bound=SETTLE_WAIT, preceding=None):
+        def check_preceding():
+            # A failed earlier profile prevents the sequential quit from ever
+            # reaching this page. Check only after an existing wait failed;
+            # a pending or normal receipt cannot satisfy the dialog oracle.
+            if preceding is not None:
+                receipt = preceding.process["guardReceipt"]
+                if self.guard_ended(receipt):
+                    with open(receipt, "rb") as source:
+                        self.check_normal_receipt(json.loads(source.read()),
+                                                  "Work did not close normally before Personal")
+
         # A real site's ad iframes can keep the renderer churning past the
         # bound after the quit request is delivered and beforeunload is armed
         # (run 42808568119: 155 frame events plus a Target.getTargets CDP
@@ -234,6 +245,7 @@ class MacObserver(Observer):
         try:
             return self.dialog(page, mark, kind, what, bound)
         except Failure:
+            check_preceding()
             windows = 4 if self.real else 1
             for extra in range(windows):
                 require(not self.guard_ended(page.process["guardReceipt"]),
@@ -243,6 +255,7 @@ class MacObserver(Observer):
                 try:
                     return self.dialog(page, mark, kind, f"{what} {attempt}", 30)
                 except Failure:
+                    check_preceding()
                     if extra + 1 == windows:
                         raise
 
@@ -389,7 +402,8 @@ class MacObserver(Observer):
             self.checkpoint("request-partial-exit")
             self.quiet_renderer(personal)
             self.system_quit(personal)
-            dialog = self.busy_dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30)
+            dialog = self.busy_dialog(personal, mark, "beforeunload", "Personal beforeunload did not open", 30,
+                                      preceding=work)
             receipt = self.normal_receipt(work.process["guardReceipt"], "Work did not close normally before Personal")
         cancelled_by = self.cancel_dialog(personal, mark, "Personal cancel was not observed", dialog)
         self.checkpoint("partial-inspected")
