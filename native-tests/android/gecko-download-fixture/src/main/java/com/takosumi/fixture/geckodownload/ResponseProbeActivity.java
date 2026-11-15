@@ -52,14 +52,21 @@ public final class ResponseProbeActivity extends Activity {
         return "outside-fixture";
     }
 
+    // Fixture-only native crash files remain private; no crash handler service
+    // is registered. The existing SDK helper writes files/minidumps locally.
+    static GeckoRuntimeSettings runtimeSettings() {
+        Bundle extras = new Bundle();
+        extras.putString("env0", "MOZ_CRASHREPORTER=1");
+        return new GeckoRuntimeSettings.Builder().remoteDebuggingEnabled(false).extras(extras).build();
+    }
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         try {
             directory = Files.createTempDirectory(getCacheDir().toPath(), "gecko-response-").toFile();
             Files.write(new File(directory, "keep.txt").toPath(), new byte[] {11, 5});
             server = new FixtureServer();
-            if (runtime == null) runtime = GeckoRuntime.create(getApplicationContext(), new GeckoRuntimeSettings.Builder()
-                .remoteDebuggingEnabled(false).build());
+            if (runtime == null) runtime = GeckoRuntime.create(getApplicationContext(), runtimeSettings());
             LinearLayout layout = new LinearLayout(this);
             layout.setOrientation(LinearLayout.VERTICAL);
             LinearLayout buttons = new LinearLayout(this);

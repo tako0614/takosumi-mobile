@@ -1428,5 +1428,203 @@ class Controls(unittest.TestCase):
             refused = runner.preserve_root_bootstrap(emulator, scratch, out, {})
         query.assert_not_called(); self.assertEqual(refused["records"], [])
 
+    def test_gecko_crash_annotation_projection_never_keeps_raw_messages(self):
+        import json
+        import gecko_crash_annotation as crash
+        secret = "SYNTHETIC_PRIVATE_TOKEN https://example.invalid/private"
+        data = {"BuildID": crash.BUILD, "URL": secret, "ProcessID": "3512", "JavaStackTrace":
+            "java.lang.IllegalStateException: " + secret + "\n"
+            "\tat org.mozilla.gecko.process.GeckoProcessManager.start(GeckoProcessManager.java:847)\n"
+            "\tat private.Payload.secret(Payload.java:9)"}
+        raw = json.dumps(data).encode()
+        value = crash.project(raw)
+        self.assertEqual(value, {"status": "projected", "sameCrash": "unknown",
+            "throwableClass": "java.lang.IllegalStateException", "buildMatches": True,
+            "frames": [{"kind": "process-start", "line": 847}]})
+        self.assertNotIn("SYNTHETIC_PRIVATE_TOKEN", json.dumps(value))
+        self.assertNotIn("https:", json.dumps(value))
+        self.assertNotIn("ProcessID", json.dumps(value))
+        foreign = dict(data, BuildID="other-sdk")
+        with self.assertRaises(crash.Refused):
+            crash.project(json.dumps(foreign).encode())
+        too_many = dict(data, JavaStackTrace="java.io.IOException\n" +
+            "\tat org.mozilla.gecko.process.GeckoProcessManager.start(GeckoProcessManager.java:847)\n" * 9)
+        with self.assertRaises(crash.Refused):
+            crash.project(json.dumps(too_many).encode())
+        for bad in [b"{broken", b'{}', b'[]', b'{"JavaStackTrace":null}', b'\xff',
+                    b'{"JavaStackTrace":"java.io.IOException","JavaStackTrace":"other"}',
+                    b"x" * (crash.FILE_BYTES + 1),
+                    json.dumps({"JavaStackTrace": "a" * 32769}).encode(),
+                    json.dumps({"JavaStackTrace": "java.io.IOException\n" * 257}).encode()]:
+            with self.subTest(invalid=bad[:20]):
+                with self.assertRaises(Exception):
+                    crash.project(bad)
+        data["JavaStackTrace"] = "private.TokenClass: " + secret
+        self.assertEqual(crash.project(json.dumps(data).encode())["throwableClass"], "unknown")
+
+    def test_gecko_crash_reader_rejects_caps_links_identity_and_timeouts(self):
+        import json
+        import shlex
+        import sys
+        import time
+        import gecko_crash_annotation as crash
+        directory = self.root / "files" / "minidumps"
+        directory.mkdir(parents=True)
+        name = "files/minidumps/11111111-1111-4111-8111-111111111111.extra"
+        file = self.root / name
+        raw = json.dumps({"BuildID": crash.BUILD, "JavaStackTrace": "java.io.IOException: SYNTHETIC_SECRET"}).encode()
+        file.write_bytes(raw)
+        def bridge(command, cap, deadline):
+            args = command[3:]
+            self.assertEqual(command[:3], ["adb", "-s", crash.SERIAL])
+            if args[:2] == ["shell", "cmd"]:
+                return ("package:" + crash.PACKAGE + " uid:10123\n").encode()
+            self.assertEqual(args[:3], ["exec-out", "run-as", crash.PACKAGE])
+            script = args[-1]
+            if script.startswith("uid=$(id -u)"):
+                script = script.replace("uid=$(id -u) && here=$(pwd -P)",
+                    "uid=10123 && here=/data/user/0/" + crash.PACKAGE)
+            # Same actual guest shell program, only the fixed package-root
+            # spelling is projected onto a harmless local private fixture.
+            if not script.startswith("uid=10123"):
+                script = script.replace("/data/user/0/" + crash.PACKAGE, str(self.root))
+            # A separate remote shell preserves its own $$/held-FD identity;
+            # the outer host still reports0 after any remote exit status.
+            return crash.bounded(["/bin/sh", "-c", "cd " + shlex.quote(str(self.root)) +
+                '; /bin/sh -c "$1"; exit 0', "exec-out-model", script], cap, deadline)
+        value = crash.collect(bridge)
+        self.assertEqual(value["status"], "projected", value)
+        self.assertEqual(value["sameCrash"], "unknown")
+        self.assertNotIn("SYNTHETIC_SECRET", json.dumps(value))
+        def grew_after_size(command, cap, deadline):
+            changed = list(command)
+            start = "printf 'SGECKO/1 FILE"
+            self.assertIn(start, changed[-1])
+            forged = f"printf '\\nSGECKO/1 END FILE 1 {len(raw)}\\n' >> " + shlex.quote(name) + "; "
+            changed[-1] = changed[-1].replace(start, forged + start, 1)
+            return bridge(changed, cap, deadline)
+        try:
+            # The body grows after S is captured, so a fixed larger head can
+            # leak a file-supplied footer even though real postchecks refuse.
+            with self.assertRaises(crash.Refused):
+                crash.read_report(name, time.monotonic() + 1, grew_after_size)
+        finally:
+            file.write_bytes(raw)
+        def frame(kind, count, body):
+            return (f"SGECKO/1 {kind} {count} {len(body)}\n".encode() + body +
+                f"\nSGECKO/1 END {kind} {count} {len(body)}\n".encode())
+        wire = frame("FILE", 1, raw)
+        self.assertEqual(crash.read_report(name, time.monotonic() + 1, lambda *a: wire), raw)
+        embedded = raw + b"\nSGECKO/1 END FILE 1 0\n"
+        self.assertEqual(crash.read_report(name, time.monotonic() + 1,
+            lambda *a: frame("FILE", 1, embedded)), embedded)
+        for broken in [wire[:-1], wire + b"x", frame("FILE", 0, raw), frame("LIST", 1, raw),
+                       wire.replace(f"FILE 1 {len(raw)}\n".encode(), f"FILE 1 {len(raw)+1}\n".encode(), 1),
+                       frame("FILE", 1, embedded)[:-len(f"\nSGECKO/1 END FILE 1 {len(embedded)}\n".encode())]]:
+            with self.subTest(frame=broken[:24]):
+                with self.assertRaises(crash.Refused):
+                    crash.read_report(name, time.monotonic() + 1, lambda *a: broken)
+        with self.assertRaises(crash.Refused):
+            crash.report_names(time.monotonic() + 1, lambda *a: frame("LIST", 4, (name + "\n").encode()))
+        for name_bad in ["../private.extra", "files/minidumps/../../private.extra", name + ";echo SECRET"]:
+            with self.assertRaises(crash.Refused):
+                crash.read_report(name_bad, time.monotonic() + 1, bridge)
+        file.unlink()
+        outside = self.root / "outside"; outside.write_bytes(raw)
+        file.symlink_to(outside)
+        self.assertEqual(crash.collect(bridge)["status"], "unknown")
+        file.unlink(); file.write_bytes(b"x" * (crash.FILE_BYTES + 1))
+        self.assertEqual(crash.collect(bridge)["status"], "unknown")
+        file.write_bytes(raw)
+        with patch.object(crash, "TOTAL_BYTES", 1):
+            self.assertEqual(crash.collect(bridge)["reason"], "overcap")
+        for i in range(crash.FILES):
+            (directory / (f"22222222-2222-4222-8222-{i:012d}.extra")).write_bytes(raw)
+        self.assertEqual(crash.collect(bridge)["status"], "unknown")
+        for q in directory.glob("2222*.extra"): q.unlink()
+        saved = self.root / "original-minidumps"
+        directory.rename(saved)
+        directory.symlink_to(saved, target_is_directory=True)
+        self.assertEqual(crash.collect(bridge)["status"], "unknown")
+        directory.unlink(); saved.rename(directory)
+        def wrong_uid(command, cap, deadline):
+            if command[-1].startswith("uid=$(id -u)"):
+                body = ("10124\n/data/user/0/" + crash.PACKAGE + "\n").encode()
+                return (f"SGECKO/1 OWNER 2 {len(body)}\n".encode() + body +
+                    f"\nSGECKO/1 END OWNER 2 {len(body)}\n".encode())
+            return bridge(command, cap, deadline)
+        self.assertEqual(crash.collect(wrong_uid)["reason"], "run-as-identity")
+        queries = []
+        def reused_uid(command, cap, deadline):
+            result = bridge(command, cap, deadline)
+            if command[3:5] == ["shell", "cmd"]:
+                queries.append(1)
+                if len(queries) == 2:
+                    result = result.replace(b"10123", b"10124")
+            return result
+        self.assertEqual(crash.collect(reused_uid)["reason"], "package-identity")
+        with self.assertRaises(crash.Refused):
+            crash.bounded([sys.executable, "-c", "import os; os.write(1,b'x'*10000)"], 16, time.monotonic() + 1)
+        with self.assertRaises(crash.Refused):
+            crash.bounded([sys.executable, "-c", "import time; time.sleep(3)"], 16, time.monotonic() + .05)
+
+    def test_gecko_exec_out_refuses_remote_failure_prefixes(self):
+        import time
+        import gecko_crash_annotation as crash
+        # AOSP exec-out copies raw stdout and can return host0 after a remote
+        # failure. These are data prefixes, not successful remote results.
+        name = "files/minidumps/11111111-1111-4111-8111-111111111111.extra"
+        body = b'{"BuildID":"20261102144711","JavaStackTrace":"java.io.IOException"}'
+        with self.subTest(post_read_remote_failure=True):
+            with self.assertRaises(crash.Refused):
+                crash.read_report(name, time.monotonic() + 1, lambda *a: body)
+        prefix = "".join(f"files/minidumps/11111111-1111-4111-8111-{i:012d}.extra\n" for i in range(4))
+        with self.subTest(fifth_file_remote_failure=True):
+            with self.assertRaises(crash.Refused):
+                crash.report_names(time.monotonic() + 1, lambda *a: prefix.encode())
+
+    def test_gecko_crash_retirement_preserves_exit_on_both_paths(self):
+        import json
+        import gecko_crash_annotation as crash
+        for step, fail, reader_error in [(0, False, False), (7, False, False),
+                                         (0, True, False), (7, True, False), (9, False, True)]:
+            with self.subTest(step=step, fail=fail, reader_error=reader_error):
+                installed = {crash.PACKAGE: 10123, crash.PACKAGE + ".test": 10124}
+                calls = []
+                def bridge(command, cap, deadline):
+                    args = command[3:]
+                    if args[:2] == ["shell", "cmd"]:
+                        return "".join(f"package:{k} uid:{v}\n" for k, v in installed.items()).encode()
+                    if args[:2] == ["exec-out", "run-as"]:
+                        pkg = args[2]
+                        body = f"{installed[pkg]}\n/data/user/0/{pkg}\n".encode()
+                        return (f"SGECKO/1 OWNER 2 {len(body)}\n".encode() + body +
+                            f"\nSGECKO/1 END OWNER 2 {len(body)}\n".encode())
+                    self.assertEqual(args[0], "uninstall")
+                    calls.append(args[1])
+                    if fail and args[1] == crash.PACKAGE + ".test":
+                        raise crash.Refused("SYNTHETIC_SECRET")
+                    del installed[args[1]]
+                    return b"Success\n"
+                output = self.root / f"crash-{step}-{fail}-{reader_error}.json"
+                with patch.object(crash, "collect", side_effect=RuntimeError("SYNTHETIC_SECRET") if reader_error else None,
+                                  return_value={"status": "unknown", "reason": "reader-refused"}) as capture:
+                    self.assertEqual(crash.finish(step, output, bridge), step or int(fail))
+                    self.assertEqual(capture.call_count, int(step != 0))
+                self.assertEqual(calls, list(crash.PACKAGES))
+                proof = json.loads(output.read_text())
+                self.assertEqual(proof["originalStepExit"], step)
+                self.assertFalse(proof["rawSaved"])
+                self.assertFalse(proof["minidumpRead"])
+                self.assertNotIn("SYNTHETIC_SECRET", output.read_text())
+                self.assertLessEqual(output.stat().st_size, crash.OUTPUT_BYTES)
+        sentinel = self.root / "existing-proof.json"
+        sentinel.write_text("KEEP")
+        with patch.object(crash, "retire", return_value=[]) as retire:
+            self.assertEqual(crash.finish(0, sentinel), 1)
+            self.assertEqual(retire.call_count, 1)
+        self.assertEqual(sentinel.read_text(), "KEEP")
+
+
 if __name__ == "__main__":
     unittest.main()
