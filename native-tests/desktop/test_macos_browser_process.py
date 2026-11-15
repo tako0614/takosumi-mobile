@@ -804,15 +804,16 @@ os.open(sys.argv[3],os.O_RDONLY)
             def sample(args, **options):
                 if args[0] != "/usr/bin/sample":
                     return mock.Mock(returncode=0, stdout=b"")
-                self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
-                self.assertEqual(args[4:6], ["-mayDie", "-file"])
+                self.assertEqual(args[:-1], ["/usr/bin/sample", "12", "1", "100", "-file"])
+                self.assertEqual(Path(args[-1]).name, "stack.log")
                 self.assertEqual(options["timeout"], 7)
                 Path(args[-1]).write_bytes(b"x" * 33)
                 return mock.Mock(returncode=0)
             with mock.patch.object(sampler, "LIMIT", 32), \
                     mock.patch.object(sampler.subprocess, "run", side_effect=sample):
                 result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, output)
-            self.assertEqual((result["status"], result["truncated"], output.stat().st_size), ("captured", True, 32))
+            self.assertEqual(result["status"], "captured")
+            self.assertEqual((result["truncated"], output.stat().st_size), (True, 32))
             with mock.patch.object(sampler.subprocess, "run", side_effect=sampler.subprocess.TimeoutExpired("sample", 5)):
                 result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))

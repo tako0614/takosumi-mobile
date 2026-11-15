@@ -2597,9 +2597,10 @@ once for one second at 100 ms intervals, before Chromium's ten-second
 [teardown watchdog](https://github.com/chromium/chromium/blob/154.0.8037.98/chrome/browser/shutdown_watchdog_mac.cc).
 PID/birth, guard ancestry and both executable paths are checked before and
 after; changed identity discards the output. The sample subprocess has a
-seven-second limit and passes `-mayDie` to collect symbol locations before a
-target exits during sampling. Earlier three- and five-second attempts expired
-before producing a report. Kernel-state collection runs first with separate
+seven-second limit and omits `-mayDie`, which the installed manual documents
+as requesting immediate symbol locations. This diagnostic variant has no
+established speed or usable-stack benefit. Earlier three- and five-second
+attempts expired before producing a report. Kernel-state collection runs first with separate
 tool bounds, so seven seconds is not a total diagnostic bound and does not
 guarantee completion before the teardown watchdog. Its retained stack text is
 capped at 4 MiB and stderr at
