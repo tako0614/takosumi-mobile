@@ -817,6 +817,91 @@ os.open(sys.argv[3],os.O_RDONLY)
                 result = sampler._sample_owned(processes, child, parent, self.browser_image, self.guard_image, Path(directory) / "missing.log")
             self.assertEqual((result["status"], result["errorType"]), ("sample-error", "TimeoutExpired"))
 
+    def test_completed_state_prefix_survives_owned_worker_retirement(self):
+        commands = (
+            ["/bin/ps", "-o", "pid,ppid,pgid,stat,etime,time,comm", "-p", "12"],
+            ["/bin/ps", "-M", "-p", "12"],
+            ["/usr/sbin/lsof", "-nP", "-p", "12"],
+        )
+        program = """import os,signal,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import macos_shutdown_sample as sampler
+count=0
+def probe(argv,**options):
+    global count
+    count+=1
+    if count==int(sys.argv[3]):
+        sampler._emit({'diagnosticOnly':True,'status':'state-read-pending'})
+        signal.pause()
+    return subprocess.CompletedProcess(argv,0,('probe-'+str(count)+'\\n').encode())
+sampler.subprocess.run=probe
+sampler.capture_state({'pid':12},Path(sys.argv[2]))
+"""
+        for blocked in (2, 3):
+            with self.subTest(retire_during_read=blocked):
+                output = self.root / f"interrupted-{blocked}.state.log"
+                process = sampler._launch_command([sys.executable, "-B", "-c", program,
+                                                   str(Path(sampler.__file__).parent), str(output), str(blocked)])
+                self.addCleanup(lambda p=process: sampler._retire(p) if p.returncode is None else None)
+                self.assertEqual(self.probe_ready(process),
+                                 [{"diagnosticOnly": True, "status": "state-read-pending"}])
+                records, receipt = sampler._retire(process)
+                self.assertTrue(receipt["cleanupComplete"])
+                self.assertEqual(receipt["exitCode"], -signal.SIGKILL)
+                self.assertEqual(records, [], "A state prefix is not a completed target sample")
+                self.assertTrue(output.exists(), "Completed state reads were lost when the owned worker retired")
+                expected = b"\n".join(b"$ " + " ".join(argv).encode() + b"\n"
+                                      + f"probe-{index + 1}\n".encode()
+                                      for index, argv in enumerate(commands[:blocked - 1]))
+                self.assertEqual(output.read_bytes(), expected)
+
+        for limit, failed in ((sampler.LIMIT, None), (64, None), (sampler.LIMIT, 1)):
+            with self.subTest(normal_limit=limit, failed_read=failed):
+                output = self.root / f"complete-{limit}-{failed}.state.log"
+                calls, chunks, expected_record = [], [], {}
+                def probe(argv, **options):
+                    index = len(calls)
+                    calls.append((argv, options))
+                    name = ("ps", "threads", "files")[index]
+                    if index == failed:
+                        expected_record[name] = {"errorType": "TimeoutExpired"}
+                        raise subprocess.TimeoutExpired("private command detail", options["timeout"])
+                    data = bytes([65 + index]) * 262161
+                    expected_record[name] = {"exit": index}
+                    chunks.append(b"$ " + " ".join(commands[index]).encode() + b"\n" + data[:262144])
+                    return subprocess.CompletedProcess(argv, index, data)
+                with mock.patch.object(sampler, "LIMIT", limit), \
+                        mock.patch.object(sampler.subprocess, "run", side_effect=probe):
+                    result = sampler.capture_state({"pid": 12}, output)
+                expected = b"\n".join(chunks)[:limit]
+                self.assertEqual(output.read_bytes(), expected)
+                self.assertEqual(result, dict(expected_record, stateBytes=len(expected)))
+                self.assertEqual([argv for argv, _ in calls], list(commands))
+                self.assertEqual([options["timeout"] for _, options in calls], [10, 10, 15])
+                for _, options in calls:
+                    self.assertEqual(options, {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                                               "stderr": subprocess.STDOUT,
+                                               "timeout": options["timeout"], "check": False})
+
+        for link in (False, True):
+            with self.subTest(existing_output_is_link=link):
+                target = self.root / f"existing-{link}"
+                target.write_bytes(b"original private evidence")
+                output = self.root / f"refused-{link}.state.log"
+                if link:
+                    output.symlink_to(target)
+                else:
+                    output.write_bytes(b"original private evidence")
+                with mock.patch.object(sampler.subprocess, "run", return_value=
+                                       subprocess.CompletedProcess([], 0, b"new data")) as reads:
+                    result = sampler.capture_state({"pid": 12}, output)
+                self.assertEqual(reads.call_count, 3)
+                self.assertEqual(output.read_bytes(), b"original private evidence")
+                self.assertEqual(target.read_bytes(), b"original private evidence")
+                self.assertEqual(result, {"ps": {"exit": 0}, "threads": {"exit": 0},
+                                          "files": {"exit": 0}, "stateWriteError": "FileExistsError"})
+
     def test_sampler_timeout_keeps_bounded_diagnostics_without_becoming_a_pass(self):
         child, parent = {"pid": 12, "parent": 11, "start": 101}, {"pid": 11, "start": 100}
         processes = mock.Mock()
