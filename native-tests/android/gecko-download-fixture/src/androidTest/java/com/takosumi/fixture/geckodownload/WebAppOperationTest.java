@@ -914,7 +914,8 @@ public final class WebAppOperationTest {
         assertTrue("The real editor export must be its original HTTPS Blob", WebAppProbeActivity.blob(transfer.response.uri));
         saveOutput();
         assertTrue("Original export did not finish", transfer.finished.await(20, TimeUnit.SECONDS));
-        assertNull(transfer.error);
+        assertNull("Original export operation=" + transfer.errorOperation + " body=" + transfer.errorBodyKind
+            + " origin=" + transfer.errorOrigin, transfer.error);
         assertFalse(transfer.cancelled);
         assertTrue(transfer.closed);
         verifyPixels(transfer);
