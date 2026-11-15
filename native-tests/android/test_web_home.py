@@ -1428,6 +1428,78 @@ class Controls(unittest.TestCase):
             refused = runner.preserve_root_bootstrap(emulator, scratch, out, {})
         query.assert_not_called(); self.assertEqual(refused["records"], [])
 
+    def test_gecko_crash_capture_keeps_only_the_refusing_stage(self):
+        import json
+        import gecko_crash_annotation as crash
+        name = "files/minidumps/11111111-1111-4111-8111-111111111111.extra"
+        report = json.dumps({"BuildID": crash.BUILD,
+            "JavaStackTrace": "java.io.IOException: SYNTHETIC_SECRET"}).encode()
+        def frame(kind, count, body):
+            return (f"SGECKO/1 {kind} {count} {len(body)}\n".encode() + body +
+                f"\nSGECKO/1 END {kind} {count} {len(body)}\n".encode())
+        owner = frame("OWNER", 2, ("10123\n/data/user/0/" + crash.PACKAGE + "\n").encode())
+        packages = ("package:" + crash.PACKAGE + " uid:10123\n").encode()
+        stages = ("package-before", "owner-before", "list", "file", "owner-after", "package-after")
+        wires = (packages, owner, frame("LIST", 1, (name + "\n").encode()),
+            frame("FILE", 1, report), owner, packages)
+        for refused_at in range(len(stages)):
+            with self.subTest(stage=stages[refused_at]):
+                calls = []
+                def bridge(command, cap, deadline):
+                    index = len(calls); calls.append((command, cap, deadline))
+                    raw = wires[index]
+                    # A missing completion frame remains UNKNOWN; package
+                    # parsing is tested through its actual malformed response.
+                    return b"SYNTHETIC_SECRET" if index == refused_at and index in (0, 5) else (
+                        raw[:-1] if index == refused_at else raw)
+                with patch.object(crash.time, "monotonic", return_value=100):
+                    result = crash.collect(bridge)
+                self.assertEqual(result, {"status": "unknown", "stage": stages[refused_at],
+                    "reason": "package-identity" if refused_at in (0, 5) else "transport-framing"})
+                self.assertEqual(len(calls), refused_at + 1)
+                self.assertTrue(all(deadline == 112 for _, _, deadline in calls))
+                self.assertEqual([cap for _, cap, _ in calls],
+                    [4096, 256 + crash.FRAME_BYTES, 512 + crash.FRAME_BYTES,
+                     crash.FILE_BYTES + crash.FRAME_BYTES, 256 + crash.FRAME_BYTES, 4096][:refused_at+1])
+                self.assertNotIn("SYNTHETIC_SECRET", json.dumps(result))
+        # A completed frame with invalid content is still a file-stage refusal.
+        calls = []
+        def invalid_report(command, cap, deadline):
+            index = len(calls); calls.append(command)
+            return frame("FILE", 1, b"SYNTHETIC_SECRET") if index == 3 else wires[index]
+        self.assertEqual(crash.collect(invalid_report),
+            {"status": "unknown", "reason": "reader-refused", "stage": "file"})
+        calls = []
+        def complete(command, cap, deadline):
+            index = len(calls); calls.append(command); return wires[index]
+        self.assertEqual(crash.collect(complete), {"status": "projected", "sameCrash": "unknown",
+            "records": [{"status": "projected", "sameCrash": "unknown", "throwableClass": "java.io.IOException",
+                "frames": [], "buildMatches": True}], "rawBytesRead": len(report)})
+        self.assertEqual(len(calls), 6)
+        installed = {crash.PACKAGE: 10123, crash.PACKAGE + ".test": 10124}
+        retired = []
+        def retire_after_refusal(command, cap, deadline):
+            args = command[3:]
+            if args[:2] == ["shell", "cmd"]:
+                return "".join(f"package:{k} uid:{v}\n" for k, v in installed.items()).encode()
+            if args[:2] == ["exec-out", "run-as"]:
+                if args[-1].startswith("uid=$(id -u)"):
+                    pkg = args[2]
+                    return frame("OWNER", 2, f"{installed[pkg]}\n/data/user/0/{pkg}\n".encode())
+                return b"SYNTHETIC_SECRET"  # LIST remote refusal, host0.
+            self.assertEqual(args[0], "uninstall")
+            retired.append(args[1]); del installed[args[1]]; return b"Success\n"
+        output = self.root / "refused-stage.json"
+        self.assertEqual(crash.finish(7, output, retire_after_refusal), 7)
+        value = json.loads(output.read_bytes())
+        self.assertEqual(value["annotation"], {"status": "unknown", "reason": "transport-framing", "stage": "list"})
+        self.assertEqual(retired, list(crash.PACKAGES))
+        self.assertTrue(all(row["status"] == "uninstalled" for row in value["retirement"]))
+        self.assertEqual(value["originalStepExit"], 7)
+        self.assertFalse(value["rawSaved"]); self.assertFalse(value["minidumpRead"])
+        self.assertNotIn("SYNTHETIC_SECRET", output.read_text())
+        self.assertLessEqual(output.stat().st_size, crash.OUTPUT_BYTES)
+
     def test_gecko_crash_annotation_projection_never_keeps_raw_messages(self):
         import json
         import gecko_crash_annotation as crash

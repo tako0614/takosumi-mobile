@@ -224,20 +224,26 @@ def project(raw):
 
 def collect(run=bounded):
     deadline = time.monotonic() + CAPTURE_SECONDS
+    stage = "package-before"
     try:
         uids = package_uids(deadline, run)
         if PACKAGE not in uids:
             raise Refused("package-unavailable")
+        stage = "owner-before"
         owner(uids[PACKAGE], deadline, run)
+        stage = "list"
         names = report_names(deadline, run)
         records, total = [], 0
         for name in names:
+            stage = "file"
             raw = read_report(name, deadline, run)
             total += len(raw)
             if total > TOTAL_BYTES:
                 raise Refused("overcap")
             records.append(project(raw))
+        stage = "owner-after"
         owner(uids[PACKAGE], deadline, run)
+        stage = "package-after"
         if package_uids(deadline, run) != uids:
             raise Refused("package-identity")
         return {"status": "projected" if records else "empty", "sameCrash": "unknown",
@@ -246,10 +252,11 @@ def collect(run=bounded):
         allowed = {"timeout", "overcap", "command-refused", "package-identity", "run-as-identity",
                    "report-path", "invalid-report", "annotation-unavailable", "package-unavailable"}
         allowed.update(("report-identity", "transport-framing"))
-        return {"status": "unknown", "reason": str(error) if str(error) in allowed else "reader-refused"}
+        return {"status": "unknown", "reason": str(error) if str(error) in allowed else "reader-refused",
+                "stage": stage}
     except Exception:
         # Never print arbitrary decoder/ADB errors or raw annotation contents.
-        return {"status": "unknown", "reason": "reader-refused"}
+        return {"status": "unknown", "reason": "reader-refused", "stage": stage}
 
 
 def retire(run=bounded):
