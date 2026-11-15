@@ -56,6 +56,10 @@ mod mac_bundle;
 #[path = "download_observation.rs"]
 mod download_observation;
 
+#[cfg(all(windows, feature = "fixture-inspection"))]
+#[path = "load_observation.rs"]
+mod load_observation;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseObservation {
     Idle,
@@ -76,6 +80,8 @@ struct State {
     profile: String,
     context: Option<RequestContext>,
     boot: Option<Vec<u8>>,
+    #[cfg(all(windows, feature = "fixture-inspection"))]
+    load_observation: load_observation::Observation,
     screens: BTreeMap<i32, Screen>,
     pending_close: BTreeMap<i32, u64>,
     /// Runtime permission callbacks this process holds open for the App's
@@ -909,21 +915,45 @@ wrap_context_menu_handler! {
         }
     }
 }
+#[cfg(all(windows, feature = "fixture-inspection"))]
+fn load_observation_active() -> bool {
+    STATE.try_with(|slot| slot.try_borrow().ok().and_then(|state|
+        state.as_ref().map(|state| state.load_observation.active())).unwrap_or(false)).unwrap_or(false)
+}
+
+#[cfg(all(windows, feature = "fixture-inspection"))]
+fn observe_load(browser_id: i32, event: load_observation::Event) {
+    let record = STATE.try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut state|
+        state.as_mut()?.load_observation.take(browser_id, true, event))).ok().flatten();
+    // This records callback ingress, not completion of its handler or URI.
+    // Release State's borrow before nonwaiting send. Only the opt-in writer
+    // uses the existing private stderr sink; no CEF reference crosses it.
+    if let Some(record) = record {
+        record.send();
+    }
+}
+
 wrap_load_handler! {
     struct Loads;
     impl LoadHandler {
         fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             let (Some(browser),Some(frame))=(browser,frame) else {return;};
             if frame.is_main()==0{return;}
+            let browser_id=browser.identifier();
+            #[cfg(all(windows, feature = "fixture-inspection"))]
+            observe_load(browser_id, load_observation::Event::Start);
             // The old document tree is dead once a new main-frame load
             // commits; media requests it still held need this dismissal —
             // requests of the new document only exist after this point.
-            retire_media_permissions_for_browser(browser.identifier());
+            retire_media_permissions_for_browser(browser_id);
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code:i32) {
             let (Some(browser),Some(frame))=(browser,frame) else {return;};
             if frame.is_main()==0{return;}
-            let note=with_state(|state|state.screens.get_mut(&browser.identifier()).is_some_and(|screen|{
+            let browser_id=browser.identifier();
+            #[cfg(all(windows, feature = "fixture-inspection"))]
+            observe_load(browser_id, load_observation::Event::End(_http_status_code));
+            let note=with_state(|state|state.screens.get_mut(&browser_id).is_some_and(|screen|{
                 if screen.load_noted {false} else {screen.load_noted=true;true}
             }));
             if note && inspection() {
@@ -931,6 +961,13 @@ wrap_load_handler! {
                 std::fs::write(directory.join(format!("load-ready-{}.json",browser.identifier())),serde_json::to_vec(
                     &serde_json::json!({"pid":std::process::id(),"browserId":browser.identifier(),"mainFrame":true})).unwrap()).unwrap();
             }
+        }
+        #[cfg(all(windows, feature = "fixture-inspection"))]
+        fn on_load_error(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _code: Errorcode, _error_text: Option<&CefString>, _failed_url: Option<&CefString>) {
+            if !load_observation_active() { return; }
+            let (Some(browser),Some(frame))=(_browser,_frame) else {return;};
+            if frame.is_main()==0{return;}
+            observe_load(browser.identifier(), load_observation::Event::Error(sys::cef_errorcode_t::from(_code) as i32));
         }
     }
 }
@@ -1575,6 +1612,8 @@ pub(crate) fn run(sandbox_info: *mut u8) -> i32 {
             profile,
             context: None,
             boot: Some(boot),
+            #[cfg(all(windows, feature = "fixture-inspection"))]
+            load_observation: load_observation::Observation::new(inspection()),
             screens: BTreeMap::new(),
             pending_close: BTreeMap::new(),
             pending_permissions: BTreeMap::new(),
