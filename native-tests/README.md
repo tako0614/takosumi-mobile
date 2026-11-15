@@ -155,8 +155,8 @@ entitlement must survive before compilation. This is wiring evidence, not push d
 It requires one nonempty Simulator `.app` with the exact fixture identifier
 and Simulator platform, rejects a device IPA, and prints the executable digest.
 CI builds this SDK in the whole-App job, separate from the desktop matrix and
-its standalone download case. Both jobs wait for `native-plugins` and still
-run if that job fails, provided Quality passed; the native failure stays red.
+its standalone download case. Both jobs start after Quality without waiting
+for `native-plugins`; a failure in that independent job stays red.
 Quality failure or workflow cancellation prevents these jobs from running.
 The SDK lane uses the standard `macos-26-intel` runner after hosted arm64
 capacity prevented job acquisition. It compiles the host's x86_64 Simulator

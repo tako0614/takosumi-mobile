@@ -727,7 +727,7 @@ jobs:
   # Exercise the existing native arm64 Simulator build on Apple Silicon;
   # the standalone download case keeps its Intel host in the desktop job.
   ios-whole-app:
-    needs: [quality, native-plugins]
+    needs: quality
     if: ${{ !cancelled() && needs.quality.result == 'success' }}
     runs-on: macos-26
     timeout-minutes: 60
@@ -795,9 +795,9 @@ jobs:
           retention-days: 14
 
   desktop:
-    needs: [quality, native-plugins]
-    # Wait for native checks, but collect independent OS evidence even if an
-    # Android SDK download/test fails. The failed native job remains red.
+    needs: quality
+    # Collect independent OS evidence after Quality without waiting for native
+    # checks. A failed native job remains red.
     if: ${{ !cancelled() && needs.quality.result == 'success' }}
     strategy:
       fail-fast: false
