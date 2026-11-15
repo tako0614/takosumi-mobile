@@ -57,7 +57,7 @@ public final class WebAppProbeActivity extends Activity {
         // context IDs; the earlier loopback test owns none of these sessions.
         if (ResponseProbeActivity.runtime == null) {
             ResponseProbeActivity.runtime = GeckoRuntime.create(getApplicationContext(),
-                new GeckoRuntimeSettings.Builder().remoteDebuggingEnabled(false).build());
+                ResponseProbeActivity.runtimeSettings());
         }
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);

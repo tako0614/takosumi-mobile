@@ -587,6 +587,7 @@ jobs:
               os.close(fd)
           PY
           }
+          fixture_test_started=0
           cleanup() {
             result=$?
             step_result=$result
@@ -609,6 +610,20 @@ jobs:
                 { timeout 15 adb -s emulator-5562 shell dumpsys meminfo com.takosumi.fixture.geckodownload;
                   timeout 10 adb -s emulator-5562 shell 'head -5 /proc/meminfo'; } \
                   > "$RUNNER_TEMP/sumi-gecko-meminfo.log" 2>&1 || true
+              fi
+            fi
+            if [[ "$fixture_test_started" == 1 ]]; then
+              if owned_device; then
+                # Only the fixed projection crosses into the artifact. The SDK
+                # raw files stay in the retained package until explicit retire.
+                if python3 -B native-tests/android/gecko_crash_annotation.py "$step_result" "$RUNNER_TEMP/sumi-gecko-crash-annotation.json"; then
+                  :
+                else
+                  retirement_result=$?
+                  if [[ "$result" == 0 ]]; then result=$retirement_result; fi
+                fi
+              else
+                result=1
               fi
             fi
             if [[ -n "$emulator_pid" ]]; then
@@ -666,7 +681,8 @@ jobs:
           # post-test pkg-removed cleanup in the last 400 lines.
           adb -s emulator-5562 logcat -c
           owned_device
-          gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture connectedDebugAndroidTest
+          fixture_test_started=1
+          gradle --no-daemon --project-dir native-tests/android/gecko-download-fixture connectedDebugAndroidTest -Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true
           python3 - <<'PY'
           import pathlib, xml.etree.ElementTree as E
           reports = list(pathlib.Path('native-tests/android/gecko-download-fixture/build/outputs/androidTest-results/connected').rglob('TEST-*.xml'))
@@ -681,7 +697,7 @@ jobs:
           if sum(int(root.get('tests', 0)) for root in roots) != 2 or any(int(root.get(k, 0)) for root in roots for k in ('failures', 'errors', 'skipped')):
               raise SystemExit('Gecko operation fixture failed or skipped')
           # PlatformTestStorage output is collected by the connected-test
-          # runner before package retirement; no post-uninstall adb pull.
+          # runner before explicit package retirement in the EXIT cleanup.
           exported = list(pathlib.Path('native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output').rglob('photopea-export.png'))
           if len(exported) != 1 or not 8 <= exported[0].stat().st_size <= 2 * 1024 * 1024:
               raise SystemExit('Missing/ambiguous OS-export bytes from the successful actual Photopea test')
@@ -701,6 +717,7 @@ jobs:
             ${{ runner.temp }}/sumi-gecko-meminfo.log
             native-tests/android/gecko-download-fixture/build/outputs/connected_android_test_additional_output/**/photopea-*
             ${{ runner.temp }}/sumi-gecko-process.json
+            ${{ runner.temp }}/sumi-gecko-crash-annotation.json
           if-no-files-found: warn
           retention-days: 14
 
