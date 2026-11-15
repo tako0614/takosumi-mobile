@@ -214,6 +214,10 @@ class Site(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         requests = self.server.requests
         if len(requests) < 512:
+            # A timeout can be logged before a request line has been parsed.
+            if not isinstance(getattr(self, "command", None), str) or not isinstance(getattr(self, "path", None), str):
+                requests.append("UNPARSED request")
+                return
             requests.append(f"{self.command} {self.path.split('?', 1)[0]} {args[1] if len(args) > 1 else ''}")
 
 

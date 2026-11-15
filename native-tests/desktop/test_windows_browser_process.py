@@ -1847,8 +1847,8 @@ class RunnerTests(unittest.TestCase):
                      '--work "$RUNNER_TEMP" --site ')
         packaged = ('run: python3 -B native-tests/desktop/macos_browser_process.py --packaged '
                     '--binary "$M4_APP_BINARY" --work "$RUNNER_TEMP" --site ')
-        # Only packaged Photopea opts into scheduling-perturbing diagnostics.
-        self.assertEqual(flows, [unbundled + "excalidraw", unbundled + "photopea",
+        # Both Photopea flows opt into scheduling-perturbing diagnostics.
+        self.assertEqual(flows, [unbundled + "excalidraw", unbundled + "photopea --sample-shutdowns",
                                  packaged + "excalidraw", packaged + "photopea --sample-shutdowns"])
 
     def test_the_macos_job_runs_the_guard_and_the_adapter_with_the_bundle(self):
@@ -2416,6 +2416,58 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((primary["polls"], primary["falsey"], primary["failure"]), (1024, 1024, 0))
         self.assertTrue(primary["countsCapped"])
         self.assertEqual(primary["lastOutcome"], "falsey")
+
+    def test_site_request_logging_keeps_pre_request_timeout_safe(self):
+        from io import BytesIO
+
+        private = "synthetic-private-unparsed-request-header-error"
+
+        class TimedOut:
+            def readline(self, bound):
+                raise TimeoutError(private)
+
+        def handler(stream, requests):
+            site = runner.Site.__new__(runner.Site)
+            site.server = mock.Mock(requests=requests)
+            site.rfile, site.wfile = stream, BytesIO()
+            site.close_connection = False
+            return site
+
+        with self.subTest(state="before-request-line"):
+            requests = []
+            site = handler(TimedOut(), requests)
+            self.assertFalse(hasattr(site, "command"))
+            self.assertFalse(hasattr(site, "path"))
+            # Exercise the inherited timeout -> log_error -> actual override.
+            site.handle_one_request()
+            self.assertTrue(site.close_connection)
+            self.assertEqual(requests, ["UNPARSED request"])
+            self.assertNotIn(private, json.dumps(requests))
+
+        with self.subTest(state="parsed-request"):
+            requests = []
+            site = handler(BytesIO(("GET /?" + private + " HTTP/1.0\r\nHost: fixture\r\n\r\n").encode()), requests)
+            site.handle_one_request()
+            self.assertEqual(requests, ["GET / 200"])
+            self.assertTrue(site.close_connection)
+            self.assertIn(b'<main data-page="login">', site.wfile.getvalue())
+            self.assertNotIn(private, json.dumps(requests))
+
+        with self.subTest(state="malformed-before-path"):
+            requests = []
+            site = handler(BytesIO((private + "\r\n\r\n").encode()), requests)
+            site.handle_one_request()
+            self.assertTrue(site.close_connection)
+            self.assertGreater(len(requests), 0)
+            self.assertTrue(all(record == "UNPARSED request" for record in requests))
+            self.assertNotIn(private, json.dumps(requests))
+
+        with self.subTest(state="already-full"):
+            requests = ["retained"] * 512
+            site = handler(TimedOut(), requests)
+            site.handle_one_request()
+            self.assertTrue(site.close_connection)
+            self.assertEqual(requests, ["retained"] * 512)
 
     def test_session_files_must_be_plain_and_bounded(self):
         # Read-only: this test file stands in for a session file.
