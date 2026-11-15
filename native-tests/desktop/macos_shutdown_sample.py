@@ -85,7 +85,11 @@ def capture_state(child, output):
     each probe records its own exit and changes no verdict.
     """
     record = {}
-    chunks = []
+    stream, kept, separator = None, 0, b""
+    try:
+        stream = os.fdopen(os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
+    except OSError as error:
+        record["stateWriteError"] = type(error).__name__
     for name, argv, bound in (
         ("ps", ["/bin/ps", "-o", "pid,ppid,pgid,stat,etime,time,comm", "-p", str(child["pid"])], 10),
         ("threads", ["/bin/ps", "-M", "-p", str(child["pid"])], 10),
@@ -95,17 +99,31 @@ def capture_state(child, output):
             completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, timeout=bound, check=False)
             record[name] = {"exit": completed.returncode}
-            chunks.append(b"$ " + " ".join(argv).encode() + b"\n" + completed.stdout[:262144])
+            chunk = separator + b"$ " + " ".join(argv).encode() + b"\n" + completed.stdout[:262144]
+            separator = b"\n"
+            if stream is not None and "stateWriteError" not in record:
+                try:
+                    data = chunk[:max(0, LIMIT - kept)]
+                    stream.write(data)
+                    # Append/flush each completed read on the same exclusive
+                    # handle. A normal worker retirement may interrupt the next
+                    # read; it must not erase this already-acquired prefix.
+                    # Prefix existence is not completion or an identity proof.
+                    stream.flush()
+                    kept += len(data)
+                except OSError as error:
+                    record["stateWriteError"] = type(error).__name__
         except subprocess.TimeoutExpired:
             record[name] = {"errorType": "TimeoutExpired"}
         except Exception as error:
             record[name] = {"errorType": type(error).__name__}
-    try:
-        with output.open("xb") as stream:
-            stream.write(b"\n".join(chunks)[:LIMIT])
-        record["stateBytes"] = output.stat().st_size
-    except OSError as error:
-        record["stateWriteError"] = type(error).__name__
+    if stream is not None:
+        try:
+            stream.close()
+            if "stateWriteError" not in record:
+                record["stateBytes"] = output.stat().st_size
+        except OSError as error:
+            record["stateWriteError"] = type(error).__name__
     return record
 
 
