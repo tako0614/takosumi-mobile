@@ -40,8 +40,8 @@ final class WebHomeUITests: XCTestCase {
         app.terminate()
     }
 
-    private func expect(_ text: String) {
-        XCTAssertTrue(app.webViews.staticTexts[text].firstMatch.waitForExistence(timeout: 15), text)
+    private func expect(_ text: String, captureResumeRejection: Bool = false) {
+        XCTAssertTrue(resumeIPCResult(app.webViews.staticTexts[text].firstMatch.waitForExistence(timeout: 15), captureRejection: captureResumeRejection), text)
     }
 
     private func expectHost(_ address: String) throws {
@@ -103,13 +103,13 @@ final class WebHomeUITests: XCTestCase {
 
     private var draft: XCUIElement { app.webViews.textFields["Draft"].firstMatch }
 
-    private func expectDraft(_ value: String) {
+    private func expectDraft(_ value: String, captureResumeRejection: Bool = false) {
         XCTAssertTrue(draft.waitForExistence(timeout: 15))
         let stored = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             draft.value as? String == value
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [stored], timeout: 10), .completed, "Wrong profile's editor state")
-        expect("Remote has no App IPC")
+        expect("Remote has no App IPC", captureResumeRejection: captureResumeRejection)
     }
 
     private func writeDraft(_ value: String) {
@@ -160,8 +160,8 @@ final class WebHomeUITests: XCTestCase {
         expectDraft("work-draft")
         XCTAssertEqual(liveDocument(), workDocument, "Reopening the same connection replaced its live page")
         XCUIDevice.shared.press(.home)
-        app.activate()
-        expectDraft("work-draft")
+        activateAndAttachResumeState()
+        expectDraft("work-draft", captureResumeRejection: true)
         XCTAssertEqual(liveDocument(), workDocument, "Foreground resume replaced its live page")
 
         picker()
@@ -231,5 +231,31 @@ final class WebHomeUITests: XCTestCase {
         expectDraft("personal-draft")
         app.buttons["閉じる"].tap()
         XCTAssertTrue(app.buttons["保存して開く"].waitForExistence(timeout: 10))
+    }
+
+    private enum ResumeStateEndpoint: String {
+        case activateReturned = "activate-returned"
+        case noIPCRejected = "no-ipc-rejected"
+    }
+
+    private func attachResumeState(_ endpoint: ResumeStateEndpoint) {
+        // A single genuine SDK endpoint sample carries no additional verdict.
+        let state = app.state
+        let attachment = XCTAttachment(string: "bundle=\(fixtureBundleIdentifier) phase=\(endpoint.rawValue) state=\(state.rawValue)")
+        attachment.name = "Whole App resume state (\(endpoint.rawValue))"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func activateAndAttachResumeState() {
+        app.activate()
+        attachResumeState(.activateReturned)
+    }
+
+    private func resumeIPCResult(_ matched: Bool, captureRejection: Bool) -> Bool {
+        if captureRejection && !matched {
+            attachResumeState(.noIPCRejected)
+        }
+        return matched
     }
 }
