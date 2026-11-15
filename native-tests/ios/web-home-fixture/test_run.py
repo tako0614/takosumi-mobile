@@ -253,6 +253,14 @@ class Controls(unittest.TestCase):
         self.assertEqual([len(names) for names in owners], [1, 1, 1], "Each native command needs one owning job")
         self.assertEqual(owners[0], owners[1], "The UI must bind the SDK built in its own job")
         self.assertNotEqual(owners[1], owners[2], "Whole App and download must not share a host/CoreSimulator service")
+        for name in (owners[1][0], owners[2][0]):
+            with self.subTest(job=name):
+                header = jobs[name].split("    steps:\n", 1)[0]
+                self.assertEqual(re.findall(r"(?m)^    needs: (.+)$", header), ["quality"],
+                                 "Independent OS jobs must not wait for another native job")
+                self.assertEqual(re.findall(r"(?m)^    if: (.+)$", header),
+                                 ["${{ !cancelled() && needs.quality.result == 'success' }}"],
+                                 "Quality failure or cancellation must still prevent these jobs")
         body = jobs[owners[1][0]]
         self.assertRegex(body, r"(?m)^    runs-on: macos-26$", "Whole-App SDK/UI use the native arm64 host")
         self.assertNotRegex(body, r"(?m)^    strategy:", "A matrix must not repeat the whole-App case")
