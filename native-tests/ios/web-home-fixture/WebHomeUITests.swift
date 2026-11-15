@@ -103,13 +103,13 @@ final class WebHomeUITests: XCTestCase {
 
     private var draft: XCUIElement { app.webViews.textFields["Draft"].firstMatch }
 
-    private func expectDraft(_ value: String, captureResumeRejection: Bool = false) {
-        XCTAssertTrue(draft.waitForExistence(timeout: 15))
+    private func expectDraft(_ value: String, postResume: Bool = false) {
+        XCTAssertTrue(waitForDraftReadiness(postResume: postResume))
         let stored = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             draft.value as? String == value
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [stored], timeout: 10), .completed, "Wrong profile's editor state")
-        expect("Remote has no App IPC", captureResumeRejection: captureResumeRejection)
+        expect("Remote has no App IPC", captureResumeRejection: postResume)
     }
 
     private func writeDraft(_ value: String) {
@@ -161,7 +161,7 @@ final class WebHomeUITests: XCTestCase {
         XCTAssertEqual(liveDocument(), workDocument, "Reopening the same connection replaced its live page")
         XCUIDevice.shared.press(.home)
         activateAndAttachResumeState()
-        expectDraft("work-draft", captureResumeRejection: true)
+        expectDraft("work-draft", postResume: true)
         XCTAssertEqual(liveDocument(), workDocument, "Foreground resume replaced its live page")
 
         picker()
@@ -257,5 +257,17 @@ final class WebHomeUITests: XCTestCase {
             attachResumeState(.noIPCRejected)
         }
         return matched
+    }
+
+    private func waitForDraftReadiness(postResume: Bool) -> Bool {
+        if !postResume {
+            return draft.waitForExistence(timeout: 15)
+        }
+        // Reuse the first Draft wait's budget for the joint readiness check.
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard app.state == .runningForeground else { return false }
+            return draft.exists
+        }, object: nil)
+        return XCTWaiter.wait(for: [ready], timeout: 15) == .completed
     }
 }
