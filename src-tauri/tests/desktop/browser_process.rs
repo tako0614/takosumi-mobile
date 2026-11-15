@@ -180,9 +180,57 @@ async fn checkpoint_within(
         "External native observation did not finish: {name}"
     ))
 }
-async fn resume_work(view: &impl Shell) -> Result<()> {
-    eval(view,"(()=>{const buttons=[...document.querySelectorAll('.web-connection')].filter(button=>button.querySelector('strong').textContent==='Work');if(buttons.length!==1)throw Error('Unique Work required');buttons[0].click();return true})()").await?;
-    ready(view,"[...document.querySelectorAll('.web-connection')].some(button=>button.querySelector('strong').textContent==='Work' && button.querySelector('small').textContent.includes('前の画面')) && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await
+// Fixed Mac-fixture diagnostics only; at most ten emission attempts per cancel.
+// IO errors are dropped. Stderr locking/writes may still delay the old flow.
+#[derive(Clone, Copy)]
+enum CancelResumeStage {
+    ResumeEval,
+    ResumeReady,
+    StatusRead,
+    RetentionCheck,
+    CancelledWrite,
+}
+fn cancel_resume_checkpoint(stage: CancelResumeStage, outcome: Option<bool>) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        let stage = match stage {
+            CancelResumeStage::ResumeEval => "resume_eval",
+            CancelResumeStage::ResumeReady => "resume_ready",
+            CancelResumeStage::StatusRead => "status_read",
+            CancelResumeStage::RetentionCheck => "retention_check",
+            CancelResumeStage::CancelledWrite => "cancelled_write",
+        };
+        let outcome = match outcome {
+            None => "enter",
+            Some(true) => "ok",
+            Some(false) => "err",
+        };
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "takosumi-fixture-cancel v=1 stage={stage} outcome={outcome} end=1"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (stage, outcome);
+}
+async fn resume_work(view: &impl Shell, observe_cancel: bool) -> Result<()> {
+    if observe_cancel {
+        cancel_resume_checkpoint(CancelResumeStage::ResumeEval, None);
+    }
+    let resumed = eval(view,"(()=>{const buttons=[...document.querySelectorAll('.web-connection')].filter(button=>button.querySelector('strong').textContent==='Work');if(buttons.length!==1)throw Error('Unique Work required');buttons[0].click();return true})()").await;
+    if observe_cancel {
+        cancel_resume_checkpoint(CancelResumeStage::ResumeEval, Some(resumed.is_ok()));
+    }
+    resumed?;
+    if observe_cancel {
+        cancel_resume_checkpoint(CancelResumeStage::ResumeReady, None);
+    }
+    let ready = ready(view,"[...document.querySelectorAll('.web-connection')].some(button=>button.querySelector('strong').textContent==='Work' && button.querySelector('small').textContent.includes('前の画面')) && !document.querySelector('.web-connection:disabled') && !document.querySelector('.web-error')").await;
+    if observe_cancel {
+        cancel_resume_checkpoint(CancelResumeStage::ResumeReady, Some(ready.is_ok()));
+    }
+    ready
 }
 async fn exit_cancelled(view: &impl Shell, app: &AppHandle, previous: u64) -> Result<Value> {
     let end = Instant::now() + Duration::from_secs(20);
@@ -761,7 +809,7 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     println!("first: both browsers recorded; waiting for the observer");
     checkpoint_within(view, case, "inspect-ready", inspect_bound()).await?;
     println!("first: observer ready; reopening Work from the home");
-    resume_work(view).await?;
+    resume_work(view, false).await?;
     let after = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
     let reopened = after
@@ -842,23 +890,36 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     )
     .map_err(|e| e.to_string())?;
     println!("first: the cancelled quit kept both browsers");
-    resume_work(view).await?;
-    let retained = tauri_plugin_app_screen::browser_process_experiment_status(app)
-        .map_err(|error| error.to_string())?;
-    let retained_work = retained
+    resume_work(view, true).await?;
+    cancel_resume_checkpoint(CancelResumeStage::StatusRead, None);
+    let retained_result = tauri_plugin_app_screen::browser_process_experiment_status(app)
+        .map_err(|error| error.to_string());
+    cancel_resume_checkpoint(CancelResumeStage::StatusRead, Some(retained_result.is_ok()));
+    let retained = retained_result?;
+    cancel_resume_checkpoint(CancelResumeStage::RetentionCheck, None);
+    let retained_work_result = retained
         .as_array()
         .unwrap()
         .iter()
         .find(|p| p["profile"] == profile)
-        .ok_or("Work disappeared after cancellation")?;
+        .ok_or("Work disappeared after cancellation");
+    if retained_work_result.is_err() {
+        cancel_resume_checkpoint(CancelResumeStage::RetentionCheck, Some(false));
+    }
+    let retained_work = retained_work_result?;
     if retained_work["opened"] != original["opened"] || retained_work["uncertain"] != false {
+        cancel_resume_checkpoint(CancelResumeStage::RetentionCheck, Some(false));
         return Err("Cancelled close did not retain the original Work browser".into());
     }
-    std::fs::write(
+    cancel_resume_checkpoint(CancelResumeStage::RetentionCheck, Some(true));
+    cancel_resume_checkpoint(CancelResumeStage::CancelledWrite, None);
+    let cancelled_write = std::fs::write(
         case.join("app-browser-process-cancelled.json"),
         serde_json::to_vec_pretty(&retained).unwrap(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string());
+    cancel_resume_checkpoint(CancelResumeStage::CancelledWrite, Some(cancelled_write.is_ok()));
+    cancelled_write?;
     // On a real site the observer's own transition to the second quit
     // (listener removal, samples, arming on a starved channel) can take
     // minutes — run 43007950291 burned ~116 s there — so this checkpoint

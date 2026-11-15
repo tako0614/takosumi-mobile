@@ -937,12 +937,32 @@ fn launch_point(pid: i32, start: u64, owner: i32, owner_start: Option<u64>,
 
 // A point is accepted only if both full samples agree. This is bookending,
 // not an atomic snapshot: same-image exec or changes between reads may be lost.
+// CHANGE_HISTORY_BEGIN
+// Closed component bits: image, argv, parent PID, parent birth, expected child
+// birth (within a pair only), and an unclassified difference fallback.
+fn launch_change_components(a: &LaunchPoint, b: &LaunchPoint) -> u8 {
+    u8::from(a.image != b.image) | (u8::from(a.argv != b.argv) << 1)
+        | (u8::from(a.parent != b.parent) << 2) | (u8::from(a.parent_start != b.parent_start) << 3)
+}
+
+#[derive(Clone, Copy)]
+struct LaunchChange {
+    first_attempt: u16,
+    within: u8,
+    across: u8,
+}
+// CHANGE_HISTORY_END
+
 fn coherent_launch_points(start: u64, first: Option<&LaunchPoint>, last: Option<&LaunchPoint>)
-    -> Result<Option<LaunchPoint>, ()>
+    -> Result<Option<LaunchPoint>, u8>
 {
     match (first, last) {
         (Some(a), Some(b)) if a.start == start && a == b => Ok(Some(a.clone())),
-        (Some(_), Some(_)) => Err(()),
+        (Some(a), Some(b)) => {
+            let components = launch_change_components(a, b)
+                | if a.start != start || b.start != start { 16 } else { 0 };
+            Err(if components == 0 { 32 } else { components })
+        }
         _ => Ok(None),
     }
 }
@@ -953,20 +973,29 @@ struct LaunchRecord {
     last_attempt_unknown: bool,
     point: Option<LaunchPoint>,
     changed: bool,
+    change: Option<LaunchChange>,
 }
 
 impl LaunchRecord {
-    fn sample(&mut self, observation: u16, sampled: Result<Option<LaunchPoint>, ()>) {
+    fn changed_at(&mut self, observation: u16, within: u8, across: u8) {
+        self.changed = true;
+        let change = self.change.get_or_insert(LaunchChange { first_attempt: observation, within: 0, across: 0 });
+        change.within |= within;
+        change.across |= across;
+    }
+
+    fn sample(&mut self, observation: u16, sampled: Result<Option<LaunchPoint>, u8>) {
         self.last_attempt = observation;
         self.last_attempt_unknown = true;
         match sampled {
-            Err(()) => self.changed = true,
+            Err(components) => self.changed_at(observation, if components == 0 { 32 } else { components }, 0),
             Ok(None) => {} // Missing later reads do not erase a dated historical snapshot.
             Ok(Some(point)) => {
                 if let Some(old) = &self.point {
                     if old.image != point.image || old.argv != point.argv
                         || old.parent != point.parent || old.parent_start != point.parent_start {
-                        self.changed = true;
+                        let components = launch_change_components(old, &point);
+                        self.changed_at(observation, 0, components);
                     }
                 }
                 if !self.changed { self.point = Some(point); self.observation = observation;
@@ -1038,6 +1067,7 @@ impl LaunchContext {
         let sampled = coherent_launch_points(start, first.as_ref().map(|v| &v.0), last.as_ref().map(|v| &v.0));
         let record = self.records.entry((pid, start)).or_insert(LaunchRecord {
             observation: next, last_attempt: next, last_attempt_unknown: true, point: None, changed: false,
+            change: None,
         });
         record.sample(next, sampled);
     }
@@ -1052,7 +1082,7 @@ impl LaunchContext {
             let options = args.as_deref().and_then(launch_options);
             let declared_exact = point.and_then(|p| self.argv.as_ref().map(|argv| p.argv == *argv));
             let shape = launch_argument_shape(args.as_deref(), declared_exact, point.map(|p| p.parent));
-            serde_json::json!({ "pid": pid, "startTick": start, "root": root == Some(pid),
+            let mut row = serde_json::json!({ "pid": pid, "startTick": start, "root": root == Some(pid),
                 "parentPid": point.map(|p| p.parent), "parentStartTick": point.map(|p| p.parent_start),
                 "observation": record.observation, "lastAttempt": record.last_attempt,
                 "lastAttemptUnknown": record.last_attempt_unknown,
@@ -1062,7 +1092,22 @@ impl LaunchContext {
                 "matchesDeclaredArgv": declared_exact,
                 "matchesDeclaredRunOptions": options.zip(declared_options).map(|(a, b)| a == b),
                 "dispatchArgKind": shape.0, "helperWaitSeconds": shape.1, "killTargetRelation": shape.2,
-            })
+            });
+            // Only a retained accepted point can supply the strictly older hint.
+            // These are observation ordinals, not event times or current roles.
+            if let Some(change) = record.change.as_ref().filter(|_| record.changed) {
+                let historical = record.point.as_ref().filter(|p| p.start == start && p.parent > 0
+                    && record.observation < change.first_attempt
+                    && (p.parent != self.guard || self.guard_start == Some(p.parent_start)))
+                    .and_then(|p| {
+                        let args = launch_argv(&p.argv)?;
+                        let shape = launch_argument_shape(Some(&args), self.argv.as_ref().map(|argv| p.argv == *argv), Some(p.parent));
+                        Some(serde_json::json!([record.observation, p.parent, p.parent_start, shape.0?, shape.1, shape.2]))
+                    });
+                row["change"] = serde_json::json!([change.first_attempt, change.within, change.across]);
+                row["historicalArg"] = historical.unwrap_or(serde_json::Value::Null);
+            }
+            row
         }).collect();
         serde_json::json!({ "schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
             "guardPid": self.guard, "guardStartTick": self.guard_start, "spawnedRootPid": root,

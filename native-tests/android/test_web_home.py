@@ -38,6 +38,124 @@ XMLTREE = """E: network-security-config (line=2)
 
 class Controls(unittest.TestCase):
 
+    # ROOT_FILTER_HISTORY_CONTROL_BEGIN
+    def test_root_matching_budget_keeps_retained_packets_before_same_pid_noise(self):
+        scratch, out = self.root / "root-filter-scratch", self.root / "root-filter-out"
+        scratch.mkdir(); out.mkdir()
+        snapshot = self.root_snapshot()
+        (out / "guest-activity-state.log").write_bytes(snapshot)
+        prior = self.native_prior()
+        prior["queries"]["guest-activity-state"].update(sourceBytes=len(snapshot), keptBytes=len(snapshot),
+            truncated=False, sha256=hashlib.sha256(snapshot).hexdigest())
+        # AOSP allocates the PID tail before ProcessBuffer's tag filter; -m
+        # counts matching messages instead. This local logd model makes that
+        # ordering visible through the actual collector, not a guest query.
+        events = [(3169, "TakosRootBootstrap", self.root_packet())]
+        events += [(3169, "Other", b"SECRET\n")] * 64
+        events += [(9999, "TakosRootBootstrap", self.root_packet(pid=9999))]
+        calls = []
+        def capture(argv, path, **options):
+            calls.append((argv, options))
+            if "logcat" not in argv:
+                path.write_bytes(self.root_identity()); return
+            selected = [event for event in events if event[0] == 3169]
+            if "-t" in argv:
+                selected = selected[-int(argv[argv.index("-t") + 1]):]
+            selected = [event for event in selected if event[1] == "TakosRootBootstrap"]
+            if "-m" in argv:
+                selected = selected[:int(argv[argv.index("-m") + 1])]
+            path.write_bytes(b"".join(event[2] for event in selected))
+        emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+        with patch.object(runner.runtime, "command", side_effect=capture):
+            value = runner.preserve_root_bootstrap(emulator, scratch, out, prior)
+        self.assertEqual(len(value["records"]), 1)
+        self.assertEqual(len(calls), 3); self.assertEqual(emulator.owned.call_count, 6)
+        self.assertEqual(calls[1][0][4:], ["logcat", "-b", "main", "-d", "-v", "raw", "-m", "64",
+            "--pid=3169", "-s", "TakosRootBootstrap:I", "*:S"])
+        self.assertTrue(all(options == {"timeout": 10, "read_output": False} for _, options in calls))
+        self.assertEqual(runner.NATIVE_OBSERVATION_QUERY[-2:], ("-t", "64"))
+        self.assertTrue(value["absenceIsUnknown"]); self.assertEqual(value["coverage"], "unknown")
+        self.assertNotIn("passed", value); self.assertNotIn("SECRET", str(value))
+        for defect in ("empty", "oversize", "malformed", "birth_changed", "packet_limit"):
+            with self.subTest(defect=defect):
+                local_scratch, local_out = self.root / (defect + "-s"), self.root / (defect + "-o")
+                local_scratch.mkdir(); local_out.mkdir()
+                (local_out / "guest-activity-state.log").write_bytes(snapshot)
+                count = 0
+                def invalid(argv, path, **options):
+                    nonlocal count
+                    count += 1
+                    if "logcat" in argv:
+                        path.write_bytes({"empty": b"", "oversize": b"x" * 65537,
+                            "malformed": b"SECRET\n", "packet_limit": self.root_packet() * 64}.get(defect, self.root_packet()))
+                    else:
+                        path.write_bytes(self.root_identity(tick=1235 if defect == "birth_changed" and count == 3 else 1234))
+                with patch.object(runner.runtime, "command", side_effect=invalid):
+                    rejected = runner.preserve_root_bootstrap(emulator, local_scratch, local_out, prior)
+                if defect == "packet_limit":
+                    self.assertEqual(len(rejected["records"]), 33); self.assertTrue(rejected["recordLimitReached"])
+                else:
+                    self.assertEqual(rejected["records"], [])
+                self.assertTrue(rejected["absenceIsUnknown"])
+                self.assertEqual(rejected["coverage"], "unknown")
+                self.assertNotIn("SECRET", str(rejected)); self.assertNotIn("passed", rejected)
+
+    def test_changed_history_is_paired_dated_and_never_current_or_cleanup_authority(self):
+        import copy
+        import json
+        row = {"pid": 12, "startTick": 34, "root": True, "parentPid": None, "parentStartTick": None,
+            "observation": 4, "lastAttempt": 8, "lastAttemptUnknown": True, "status": "changed",
+            "execIdentity": None, "matchesDeclaredImage": None, "matchesDeclaredArgv": None,
+            "matchesDeclaredRunOptions": None, "dispatchArgKind": None, "helperWaitSeconds": None,
+            "killTargetRelation": None, "change": [5, 1, 2],
+            "historicalArg": [4, 10, 20, "canonical_kill_sleep", 10, "same_retained_parent_pid"]}
+        context = {"schema": "takosumi.guard-launch-context@v1", "source": "owned_running_bookends",
+            "guardPid": 10, "guardStartTick": 20, "spawnedRootPid": 12,
+            "declaredLaunch": {"imageIdentity": [1, 2], "runOptionsPresent": True}, "capacity": 16,
+            "truncated": True, "absenceIsUnknown": True, "signalTimeStateUnknown": True, "records": [row]}
+        self.assertEqual(runner.guard_launch_context(context, 10, 20), context)
+        for historical in (None,
+                [4, 10, 20, "declared_exact", None, None], [4, 11, 99, "other_complete", None, None],
+                [4, 11, 99, "canonical_kill_sleep", 2**31-1, "different_pid"]):
+            changed = copy.deepcopy(context); changed["records"][0]["historicalArg"] = historical
+            self.assertEqual(runner.guard_launch_context(changed, 10, 20), changed)
+        old = copy.deepcopy(context)
+        for key in ("change", "historicalArg"): old["records"][0].pop(key)
+        self.assertEqual(runner.guard_launch_context(old, 10, 20), old)
+        bad = []
+        for key in ("change", "historicalArg"):
+            changed = copy.deepcopy(context); changed["records"][0].pop(key); bad.append(changed)
+        for value in ([0, 1, 0], [9, 1, 0], [True, 1, 0], [5, 0, 0], [5, 64, 0],
+                [5, 1, 16], [5, -1, 0], [5, "SECRET", 0], [5, 1]):
+            changed = copy.deepcopy(context); changed["records"][0]["change"] = value; bad.append(changed)
+        for value in ([5, 10, 20, "canonical_kill_sleep", 10, "same_retained_parent_pid"],
+                [3, 10, 20, None, None, None], [4, 10, 21, None, None, None],
+                [4, True, 20, None, None, None], [4, 11, -1, None, None, None],
+                [4, 10, 20, None, None, None],
+                [4, 10, 20, "sdk_helper", None, None], [4, 10, 20, None, 10, None],
+                [4, 10, 20, "other_complete", 10, None], [4, 10, 20, "canonical_kill_sleep", 0, "different_pid"],
+                [4, 10, 20, "canonical_kill_sleep", 10, "same_lifetime"], [4, 10, 20]):
+            changed = copy.deepcopy(context); changed["records"][0]["historicalArg"] = value; bad.append(changed)
+        for key, value in (("status", "unknown"), ("parentPid", 10),
+                ("dispatchArgKind", "other_complete"), ("lastAttemptUnknown", False), ("rawArgv", "SECRET")):
+            changed = copy.deepcopy(context); changed["records"][0][key] = value; bad.append(changed)
+        for n, changed in enumerate(bad):
+            with self.subTest(invalid=n):
+                rejected = runner.guard_launch_context(changed, 10, 20)
+                self.assertEqual(rejected["status"], "unknown"); self.assertNotIn("SECRET", str(rejected))
+        proof = {"complete": True, "kernelNoChildren": True, "remaining": [], "error": None,
+            "cleanupErrors": [], "nonFatalErrors": [], "rootExit": 0, "forcedCleanup": 1, "launchContext": context}
+        emulator = object.__new__(runner.Emulator); emulator.process = Mock(pid=10)
+        emulator.process.poll.return_value = 0
+        emulator.birth, emulator.fd, emulator.output = 20, None, io.BytesIO()
+        emulator.proof = self.root / "changed-history-receipt.json"
+        emulator.proof.write_text(json.dumps(proof))
+        returned = emulator.stop()
+        self.assertEqual(returned, proof)
+        with self.assertRaises(RuntimeError): runner.receipt(returned, normal=True)
+        runner.receipt(returned, normal=False)
+    # ROOT_FILTER_HISTORY_CONTROL_END
+
     # ARGUMENT_SHAPE_CONTROL_BEGIN
     def test_launch_argument_shape_is_optional_closed_and_has_no_cleanup_authority(self):
         import copy

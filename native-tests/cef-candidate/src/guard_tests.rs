@@ -140,6 +140,7 @@ macro_rules! tests {
     ($($name:ident),* $(,)?) => { &[$((stringify!($name), $name as fn())),*] };
 }
 const TESTS: &[Test] = tests![
+    launch_change_history_keeps_dated_hints_and_current_refusal,
     launch_argument_shape_projection_is_bounded_and_historical,
     launch_context_refuses_reuse_exec_motion_and_private_poison,
     launch_context_real_owned_root_keeps_receipt_and_cleanup_separate,
@@ -1872,7 +1873,7 @@ fn launch_context_refuses_reuse_exec_motion_and_private_poison() {
     let mut context = LaunchContext::new(std::process::id() as i32,
         &OsString::from("/usr/bin/python3"), &[OsString::from("private-token")]);
     // A different actual SDK/image is a false equality hint, never a role match.
-    context.records.insert((12, 34), LaunchRecord { observation: 1, last_attempt: 1, last_attempt_unknown: false, point: Some(point.clone()), changed: false });
+    context.records.insert((12, 34), LaunchRecord { observation: 1, last_attempt: 1, last_attempt_unknown: false, point: Some(point.clone()), changed: false, change: None });
     let proof = context.json(Some(12));
     assert_eq!(proof["records"][0]["matchesDeclaredImage"], false);
     assert_eq!(proof["records"][0]["matchesDeclaredArgv"], false);
@@ -1910,6 +1911,7 @@ fn launch_context_refuses_reuse_exec_motion_and_private_poison() {
     for n in 0..LAUNCH_CONTEXT_CAP {
         context.records.insert((100000 + n as i32, 1), LaunchRecord {
             observation: 1, last_attempt: 1, last_attempt_unknown: true, point: None, changed: false,
+            change: None,
         });
     }
     context.capture(&run.tracker);
@@ -1963,7 +1965,7 @@ fn launch_argument_shape_projection_is_bounded_and_historical() {
     let context = |argv: &[u8], requested: &[u8], parent: i32| LaunchContext {
         guard: 10, guard_start: Some(20), image: None, argv: Some(requested.to_vec()),
         records: BTreeMap::from([((12, 34), LaunchRecord { observation: 1, last_attempt: 1,
-            last_attempt_unknown: false, changed: false,
+            last_attempt_unknown: false, changed: false, change: None,
             point: Some(LaunchPoint { start: 34, parent, parent_start: 20,
                 image: [1, 2], argv: argv.to_vec() }) })]),
         observation: 1, cursor: 0, truncated: false,
@@ -2028,7 +2030,7 @@ fn launch_argument_shape_projection_is_bounded_and_historical() {
     max.records.clear();
     for n in 0..LAUNCH_CONTEXT_CAP {
         max.records.insert((1000 + n as i32, u64::MAX), LaunchRecord { observation: u16::MAX,
-            last_attempt: u16::MAX, last_attempt_unknown: false, changed: false,
+            last_attempt: u16::MAX, last_attempt_unknown: false, changed: false, change: None,
             point: Some(LaunchPoint { start: u64::MAX, parent: i32::MAX, parent_start: u64::MAX,
                 image: [u64::MAX, u64::MAX],
                 argv: b"private-exec\0-kill\02147483647\0-sleep\02147483647\0".to_vec() }) });
@@ -2040,3 +2042,125 @@ fn launch_argument_shape_projection_is_bounded_and_historical() {
     println!("ARGUMENT_SHAPE pure=true new_io=0 mode_authority=false signal_state_unknown=true");
 }
 // ARGUMENT_SHAPE_CONTROL_END
+
+fn launch_change_history_keeps_dated_hints_and_current_refusal() {
+    let old = LaunchPoint { start: 34, parent: 10, parent_start: 20, image: [1, 2],
+        argv: b"private-exec\0-kill\010\0-sleep\010\0".to_vec() };
+    let context = |point: Option<LaunchPoint>, observation| LaunchContext {
+        guard: 10, guard_start: Some(20), image: None,
+        argv: Some(b"private-exec\0-avd\0private-slot\0-port\05582\0".to_vec()),
+        records: BTreeMap::from([((12, 34), LaunchRecord { observation,
+            last_attempt: observation, last_attempt_unknown: point.is_none(),
+            point, changed: false, change: None })]), observation, cursor: 0, truncated: false,
+    };
+    let mut history = context(Some(old.clone()), 1);
+    let image_changed = LaunchPoint { image: [1, 3], ..old.clone() };
+    history.records.get_mut(&(12, 34)).unwrap().sample(2, Ok(Some(image_changed)));
+    let proof = history.json(Some(12));
+    let row = &proof["records"][0];
+    // PR54's wire loses this reason and the accepted argument hint even
+    // though the current-null refusal itself is correct.
+    assert_eq!(row["change"], json!([2, 0, 1]));
+    assert_eq!(row["historicalArg"], json!([1, 10, 20, "canonical_kill_sleep", 10, "same_retained_parent_pid"]));
+    for field in ["parentPid", "parentStartTick", "execIdentity", "matchesDeclaredImage",
+        "matchesDeclaredArgv", "matchesDeclaredRunOptions", "dispatchArgKind", "helperWaitSeconds", "killTargetRelation"] {
+        assert_eq!(row[field], Value::Null);
+    }
+    assert_eq!(row["status"], "changed");
+    assert_eq!(row["lastAttemptUnknown"], true);
+    assert_eq!(proof["signalTimeStateUnknown"], true);
+
+    // A within-attempt mismatch and a cross-observation mismatch stay
+    // separate; subsequent missing/equal samples cannot clear or refresh it.
+    let moved = LaunchPoint { parent: 11, argv: b"changed-private\0".to_vec(), ..old.clone() };
+    history.records.get_mut(&(12, 34)).unwrap().sample(3,
+        coherent_launch_points(34, Some(&old), Some(&moved)));
+    history.records.get_mut(&(12, 34)).unwrap().sample(4, Ok(None));
+    history.records.get_mut(&(12, 34)).unwrap().sample(5, Ok(Some(old.clone())));
+    let proof = history.json(Some(12));
+    let row = &proof["records"][0];
+    assert_eq!(row["change"], json!([2, 6, 1]));
+    assert_eq!(row["observation"], 1);
+    assert_eq!(row["lastAttempt"], 5);
+    assert_eq!(row["historicalArg"][0], 1);
+    assert_eq!(history.records[&(12, 34)].point, Some(old.clone()));
+    assert_eq!(row["status"], "changed");
+    assert_eq!(row["lastAttemptUnknown"], true);
+
+    for (point, bit) in [
+        (LaunchPoint { image: [1, 3], ..old.clone() }, 1),
+        (LaunchPoint { argv: b"private-new\0".to_vec(), ..old.clone() }, 2),
+        (LaunchPoint { parent: 11, ..old.clone() }, 4),
+        (LaunchPoint { parent_start: 21, ..old.clone() }, 8),
+        (LaunchPoint { start: 35, ..old.clone() }, 16),
+    ] {
+        let mut pair = context(Some(old.clone()), 1);
+        pair.records.get_mut(&(12, 34)).unwrap().sample(2,
+            coherent_launch_points(34, Some(&old), Some(&point)));
+        assert_eq!(pair.json(Some(12))["records"][0]["change"], json!([2, bit, 0]));
+    }
+    let mut expected_birth = context(Some(old.clone()), 1);
+    expected_birth.records.get_mut(&(12, 34)).unwrap().sample(2,
+        coherent_launch_points(35, Some(&old), Some(&old)));
+    assert_eq!(expected_birth.json(Some(12))["records"][0]["change"], json!([2, 16, 0]));
+
+    // A zero-detail error remains a change, but never invents a component.
+    let mut no_history = context(None, 1);
+    no_history.records.get_mut(&(12, 34)).unwrap().sample(1,
+        coherent_launch_points(34, Some(&old), Some(&moved)).map_err(|_| Default::default()));
+    let proof = no_history.json(Some(12));
+    assert_eq!(proof["records"][0]["change"], json!([1, 32, 0]));
+    assert_eq!(proof["records"][0]["historicalArg"], Value::Null);
+    no_history.records.get_mut(&(12, 34)).unwrap().sample(2, Ok(Some(old.clone())));
+    assert!(no_history.records[&(12, 34)].point.is_none());
+    assert_eq!(no_history.json(Some(12))["records"][0]["historicalArg"], Value::Null);
+
+    let mut missing = context(None, 1);
+    missing.records.get_mut(&(12, 34)).unwrap().sample(2,
+        coherent_launch_points(34, None, Some(&old)));
+    let proof = missing.json(Some(12));
+    assert_eq!(proof["records"][0]["status"], "unknown");
+    assert!(proof["records"][0].get("change").is_none());
+    let mut malformed = context(Some(LaunchPoint { argv: b"private-partial".to_vec(), ..old.clone() }), 1);
+    malformed.records.get_mut(&(12, 34)).unwrap().sample(2,
+        Ok(Some(LaunchPoint { image: [2, 3], ..old.clone() })));
+    assert_eq!(malformed.json(Some(12))["records"][0]["historicalArg"], Value::Null);
+
+    let small = history.json(Some(12));
+    assert!(!serde_json::to_string(&small).unwrap().contains("private-"));
+    println!("HISTORY_FORMATTER_SMALL {}", serde_json::to_string(&small).unwrap());
+    let mut maximum = LaunchContext { guard: i32::MAX, guard_start: Some(u64::MAX),
+        image: None, argv: Some(b"private-requested\0".to_vec()), records: BTreeMap::new(),
+        observation: u16::MAX, cursor: 0, truncated: true };
+    for n in 0..LAUNCH_CONTEXT_CAP {
+        let original = LaunchPoint { start: u64::MAX, parent: i32::MAX, parent_start: u64::MAX,
+            image: [u64::MAX, u64::MAX],
+            argv: b"private-exec\0-kill\02147483647\0-sleep\02147483647\0".to_vec() };
+        let mut record = LaunchRecord { observation: u16::MAX - 3, last_attempt: u16::MAX - 3,
+            last_attempt_unknown: false, point: Some(original.clone()), changed: false, change: None };
+        let moved = LaunchPoint { start: u64::MAX - 1, parent: i32::MAX - 1,
+            parent_start: u64::MAX - 1, image: [1, 2], argv: b"private-changed\0".to_vec() };
+        record.sample(u16::MAX - 2,
+            coherent_launch_points(u64::MAX, Some(&original), Some(&moved)).map_err(|_| Default::default()));
+        record.sample(u16::MAX - 1,
+            coherent_launch_points(u64::MAX, Some(&original), Some(&moved)));
+        record.sample(u16::MAX, Ok(Some(LaunchPoint { start: u64::MAX, ..moved })));
+        maximum.records.insert((1000 + n as i32, u64::MAX), record);
+    }
+    let proof = maximum.json(Some(1000));
+    let bytes = serde_json::to_vec(&proof).unwrap();
+    assert!(bytes.len() < 16384);
+    assert!(!String::from_utf8(bytes.clone()).unwrap().contains("private-"));
+    for row in proof["records"].as_array().unwrap() {
+        assert_eq!(row["change"], json!([65533, 63, 15]));
+        assert_eq!(row["historicalArg"][0], 65532);
+        assert_eq!(row["dispatchArgKind"], Value::Null);
+    }
+    let mut without = proof.clone();
+    for row in without["records"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("change");
+        row.as_object_mut().unwrap().remove("historicalArg");
+    }
+    assert_eq!(bytes.len() - serde_json::to_vec(&without).unwrap().len(), 16 * 140);
+    println!("HISTORY_FORMATTER_MAX {}", String::from_utf8(bytes).unwrap());
+}
