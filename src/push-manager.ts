@@ -14,6 +14,7 @@ import {
   mobileAccountIdentity,
   normalizeHostUrl,
   type MobilePersistentStore,
+  type MobileRetiredAccountScope,
   type MobileSecureStore,
   type MobileSession,
 } from "@takosjp/mobile-kit";
@@ -426,7 +427,7 @@ export function createPushManager(deps: PushManagerDeps) {
     return { key: config.webPushPublicKey };
   }
 
-  async function findRecord(session: MobileSession): Promise<PushInstanceRecord | undefined> {
+  async function findRecord(session: Pick<MobileSession, "hostUrl" | "accountId">): Promise<PushInstanceRecord | undefined> {
     const identity = mobileAccountIdentity(session);
     return (await loadState()).instances.find((item) => item.identity === identity);
   }
@@ -606,6 +607,19 @@ export function createPushManager(deps: PushManagerDeps) {
         if (availability()) return;
         const current = await findRecord(session);
         if (current) await removeSubscription(current, session);
+      });
+    },
+
+    /**
+     * The Kit has actually retired this saved row, possibly without a usable
+     * session. Only our matching stored subscription and existing device
+     * custody can clean up; no instance credential is reconstructed.
+     */
+    accountScopeRetired(scope: MobileRetiredAccountScope): Promise<void> {
+      return serial(async () => {
+        if (availability()) return;
+        const current = await findRecord(scope);
+        if (current) await removeSubscription(current, undefined);
       });
     },
 
