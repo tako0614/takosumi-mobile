@@ -320,6 +320,7 @@ function renderShell(input: {
   renderMobileClientApp<TakosumiMobileHome>({
     adapter: productAdapter,
     createNativeBridge: () => nativeBridge,
+    onAccountScopeRetired: (scope) => push.manager.accountScopeRetired(scope),
     loadHome,
     sessionUnlock: {
       restoreMode: "required",
