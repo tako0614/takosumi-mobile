@@ -48,6 +48,10 @@ public final class WebHomeOperationTest {
     private InitialSaveObservation initialSaveObservation;
     private boolean initialSaveObservationIncomplete;
     // INITIAL_SAVE_OBSERVATION_FIELDS_END
+    // PERSONAL_HOME_WAIT_FIELDS_BEGIN
+    private PersonalHomeWaitObservation personalHomeWait;
+    private boolean personalHomeWaitIncomplete;
+    // PERSONAL_HOME_WAIT_FIELDS_END
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
@@ -83,6 +87,12 @@ public final class WebHomeOperationTest {
     private UiObject2 one(BySelector selector, JSONObject trace, boolean scrollConnectionForm) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
+        // PERSONAL_HOME_WAIT_DEADLINE_BEGIN
+        if (personalHomeWait != null && personalHomeWait.waiting) {
+            try { personalHomeWait.begin(end - 15000, end); }
+            catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
+        }
+        // PERSONAL_HOME_WAIT_DEADLINE_END
         ConnectionSaveKeyboard keyboard = trace == null ? null : new ConnectionSaveKeyboard();
         ConnectionSaveKeyboard.Probe keyboardProbe = trace == null ? null : new ConnectionSaveKeyboard.Probe() {
             public boolean isShown() { return keyboardShown(trace); }
@@ -291,6 +301,7 @@ public final class WebHomeOperationTest {
     }
 
     private void observeHomeQuery(BackWaitObservation.Outcome outcome) {
+        observePersonalHomeQuery(outcome); // personal-home-wait:existing-outcome
         observeInitialSaveQuery(outcome); // initial-save-observation:existing-outcome
         if (backHomeObservation == null || !backHomeObservation.waiting) return;
         try { backHomeObservation.sample(outcome, SystemClock.elapsedRealtime()); }
@@ -371,6 +382,64 @@ public final class WebHomeOperationTest {
             diagnostic(metadata, "droppedCapped", value.dropped);
         } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
     }
+
+    // PERSONAL_HOME_WAIT_METHODS_BEGIN
+    private void expectPersonalHomeAfterReset() {
+        try { personalHomeWait = new PersonalHomeWaitObservation(); }
+        catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
+        boolean returned = false;
+        try { expect("Fixture home Personal"); returned = true; }
+        catch (RuntimeException error) { personalHomeWaitIncomplete = true; throw error; }
+        finally {
+            try { if (personalHomeWait != null) personalHomeWait.finish(SystemClock.elapsedRealtime(), returned); }
+            catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
+            finally { if (personalHomeWait != null) personalHomeWait.waiting = false; }
+        }
+    }
+
+    private void observePersonalHomeQuery(BackWaitObservation.Outcome outcome) {
+        PersonalHomeWaitObservation value = personalHomeWait;
+        if (value == null || !value.waiting) return;
+        try {
+            value.sample(outcome, SystemClock.elapsedRealtime(), () -> {
+                long startedAt = SystemClock.elapsedRealtime();
+                List<android.view.accessibility.AccessibilityWindowInfo> windows =
+                    InstrumentationRegistry.getInstrumentation().getUiAutomation(
+                        androidx.test.uiautomator.Configurator.getInstance().getUiAutomationFlags()).getWindows();
+                int count = Math.min(windows.size(), PersonalHomeWaitObservation.WINDOW_LIMIT);
+                PersonalHomeWaitObservation.Window[] rows = new PersonalHomeWaitObservation.Window[
+                    count + (windows.size() > count ? 1 : 0)];
+                try {
+                    for (int i = 0; i < count; i++) {
+                        android.view.accessibility.AccessibilityWindowInfo window = windows.get(i);
+                        android.view.accessibility.AccessibilityNodeInfo root = window.getRoot();
+                        try {
+                            rows[i] = new PersonalHomeWaitObservation.Window(window.getId(),
+                                root == null ? -1 : root.getWindowId(), window.getType(),
+                                window.isActive(), window.isFocused(),
+                                root != null && TARGET.contentEquals(root.getPackageName()));
+                        } finally { if (root != null) root.recycle(); }
+                    }
+                } finally { for (android.view.accessibility.AccessibilityWindowInfo window : windows) window.recycle(); }
+                return new PersonalHomeWaitObservation.Capture(startedAt, SystemClock.elapsedRealtime(), rows);
+            });
+        } catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
+    }
+
+    private void savePersonalHomeWait() {
+        try {
+            if (personalHomeWait == null) {
+                if (personalHomeWaitIncomplete) diagnostic(result, "personalHomeWaitIncomplete", true);
+                return;
+            }
+            JSONObject metadata = new JSONObject();
+            boolean complete = personalHomeWait.writeTo((key, value) -> metadata.put(key,
+                value instanceof List ? new JSONArray((List<?>) value) : value), personalHomeWaitIncomplete);
+            if (complete) result.put("personalHomeWait", metadata);
+            else result.put("personalHomeWaitIncomplete", true);
+        } catch (Exception ignored) { diagnostic(result, "personalHomeWaitIncomplete", true); }
+    }
+    // PERSONAL_HOME_WAIT_METHODS_END
 
     private void add(String name) {
         JSONObject trace = new JSONObject();
@@ -526,7 +595,7 @@ public final class WebHomeOperationTest {
         reopen("Work"); expect("Fixture signed out"); host(origin);
         click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("");
         closeAndOpenMain(); reopen("Personal");
-        expect("Fixture home Personal"); expect("Instance data instance-Personal");
+        expectPersonalHomeAfterReset(); expect("Instance data instance-Personal");
         click("📝 Notes"); draft("personal-draft"); closeAndOpenMain();
         cases.put("cleared-profile-reset").put("other-profile-preserved").put("native-views-closed");
         result.put("passed", true);
@@ -552,6 +621,7 @@ public final class WebHomeOperationTest {
         }
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
+        savePersonalHomeWait(); // personal-home-wait:result-delivery
         result.put("diagnosticsSaved", saved);
         try (FileOutputStream stream = new FileOutputStream(new File(files, "result.json"))) {
             stream.write(result.toString().getBytes(StandardCharsets.UTF_8));
