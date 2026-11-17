@@ -438,6 +438,27 @@ class Controls(unittest.TestCase):
         self.assertRegex(checked.stdout, r"PASS: initial save outcome metadata checks=[1-9][0-9]*")
     # initial-save-observation-control-end
 
+    # personal-home-wait-control-begin
+    def test_personal_home_wait_observation_keeps_deadline_and_root_context_separate(self):
+        compiler, java = shutil.which("javac"), shutil.which("java")
+        self.assertIsNotNone(compiler, "Existing JDK17+ required for the Personal home wait control")
+        self.assertIsNotNone(java, "Existing Java runtime required for the Personal home wait control")
+        classes = self.root / "personal-home-wait-classes"
+        classes.mkdir()
+        sources = runner.HERE / "web-home-fixture/src/androidTest/java/com/takosumi/fixture/webhome"
+        built = subprocess.run([compiler, "-J-Xmx128m", "--release", "17", "-encoding", "UTF-8", "-d", str(classes),
+                                str(sources / "BackWaitObservation.java"),
+                                str(sources / "PersonalHomeWaitObservation.java"),
+                                str(runner.HERE / "label-controls/PersonalHomeWaitObservationTest.java")],
+                               capture_output=True, text=True, timeout=15)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        checked = subprocess.run([java, "-Xmx64m", "-cp", str(classes),
+                                  "com.takosumi.fixture.webhome.PersonalHomeWaitObservationTest"],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertRegex(checked.stdout, r"PASS: personal home wait metadata checks=[1-9][0-9]*")
+    # personal-home-wait-control-end
+
     def test_original_export_io_operation_preserves_stream_results_and_exceptions(self):
         compiler, java = shutil.which("javac"), shutil.which("java")
         self.assertIsNotNone(compiler, "Existing JDK17+ required for the export I/O control")
