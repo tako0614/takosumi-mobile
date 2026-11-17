@@ -1,5 +1,8 @@
 use tauri::Manager;
 
+#[cfg(windows)]
+mod windows_exit;
+
 #[cfg(all(debug_assertions, any(target_os = "ios", target_os = "android")))]
 mod bootstrap_fixture;
 
@@ -99,11 +102,26 @@ pub fn run() {
             .expect("error while running Takosumi mobile");
         #[cfg(windows)]
         {
-            // Tao's Windows run exits inside the loop, before the runtime's
-            // remaining WebView2 controllers can drop. Like the actual-App
-            // fixture, return through the runtime before ending the process.
-            let code = app.run_return(|_, _| {});
-            std::process::exit(code);
+            // Returning from the loop does not release managed WebViews
+            // still retained by AppHandles. Close our views on the UI thread
+            // only once exit is terminal; a cancelled request keeps them live.
+            let close_failures = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let failures_in_run = close_failures.clone();
+            let code = app.run_return(move |app, event| {
+                let failed = windows_exit::close_managed_views(
+                    matches!(event, tauri::RunEvent::Exit),
+                    || app.webviews().into_values(),
+                    |view| {
+                        // Preserve the per-view cleanup that Tauri would run
+                        // after this callback, before removing its registry row.
+                        drop(std::mem::take(&mut *view.resources_table()));
+                        view.close()
+                    },
+                );
+                failures_in_run.set(failures_in_run.get() + failed);
+            });
+            let failed = close_failures.get();
+            std::process::exit(windows_exit::exit_code(code, failed));
         }
         #[cfg(not(windows))]
         app.run(|_, _| {});
