@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import ts from "typescript";
 import {
@@ -121,8 +122,13 @@ test("actual Kit retirement reaches only the product's matching saved subscripti
 
 test("the product bridge and same controller recover rejected initialization only on explicit Retry", async () => {
   const installed = dirname(Bun.resolveSync("@takosjp/mobile-kit", appRoot));
-  // This is the exact helper called by the installed Solid shell's Retry button.
-  const { createStartupRetry } = await import(resolve(installed, "startup-retry.ts"));
+  // Execute the shell's exact helper body with its peer resolved from this App,
+  // without requiring a second dependency install in the source-only Kit checkout.
+  const retrySource = readFileSync(resolve(installed, "startup-retry.ts"), "utf8");
+  const retryModule = ts.transpileModule(retrySource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  const { createStartupRetry } = new Function("require", "exports", `${retryModule}; return exports;`)(createRequire(resolve(appRoot, "package.json")), {}) as {
+    createStartupRetry(run: () => Promise<unknown>): { failed(): boolean; attempt(): Promise<void>; dispose(): void };
+  };
   const nativeSource = readFileSync(resolve(appRoot, "src/native.ts"), "utf8");
   for (const failedPort of ["store", "stronghold"] as const) {
     let allow = false, loads = 0, vaultLoads = 0, live = 0, maxLive = 0;
