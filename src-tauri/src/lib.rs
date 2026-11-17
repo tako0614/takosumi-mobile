@@ -114,7 +114,7 @@ pub fn run() {
                     |view| {
                         // Preserve the per-view cleanup that Tauri would run
                         // after this callback, before removing its registry row.
-                        view.resources_table().clear();
+                        drop(std::mem::take(&mut *view.resources_table()));
                         view.close()
                     },
                 );
