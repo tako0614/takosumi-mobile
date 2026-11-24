@@ -1492,7 +1492,7 @@ jobs:
           $tls = Join-Path $env:RUNNER_TEMP 'w3-tls'
           $log = Join-Path $env:RUNNER_TEMP 'w3-cases.log'
           $stage = Join-Path $env:RUNNER_TEMP 'w3-stage\cef'
-          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset | Tee-Object -FilePath $log
+          python -B native-tests/desktop/windows_browser_process.py --binary "$env:CARGO_TARGET_DIR\debug\takosumi-mobile.exe" --browser "$stage\takosumi-cef-browser-process.exe" --guard "$stage\takosumi-browser-guard.exe" --data $case --tls-cert "$tls\cert.pem" --tls-key "$tls\key.pem" --tls-ca "$tls\ca.pem" --restart --reset --native-fault-probe | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "W3 actual App cases failed (exit $LASTEXITCODE)" }
           $w3Cases = @(
             'separate-profiles',

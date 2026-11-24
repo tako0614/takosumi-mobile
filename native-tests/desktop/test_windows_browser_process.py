@@ -1959,6 +1959,9 @@ class RunnerTests(unittest.TestCase):
         workflow = (root / "ci.yml").read_text(encoding="utf-8")
         w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
         w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("--native-fault-probe"), 1)
+        self.assertIn("--restart --reset --native-fault-probe | Tee-Object", w3)
+        self.assertNotIn("--native-fault-probe", w4)
         for job, stage, runs in ((w3, "w3-stage", 2), (w4, "w4-stage", 2)):
             self.assertNotIn("unsandboxed-candidate", job)
             self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
@@ -2585,6 +2588,108 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(app.waited, cleanup_app)
                 self.assertTrue(job.closed)
                 self.assertFalse(job.terminated)
+
+    def test_native_fault_probe_requires_exact_first_exit_and_empty_owned_job(self):
+        av = runner.EXCEPTION_ACCESS_VIOLATION
+        cases = (
+            ("probe-succeeds", "", av, 0, "head", True, None, 1),
+            ("probe-fails", "", av - (1 << 32), 0, "head", True, OSError("private probe failure"), 1),
+            ("disabled", "", av, 0, "head", False, None, 0),
+            ("restart", "-restart", av, 0, "head", True, None, 0),
+            ("recovery", "-recover", av, 0, "head", True, None, 0),
+            ("other-exit", "", 1, 0, "head", True, None, 0),
+            ("non-dword-exit", "", av + (1 << 32), 0, "head", True, None, 0),
+            ("app-running", "", None, 0, "head", True, None, 0),
+            ("descendant-running", "", av, 1, "head", True, None, 0),
+            ("unknown-cleanup", "", av, None, "head", True, None, 0),
+            ("changed-source", "", av, 0, "another-head", True, None, 0),
+        )
+        for name, suffix, code, active, head_after, enabled, probe_error, calls in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "takosumi-mobile.exe",
+                                       browser=root / "browser.exe", guard=root / "guard.exe", packaged=False,
+                                       real_site=None, unsandboxed_candidate=False, site="https://127.0.0.1:1234")
+                app = mock.Mock(pid=456)
+                app.poll.return_value = code
+                job = mock.Mock()
+                if active is None:
+                    job.processes.side_effect = OSError("cleanup state unavailable")
+                else:
+                    job.processes.return_value = (7, active)
+                original = runner.subprocess.CalledProcessError(1, ["observer"])
+                observations = []
+
+                def check_then_probe():
+                    proof = json.loads((root / "execution.json").read_text())
+                    observations.append((job.close.call_count, job.terminate.called, app.terminate.called,
+                                         proof["sessionJob"], proof["error"], proof["passed"]))
+                    if probe_error is not None:
+                        raise probe_error
+
+                probe = mock.Mock(side_effect=check_then_probe)
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=original), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value=head_after), \
+                        mock.patch.object(runner, "app_data", return_value=[root]), \
+                        mock.patch.object(runner, "job_pids", return_value=[]), \
+                        mock.patch.object(runner, "leftover_records", return_value={}), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "app_error_at_observer_failure", return_value={}):
+                    with self.assertRaises(runner.subprocess.CalledProcessError) as error:
+                        runner.run_phase(args, {}, [], {}, "head", suffix,
+                                         after_access_violation=probe if enabled else None)
+                self.assertIs(error.exception, original)
+                self.assertEqual(probe.call_count, calls)
+                self.assertEqual(observations, [
+                    (1, False, False, {"observed": 7, "remaining": []}, f"CalledProcessError: {original}", False)
+                ] if calls else [])
+
+    def test_native_fault_probe_uses_fresh_case_and_bounds_the_diagnostic_process(self):
+        receipt = {"diagnosticComplete": True, "observed": True, "reason": "last_chance_access_violation",
+                   "faultingModule": "runtime.dll", "faultingOffset": "0x10", "exceptionCode": "0xC0000005",
+                   "jobHandleClosed": True, "ownedProcessReaped": True}
+        for mode in ("captured", "timeout", "non-loopback", "unproven-fixture"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                data = root / "sumi-w3"
+                data.mkdir()
+                if mode != "unproven-fixture":
+                    (data / "app-bootstrap-first.log").write_bytes(b"app-build\r\nhome-window\r\n")
+                site = "https://fixture.invalid" if mode == "non-loopback" else "https://127.0.0.1:1234"
+                args = SimpleNamespace(data=data, session=data, binary=root / "takosumi-mobile.exe", site=site)
+
+                def launch(argv, **options):
+                    self.assertEqual(argv[:4], [sys.executable, "-I", "-B", str(runner.NATIVE_FAULT_PROBE)])
+                    self.assertEqual(argv[4:6], ["--binary", str(args.binary)])
+                    self.assertEqual(argv[-2:], ["--site", site])
+                    self.assertEqual(argv[6], "--case")
+                    case = Path(argv[7])
+                    self.assertEqual(case.parent, root)
+                    self.assertNotEqual(case, data)
+                    self.assertEqual((case / ".owned-browser-reference").read_text(), case.name)
+                    self.assertTrue((case / "tmp").is_dir())
+                    self.assertEqual(options["timeout"], runner.NATIVE_FAULT_PROBE_WAIT)
+                    self.assertEqual(options["env"]["TEMP"], str(case / "tmp"))
+                    self.assertNotIn("GITHUB_TOKEN", options["env"])
+                    if mode == "timeout":
+                        raise runner.subprocess.TimeoutExpired(argv, options["timeout"], output="private timeout")
+                    return runner.subprocess.CompletedProcess(argv, 0, json.dumps(receipt))
+
+                with mock.patch.dict(runner.os.environ, {"USERPROFILE": str(root), "LOCALAPPDATA": str(root / "local"),
+                                                        "APPDATA": str(root / "roaming"), "GITHUB_TOKEN": "private"}), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=launch) as command:
+                    runner.record_native_fault_probe(args)
+                self.assertEqual(command.call_count, int(mode in ("captured", "timeout")))
+                observed = json.loads((data / "native-fault-probe.json").read_text())
+                expected = receipt if mode == "captured" else {
+                    "observed": False, "diagnosticComplete": False,
+                    "reason": "probe_process_timeout" if mode == "timeout" else "probe_unavailable"}
+                self.assertEqual(observed, dict(expected, diagnosticOnly=True))
 
 
 if __name__ == "__main__":

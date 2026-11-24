@@ -73,6 +73,7 @@ from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs
+from uuid import uuid4
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -80,10 +81,13 @@ sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
 from windows_smoke import (CREATE_SUSPENDED, Failure, WindowsJob, browser_shutdown, describe_processes,  # noqa: E402
                            process_records, require, tail)
 from windows_browser_observer import REAL_SITES  # noqa: E402
+from windows_native_fault_probe import EXCEPTION_ACCESS_VIOLATION, loopback_site, safe_fixture_environment  # noqa: E402
 from windows_package import application_error_event  # noqa: E402
 
 WINDOWS = os.name == "nt"
 OBSERVER = HERE / "windows_browser_observer.py"
+NATIVE_FAULT_PROBE = HERE / "windows_native_fault_probe.py"
+NATIVE_FAULT_PROBE_WAIT = 45  # Separate process bound, including Win32 calls and diagnostic cleanup.
 # As browser_process.py: the App gives a browser that agreed to stop up to
 # STOP_FINISH (30 s, process_adapter.rs) to end normally, and the runner waits
 # that long plus a margin before calling an App exit abnormal.
@@ -540,7 +544,45 @@ def app_error_at_observer_failure(app, executable, started_at):
     return {"available": False, "reason": "event_query_unavailable"}
 
 
-def run_phase(args, env, files, before, head, suffix):
+def is_access_violation(exit_code):
+    return type(exit_code) is int and exit_code in (
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_ACCESS_VIOLATION - (1 << 32))
+
+
+def record_native_fault_probe(args):
+    """Run the existing diagnostic in a fresh case and retain only its structured report."""
+    report = {"observed": False, "diagnosticComplete": False, "reason": "probe_unavailable"}
+    try:
+        require(loopback_site(args.site) is not None, "Expected the existing loopback fixture origin")
+        # This marker is written by the App's fixture build, not its launcher.
+        require(read_session(args.session / "app-bootstrap-first.log", 4096).splitlines()[:1] == [b"app-build"],
+                "The failed App did not establish the fixture entry point")
+        case = new_case(args.data.parent / f"fault-{uuid4().hex[:12]}")
+        require(not any(os.path.lexists(path) for path in app_data(case.name)),
+                "The diagnostic fixture app data must be fresh")
+        case.mkdir()
+        (case / "tmp").mkdir()
+        (case / ".owned-browser-reference").write_text(case.name, encoding="utf-8")
+        # A process deadline covers native calls. Ending the diagnostic also
+        # closes its own kill-on-close job, which no child inherits.
+        result = subprocess.run([sys.executable, "-I", "-B", str(NATIVE_FAULT_PROBE),
+                                 "--binary", str(args.binary), "--case", str(case), "--site", args.site],
+                                env=safe_fixture_environment(os.environ, case), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                timeout=NATIVE_FAULT_PROBE_WAIT, check=False)
+        if result.returncode in (0, 2):
+            value = json.loads(result.stdout)
+            if isinstance(value, dict):
+                report = value
+    except subprocess.TimeoutExpired:
+        report["reason"] = "probe_process_timeout"
+    except (OSError, ValueError, Failure):
+        pass
+    with create_exclusive(args.session / "native-fault-probe.json") as output:
+        json.dump(dict(report, diagnosticOnly=True), output, indent=2)
+
+
+def run_phase(args, env, files, before, head, suffix, after_access_violation=None):
     """One App launch on the case's data; returns its proof."""
     session, phase = args.session, suffix[1:]
     proof = {"passed": False, "phase": phase or "first", "sourceHead": head, "artifactsBefore": before}
@@ -592,9 +634,7 @@ def run_phase(args, env, files, before, head, suffix):
                     # terminates it; do not replace the observer's failure.
                     state = app_state_at_observer_failure(app)
                     execution["appStateAtObserverFailure"] = state
-                    exit_code = state.get("exitCode")
-                    if state.get("state") == "exited" and type(exit_code) is int and \
-                            exit_code & 0xFFFFFFFF == 0xC0000005:
+                    if state.get("state") == "exited" and is_access_violation(state.get("exitCode")):
                         execution["applicationError"] = app_error_at_observer_failure(
                             app, args.binary, started_at)
                     raise
@@ -634,6 +674,7 @@ def run_phase(args, env, files, before, head, suffix):
             proof["error"] = execution["error"] = f"{type(error).__name__}: {error}"
             raise
         finally:
+            active = None
             try:
                 if app.poll() is None:
                     # This exact Popen is owned; ending it closes the App's own
@@ -676,6 +717,15 @@ def run_phase(args, env, files, before, head, suffix):
                     output.write(json.dumps(proof, indent=2) + "\n")
                 if not proof["passed"]:
                     tails(session, suffix)
+                    exit_code = execution.get("appExit", execution.get("appStateAtObserverFailure", {}).get("exitCode"))
+                    if (after_access_violation is not None and not suffix and active == 0
+                            and "cleanupError" not in proof and proof.get("artifactsAfter") == before
+                            and proof.get("sourceHeadAfter") == head
+                            and is_access_violation(exit_code)):
+                        try:
+                            after_access_violation()
+                        except Exception:
+                            pass  # The original error and cleanup evidence are already recorded.
     return proof
 
 
@@ -709,6 +759,8 @@ def main():
                         help="relaunch, clear Work's site data from the home, and verify only Work was cleared")
     parser.add_argument("--recover", action="store_true",
                         help="standalone fresh-case same-App recovery after an explicitly owned browser fault")
+    parser.add_argument("--native-fault-probe", action="store_true",
+                        help="after an initial fixture App access violation, try one isolated diagnostic")
     parser.add_argument("--real-site", choices=sorted(REAL_SITES),
                         help="W4: the app home links to this real site; first launch only, cases named <site>/<case>")
     parser.add_argument("--unsandboxed-candidate", action="store_true",
@@ -717,6 +769,8 @@ def main():
     args = parser.parse_args()
     if args.recover and (args.restart or args.reset or args.real_site or args.packaged or args.unsandboxed_candidate):
         parser.error("--recover is a standalone sandboxed synthetic-site scenario, without --packaged")
+    if args.native_fault_probe and (args.packaged or args.real_site or args.recover or args.unsandboxed_candidate):
+        parser.error("--native-fault-probe requires the normal uninstalled sandboxed loopback fixture")
     if args.real_site and (args.restart or args.reset):
         parser.error("--real-site runs the first launch only")
     if args.packaged and (args.browser or args.guard):
@@ -846,8 +900,13 @@ def run(args, summary):
         env = browser_env(os.environ, args, session, log)
         runtime = args.browser.parent / "libcef.dll"
         require(runtime.is_file(), f"No libcef.dll beside {args.browser}")
-        files = sorted(set([args.binary, args.browser, runtime, args.guard] + browser_code(args.browser) +
-                           source_files(REPO)))
+        files = set([args.binary, args.browser, runtime, args.guard] + browser_code(args.browser) +
+                    source_files(REPO))
+        if args.native_fault_probe:
+            require(NATIVE_FAULT_PROBE.is_file() and not NATIVE_FAULT_PROBE.is_symlink(),
+                    "Expected the local Windows fault probe source")
+            files.add(NATIVE_FAULT_PROBE)
+        files = sorted(files)
         before = {str(file): digest(file) for file in files}
         snapshot = args.data / "source-snapshot"
         for file in files:
@@ -858,9 +917,16 @@ def run(args, summary):
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
         phases = (["-recover"] if getattr(args, "recover", False) else
                   [""] + (["-restart"] if args.restart else []) + (["-reset"] if args.reset else []))
+
+        def probe_first_fault():
+            # Preserve only the normal run's site requests in its summary.
+            summary["siteRequests"] = list(server.requests)
+            record_native_fault_probe(args)
+
         for suffix in phases:
             phase_env = dict(env, TAKOSUMI_BROWSER_PROCESS_PHASE=suffix[1:]) if suffix else env
-            proof = run_phase(args, phase_env, files, before, head, suffix)
+            probe = probe_first_fault if args.native_fault_probe and not suffix else None
+            proof = run_phase(args, phase_env, files, before, head, suffix, after_access_violation=probe)
             shutdown = shutdown_summary(proof.get("guardRecords"))
             summary["phases"].append({"phase": proof["phase"], "passed": proof["passed"],
                                       "sessionJob": proof.get("sessionJob"), "sandbox": proof.get("sandbox"),
@@ -896,7 +962,7 @@ def run(args, summary):
     finally:
         server.shutdown()
         server.server_close()
-        summary["siteRequests"] = server.requests
+        summary.setdefault("siteRequests", server.requests)
 
 
 if __name__ == "__main__":
