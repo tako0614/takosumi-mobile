@@ -551,7 +551,33 @@ class Emulator:
                 self.fd = None
 
 
-def preserve_guest_anr(emulator, scratch, out):
+def focused_system_ui_anr_at_initial_save(ui_result, hierarchy, activities):
+    if not isinstance(ui_result, dict) or ui_result.get("passed") is not False or ui_result.get("cases") != []:
+        return False
+    wait = ui_result.get("initialSaveWait")
+    if (not isinstance(wait, dict) or wait.get("phase") != "initial_save_wait"
+            or wait.get("recordingIncomplete") is not False):
+        return False
+    samples = wait.get("samples")
+    if type(samples) is not int or samples <= 0 or wait.get("queryNull") != samples:
+        return False
+    focus = re.findall(rb"(?m)^[ \t]*mCurrentFocus=([^\r\n]*)", activities)
+    if len(focus) != 1 or not re.fullmatch(
+            rb"Window\{[0-9a-f]{1,16} u0 Application Not Responding: com\.android\.systemui\}", focus[0].rstrip()):
+        return False
+    # The driver captured this hierarchy at the failed wait. The later window
+    # snapshot alone could reflect a dialog shown after the failure.
+    if len(hierarchy) > 128 * 1024:
+        return False
+    try:
+        nodes = ET.fromstring(hierarchy).iter("node")
+        return any(node.get("package") == "android" and node.get("resource-id") == "android:id/alertTitle"
+                   and node.get("text") == "System UI isn't responding" for node in nodes)
+    except ET.ParseError:
+        return False
+
+
+def preserve_guest_anr(emulator, scratch, out, *, ui_result=None, hierarchy=b""):
     """Failure-only reads; an absent/late diagnostic never qualifies the UI."""
     result = {"diagnosticOnly": True, "scope": "Exact owned disposable Android guest", "queries": {}}
     for label, query, limit in (
@@ -596,6 +622,10 @@ def preserve_guest_anr(emulator, scratch, out):
                     # Reuse this already-read snapshot; no new PID/process query.
                     entry["appProcessPid"] = (native_activity_pid(data, truncated=size > len(data))
                                               if entry.get("queryReturned") else None)
+                    if (entry.get("queryReturned") and not entry["truncated"]
+                            and focused_system_ui_anr_at_initial_save(ui_result, hierarchy, data)):
+                        result["setupBlocker"] = {"phase": "initial_save_wait", "reason": "focused_system_ui_anr",
+                                                  "evidenceScope": "failure_capture"}
         except Exception as error:
             entry["collectionErrorType"] = type(error).__name__
     return result
@@ -766,9 +796,10 @@ ROOT_BOOTSTRAP_TAG = "TakosRootBootstrap"
 # messages from the retained main buffer; unrelated later noise cannot spend
 # this budget. -d stays finite and the existing read/identity bounds still apply.
 ROOT_BOOTSTRAP_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-m", "64")
+ROOT_BOOTSTRAP_BIRTH = rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
+ROOT_PAGE_LOAD_PACKET = re.compile(ROOT_BOOTSTRAP_BIRTH + rb"pageLoad=(started|finished) rootEnd=1")
 ROOT_BOOTSTRAP_PACKET = re.compile(
-    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
-    rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
+    ROOT_BOOTSTRAP_BIRTH + rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
     rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
     rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1 rootEnd=1")
 
@@ -845,15 +876,22 @@ def root_guest_identity(data, pid):
 
 
 def parse_root_bootstrap(data, identity):
-    records, rejected, cut = [], 0, False
+    records, page_load, rejected, cut = [], [], 0, False
     for line in data.splitlines():
-        match = ROOT_BOOTSTRAP_PACKET.fullmatch(line) if len(line) <= 384 else None
-        if match:
-            pid, tick, receipt, seq = (int(match[v]) for v in (1, 2, 4, 5))
+        load = ROOT_PAGE_LOAD_PACKET.fullmatch(line) if len(line) <= 384 else None
+        match = load or (ROOT_BOOTSTRAP_PACKET.fullmatch(line) if len(line) <= 384 else None)
+        if (match and int(match[1]) == identity["pid"] and int(match[2]) == identity["startTick"]
+                and match[3].decode("ascii") == identity["bootId"]):
+            if load:
+                event = load[4].decode("ascii")
+                if event not in page_load:
+                    page_load.append(event)
+                    continue
+                rejected = min(65, rejected + 1)
+                continue
+            receipt, seq = int(match[4]), int(match[5])
             stage, elapsed = match[6].decode("ascii"), int(match[7])
-            valid = (pid == identity["pid"] and tick == identity["startTick"]
-                     and match[3].decode("ascii") == identity["bootId"] and receipt <= 33
-                     and elapsed <= 600_000 and
+            valid = (receipt <= 33 and elapsed <= 600_000 and
                      ((stage in ("unknown", "cap") and seq == 0 and elapsed == -1
                        and (stage == "cap" or receipt <= 32)) or
                       (stage not in ("unknown", "cap") and receipt <= 32 and 1 <= seq <= 16)))
@@ -865,7 +903,7 @@ def parse_root_bootstrap(data, identity):
                                 "elapsedMs": None if elapsed == -1 else elapsed})
                 continue
         rejected = min(65, rejected + 1)
-    return records, rejected, cut
+    return records, page_load, rejected, cut
 
 
 def preserve_root_bootstrap(emulator, scratch, out, prior):
@@ -873,7 +911,8 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
     result = {"diagnosticOnly": True, "phase": "root_main_snapshot", "absenceIsUnknown": True,
               "clockDomain": "browser_performance_time_origin_ms", "birthDomain": "guest_kernel_start_ticks",
               "timestampsComparableAcrossDomains": False, "sequenceMayRepeatAcrossRealms": True,
-              "coverage": "unknown", "records": [], "queryReturned": False, "identityBookendsMatch": False,
+              "coverage": "unknown", "records": [], "pageLoadCallbacks": [], "queryReturned": False,
+              "identityBookendsMatch": False,
               "commandWaitSeconds": 10, "matchingPacketLimit": 64,
               "captureWindow": "pid_main_closed_tag_then_first64", "rawReadCapBytes": 65536,
               "recordLimit": 33, "lineLimitBytes": 384, "savedByteLimit": 16384}
@@ -911,9 +950,9 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
                                  "-s", ROOT_BOOTSTRAP_TAG + ":I", "*:S"), 65536)
         after = root_guest_identity(query("after", identity_query, 8192), pid)
         require(after == before, "Root guest identity changed")
-        records, rejected, cut = parse_root_bootstrap(data, before)
+        records, page_load, rejected, cut = parse_root_bootstrap(data, before)
         result.update(guestIdentity=before, identityBookendsMatch=True, queryReturned=True,
-                      records=records, rejectedPackets=rejected, recordLimitReached=cut,
+                      records=records, pageLoadCallbacks=page_load, rejectedPackets=rejected, recordLimitReached=cut,
                       sourceBytes=len(data), nativeCapSeen=any(row["stage"] == "cap" for row in records))
     except BaseException as error:
         result["records"] = []
@@ -998,6 +1037,7 @@ def main():
              "normalSDKApp": baseline, "cleanup": False, "normalAPKRestored": False, "scratchRemoved": False,
              "adbServiceScope": "Existing adb service is outside the emulator guard; never killed"}
     servers, overlay, emulator, variant, failure = [], None, None, None, None
+    ui_result, hierarchy = None, b""
     backup = scratch / "normal.apk"
     shutil.copyfile(apk, backup)
     backup_custody = FileCustody(backup, scratch)
@@ -1043,10 +1083,12 @@ def main():
                 try:
                     data = emulator.run("exec-out", "run-as", DRIVER, "cat", "files/" + name, binary=True)
                     (out / name).write_bytes(data)
+                    if name == "hierarchy.xml":
+                        hierarchy = data
                 except Exception as error:
                     proof.setdefault("diagnosticErrors", []).append(name + ":" + type(error).__name__)
-        result = json.loads((out / "result.json").read_text())
-        proof["test"] = require_ui_pass(log, result)
+        ui_result = json.loads((out / "result.json").read_text())
+        proof["test"] = require_ui_pass(log, ui_result)
         require_site_events(instance.events, editor.events)
         proof["installedAfter"] = installed(emulator, variant["apk"]["sha256"])
         require(verify_app(ROOT, fixture_ca=ca) == variant, "App build changed during UI operations")
@@ -1056,7 +1098,7 @@ def main():
         proof["errorType"] = type(error).__name__
         proof["error"] = str(error)
         if isinstance(error, Exception) and emulator is not None:
-            proof["guestANR"] = preserve_guest_anr(emulator, scratch, out)
+            proof["guestANR"] = preserve_guest_anr(emulator, scratch, out, ui_result=ui_result, hierarchy=hierarchy)
             # native-observation-begin:failure-call
             try:
                 proof["nativeObservation"] = preserve_native_observation(emulator, scratch, out, proof["guestANR"])

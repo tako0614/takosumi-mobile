@@ -141,38 +141,73 @@ fn android_packet(pid: u32, start_tick: u64, boot: &str, line: &str) -> String {
 }
 
 #[cfg(target_os = "android")]
-pub fn install_android<R: tauri::Runtime>(app: &tauri::App<R>) {
+fn android_birth() -> Option<&'static (u32, u64, String)> {
     use std::io::Read;
+    use std::sync::OnceLock;
+
+    static BIRTH: OnceLock<Option<(u32, u64, String)>> = OnceLock::new();
+    BIRTH.get_or_init(|| {
+        let pid = std::process::id();
+        let mut stat = Vec::new();
+        std::fs::File::open("/proc/self/stat").ok()?.take(4097).read_to_end(&mut stat).ok()?;
+        let start_tick = process_start_tick(&stat, pid)?;
+        let mut boot = Vec::new();
+        std::fs::File::open("/proc/sys/kernel/random/boot_id").ok()?.take(38).read_to_end(&mut boot).ok()?;
+        Some((pid, start_tick, kernel_boot_id(&boot)?))
+    }).as_ref()
+}
+
+#[cfg(target_os = "android")]
+fn write_android(line: &str) {
+    let Some((pid, start_tick, boot)) = android_birth() else { return };
+    let packet = android_packet(*pid, *start_tick, boot, line);
+    if let Ok(message) = std::ffi::CString::new(packet) {
+        #[link(name = "log")]
+        unsafe extern "C" {
+            fn __android_log_write(priority: i32, tag: *const std::ffi::c_char,
+                                   text: *const std::ffi::c_char) -> i32;
+        }
+        unsafe { __android_log_write(4, c"TakosRootBootstrap".as_ptr(), message.as_ptr()); }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn observe_android_page_load<R: tauri::Runtime>(
+    webview: &tauri::Webview<R>,
+    payload: &tauri::webview::PageLoadPayload<'_>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tauri::{webview::PageLoadEvent, Manager};
+
+    if webview.label() != "main" || webview.app_handle().config().identifier != "com.takosumi.fixture.android" {
+        return;
+    }
+    // Keep the first Wry callback of each kind. Finished is an observation,
+    // including on error pages. It does not prove successful load or paint.
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    static FINISHED: AtomicBool = AtomicBool::new(false);
+    let (seen, line) = match payload.event() {
+        PageLoadEvent::Started => (&STARTED, "pageLoad=started"),
+        PageLoadEvent::Finished => (&FINISHED, "pageLoad=finished"),
+    };
+    if !seen.swap(true, Ordering::Relaxed) {
+        write_android(line);
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn install_android<R: tauri::Runtime>(app: &tauri::App<R>) {
     use std::sync::{Arc, Mutex};
     use tauri::Listener;
 
-    if !cfg!(debug_assertions) || app.config().identifier != "com.takosumi.fixture.android" {
+    if app.config().identifier != "com.takosumi.fixture.android" || android_birth().is_none() {
         return;
     }
-    let pid = std::process::id();
-    let mut stat = Vec::new();
-    let Some(start_tick) = std::fs::File::open("/proc/self/stat").ok()
-        .and_then(|file| file.take(4097).read_to_end(&mut stat).ok())
-        .and_then(|_| process_start_tick(&stat, pid)) else { return };
-    let mut boot = Vec::new();
-    let Some(boot) = std::fs::File::open("/proc/sys/kernel/random/boot_id").ok()
-        .and_then(|file| file.take(38).read_to_end(&mut boot).ok())
-        .and_then(|_| kernel_boot_id(&boot)) else { return };
     let recorder = Arc::new(Mutex::new(Recorder::new(true)));
     app.listen("takosumi-fixture-bootstrap", move |event| {
         let line = recorder.lock().ok().and_then(|mut r| r.record(event.payload()));
         if let Some(line) = line {
-            let packet = android_packet(pid, start_tick, &boot, &line);
-            if let Ok(message) = std::ffi::CString::new(packet) {
-                // Private diagnostic only. Log loss/blocking must not alter the
-                // Root event or UI verdict; no new invoke command/permission.
-                #[link(name = "log")]
-                unsafe extern "C" {
-                    fn __android_log_write(priority: i32, tag: *const std::ffi::c_char,
-                                           text: *const std::ffi::c_char) -> i32;
-                }
-                unsafe { __android_log_write(4, c"TakosRootBootstrap".as_ptr(), message.as_ptr()); }
-            }
+            write_android(&line);
         }
     });
 }
