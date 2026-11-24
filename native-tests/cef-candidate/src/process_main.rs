@@ -680,22 +680,33 @@ fn mac_window_pending(browser: &Browser) -> bool {
 /// `window_wait::BOUND` (15 s, before the adapter's 20 s Open wait; the
 /// screen is closed). A look that cannot be posted ends the same way.
 #[cfg(target_os = "macos")]
-fn await_window(id: u64, key: String, browser: Browser, started: std::time::Instant) {
+fn await_window(id: u64, key: String, browser_id: i32, started: std::time::Instant) {
     use window_wait::Step;
-    let browser_id = browser.identifier();
     let waited = started.elapsed();
-    let (screen_open, stopping) = with_state(|state| {
+    let (browser, stopping) = with_state(|state| {
         (
-            state.screens.contains_key(&browser_id),
+            state
+                .screens
+                .get(&browser_id)
+                .map(|screen| screen.browser.clone()),
             state.shutdown.is_some() || state.quitting,
         )
     });
-    let host = browser.host().unwrap();
-    let window = screen_open && mac_front::window_number(host.window_handle()) != 0;
-    let step = window_wait::step(screen_open, stopping, window, waited);
+    // OnBeforeClose removes the registry entry. A queued poll owns only
+    // its identifier, so it cannot retain or call a destroyed CEF browser.
+    let host = browser.as_ref().map(|browser| browser.host().unwrap());
+    let step = window_wait::step(
+        browser.is_some(),
+        stopping,
+        || {
+            host.as_ref()
+                .is_some_and(|host| mac_front::window_number(host.window_handle()) != 0)
+        },
+        waited,
+    );
     match step {
         Step::Again => {
-            let mut task = WindowTask::new(id, key, browser.clone(), started);
+            let mut task = WindowTask::new(id, key, browser_id, started);
             let delay = i64::try_from(window_wait::POLL.as_millis()).unwrap_or(i64::MAX);
             if post_delayed_task(ThreadId::UI, Some(&mut task), delay) == 1 {
                 return;
@@ -703,9 +714,10 @@ fn await_window(id: u64, key: String, browser: Browser, started: std::time::Inst
             eprintln!(
                 "macOS: the look for browser {browser_id}'s window could not be posted; closing it"
             );
-            end_window_wait(id, &host, true, "The browser window could not be awaited");
+            end_window_wait(id, host.as_ref(), "The browser window could not be awaited");
         }
         Step::Ready => {
+            let host = host.as_ref().unwrap();
             eprintln!(
                 "macOS: browser {browser_id} window after {} ms: {}",
                 waited.as_millis(),
@@ -720,7 +732,7 @@ fn await_window(id: u64, key: String, browser: Browser, started: std::time::Inst
                 host.close_browser(1);
                 return;
             }
-            opened(id, key, &browser);
+            opened(id, key, browser.as_ref().unwrap());
         }
         Step::Closed | Step::Stopping | Step::Expired => {
             eprintln!(
@@ -728,7 +740,7 @@ fn await_window(id: u64, key: String, browser: Browser, started: std::time::Inst
                 waited.as_millis()
             );
             let message = window_wait::refusal(step).expect("An end without opened has its error");
-            end_window_wait(id, &host, step != Step::Closed, message);
+            end_window_wait(id, host.as_ref(), message);
         }
     }
 }
@@ -738,10 +750,10 @@ fn await_window(id: u64, key: String, browser: Browser, started: std::time::Inst
 /// on_before_close lets the browser quit), and let a browser whose last
 /// screen has gone quit.
 #[cfg(target_os = "macos")]
-fn end_window_wait(id: u64, host: &BrowserHost, close: bool, message: &str) {
+fn end_window_wait(id: u64, host: Option<&BrowserHost>, message: &str) {
     error(id, message);
     with_state(|state| state.pending -= 1);
-    if close {
+    if let Some(host) = host {
         host.close_browser(1);
     }
     maybe_quit();
@@ -815,7 +827,7 @@ wrap_life_span_handler! {
             });
             if !self.bound { browser.host().unwrap().close_browser(1);return; }
             #[cfg(target_os = "macos")]
-            if awaiting { await_window(self.id,self.key.clone(),browser.clone(),std::time::Instant::now());return; }
+            if awaiting { await_window(self.id,self.key.clone(),browser.identifier(),std::time::Instant::now());return; }
             let (stopping,failed,over_limit)=with_state(|state|(state.shutdown.is_some(),state.failed,state.screens.len()>48));
             if stopping||over_limit { browser.host().unwrap().close_browser(i32::from(failed||over_limit));return; }
             if !popup { opened(self.id,self.key.clone(),browser); }
@@ -1290,8 +1302,8 @@ wrap_task! {
 // macOS: the next look for a new browser's NSWindow (`await_window`).
 #[cfg(target_os = "macos")]
 wrap_task! {
-    struct WindowTask { id: u64, key: String, browser: Browser, started: std::time::Instant }
-    impl Task { fn execute(&self) { await_window(self.id, self.key.clone(), self.browser.clone(), self.started); } }
+    struct WindowTask { id: u64, key: String, browser_id: i32, started: std::time::Instant }
+    impl Task { fn execute(&self) { await_window(self.id, self.key.clone(), self.browser_id, self.started); } }
 }
 // Windows: keyboard focus for a reused browser, requested after its raise.
 #[cfg(windows)]
