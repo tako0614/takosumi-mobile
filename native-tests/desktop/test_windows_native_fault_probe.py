@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
@@ -16,6 +16,18 @@ import windows_native_fault_probe as probe  # noqa: E402
 
 
 class EventPolicyTests(unittest.TestCase):
+    def test_source_location_keeps_only_checkout_or_public_crate_relative_paths(self):
+        repo = PureWindowsPath(r"D:\\a\\private-runner-path\\takosumi-mobile")
+        self.assertEqual(probe.source_location(str(repo / "src-tauri/src/lib.rs"), 422, repo),
+                         {"file": "src-tauri/src/lib.rs", "line": 422})
+        self.assertEqual(probe.source_location(
+            r"C:\\Users\\private\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\wry-0.55.1\\src\\lib.rs",
+            34, repo), {"file": "wry-0.55.1/src/lib.rs", "line": 34})
+        for name in (r"C:\\private\\token.rs", "src/lib.rs", "src-tauri/../private.rs",
+                     r"C:\\.cargo\\registry\\src\\private-registry-12345678\\scope-1.2.3\\src\\lib.rs"):
+            self.assertIsNone(probe.source_location(name, 34, repo))
+        self.assertIsNone(probe.source_location(str(repo / "src-tauri/src/lib.rs"), 0, repo))
+
     def test_only_initial_breakpoint_is_handled_and_other_exceptions_fail_through(self):
         pid = 73
         created = probe.DebugEvent(probe.DEBUG_EVENT_CREATE_PROCESS, pid, 1)
@@ -71,7 +83,7 @@ class ProbeLifecycleTests(unittest.TestCase):
             binary, case = self.make_owned_case(Path(temporary))
             pid = 73
             events = [
-                probe.DebugEvent(probe.DEBUG_EVENT_CREATE_PROCESS, pid, 1, close_handles=(10,)),
+                probe.DebugEvent(probe.DEBUG_EVENT_CREATE_PROCESS, pid, 1, close_handles=(10,), image_base=0xA000),
                 probe.DebugEvent(probe.DEBUG_EVENT_EXCEPTION, pid, 1,
                                  probe.EXCEPTION_BREAKPOINT, True),
                 probe.DebugEvent(probe.DEBUG_EVENT_EXCEPTION, pid, 1,
@@ -144,6 +156,8 @@ class ProbeLifecycleTests(unittest.TestCase):
                         return "takosumi-mobile.exe", 0xA000
                     if address == 0xB425:
                         return r"C:\\private\\bad.dll", 0xB000
+                    if address == 0xC420:
+                        return "takosumi-mobile.exe", 0xC000
                     self.lookup = (actual_pid, address)
                     return "WebView2Loader.dll", 0x1000
 
@@ -159,7 +173,7 @@ class ProbeLifecycleTests(unittest.TestCase):
             def unwind(*_):
                 self.assertEqual(published, [{"faultingModule": "WebView2Loader.dll",
                                               "faultingOffset": "0x190", "moduleReason": "module_mapped"}])
-                return iter((0xA420, 0xB425))
+                return iter((0xA420, 0xB425, 0xC420))
             with patch.object(probe, "stopped_amd64_frames", side_effect=unwind) as stack:
                 report = probe.run_probe(binary, case, timeout_seconds=2, source_env=secrets,
                                          site_url="https://127.0.0.1:44321",
@@ -171,7 +185,10 @@ class ProbeLifecycleTests(unittest.TestCase):
                                      "reason": "last_chance_access_violation",
                                      "exceptionCode": "0xC0000005", "faultingModule": "WebView2Loader.dll",
                                      "faultingOffset": "0x190", "moduleReason": "module_mapped",
-                                     "callerFrames": [{"module": "takosumi-mobile.exe", "offset": "0x420"}],
+                                     "callerFrames": [
+                                         {"module": "takosumi-mobile.exe", "offset": "0x420", "fixtureAppImage": True},
+                                         {"module": "takosumi-mobile.exe", "offset": "0x420"},
+                                     ],
                                      "processExitCode": 3221225477,
                                      "jobHandleClosed": True, "ownedProcessReaped": True})
             self.assertNotIn("passed", report)

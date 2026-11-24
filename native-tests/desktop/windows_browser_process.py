@@ -581,14 +581,21 @@ def record_native_fault_probe(args):
                 report = value
     except subprocess.TimeoutExpired as error:
         report["reason"] = "probe_process_timeout"
-        try:
-            prefix = json.loads((error.stdout or b"").splitlines()[0])
-            module = prefix.get("moduleObserved") if isinstance(prefix, dict) else None
+        for line in (error.stdout or b"").splitlines()[:2]:
+            try:
+                prefix = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(prefix, dict):
+                continue
+            module = prefix.get("moduleObserved")
             if isinstance(module, dict) and module.get("moduleReason") == "module_mapped":
                 report.update(observed=True, exceptionCode="0xC0000005", moduleReason="module_mapped",
                               faultingModule=module.get("faultingModule"), faultingOffset=module.get("faultingOffset"))
-        except (ValueError, IndexError):
-            pass
+            stack = prefix.get("stackObserved")
+            if (isinstance(stack, dict) and stack.get("diagnosticComplete") is True
+                    and stack.get("observed") is True and stack.get("ownedProcessReaped") is True):
+                report = dict(stack, sourceResolution="timeout")
     except (OSError, ValueError, Failure):
         pass
     with create_exclusive(args.session / "native-fault-probe.json") as output:

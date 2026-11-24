@@ -19,7 +19,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -69,6 +69,7 @@ class DebugEvent:
     exception_address: int | None = None
     exit_code: int | None = None
     close_handles: tuple[int, ...] = ()
+    image_base: int | None = None
 
 
 def continue_status(event: DebugEvent, target_pid: int, process_created: bool,
@@ -361,7 +362,8 @@ def _unwind(process, thread, context: _Amd64Context, case_dir: Path):
         cleanup(process)
 
 
-def caller_frame_projection(api, event: DebugEvent, case_dir: Path) -> list[dict[str, str]]:
+def caller_frame_projection(api, event: DebugEvent, case_dir: Path,
+                            app_image_base: int | None) -> list[dict[str, object]]:
     """Project only mapped module-relative frames. Missing unwind keeps the fault."""
     if event.exception_address is None:
         return []
@@ -374,10 +376,103 @@ def caller_frame_projection(api, event: DebugEvent, case_dir: Path) -> list[dict
             projected = module_projection(name, base, address)
             module, offset = projected["faultingModule"], projected["faultingOffset"]
             if module is not None and offset is not None:
-                frames.append({"module": module, "offset": offset})
+                frame: dict[str, object] = {"module": module, "offset": offset}
+                if app_image_base and base == app_image_base:
+                    frame["fixtureAppImage"] = True
+                frames.append(frame)
         return frames
     except Exception:
         return []
+
+
+class _ImageHlpLine64(ctypes.Structure):
+    _fields_ = [("SizeOfStruct", _U32), ("Key", _POINTER), ("LineNumber", _U32),
+                ("FileName", wintypes.LPWSTR), ("Address", _U64)]
+
+
+def source_location(file_name: str | None, line: int, repo: PureWindowsPath) -> dict[str, object] | None:
+    """Retain checkout-relative or crate-relative Rust paths only."""
+    if not file_name or len(file_name) > 1024 or not 1 <= line <= 200_000:
+        return None
+    path = PureWindowsPath(file_name)
+    if path.suffix.lower() != ".rs" or ".." in path.parts:
+        return None
+    if path.is_relative_to(repo):
+        parts = path.relative_to(repo).parts
+    elif not path.anchor and path.parts[:1] == ("src-tauri",):
+        parts = path.parts
+    else:
+        lowered = tuple(part.lower() for part in path.parts)
+        try:
+            index = lowered.index(".cargo")
+        except ValueError:
+            return None
+        if len(lowered) < index + 7 or lowered[index + 1:index + 3] != ("registry", "src"):
+            return None
+        if not re.fullmatch(r"index\.crates\.io-[0-9a-f]{8,20}", lowered[index + 3]):
+            return None
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*-[0-9][a-z0-9_.-]*", lowered[index + 4]):
+            return None
+        parts = path.parts[index + 4:]
+    if not parts or any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", part) for part in parts):
+        return None
+    return {"file": "/".join(parts), "line": line}
+
+
+def application_source_lines(frames: list[dict[str, object]], binary: Path, repo: PureWindowsPath):
+    """Read matched line tables from the exact fixture EXE after the child exited."""
+    if os.name != "nt" or ctypes.sizeof(_ImageHlpLine64) != 40:
+        return
+    search_path = str(binary.parent)
+    if not re.fullmatch(r"[A-Za-z]:\\[^;*]*", search_path):
+        return
+    pdbs = (binary.with_suffix(".pdb"), binary.with_name(binary.stem.replace("-", "_") + ".pdb"))
+    if not any(path.is_file() and not path.is_symlink() for path in pdbs):
+        return
+    dbghelp = ctypes.WinDLL("dbghelp.dll", winmode=_SYSTEM32)
+    kernel = ctypes.WinDLL("kernel32", winmode=_SYSTEM32)
+    current_process = _declare(kernel, "GetCurrentProcess", _HANDLE)
+    initialize = _declare(dbghelp, "SymInitializeW", wintypes.BOOL, _HANDLE, wintypes.LPCWSTR, wintypes.BOOL)
+    cleanup = _declare(dbghelp, "SymCleanup", wintypes.BOOL, _HANDLE)
+    options = _declare(dbghelp, "SymSetOptions", _U32, _U32)
+    load = _declare(dbghelp, "SymLoadModuleExW", _U64, _HANDLE, _HANDLE, wintypes.LPCWSTR,
+                    wintypes.LPCWSTR, _U64, _U32, _POINTER, _U32)
+    get_line = _declare(dbghelp, "SymGetLineFromAddrW64", wintypes.BOOL, _HANDLE, _U64,
+                        ctypes.POINTER(_U32), ctypes.POINTER(_ImageHlpLine64))
+    # Request line tables and exact matching of the local image's PDB.
+    options(_LOCAL_SYMBOL_OPTIONS | 0x00000010 | 0x00000400)
+    process = current_process()
+    if not initialize(process, search_path, False):
+        return
+    try:
+        base = load(process, None, str(binary), None, 0, 0, None, 0)
+        if not base:
+            return
+        for frame in frames:
+            module = frame.get("module")
+            if (frame.get("fixtureAppImage") is not True or not isinstance(module, str)
+                    or module.lower() != binary.name.lower()):
+                continue
+            offset = frame.get("offset")
+            if not isinstance(offset, str) or not re.fullmatch(r"0x[0-9a-f]{1,8}", offset):
+                continue
+            rva = int(offset, 16)
+            if rva == 0:
+                continue
+            # StackWalk reports a return PC. The preceding byte is at the call site.
+            address = base + rva - 1
+            line = _ImageHlpLine64()
+            line.SizeOfStruct = ctypes.sizeof(line)
+            displacement = _U32()
+            if not get_line(process, address, ctypes.byref(displacement), ctypes.byref(line)):
+                continue
+            if not (base <= line.Address <= address and line.Address + displacement.value == address):
+                continue
+            location = source_location(line.FileName, line.LineNumber, repo)
+            if location is not None:
+                frame["source"] = location
+    finally:
+        cleanup(process)
 
 
 class WindowsDebugApi:
@@ -413,7 +508,7 @@ class WindowsDebugApi:
             raise ProbeApiUnavailable("debug_event_unavailable")
         code, pid, tid = native.dwDebugEventCode, native.dwProcessId, native.dwThreadId
         handles: tuple[int, ...] = ()
-        exception_code = first_chance = address = exit_code = None
+        exception_code = first_chance = address = exit_code = image_base = None
         if code == DEBUG_EVENT_EXCEPTION:
             exception = native.u.Exception
             exception_code = exception.ExceptionRecord.ExceptionCode
@@ -425,12 +520,13 @@ class WindowsDebugApi:
             # and thread event handles are managed by the debug-event lifecycle.
             handle = info.hFile
             handles = (int(handle),) if handle else ()
+            image_base = int(info.lpBaseOfImage) if info.lpBaseOfImage else None
         elif code == DEBUG_EVENT_LOAD_DLL:
             handle = native.u.LoadDll.hFile
             handles = (int(handle),) if handle else ()
         elif code == DEBUG_EVENT_EXIT_PROCESS:
             exit_code = native.u.ExitCode
-        return DebugEvent(code, pid, tid, exception_code, first_chance, address, exit_code, handles)
+        return DebugEvent(code, pid, tid, exception_code, first_chance, address, exit_code, handles, image_base)
 
     def continue_debug_event(self, event: DebugEvent, status: int) -> None:
         if not self.kernel32.ContinueDebugEvent(event.process_id, event.thread_id, status):
@@ -504,6 +600,7 @@ def run_probe(binary: Path, case_dir: Path, *, timeout_seconds: int = WAIT_TIMEO
         job.adopt(process.pid)
         deadline = time.monotonic() + timeout_seconds
         created = False
+        app_image_base = None
         initial_breakpoint_seen = False
         fault: dict[str, object] | None = None
         while time.monotonic() < deadline:
@@ -514,6 +611,7 @@ def run_probe(binary: Path, case_dir: Path, *, timeout_seconds: int = WAIT_TIMEO
             try:
                 if event.process_id == process.pid and event.code == DEBUG_EVENT_CREATE_PROCESS:
                     created = True
+                    app_image_base = event.image_base
                 if fault is None and observed_fault(event, process.pid):
                     module_name, image_base = api.module_for_address(
                         process.pid, event.exception_address or 0)
@@ -522,7 +620,7 @@ def run_probe(binary: Path, case_dir: Path, *, timeout_seconds: int = WAIT_TIMEO
                         on_module_observed(module)
                     fault = {
                         **module,
-                        "callerFrames": caller_frame_projection(api, event, case_dir),
+                        "callerFrames": caller_frame_projection(api, event, case_dir, app_image_base),
                     }
                 status, initial_breakpoint_seen = continue_status(
                     event, process.pid, created, initial_breakpoint_seen)
@@ -622,12 +720,37 @@ def main() -> int:
     parser.add_argument("--site", required=True, help="the fixture HTTPS origin https://127.0.0.1:<port>")
     parser.add_argument("--timeout-seconds", type=int, default=WAIT_TIMEOUT_SECONDS)
     args = parser.parse_args()
+
+    def image_identity():
+        try:
+            if args.binary.is_symlink():
+                return None
+            info = args.binary.stat()
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+        except OSError:
+            return None
+
     def publish_module(module):
         # Retain this projection if a later native unwind hits the process deadline.
         print(json.dumps({"moduleObserved": module}, sort_keys=True), flush=True)
 
+    identity = image_identity()
     report = run_probe(args.binary, args.case, site_url=args.site, timeout_seconds=args.timeout_seconds,
                        on_module_observed=publish_module)
+    frames = report.get("callerFrames")
+    if (isinstance(frames, list) and report.get("diagnosticComplete") is True
+            and report.get("ownedProcessReaped") is True
+            and any(frame.get("fixtureAppImage") is True for frame in frames)):
+        print(json.dumps({"stackObserved": report}, sort_keys=True), flush=True)
+        try:
+            if identity is not None and image_identity() == identity:
+                application_source_lines(frames, args.binary.resolve(), PureWindowsPath(Path(__file__).resolve().parents[2]))
+        except Exception:
+            pass
+        if image_identity() != identity:
+            for frame in frames:
+                frame.pop("source", None)
+        report["sourceResolution"] = "available" if any("source" in frame for frame in frames) else "unavailable"
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("diagnosticComplete") is True else 2
 
