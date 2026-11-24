@@ -8,7 +8,7 @@ publish = false
 # The source and its ECHILD/receipt contract have one owner.
 [[bin]]
 name = "sumi-android-emulator-guard"
-path = "../../cef-candidate/src/guard_entry.rs"
+path = "android_fixture_main.rs"
 harness = false
 
 [dependencies]

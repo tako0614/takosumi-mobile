@@ -18,7 +18,12 @@ mod guard;
 #[path = "guard_macos.rs"]
 mod guard;
 
-#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn main() -> std::process::ExitCode {
+    guard::main(None)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn main() -> std::process::ExitCode {
     guard::main()
 }
