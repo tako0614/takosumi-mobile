@@ -1000,7 +1000,7 @@ def main():
             ca, cert, key = runtime.certificate(scratch, localhost=True)
             runtime.command(["xcrun", "simctl", "boot", udid], out / "boot.log", timeout=30)
             runtime.command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
-            runtime.command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log", trust_trace=True)
+            runtime.import_simulator_ca_with_one_timeout_retry(out, udid, ca, result)
             runtime.command(["xcrun", "simctl", "install", udid, str(app)], out / "install.log", timeout=INSTALL_WAIT)
             result["installedBefore"] = installed_app(out, udid, created, app_proof, "before")
             diagnostic_context = watchdog_context_from_saved_install(out / "installed-before.log", created,

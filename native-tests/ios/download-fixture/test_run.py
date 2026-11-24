@@ -554,6 +554,78 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(stage["diagnosticOnly"])
             self.assertGreaterEqual(stage["stageElapsedSeconds"], 0)
 
+    def test_simulator_ca_import_retries_one_timeout_on_the_same_device_and_ca(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired(argv, 60)
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                    out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            expected = ["xcrun", "simctl", "keychain", "owned-simulator",
+                        "add-root-cert", "owned-ca.pem"]
+            self.assertEqual(calls, [
+                (expected, "trust.log", {"timeout": 60, "trust_trace": True}),
+                (expected, "trust-retry.log", {"timeout": 60, "trust_trace": True}),
+            ])
+            sleep.assert_called_once_with(30)
+            self.assertIn("first attempt:", (out / "trust-stalled.txt").read_text())
+            self.assertEqual(result["simulator"]["trustRetry"], "stalled-retried")
+
+    def test_simulator_ca_import_success_does_not_settle_or_retry(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                    out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1:], ("trust.log", {"timeout": 60, "trust_trace": True}))
+            sleep.assert_not_called()
+            self.assertNotIn("trustRetry", result["simulator"])
+            self.assertFalse((out / "trust-stalled.txt").exists())
+
+    def test_simulator_ca_import_does_not_retry_a_refused_retry(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+            refusal = RuntimeError("retry refused")
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired(argv, 60)
+                raise refusal
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                with self.assertRaises(RuntimeError) as raised:
+                    fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                        out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            self.assertIs(raised.exception, refusal)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][0], calls[1][0])
+            self.assertEqual([call[1] for call in calls], ["trust.log", "trust-retry.log"])
+            sleep.assert_called_once_with(30)
+            self.assertNotIn("trustRetry", result["simulator"])
+
     def test_owned_snapshot_rejects_changed_birth_or_foreign_parent(self):
         ctypes = fixture_runner.ctypes
         for mode in ("simctl", "other", "birth-changed", "foreign-parent"):
