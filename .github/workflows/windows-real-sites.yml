@@ -46,6 +46,7 @@ jobs:
     timeout-minutes: 150
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-pc-windows-msvc
       # The ref under test: the dispatch input, or the labeled pull request's head.
       TEST_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.pull_request.head.sha }}
     steps:
@@ -161,11 +162,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
-            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -180,7 +179,14 @@ jobs:
           } else {
             ninja --version
           }
-          rustc --version
+          # Use the same Windows toolchain as the cef-windows-app job.
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the Windows Rust toolchain' }
+          $compiler = @(rustc --version --verbose)
+          if ($LASTEXITCODE -ne 0 -or $compiler[0] -notmatch '^rustc 1\.99\.1 \(' -or $compiler -notcontains 'host: x86_64-pc-windows-msvc') {
+            throw 'Expected active Rust 1.99.1 for x86_64-pc-windows-msvc'
+          }
+          $compiler
           cargo --version
           python --version
       # The sandboxed browser (W7): the DLL built with windows-sandbox, staged
