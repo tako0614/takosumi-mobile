@@ -525,8 +525,13 @@ def app_error_at_observer_failure(app, executable, started_at):
     if not isinstance(summary, dict):
         return {"available": False, "reason": "event_query_unavailable"}
     reason = summary.get("reason")
+    if not isinstance(reason, str):
+        return {"available": False, "reason": "event_query_unavailable"}
     if summary.get("available") is True and reason == "pid_and_path_matched":
-        return summary
+        return {"available": True, "reason": reason,
+                "faultingModule": summary.get("faultingModule"),
+                "exceptionCode": summary.get("exceptionCode"),
+                "faultingOffset": summary.get("faultingOffset")}
     if reason == "pid_matched_path_unavailable":
         return {"available": False, "reason": reason}
     if reason in {"no_matching_event", "app_path_mismatch", "event_query_limit",

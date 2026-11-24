@@ -2521,11 +2521,18 @@ class RunnerTests(unittest.TestCase):
 
         matched = {"available": True, "reason": "pid_and_path_matched", "faultingModule": "runtime.dll",
                    "exceptionCode": "0xC0000005", "faultingOffset": "0x10"}
+        matched_with_extra = {**matched, "unrecognized": "private diagnostic detail"}
         path_unavailable = {"available": True, "reason": "pid_matched_path_unavailable",
                             "faultingModule": "must-not-be-saved"}
         cases = (
             ("access-violation", [3221225477, 3221225477], {"state": "exited", "exitCode": 3221225477},
              False, matched, matched, 1),
+            ("access-violation-extra-field", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, matched_with_extra, matched, 1),
+            ("access-violation-malformed-reason", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False,
+             {**matched, "reason": ["pid_and_path_matched"]},
+             {"available": False, "reason": "event_query_unavailable"}, 1),
             ("access-violation-path-unavailable", [3221225477, 3221225477],
              {"state": "exited", "exitCode": 3221225477}, False, path_unavailable,
              {"available": False, "reason": "pid_matched_path_unavailable"}, 1),
