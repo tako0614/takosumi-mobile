@@ -34,7 +34,6 @@ Each command prints one JSON report line and writes it to --report; it never
 removes anything besides what the installer and uninstaller do.
 """
 import argparse
-import base64
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -42,10 +41,10 @@ import json
 import ntpath
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -168,7 +167,9 @@ def application_error_summary(events, pid, executable):
     """
     if isinstance(events, dict):
         reason = events.get("reason")
-        if isinstance(reason, str) and reason in {"no_matching_event", "event_query_unavailable", "event_query_timeout"}:
+        if isinstance(reason, str) and reason in {
+                "no_matching_event", "app_path_mismatch", "event_query_limit",
+                "event_query_unavailable", "event_query_timeout"}:
             return {"available": False, "reason": reason}
     if not isinstance(events, list):
         return {"available": False, "reason": "event_query_unavailable"}
@@ -205,74 +206,220 @@ def application_error_summary(events, pid, executable):
             "reason": "app_path_mismatch" if pid_match else "no_matching_event"}
 
 
+class EventLogUnavailable(Exception):
+    """The local Windows Event Log API could not return a result."""
+
+
+class EventLogTimeout(Exception):
+    """The local Event Log query did not complete inside its bound."""
+
+
+class WindowsEventLogApi:
+    """Small ctypes wrapper for the Windows Event Log API used by W6."""
+
+    QUERY_REVERSE_DIRECTION = 0x200
+    QUERY_CHANNEL_PATH = 0x1
+    RENDER_EVENT_XML = 1
+    ERROR_INSUFFICIENT_BUFFER = 122
+    ERROR_NO_MORE_ITEMS = 259
+    ERROR_TIMEOUT = 1460
+    MAX_EVENT_XML_BYTES = 64 * 1024
+
+    def __init__(self):
+        from ctypes import wintypes
+
+        self.handle_type = ctypes.c_void_p
+        self.dword_type = wintypes.DWORD
+        self.library = ctypes.WinDLL("wevtapi.dll", use_last_error=True)
+        self.library.EvtQuery.argtypes = [self.handle_type, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        self.library.EvtQuery.restype = self.handle_type
+        self.library.EvtNext.argtypes = [self.handle_type, wintypes.DWORD,
+                                         ctypes.POINTER(self.handle_type), wintypes.DWORD,
+                                         wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        self.library.EvtNext.restype = wintypes.BOOL
+        self.library.EvtRender.argtypes = [self.handle_type, self.handle_type, wintypes.DWORD,
+                                           wintypes.DWORD, wintypes.LPVOID,
+                                           ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+        self.library.EvtRender.restype = wintypes.BOOL
+        self.library.EvtClose.argtypes = [self.handle_type]
+        self.library.EvtClose.restype = wintypes.BOOL
+
+    @staticmethod
+    def _last_error():
+        return ctypes.get_last_error()
+
+    def query(self):
+        xpath = ("*[System[Provider[@Name='Application Error'] and EventID=1000 "
+                 "and TimeCreated[timediff(@SystemTime) <= 300000]]]")
+        handle = self.library.EvtQuery(None, "Application", xpath,
+                                       self.QUERY_CHANNEL_PATH | self.QUERY_REVERSE_DIRECTION)
+        if not handle:
+            raise EventLogUnavailable()
+        return handle
+
+    def next_event(self, query_handle, timeout_ms):
+        event = self.handle_type()
+        returned = self.dword_type()
+        if self.library.EvtNext(query_handle, 1, ctypes.byref(event), timeout_ms, 0,
+                                ctypes.byref(returned)):
+            return event
+        error = self._last_error()
+        if error == self.ERROR_NO_MORE_ITEMS:
+            return None
+        if error == self.ERROR_TIMEOUT:
+            raise EventLogTimeout()
+        raise EventLogUnavailable()
+
+    def render_xml(self, event_handle):
+        used = self.dword_type()
+        properties = self.dword_type()
+        ok = self.library.EvtRender(None, event_handle, self.RENDER_EVENT_XML, 0, None,
+                                    ctypes.byref(used), ctypes.byref(properties))
+        error = self._last_error()
+        if ok or error != self.ERROR_INSUFFICIENT_BUFFER or used.value == 0:
+            raise EventLogUnavailable()
+        if used.value > self.MAX_EVENT_XML_BYTES:
+            raise EventLogUnavailable()
+        chars = used.value // ctypes.sizeof(ctypes.c_wchar) + 1
+        buffer = ctypes.create_unicode_buffer(chars)
+        if not self.library.EvtRender(None, event_handle, self.RENDER_EVENT_XML, used.value,
+                                     buffer, ctypes.byref(used), ctypes.byref(properties)):
+            raise EventLogUnavailable()
+        return buffer.value
+
+    def close(self, handle):
+        if handle:
+            self.library.EvtClose(handle)
+
+
+def event_fields(xml_text):
+    """Extract only the fields needed to match and summarize one event."""
+    root = ET.fromstring(xml_text)
+    namespace = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+    provider = root.find("./e:System/e:Provider", namespace)
+    event_id = root.findtext("./e:System/e:EventID", namespaces=namespace)
+    created = root.find("./e:System/e:TimeCreated", namespace)
+    system_time = created.get("SystemTime") if created is not None else None
+    if provider is None or provider.get("Name") != "Application Error" or event_id != "1000" or not system_time:
+        return None
+    values = {item.get("Name"): item.text or "" for item in root.findall("./e:EventData/e:Data", namespace)
+              if item.get("Name")}
+    values["systemTime"] = system_time
+    return values
+
+
+def _utc_datetime(value):
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def read_application_error(api, pid, executable, started_at, maximum=64):
+    """Read a bounded number of recent, exact-process Application Error events."""
+    query_handle = None
+    path_mismatch = False
+    try:
+        query_handle = api.query()
+        for _ in range(maximum):
+            event_handle = api.next_event(query_handle, 200)
+            if event_handle is None:
+                break
+            try:
+                try:
+                    fields = event_fields(api.render_xml(event_handle))
+                except (ET.ParseError, EventLogUnavailable, OSError, ValueError):
+                    continue
+                if fields is None:
+                    continue
+                try:
+                    event_time = _utc_datetime(datetime.fromisoformat(fields["systemTime"].replace("Z", "+00:00")))
+                    launch_time = _utc_datetime(started_at)
+                except (TypeError, ValueError):
+                    continue
+                if event_time < launch_time:
+                    continue
+                event = {
+                    "processId": fields.get("ProcessId", ""),
+                    "appPath": fields.get("AppPath", ""),
+                    "faultingModule": fields.get("ModuleName", ""),
+                    "exceptionCode": fields.get("ExceptionCode", ""),
+                    "faultingOffset": fields.get("FaultingOffset", ""),
+                }
+                summary = application_error_summary([event], pid, executable)
+                if summary.get("reason") == "no_matching_event":
+                    continue
+                if summary.get("reason") == "app_path_mismatch":
+                    path_mismatch = True
+                    continue
+                if summary.get("available"):
+                    return summary
+            finally:
+                try:
+                    api.close(event_handle)
+                except OSError:
+                    pass
+        else:
+            return {"available": False, "reason": "event_query_limit"}
+        return {"available": False,
+                "reason": "app_path_mismatch" if path_mismatch else "no_matching_event"}
+    except EventLogTimeout:
+        return {"available": False, "reason": "event_query_timeout"}
+    except (EventLogUnavailable, OSError):
+        return {"available": False, "reason": "event_query_unavailable"}
+    finally:
+        if query_handle is not None:
+            try:
+                api.close(query_handle)
+            except OSError:
+                pass
+
+
+def _application_error_worker():
+    """Child entry point: raw event XML and executable paths never leave it."""
+    try:
+        payload = json.load(sys.stdin)
+        started_at = datetime.fromisoformat(payload["startedAt"].replace("Z", "+00:00"))
+        summary = read_application_error(WindowsEventLogApi(), int(payload["pid"]),
+                                         str(payload["executable"]), started_at)
+    except (AttributeError, KeyError, TypeError, ValueError, EventLogTimeout, EventLogUnavailable, OSError):
+        summary = {"available": False, "reason": "event_query_unavailable"}
+    print(json.dumps(summary, separators=(",", ":")), flush=True)
+    return 0
+
+
 def application_error_event(pid, executable, started_at):
-    """Best-effort, bounded read of Application Error event 1000 for this launch."""
-    powershell = shutil.which("powershell.exe")
-    if not powershell:
-        return {"available": False, "reason": "event_reader_unavailable"}
-    script = r"""
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$start = [DateTimeOffset]::Parse([string]$payload.startedAt).LocalDateTime
-try {
-  $events = @(Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; `
-      Id=1000; StartTime=$start} `
-    -MaxEvents 64 -ErrorAction Stop)
-} catch {
-  if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
-    [Console]::Out.Write('{"reason":"no_matching_event"}')
-  } else {
-    [Console]::Out.Write('{"reason":"event_query_unavailable"}')
-  }
-  exit 0
-}
-$foundEvents = @()
-foreach ($event in $events) {
-  try { [xml]$xml = $event.ToXml() } catch { continue }
-  $data = @{}
-  foreach ($item in $xml.Event.EventData.Data) {
-    if ($item.Name) { $data[[string]$item.Name] = [string]$item.InnerText }
-  }
-  $rawPid = [string]$data['ProcessId']
-  try {
-    if ($rawPid -match '^0[xX]([0-9a-fA-F]+)$') {
-      $eventPid = [Convert]::ToInt64($Matches[1], 16)
-    } else {
-      $eventPid = [Convert]::ToInt64($rawPid, 10)
-    }
-  } catch { continue }
-  if ($eventPid -ne [long]$payload.pid) { continue }
-  $foundEvents += [pscustomobject]@{
-    processId = [string]$eventPid
-    appPath = [string]$data['AppPath']
-    faultingModule = [string]$data['ModuleName']
-    exceptionCode = [string]$data['ExceptionCode']
-    faultingOffset = [string]$data['FaultingOffset']
-  }
-}
-ConvertTo-Json -InputObject @($foundEvents) -Compress -Depth 2
-"""
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    payload = json.dumps({"pid": pid, "startedAt": started_at.isoformat()})
+    """Best-effort bounded native Event Log read, isolated behind a hard timeout."""
+    payload = json.dumps({"pid": pid, "executable": str(executable), "startedAt": started_at.isoformat()})
     try:
         result = subprocess.run(
-            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
-             "-EncodedCommand", encoded],
+            [sys.executable, "-B", str(Path(__file__).resolve()), "_application-error-worker"],
             input=payload, capture_output=True, text=True, timeout=2, env=clean_env(), check=False)
     except subprocess.TimeoutExpired:
         return {"available": False, "reason": "event_query_timeout"}
-    except OSError:
-        return {"available": False, "reason": "event_reader_unavailable"}
-    except UnicodeError:
+    except (OSError, UnicodeError):
         return {"available": False, "reason": "event_query_unavailable"}
     if result.returncode != 0:
         return {"available": False, "reason": "event_query_unavailable"}
     try:
-        events = json.loads(result.stdout)
+        summary = json.loads(result.stdout)
     except (TypeError, ValueError):
         return {"available": False, "reason": "event_query_unavailable"}
-    return application_error_summary(events, pid, executable)
+    if isinstance(summary, dict) and summary.get("available") is False:
+        reason = summary.get("reason")
+        if isinstance(reason, str) and reason in {
+                "no_matching_event", "app_path_mismatch", "event_query_limit",
+                "event_query_unavailable", "event_query_timeout"}:
+            return {"available": False, "reason": reason}
+    if isinstance(summary, dict) and summary.get("available") is True:
+        reason = summary.get("reason")
+        if isinstance(reason, str) and reason in {"pid_and_path_matched", "pid_matched_path_unavailable"}:
+            module = summary.get("faultingModule")
+            if module is not None:
+                module = ntpath.basename(module.replace("/", "\\")) if isinstance(module, str) else None
+                if module is not None and not re.fullmatch(r"[\x20-\x7e]{1,96}", module):
+                    module = None
+            return {"available": True, "reason": reason, "faultingModule": module,
+                    "exceptionCode": _ntstatus(summary.get("exceptionCode"), 8),
+                    "faultingOffset": _ntstatus(summary.get("faultingOffset"), 16)}
+    return {"available": False, "reason": "event_query_unavailable"}
 
 
 def require_app_running(app, value, executable, started_at, message_suffix):
@@ -531,4 +678,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "_application-error-worker":
+        sys.exit(_application_error_worker())
     sys.exit(main())
