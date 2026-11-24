@@ -1076,6 +1076,8 @@ def main():
                 try:
                     server.stop()
                     runtime.save(out / (server.kind + "-events.json"), server.events)
+                    if failure is not None:
+                        result.setdefault("fixtureTransport", {"diagnosticOnly": True})[server.kind] = server.transport_summary()
                 except Exception as error:
                     failure = failure or error
                     result["serverCleanupError"] = type(error).__name__

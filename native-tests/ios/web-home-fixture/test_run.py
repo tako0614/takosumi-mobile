@@ -1311,8 +1311,23 @@ class TLSTransportControls(unittest.TestCase):
         # A client read can finish before its worker publishes the write snapshot.
         self.server.stop()
         self.assertTrue(all(e["response"]["state"] == "written" for e in self.server.events))
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 3, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 2,
+        })
         self.assertTrue(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_verified_tls_without_http_has_its_own_transport_count(self):
+        context = ssl.create_default_context(cafile=str(self.ca))
+        self.server.connection_timeout = 1
+        with socket.create_connection(self.address, timeout=2) as connection:
+            with context.wrap_socket(connection, server_hostname="localhost") as secure:
+                self.assertEqual(secure.recv(1), b"")
+        self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 0, "handlerEndedAfterTls": 1,
+        })
+        self.assertEqual(self.server.events, [])
 
     def test_idle_tls_is_closed_by_the_connection_deadline_without_a_request_event(self):
         self.server.connection_timeout = 0.15

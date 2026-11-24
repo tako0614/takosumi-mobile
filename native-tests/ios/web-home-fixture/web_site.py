@@ -21,6 +21,8 @@ class Site(http.server.ThreadingHTTPServer):
         self.tokens = {user: secrets.token_hex(24) for user in ("Work", "Personal")}
         self.events = []
         self.editor = None
+        self._transport_lock = threading.Lock()
+        self._transport = {"accepted": 0, "handlerEndedBeforeTls": 0, "handlerEndedAfterTls": 0}
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate, key)
         self.tls_context = context
@@ -29,6 +31,8 @@ class Site(http.server.ThreadingHTTPServer):
 
     def get_request(self):
         connection, address = super().get_request()
+        with self._transport_lock:
+            self._transport["accepted"] += 1
         try:
             connection.settimeout(self.connection_timeout)
             # The first read handshakes in the request worker. An unfinished
@@ -38,6 +42,25 @@ class Site(http.server.ThreadingHTTPServer):
         except BaseException:
             connection.close()
             raise
+
+    def record_handler_end(self, connection):
+        # SSL exposes handshake state here without another read. The fixture
+        # doesn't request a client certificate, so a completed TLS session
+        # returns None. Only retain whether the call succeeded.
+        try:
+            connection.getpeercert()
+        except ValueError:
+            field = "handlerEndedBeforeTls"
+        except OSError:
+            return  # Accepted, with no usable observation at handler teardown.
+        else:
+            field = "handlerEndedAfterTls"
+        with self._transport_lock:
+            self._transport[field] += 1
+
+    def transport_summary(self):
+        with self._transport_lock:
+            return self._transport.copy()
 
     @property
     def url(self):
@@ -60,6 +83,12 @@ class Site(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Never log cookie headers or disposable tokens.
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            self.server.record_handler_end(self.connection)
 
     def reply(self, status, body, **headers):
         data = body.encode()
