@@ -49,12 +49,17 @@ public final class WebAppOperationTest {
     Uri input;
 
     private void await(String message, BooleanSupplier predicate, int seconds) {
+        await(message, predicate, seconds, () -> {});
+    }
+
+    private void await(String message, BooleanSupplier predicate, int seconds, Runnable onTimeout) {
         long end = SystemClock.elapsedRealtime() + seconds * 1000L;
         while (SystemClock.elapsedRealtime() < end) {
             if (activity != null) assertNull(activity.failure);
             if (predicate.getAsBoolean()) return;
             SystemClock.sleep(100);
         }
+        onTimeout.run();
         fail(message + "\n" + (activity == null ? "No Activity" : activity.diagnostics()) + "\n" + tree());
     }
 
@@ -411,10 +416,12 @@ public final class WebAppOperationTest {
         assertNotNull(entryPage);
         PageBaseline.Entry entry = entryPage.baseline.new Entry();
         PageBaseline.Snapshot[] baseline = {null};
+        boolean[] fileSeenAfterTap = {false};
         long deadline = SystemClock.elapsedRealtime() + 60000;
         await("Actual anonymous Photopea File menu did not load for " + profile, () -> {
             if (bounds("File", false, false) != null) {
                 if (expected == null) return true;
+                if (entry.tapped()) fileSeenAfterTap[0] = true;
                 baseline[0] = initialBaseline(expected, deadline);
                 return baseline[0] != null;
             }
@@ -440,7 +447,13 @@ public final class WebAppOperationTest {
                 }
             }
             return false;
-        }, 60);
+        }, 60, () -> {
+            // Only Personal requires an exact baseline. Use the existing polls after its landing tap.
+            if (expected != null && entry.tapped()) {
+                activity.trace(fileSeenAfterTap[0] ? "personal_entry_timeout file_seen_baseline_unready"
+                    : "personal_entry_timeout file_not_seen");
+            }
+        });
         return baseline[0];
     }
 
