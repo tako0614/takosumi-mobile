@@ -85,6 +85,8 @@ pub fn run() {
             browser_process_fixture::start(app.handle().clone());
             Ok(())
         });
+    #[cfg(all(debug_assertions, target_os = "android"))]
+    let builder = builder.on_page_load(bootstrap_fixture::observe_android_page_load);
     #[cfg(all(feature = "native-web-home-fixture", target_os = "linux"))]
     web_home_fixture::run(builder, tauri::generate_context!());
     #[cfg(all(

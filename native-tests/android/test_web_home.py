@@ -1378,8 +1378,9 @@ class Controls(unittest.TestCase):
             with self.subTest(raw=raw[:20]):
                 self.assertIsNone(runner.root_guest_identity(raw, 3169))
         packet = self.root_packet()
-        rows, rejected, cut = runner.parse_root_bootstrap(packet, identity)
+        rows, page_load, rejected, cut = runner.parse_root_bootstrap(packet, identity)
         self.assertEqual((len(rows), rejected, cut), (1, 0, False))
+        self.assertEqual(page_load, [])
         self.assertEqual(rows[0]["elapsedMs"], 600000)
         for raw in (self.root_packet(pid=3170), self.root_packet(tick=1235),
                     self.root_packet(stage="SECRET"), self.root_packet(seq=17), self.root_packet(receipt=34),
@@ -1390,13 +1391,25 @@ class Controls(unittest.TestCase):
         for length in range(len(packet.rstrip())):
             with self.subTest(prefix=length):
                 self.assertEqual(runner.parse_root_bootstrap(packet[:length] + b"\n", identity)[0], [])
-        rows, _, cut = runner.parse_root_bootstrap(packet * 34, identity)
+        rows, _, _, cut = runner.parse_root_bootstrap(packet * 34, identity)
         self.assertEqual(len(rows), 33); self.assertTrue(cut)
-        rows, rejected, _ = runner.parse_root_bootstrap(
+        rows, _, rejected, _ = runner.parse_root_bootstrap(
             self.root_packet(stage="unknown", seq=0, elapsed=-1)
             + self.root_packet(stage="cap", seq=0, elapsed=-1, receipt=33), identity)
         self.assertEqual([row["stage"] for row in rows], ["unknown", "cap"])
         self.assertEqual(rejected, 0)
+        birth = packet.split(b" com.takosumi.", 1)[0]
+        start = birth + b" pageLoad=started rootEnd=1\n"
+        finish = birth + b" pageLoad=finished rootEnd=1\n"
+        invalid = (start + finish.replace(b"startTick=1234", b"startTick=1235")
+                   + finish.replace(b"pid=3169", b"pid=3170")
+                   + finish.replace(b"boot=0", b"boot=1")
+                   + finish.replace(b"finished", b"SECRET")
+                   + finish.rstrip() + b" extra\n")
+        rows = runner.parse_root_bootstrap(packet, identity)[0]
+        self.assertEqual(runner.parse_root_bootstrap(start + packet + finish + invalid, identity),
+                         (rows, ["started", "finished"], 6, False))
+        self.assertEqual(runner.parse_root_bootstrap(finish, identity), ([], ["finished"], 0, False))
 
     def test_root_bootstrap_capture_binds_main_package_and_birth_without_changing_verdict(self):
         scratch, out = self.root / "scratch", self.root / "out"
@@ -1411,7 +1424,9 @@ class Controls(unittest.TestCase):
         calls = []
         def capture(argv, path, **options):
             calls.append(argv)
-            path.write_bytes(self.root_packet() if "logcat" in argv else self.root_identity())
+            packet = self.root_packet()
+            load = packet.split(b" com.takosumi.", 1)[0] + b" pageLoad=started rootEnd=1\n"
+            path.write_bytes(load + packet if "logcat" in argv else self.root_identity())
         with patch.object(runner.runtime, "command", side_effect=capture):
             value = runner.preserve_root_bootstrap(emulator, scratch, out, prior)
         self.assertEqual(len(calls), 3)
@@ -1421,6 +1436,7 @@ class Controls(unittest.TestCase):
         self.assertEqual(value["guestIdentity"], {"pid": 3169, "startTick": 1234, "bootId": "0123456789abcdef0123456789abcdef"})
         self.assertTrue(value["identityBookendsMatch"])
         self.assertEqual(len(value["records"]), 1)
+        self.assertEqual(value["pageLoadCallbacks"], ["started"])
         self.assertTrue(value["absenceIsUnknown"])
         self.assertNotIn("passed", value)
         self.assertLessEqual((out / "guest-root-bootstrap.json").stat().st_size, 16384)
