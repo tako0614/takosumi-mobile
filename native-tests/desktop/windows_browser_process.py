@@ -357,15 +357,19 @@ def job_pids(job):
     return [ids.ids[index] for index in range(min(ids.listed, 256))]
 
 
+def wait_for_job_processes(job, deadline):
+    while True:
+        total, active = job.processes()
+        remaining = deadline - time.monotonic()
+        if active == 0 or remaining <= 0:
+            return total, active
+        time.sleep(min(0.25, remaining))
+
+
 def session_receipt(job, app_exit):
     """The session's counterpart of the Linux outer guard receipt: the App's
     job must empty within LEFTOVER_WAIT of the App's exit, without force."""
-    deadline = time.monotonic() + LEFTOVER_WAIT
-    while True:
-        total, active = job.processes()
-        if active == 0 or time.monotonic() >= deadline:
-            break
-        time.sleep(0.25)
+    total, active = wait_for_job_processes(job, time.monotonic() + LEFTOVER_WAIT)
     remaining = job_pids(job) if active else []
     receipt = {"rootExit": app_exit, "complete": True, "kernelNoChildren": active == 0, "remaining": remaining or [],
                "forcedCleanup": 0, "cleanupErrors": [] if remaining is not None else ["JobProcessListUnavailable"],
@@ -674,9 +678,12 @@ def run_phase(args, env, files, before, head, suffix, after_access_violation=Non
             proof["error"] = execution["error"] = f"{type(error).__name__}: {error}"
             raise
         finally:
-            active = None
+            exit_code = execution.get("appExit", execution.get("appStateAtObserverFailure", {}).get("exitCode"))
+            probe_candidate = after_access_violation is not None and not suffix and is_access_violation(exit_code)
+            confirmed_empty = closed = False
             try:
-                if app.poll() is None:
+                root_exit = app.poll()
+                if root_exit is None:
                     # This exact Popen is owned; ending it closes the App's own
                     # job, which ends its guards and browsers (no receipts).
                     app.terminate()
@@ -692,8 +699,23 @@ def run_phase(args, env, files, before, head, suffix, after_access_violation=Non
             except Exception as error:
                 proof["passed"] = False
                 proof["cleanupError"] = str(error)
+            else:
+                if probe_candidate and is_access_violation(root_exit):
+                    try:
+                        # Read only this Job after its existing termination.
+                        # Keep the original forced-cleanup receipt as recorded.
+                        deadline = time.monotonic() + LEFTOVER_WAIT
+                        final = wait_for_job_processes(job, deadline) if active else (total, active)
+                        confirmed_empty = (final == (total, 0) and time.monotonic() < deadline
+                                           and job.processes() == final and time.monotonic() <= deadline)
+                    except Exception:
+                        pass  # No readback proof for the optional diagnostic.
             finally:
-                job.close()
+                try:
+                    closed = job.close() is True
+                except Exception:
+                    if not probe_candidate:
+                        raise
                 # Every guard has ended: its receipt and what, if anything,
                 # its drain forced (diagnostics only). app-execution.json's
                 # browserGuards keeps the receipts a passed launch checked.
@@ -717,11 +739,8 @@ def run_phase(args, env, files, before, head, suffix, after_access_violation=Non
                     output.write(json.dumps(proof, indent=2) + "\n")
                 if not proof["passed"]:
                     tails(session, suffix)
-                    exit_code = execution.get("appExit", execution.get("appStateAtObserverFailure", {}).get("exitCode"))
-                    if (after_access_violation is not None and not suffix and active == 0
-                            and "cleanupError" not in proof and proof.get("artifactsAfter") == before
-                            and proof.get("sourceHeadAfter") == head
-                            and is_access_violation(exit_code)):
+                    if (probe_candidate and confirmed_empty and closed
+                            and proof.get("artifactsAfter") == before and proof.get("sourceHeadAfter") == head):
                         try:
                             after_access_violation()
                         except Exception:

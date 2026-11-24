@@ -2615,6 +2615,7 @@ class RunnerTests(unittest.TestCase):
                 app = mock.Mock(pid=456)
                 app.poll.return_value = code
                 job = mock.Mock()
+                job.close.return_value = True
                 if active is None:
                     job.processes.side_effect = OSError("cleanup state unavailable")
                 else:
@@ -2638,6 +2639,7 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(runner, "job_pids", return_value=[]), \
                         mock.patch.object(runner, "leftover_records", return_value={}), \
                         mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "LEFTOVER_WAIT", 0 if active else 10), \
                         mock.patch.object(runner, "tails"), \
                         mock.patch.object(runner, "app_error_at_observer_failure", return_value={}):
                     with self.assertRaises(runner.subprocess.CalledProcessError) as error:
@@ -2648,6 +2650,82 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(observations, [
                     (1, False, False, {"observed": 7, "remaining": []}, f"CalledProcessError: {original}", False)
                 ] if calls else [])
+
+    def test_native_fault_probe_requires_confirmed_drain_after_existing_forced_cleanup(self):
+        av = runner.EXCEPTION_ACCESS_VIOLATION
+        cases = (
+            ("confirmed", [(7, 4), (7, 0), (7, 0)], True, None, True),
+            ("timeout", [(7, 3)], True, None, False),
+            ("read-failed", [OSError("accounting unavailable")], True, None, False),
+            ("confirm-failed", [(7, 0), OSError("accounting unavailable")], True, None, False),
+            ("reappeared", [(7, 0), (8, 1)], True, None, False),
+            ("appeared-and-exited", [(7, 0), (8, 0)], True, None, False),
+            ("changed-before-zero", [(8, 0)], True, None, False),
+            ("terminate-failed", [], True, OSError("terminate unavailable"), False),
+            ("close-refused", [(7, 0), (7, 0)], False, None, False),
+            ("close-failed", [(7, 0), (7, 0)], OSError("close unavailable"), None, False),
+        )
+        for name, readback, close, terminate_error, should_probe in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "takosumi-mobile.exe",
+                                       packaged=False, real_site=None, unsandboxed_candidate=False,
+                                       site="https://127.0.0.1:1234")
+                app = mock.Mock(pid=456)
+                app.poll.return_value = av
+                job = mock.Mock()
+                job.processes.side_effect = [(7, 6), *readback]
+                job.terminate.side_effect = terminate_error
+                if isinstance(close, OSError):
+                    job.close.side_effect = close
+                else:
+                    job.close.return_value = close
+                original = runner.subprocess.CalledProcessError(1, ["observer"])
+                pids = list(range(500, 506))
+                records = [{"pid": pid, "image": "msedgewebview2.exe"} for pid in pids]
+                original_job = {"observed": 7, "remaining": pids, "remainingProcesses": records, "forcedCleanup": 6}
+                observed = []
+
+                def observe_probe():
+                    observed.append((job.mock_calls.copy(), json.loads((root / "execution.json").read_text())))
+
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=original), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value="head"), \
+                        mock.patch.object(runner, "job_pids", return_value=pids), \
+                        mock.patch.object(runner, "leftover_records", return_value={"remainingProcesses": records}), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "LEFTOVER_WAIT", 0 if name == "timeout" else 10), \
+                        mock.patch.object(runner.time, "sleep"), \
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "app_error_at_observer_failure", return_value={}):
+                    with self.assertRaises(runner.subprocess.CalledProcessError) as error:
+                        runner.run_phase(args, {}, [], {}, "head", "", after_access_violation=observe_probe)
+                self.assertIs(error.exception, original)
+                self.assertEqual(len(observed), int(should_probe))
+                self.assertEqual(job.mock_calls, [mock.call.adopt(app.pid), mock.call.processes(), mock.call.terminate(),
+                                                  *[mock.call.processes()] * len(readback), mock.call.close()])
+                app.terminate.assert_not_called()
+                proof = json.loads((root / "execution.json").read_text())
+                self.assertEqual(proof["sessionJob"], original_job)
+                self.assertEqual(proof["error"], f"CalledProcessError: {original}")
+                self.assertFalse(proof["passed"])
+                if should_probe:
+                    self.assertEqual(observed, [(job.mock_calls, proof)])
+
+    def test_windows_job_close_reports_the_native_result(self):
+        for native_result in (0, 1):
+            with self.subTest(native_result=native_result):
+                job = runner.WindowsJob.__new__(runner.WindowsJob)
+                job.handle = 41
+                job.kernel32 = mock.Mock()
+                job.kernel32.CloseHandle.return_value = native_result
+                self.assertIs(job.close(), bool(native_result))
+                self.assertFalse(job.close())
+                job.kernel32.CloseHandle.assert_called_once_with(41)
 
     def test_native_fault_probe_uses_fresh_case_and_bounds_the_diagnostic_process(self):
         receipt = {"diagnosticComplete": True, "observed": True, "reason": "last_chance_access_violation",
