@@ -173,9 +173,14 @@ public final class WebHomeOperationTest {
     }
 
     private void click(String text) {
+        click(text, null);
+    }
+
+    private void click(String text, JSONObject trace) {
         long end = SystemClock.elapsedRealtime() + 15000;
         do {
             UiObject2 ready = null;
+            boolean selectedClickable = false;
             try {
                 // One snapshot avoids counting a node twice when text and
                 // description both expose the same exact action name.
@@ -200,14 +205,24 @@ public final class WebHomeOperationTest {
                 }
                 int selected = AccessibleName.unique(names, TARGET, text);
                 assertTrue("Ambiguous actual App action: " + text, selected != AccessibleName.AMBIGUOUS);
-                if (selected >= 0 && AccessibleName.matches(nameSnapshot(values.get(selected)), TARGET, text)) {
-                    ready = values.get(selected);
+                if (selected >= 0) {
+                    UiObject2 value = values.get(selected);
+                    AccessibleName.Candidate candidate = nameSnapshot(value);
+                    if (AccessibleName.matches(candidate, TARGET, text)) {
+                        ready = value;
+                        selectedClickable = candidate.clickable;
+                    }
                 }
             } catch (StaleObjectException ignored) {
                 // No gesture occurred. Reacquire within the same deadline.
             }
             if (ready != null && SystemClock.elapsedRealtime() < end) {
+                if (trace != null) {
+                    diagnostic(trace, "selectedNode", selectedClickable ? "CLICKABLE_ACTION" : "NONCLICKABLE_LABEL");
+                    diagnostic(trace, "tapStartedAtMs", SystemClock.elapsedRealtime());
+                }
                 ready.click(); // Never catch/retry a possibly delivered gesture.
+                if (trace != null) diagnostic(trace, "tapReturnedAtMs", SystemClock.elapsedRealtime());
                 return;
             }
             SystemClock.sleep(100);
@@ -253,8 +268,8 @@ public final class WebHomeOperationTest {
     private void menu(String text) { nativeButton("メニュー"); click(text); }
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }
 
-    private void hideKeyboardIfShown() {
-        if (keyboardShown(null)) device.pressBack();
+    private void hideKeyboardIfShown(JSONObject trace) {
+        if (keyboardShown(trace)) device.pressBack();
     }
 
     private boolean keyboardShown(JSONObject trace) {
@@ -620,10 +635,14 @@ public final class WebHomeOperationTest {
     }
 
     private void writeDraft(String value, String expectedProfile) {
+        writeDraft(value, expectedProfile, null);
+    }
+
+    private void writeDraft(String value, String expectedProfile, JSONObject trace) {
         draft("", expectedProfile);
         UiObject2 field = one(By.clazz("android.widget.EditText"));
         field.click(); field.setText(value);
-        hideKeyboardIfShown();
+        hideKeyboardIfShown(trace);
         draft(value, expectedProfile);
     }
 
@@ -700,8 +719,21 @@ public final class WebHomeOperationTest {
             accountHomeReturned = true;
         } finally { finishHomeWaitObservation(accountHomeReturned); }
         click("📝 Notes"); expect("Notes editor"); host(editor);
-        writeDraft("work-draft", "Work");
-        click("Page two"); expect("Notes page two");
+        JSONObject pageTwoTap = new JSONObject();
+        writeDraft("work-draft", "Work", pageTwoTap);
+        click("Page two", pageTwoTap);
+        boolean pageTwoReady = false;
+        try {
+            expect("Notes page two");
+            pageTwoReady = true;
+        } finally {
+            if (!pageTwoReady) {
+                diagnostic(pageTwoTap, "diagnosticOnly", true);
+                diagnostic(pageTwoTap, "clockDomain", "android_elapsed_realtime");
+                diagnostic(pageTwoTap, "headingWaitFailedAtMs", SystemClock.elapsedRealtime());
+                diagnostic(result, "pageTwoTap", pageTwoTap);
+            }
+        }
         nativeButton("戻る"); expect("Notes editor"); draft("work-draft", "Work");
         menu("アプリホームへ"); expect("Fixture home Work");
         nativeButton("戻る"); draft("work-draft", "Work");
