@@ -681,6 +681,46 @@ class Controls(unittest.TestCase):
         self.assertFalse(any(out.glob("*-raw.log")))
         self.assertNotIn("passed", result)
 
+    def test_guest_setup_blocker_requires_current_system_ui_focus_at_the_failed_initial_save(self):
+        modal = b"  mCurrentFocus=Window{abc123 u0 Application Not Responding: com.android.systemui}\r\n"
+        app = b"  mCurrentFocus=Window{def456 u0 com.takosumi.fixture.android/.MainActivity}\n"
+        dialog = (b'<hierarchy><node package="android" resource-id="android:id/alertTitle" '
+                  b'text="System UI isn\'t responding"/></hierarchy>')
+        initial = {"passed": False, "cases": [], "initialSaveWait": {
+            "phase": "initial_save_wait", "samples": 69, "queryNull": 69, "recordingIncomplete": False,
+        }}
+        saved = dict(initial, initialSaveWait=dict(initial["initialSaveWait"], queryNull=68))
+        for name, focus, hierarchy, ui_result in (
+            ("blocking", modal, dialog, initial),
+            ("historical", app, b"<hierarchy/>", initial),
+            ("focus-changed", app, dialog, initial),
+            ("appeared-after-capture", modal, b"<hierarchy/>", initial),
+            ("after-save", modal, dialog, saved),
+            ("ambiguous-focus", modal + app, dialog, initial),
+            ("partial-hierarchy", modal, dialog[:-4], initial),
+            ("truncated-activity", modal + b"x" * (128 * 1024), dialog, initial),
+        ):
+            with self.subTest(name=name):
+                scratch, out = self.root / (name + "-scratch"), self.root / (name + "-evidence")
+                scratch.mkdir()
+                out.mkdir()
+                emulator = Mock(adb=Path("/sdk/platform-tools/adb"))
+
+                def command(_argv, path, **_options):
+                    data = focus if path.name == "guest-activity-state-raw.log" else b"historical ANR in com.android.systemui"
+                    path.write_bytes(data)
+
+                with patch.object(runner.runtime, "command", side_effect=command) as query:
+                    result = runner.preserve_guest_anr(emulator, scratch, out,
+                                                       ui_result=ui_result, hierarchy=hierarchy)
+                self.assertEqual(query.call_count, 7)
+                if name == "blocking":
+                    self.assertEqual(result["setupBlocker"], {"phase": "initial_save_wait",
+                        "reason": "focused_system_ui_anr", "evidenceScope": "failure_capture"})
+                else:
+                    self.assertNotIn("setupBlocker", result)
+                self.assertNotIn("passed", result)
+
     def test_guest_ownership_loss_before_anr_events_refuses_all_remaining_queries(self):
         scratch, out = self.root / "scratch", self.root / "evidence"
         scratch.mkdir(); out.mkdir()

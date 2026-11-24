@@ -551,7 +551,33 @@ class Emulator:
                 self.fd = None
 
 
-def preserve_guest_anr(emulator, scratch, out):
+def focused_system_ui_anr_at_initial_save(ui_result, hierarchy, activities):
+    if not isinstance(ui_result, dict) or ui_result.get("passed") is not False or ui_result.get("cases") != []:
+        return False
+    wait = ui_result.get("initialSaveWait")
+    if (not isinstance(wait, dict) or wait.get("phase") != "initial_save_wait"
+            or wait.get("recordingIncomplete") is not False):
+        return False
+    samples = wait.get("samples")
+    if type(samples) is not int or samples <= 0 or wait.get("queryNull") != samples:
+        return False
+    focus = re.findall(rb"(?m)^[ \t]*mCurrentFocus=([^\r\n]*)", activities)
+    if len(focus) != 1 or not re.fullmatch(
+            rb"Window\{[0-9a-f]{1,16} u0 Application Not Responding: com\.android\.systemui\}", focus[0].rstrip()):
+        return False
+    # The driver captured this hierarchy at the failed wait. The later window
+    # snapshot alone could reflect a dialog shown after the failure.
+    if len(hierarchy) > 128 * 1024:
+        return False
+    try:
+        nodes = ET.fromstring(hierarchy).iter("node")
+        return any(node.get("package") == "android" and node.get("resource-id") == "android:id/alertTitle"
+                   and node.get("text") == "System UI isn't responding" for node in nodes)
+    except ET.ParseError:
+        return False
+
+
+def preserve_guest_anr(emulator, scratch, out, *, ui_result=None, hierarchy=b""):
     """Failure-only reads; an absent/late diagnostic never qualifies the UI."""
     result = {"diagnosticOnly": True, "scope": "Exact owned disposable Android guest", "queries": {}}
     for label, query, limit in (
@@ -596,6 +622,10 @@ def preserve_guest_anr(emulator, scratch, out):
                     # Reuse this already-read snapshot; no new PID/process query.
                     entry["appProcessPid"] = (native_activity_pid(data, truncated=size > len(data))
                                               if entry.get("queryReturned") else None)
+                    if (entry.get("queryReturned") and not entry["truncated"]
+                            and focused_system_ui_anr_at_initial_save(ui_result, hierarchy, data)):
+                        result["setupBlocker"] = {"phase": "initial_save_wait", "reason": "focused_system_ui_anr",
+                                                  "evidenceScope": "failure_capture"}
         except Exception as error:
             entry["collectionErrorType"] = type(error).__name__
     return result
@@ -1007,6 +1037,7 @@ def main():
              "normalSDKApp": baseline, "cleanup": False, "normalAPKRestored": False, "scratchRemoved": False,
              "adbServiceScope": "Existing adb service is outside the emulator guard; never killed"}
     servers, overlay, emulator, variant, failure = [], None, None, None, None
+    ui_result, hierarchy = None, b""
     backup = scratch / "normal.apk"
     shutil.copyfile(apk, backup)
     backup_custody = FileCustody(backup, scratch)
@@ -1052,10 +1083,12 @@ def main():
                 try:
                     data = emulator.run("exec-out", "run-as", DRIVER, "cat", "files/" + name, binary=True)
                     (out / name).write_bytes(data)
+                    if name == "hierarchy.xml":
+                        hierarchy = data
                 except Exception as error:
                     proof.setdefault("diagnosticErrors", []).append(name + ":" + type(error).__name__)
-        result = json.loads((out / "result.json").read_text())
-        proof["test"] = require_ui_pass(log, result)
+        ui_result = json.loads((out / "result.json").read_text())
+        proof["test"] = require_ui_pass(log, ui_result)
         require_site_events(instance.events, editor.events)
         proof["installedAfter"] = installed(emulator, variant["apk"]["sha256"])
         require(verify_app(ROOT, fixture_ca=ca) == variant, "App build changed during UI operations")
@@ -1065,7 +1098,7 @@ def main():
         proof["errorType"] = type(error).__name__
         proof["error"] = str(error)
         if isinstance(error, Exception) and emulator is not None:
-            proof["guestANR"] = preserve_guest_anr(emulator, scratch, out)
+            proof["guestANR"] = preserve_guest_anr(emulator, scratch, out, ui_result=ui_result, hierarchy=hierarchy)
             # native-observation-begin:failure-call
             try:
                 proof["nativeObservation"] = preserve_native_observation(emulator, scratch, out, proof["guestANR"])
