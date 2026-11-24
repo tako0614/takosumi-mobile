@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Diagnostic-only, self-launched probe for a Windows fixture App crash.
+
+This does not attach to an existing PID, write a dump, or qualify the App.
+It starts the explicitly supplied fixture executable under the Windows debug
+API, assigns that suspended process to the existing kill-on-close Job before
+the debug-event pump runs, and retains only a last-chance 0xC0000005 summary.
+The caller must provide a fresh fixture case directory carrying the runner's
+`.owned-browser-reference` marker. Only local fixture environment variables
+are forwarded; no inherited credentials or WebView2 overrides are passed.
+
+The native API path is intentionally Windows-only and needs native CI
+verification. Portable tests exercise event policy, projection and cleanup.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+from ctypes import wintypes
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+
+
+CREATE_SUSPENDED = 0x00000004
+DEBUG_ONLY_THIS_PROCESS = 0x00000002
+DETACHED_PROCESS = 0x00000008
+DEBUG_EVENT_EXCEPTION = 1
+DEBUG_EVENT_CREATE_THREAD = 2
+DEBUG_EVENT_CREATE_PROCESS = 3
+DEBUG_EVENT_EXIT_THREAD = 4
+DEBUG_EVENT_EXIT_PROCESS = 5
+DEBUG_EVENT_LOAD_DLL = 6
+DEBUG_EVENT_UNLOAD_DLL = 7
+DEBUG_EVENT_OUTPUT_STRING = 8
+DEBUG_EVENT_RIP = 9
+EXCEPTION_BREAKPOINT = 0x80000003
+EXCEPTION_ACCESS_VIOLATION = 0xC0000005
+DBG_CONTINUE = 0x00010002
+DBG_EXCEPTION_NOT_HANDLED = 0x80010001
+ERROR_SEM_TIMEOUT = 121
+WAIT_TIMEOUT_SECONDS = 25
+EXIT_WAIT_SECONDS = 5
+PROCESS_CASE = re.compile(r"[a-z0-9][a-z0-9-]{0,23}\Z")
+MODULE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,96}\Z")
+SAFE_SYSTEM_ENV = {
+    "APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PROGRAMDATA",
+    "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
+}
+SAFE_FIXTURE_ENV = {
+    "TAKOSUMI_BROWSER_PROCESS_APP", "TAKOSUMI_BROWSER_PROCESS_CASE",
+    "TAKOSUMI_BROWSER_PROCESS_INSPECT",
+}
+
+
+@dataclass(frozen=True)
+class DebugEvent:
+    code: int
+    process_id: int
+    thread_id: int
+    exception_code: int | None = None
+    first_chance: bool | None = None
+    exception_address: int | None = None
+    exit_code: int | None = None
+    close_handles: tuple[int, ...] = ()
+
+
+def continue_status(event: DebugEvent, target_pid: int, process_created: bool,
+                    initial_breakpoint_seen: bool) -> tuple[int, bool]:
+    """Return the only accepted initial breakpoint and fail-through policy."""
+    if event.code != DEBUG_EVENT_EXCEPTION:
+        return DBG_CONTINUE, initial_breakpoint_seen
+    if (event.process_id == target_pid and process_created and not initial_breakpoint_seen and
+            event.exception_code == EXCEPTION_BREAKPOINT and event.first_chance is True):
+        return DBG_CONTINUE, True
+    return DBG_EXCEPTION_NOT_HANDLED, initial_breakpoint_seen
+
+
+def observed_fault(event: DebugEvent, target_pid: int) -> bool:
+    """Only the spawned App's last-chance access violation is diagnostic."""
+    return (event.process_id == target_pid and event.code == DEBUG_EVENT_EXCEPTION and
+            event.exception_code == EXCEPTION_ACCESS_VIOLATION and event.first_chance is False)
+
+
+def module_projection(module_name: str | None, image_base: int | None,
+                      fault_address: int | None) -> dict[str, str | None]:
+    """Project a mapped image to basename and relative offset, never an address/path."""
+    if not isinstance(module_name, str) or not MODULE_NAME.fullmatch(module_name):
+        return {"faultingModule": None, "faultingOffset": None,
+                "moduleReason": "module_name_unavailable"}
+    if (type(image_base) is not int or type(fault_address) is not int or
+            image_base < 0 or fault_address < image_base):
+        return {"faultingModule": None, "faultingOffset": None,
+                "moduleReason": "module_range_unavailable"}
+    return {"faultingModule": module_name,
+            "faultingOffset": f"0x{fault_address - image_base:x}",
+            "moduleReason": "module_mapped"}
+
+
+def safe_fixture_environment(source: dict[str, str], case_dir: Path) -> dict[str, str]:
+    """Keep OS launch variables and fixed fixture controls; drop all credentials."""
+    result = {key: value for key, value in source.items()
+              if key.upper() in SAFE_SYSTEM_ENV - {"TEMP", "TMP"} and isinstance(value, str)}
+    for key in SAFE_FIXTURE_ENV:
+        value = source.get(key)
+        if isinstance(value, str):
+            result[key] = value
+    result["TAKOSUMI_BROWSER_PROCESS_CASE"] = str(case_dir)
+    result["TAKOSUMI_BROWSER_PROCESS_INSPECT"] = "1"
+    result["TAKOSUMI_BROWSER_PROCESS_APP"] = "local"
+    case_tmp = case_dir / "tmp"
+    result["TEMP"] = str(case_tmp)
+    result["TMP"] = str(case_tmp)
+    # CEF child executable, external sites and caller-selected WebView2
+    # runtimes are never forwarded by this diagnostic.
+    return result
+
+
+def loopback_site(site_url: str | None) -> str | None:
+    """Accept only the Windows fixture's HTTPS loopback origin format."""
+    if not isinstance(site_url, str):
+        return None
+    match = re.fullmatch(r"https://127\.0\.0\.1:([1-9][0-9]{0,4})", site_url)
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return site_url if 1 <= port <= 65535 else None
+
+
+def owned_fixture_case(case_dir: Path) -> bool:
+    """Require the exact marker written by windows_browser_process.run()."""
+    try:
+        if not PROCESS_CASE.fullmatch(case_dir.name) or case_dir.is_symlink() or not case_dir.is_dir():
+            return False
+        marker = case_dir / ".owned-browser-reference"
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 64:
+            return False
+        temp_dir = case_dir / "tmp"
+        if temp_dir.is_symlink() or not temp_dir.is_dir():
+            return False
+        return marker.read_text(encoding="utf-8") == case_dir.name
+    except (OSError, UnicodeError):
+        return False
+
+
+class ProbeApiUnavailable(RuntimeError):
+    pass
+
+
+class _ExceptionRecord(ctypes.Structure):
+    pass
+
+
+_ULONG_PTR = ctypes.c_size_t
+_ExceptionRecord._fields_ = [
+    ("ExceptionCode", wintypes.DWORD),
+    ("ExceptionFlags", wintypes.DWORD),
+    ("ExceptionRecord", ctypes.POINTER(_ExceptionRecord)),
+    ("ExceptionAddress", ctypes.c_void_p),
+    ("NumberParameters", wintypes.DWORD),
+    ("ExceptionInformation", _ULONG_PTR * 15),
+]
+
+
+class _ExceptionDebugInfo(ctypes.Structure):
+    _fields_ = [("ExceptionRecord", _ExceptionRecord), ("dwFirstChance", wintypes.DWORD)]
+
+
+class _CreateThreadDebugInfo(ctypes.Structure):
+    _fields_ = [("hThread", wintypes.HANDLE), ("lpThreadLocalBase", ctypes.c_void_p),
+                ("lpStartAddress", ctypes.c_void_p)]
+
+
+class _CreateProcessDebugInfo(ctypes.Structure):
+    _fields_ = [("hFile", wintypes.HANDLE), ("hProcess", wintypes.HANDLE),
+                ("hThread", wintypes.HANDLE), ("lpBaseOfImage", ctypes.c_void_p),
+                ("dwDebugInfoFileOffset", wintypes.DWORD), ("nDebugInfoSize", wintypes.DWORD),
+                ("lpThreadLocalBase", ctypes.c_void_p), ("lpStartAddress", ctypes.c_void_p),
+                ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
+
+
+class _LoadDllDebugInfo(ctypes.Structure):
+    _fields_ = [("hFile", wintypes.HANDLE), ("lpBaseOfDll", ctypes.c_void_p),
+                ("dwDebugInfoFileOffset", wintypes.DWORD), ("nDebugInfoSize", wintypes.DWORD),
+                ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
+
+
+class _OutputStringDebugInfo(ctypes.Structure):
+    _fields_ = [("lpDebugStringData", ctypes.c_void_p), ("fUnicode", wintypes.WORD),
+                ("nDebugStringLength", wintypes.WORD)]
+
+
+class _RipInfo(ctypes.Structure):
+    _fields_ = [("dwError", wintypes.DWORD), ("dwType", wintypes.DWORD)]
+
+
+class _DebugEventPayload(ctypes.Union):
+    _fields_ = [("Exception", _ExceptionDebugInfo), ("CreateThread", _CreateThreadDebugInfo),
+                ("CreateProcessInfo", _CreateProcessDebugInfo), ("ExitCode", wintypes.DWORD),
+                ("LoadDll", _LoadDllDebugInfo), ("UnloadDll", ctypes.c_void_p),
+                ("OutputString", _OutputStringDebugInfo), ("RipInfo", _RipInfo)]
+
+
+class _DebugEvent(ctypes.Structure):
+    _fields_ = [("dwDebugEventCode", wintypes.DWORD), ("dwProcessId", wintypes.DWORD),
+                ("dwThreadId", wintypes.DWORD), ("u", _DebugEventPayload)]
+
+
+class _ModuleEntry32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("GlblcntUsage", wintypes.DWORD),
+                ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.c_void_p),
+                ("modBaseSize", wintypes.DWORD), ("hModule", wintypes.HMODULE),
+                ("szModule", wintypes.WCHAR * 256), ("szExePath", wintypes.WCHAR * 260)]
+
+
+class WindowsDebugApi:
+    """Thin, bounded ctypes adapter. Never emits raw Win32 errors or paths."""
+
+    def __init__(self):
+        if os.name != "nt":
+            raise ProbeApiUnavailable("windows_only")
+        if (ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(_ExceptionRecord) != 152 or
+                ctypes.sizeof(_ExceptionDebugInfo) != 160 or ctypes.sizeof(_DebugEvent) != 176 or
+                ctypes.sizeof(_CreateProcessDebugInfo) != 72 or ctypes.sizeof(_LoadDllDebugInfo) != 40 or
+                ctypes.sizeof(_ModuleEntry32W) != 1080):
+            raise ProbeApiUnavailable("native_layout_unsupported")
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.WaitForDebugEvent.argtypes = [ctypes.POINTER(_DebugEvent), wintypes.DWORD]
+        self.kernel32.WaitForDebugEvent.restype = wintypes.BOOL
+        self.kernel32.ContinueDebugEvent.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        self.kernel32.ContinueDebugEvent.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        self.kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        self.kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ModuleEntry32W)]
+        self.kernel32.Module32FirstW.restype = wintypes.BOOL
+        self.kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ModuleEntry32W)]
+        self.kernel32.Module32NextW.restype = wintypes.BOOL
+
+    def wait_for_debug_event(self, timeout_ms: int) -> DebugEvent | None:
+        native = _DebugEvent()
+        if not self.kernel32.WaitForDebugEvent(ctypes.byref(native), timeout_ms):
+            if ctypes.get_last_error() == ERROR_SEM_TIMEOUT:
+                return None
+            raise ProbeApiUnavailable("debug_event_unavailable")
+        code, pid, tid = native.dwDebugEventCode, native.dwProcessId, native.dwThreadId
+        handles: tuple[int, ...] = ()
+        exception_code = first_chance = address = exit_code = None
+        if code == DEBUG_EVENT_EXCEPTION:
+            exception = native.u.Exception
+            exception_code = exception.ExceptionRecord.ExceptionCode
+            first_chance = bool(exception.dwFirstChance)
+            address = int(exception.ExceptionRecord.ExceptionAddress or 0)
+        elif code == DEBUG_EVENT_CREATE_PROCESS:
+            info = native.u.CreateProcessInfo
+            # The API explicitly transfers ownership of hFile. The process
+            # and thread event handles are managed by the debug-event lifecycle.
+            handle = info.hFile
+            handles = (int(handle),) if handle else ()
+        elif code == DEBUG_EVENT_LOAD_DLL:
+            handle = native.u.LoadDll.hFile
+            handles = (int(handle),) if handle else ()
+        elif code == DEBUG_EVENT_EXIT_PROCESS:
+            exit_code = native.u.ExitCode
+        return DebugEvent(code, pid, tid, exception_code, first_chance, address, exit_code, handles)
+
+    def continue_debug_event(self, event: DebugEvent, status: int) -> None:
+        if not self.kernel32.ContinueDebugEvent(event.process_id, event.thread_id, status):
+            raise ProbeApiUnavailable("debug_event_continue_failed")
+
+    def close_event_handles(self, event: DebugEvent) -> None:
+        for handle in event.close_handles:
+            self.kernel32.CloseHandle(handle)
+
+    def module_for_address(self, pid: int, address: int) -> tuple[str | None, int | None]:
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(0x00000008 | 0x00000010, pid)
+        invalid = ctypes.c_void_p(-1).value
+        if snapshot in (None, invalid):
+            return None, None
+        try:
+            entry = _ModuleEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = self.kernel32.Module32FirstW(snapshot, ctypes.byref(entry))
+            while found:
+                base = int(entry.modBaseAddr or 0)
+                size = int(entry.modBaseSize)
+                if base <= address < base + size:
+                    # szModule is already a basename; szExePath is deliberately
+                    # never returned or written.
+                    return entry.szModule, base
+                entry.dwSize = ctypes.sizeof(entry)
+                found = self.kernel32.Module32NextW(snapshot, ctypes.byref(entry))
+            return None, None
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+
+
+def _job_factory():
+    repo = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo / "native-tests" / "cef-candidate"))
+    from windows_smoke import WindowsJob  # noqa: PLC0415
+    return WindowsJob()
+
+
+def run_probe(binary: Path, case_dir: Path, *, timeout_seconds: int = WAIT_TIMEOUT_SECONDS,
+              site_url: str, source_env: dict[str, str] | None = None, popen_factory=None,
+              job_factory=None, api_factory=None) -> dict[str, object]:
+    """Self-launch one fixture process and pump its debug events on this thread."""
+    result: dict[str, object] = {"diagnosticComplete": False, "observed": False,
+                                 "reason": "probe_unavailable"}
+    process = None
+    job = None
+    api = None
+    if ((os.name != "nt" and api_factory is None) or not owned_fixture_case(case_dir) or
+            binary.name.lower() != "takosumi-mobile.exe" or
+            binary.is_symlink() or not binary.is_file() or type(timeout_seconds) is not int or
+            timeout_seconds < 1 or timeout_seconds > 60 or loopback_site(site_url) is None):
+        result["reason"] = "fixture_or_platform_unavailable"
+        return result
+    case_dir = case_dir.resolve()
+    binary = binary.resolve()
+    create = popen_factory or subprocess.Popen
+    job_closed = False
+    process_reaped = False
+    try:
+        job = (job_factory or _job_factory)()
+        api = (api_factory or WindowsDebugApi)()
+        env = safe_fixture_environment(source_env if source_env is not None else dict(os.environ), case_dir)
+        env["TAKOSUMI_BROWSER_PROCESS_SITE"] = site_url
+        process = create([str(binary)], cwd=str(case_dir), env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=CREATE_SUSPENDED | DEBUG_ONLY_THIS_PROCESS | DETACHED_PROCESS)
+        # WindowsJob.adopt assigns the suspended exact child to its kill-on-close
+        # job before resuming its initial thread. This synchronous function then
+        # pumps events on the same thread that called Popen/CreateProcess.
+        job.adopt(process.pid)
+        deadline = time.monotonic() + timeout_seconds
+        created = False
+        initial_breakpoint_seen = False
+        fault: dict[str, str | None] | None = None
+        while time.monotonic() < deadline:
+            wait_ms = max(1, min(1000, int((deadline - time.monotonic()) * 1000)))
+            event = api.wait_for_debug_event(wait_ms)
+            if event is None:
+                continue
+            try:
+                if event.process_id == process.pid and event.code == DEBUG_EVENT_CREATE_PROCESS:
+                    created = True
+                if observed_fault(event, process.pid):
+                    module_name, image_base = api.module_for_address(
+                        process.pid, event.exception_address or 0)
+                    fault = module_projection(module_name, image_base, event.exception_address)
+                status, initial_breakpoint_seen = continue_status(
+                    event, process.pid, created, initial_breakpoint_seen)
+                api.continue_debug_event(event, status)
+                if event.process_id == process.pid and event.code == DEBUG_EVENT_EXIT_PROCESS:
+                    if fault is None:
+                        result = {"diagnosticComplete": True, "observed": False,
+                                  "reason": "process_exited_without_target_exception",
+                                  "processExitCode": event.exit_code}
+                    else:
+                        result = {"diagnosticComplete": True, "observed": True,
+                                  "reason": "last_chance_access_violation",
+                                  "exceptionCode": "0xC0000005", **fault,
+                                  "processExitCode": event.exit_code}
+                    try:
+                        process.wait(timeout=EXIT_WAIT_SECONDS)
+                    except Exception:
+                        pass
+                    return result
+            finally:
+                try:
+                    api.close_event_handles(event)
+                except Exception:
+                    pass
+        if fault is not None:
+            result = {"diagnosticComplete": False, "observed": True,
+                      "reason": "exception_seen_exit_unconfirmed", "exceptionCode": "0xC0000005",
+                      **fault}
+        else:
+            result = {"diagnosticComplete": False, "observed": False, "reason": "probe_timeout"}
+        return result
+    except Exception:
+        # Do not replace any App verdict with native error text, command lines,
+        # or paths. This probe has no authority to report the App as passing.
+        result = {"diagnosticComplete": False, "observed": False, "reason": "probe_unavailable"}
+        return result
+    finally:
+        if process is not None and job is not None:
+            try:
+                if process.poll() is None:
+                    job.terminate()
+                    if api is not None:
+                        _drain_exit_event(api, process.pid, EXIT_WAIT_SECONDS)
+            except Exception:
+                pass
+        if job is not None:
+            try:
+                job.close()
+                job_closed = True
+            except Exception:
+                job_closed = False
+        if process is not None:
+            try:
+                process.wait(timeout=EXIT_WAIT_SECONDS)
+                process_reaped = True
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=EXIT_WAIT_SECONDS)
+                    process_reaped = True
+                except Exception:
+                    process_reaped = False
+        if isinstance(result, dict) and "diagnosticComplete" in result:
+            result["jobHandleClosed"] = job_closed
+            result["ownedProcessReaped"] = process_reaped
+
+
+def _drain_exit_event(api, pid: int, timeout_seconds: int) -> bool:
+    """Terminate only the owned job, then drain its matching debug exit event."""
+    deadline = time.monotonic() + timeout_seconds
+    created = False
+    breakpoint_seen = False
+    while time.monotonic() < deadline:
+        timeout_ms = max(1, min(500, int((deadline - time.monotonic()) * 1000)))
+        event = api.wait_for_debug_event(timeout_ms)
+        if event is None:
+            continue
+        try:
+            if event.process_id == pid and event.code == DEBUG_EVENT_CREATE_PROCESS:
+                created = True
+            status, breakpoint_seen = continue_status(event, pid, created, breakpoint_seen)
+            api.continue_debug_event(event, status)
+            if event.process_id == pid and event.code == DEBUG_EVENT_EXIT_PROCESS:
+                return True
+        finally:
+            try:
+                api.close_event_handles(event)
+            except Exception:
+                pass
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Diagnostic-only fixture crash probe; never an App pass.")
+    parser.add_argument("--binary", required=True, type=Path, help="the fixture-built takosumi-mobile.exe")
+    parser.add_argument("--case", required=True, type=Path, help="a fresh owned fixture case directory")
+    parser.add_argument("--site", required=True, help="the fixture HTTPS origin https://127.0.0.1:<port>")
+    parser.add_argument("--timeout-seconds", type=int, default=WAIT_TIMEOUT_SECONDS)
+    args = parser.parse_args()
+    report = run_probe(args.binary, args.case, site_url=args.site, timeout_seconds=args.timeout_seconds)
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report.get("diagnosticComplete") is True else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
