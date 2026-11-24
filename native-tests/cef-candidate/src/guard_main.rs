@@ -54,8 +54,9 @@ const MAX_ANCESTRY: usize = 128;
 /// recorded in `nonFatalErrors` and the browser keeps running.
 const MAX_RUNNING_FAULTS: u32 = 8;
 
-/// Called by `guard_entry.rs`, which compiles this supervisor only for Linux.
-pub(super) fn main() -> ExitCode {
+/// The Android fixture entry can allow its SDK helper one clean-exit poll.
+/// The product entry keeps the standard drain.
+pub(super) fn main(clean_exit_grace: Option<Duration>) -> ExitCode {
     // The self-test build runs its tests unless it is asked to act as the
     // guard; the release binary has no such switch.
     #[cfg(test)]
@@ -64,7 +65,7 @@ pub(super) fn main() -> ExitCode {
     }
     let args: Vec<OsString> = std::env::args_os().collect();
     match prepare(&args) {
-        Ok(prepared) => supervise(prepared, &args[2], &args[3..]),
+        Ok(prepared) => supervise(prepared, &args[2], &args[3..], clean_exit_grace),
         Err((code, message)) => {
             eprintln!("takosumi-browser-guard: {message}");
             ExitCode::from(code)
@@ -1261,8 +1262,8 @@ impl Run {
     }
 
     /// Wait for the browser to exit or for a stop request, without a lifetime
-    /// cap. Blocks on the signalfd between observations.
-    fn running(&mut self, signals: &Signals) -> Result<(), String> {
+    /// cap. Returns whether the browser exited before a stop was requested.
+    fn running(&mut self, signals: &Signals) -> Result<bool, String> {
         let mut stopping = false;
         let mut faults = 0;
         while self.root_exit.is_none() && !stopping {
@@ -1317,18 +1318,20 @@ impl Run {
                 }
             }
         }
-        Ok(())
+        Ok(!stopping)
     }
 
     /// The bounded drain every run takes, however it ended. Returns whether
     /// the kernel reported no children (ECHILD).
-    fn drain(&mut self, signals: &Signals) -> bool {
+    fn drain(&mut self, signals: &Signals, clean_exit_grace: Option<Duration>) -> bool {
         self.stop_observation.begin();
         'phases: for (signal, budget) in DRAIN {
             if let Some(signal) = signal {
                 self.send(signal);
             }
-            let deadline = Instant::now() + budget;
+            let start = Instant::now();
+            let grace = if signal.is_none() { clean_exit_grace } else { None };
+            let mut deadline = start + grace.unwrap_or(budget);
             loop {
                 self.safe_observe();
                 if self.safe_reap() {
@@ -1337,15 +1340,25 @@ impl Run {
                 if let Some(signal) = signal {
                     self.send(signal); // Includes newly adopted late-fork helpers.
                 }
+                if grace.is_some() && !self.cleanup_errors.is_empty() {
+                    deadline = deadline.min(start + budget);
+                }
                 let now = Instant::now();
                 if now >= deadline {
                     break;
                 }
-                // A child exit wakes this early; a further stop request is
-                // consumed here because the drain already serves it.
+                // A child exit wakes this early. Explicit stop requests keep
+                // the standard drain even after a normal SDK exit.
                 let pause = DRAIN_TICK.min(deadline - now);
-                if signals.wait(pause).is_err() {
-                    std::thread::sleep(pause);
+                match signals.wait(pause) {
+                    Ok(true) if grace.is_some() => deadline = deadline.min(start + budget),
+                    Ok(_) => {}
+                    Err(_) => {
+                        if grace.is_some() {
+                            deadline = deadline.min(start + budget);
+                        }
+                        std::thread::sleep(pause);
+                    }
                 }
             }
         }
@@ -1357,7 +1370,12 @@ impl Run {
     }
 }
 
-fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitCode {
+fn supervise(
+    prepared: Prepared,
+    program: &OsString,
+    args: &[OsString],
+    clean_exit_grace: Option<Duration>,
+) -> ExitCode {
     let Prepared {
         mut receipt,
         signals,
@@ -1381,6 +1399,7 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
         run.launch_context = Some(LaunchContext::new(run.me, program, args));
     }
     let mut failure = None;
+    let mut exited_without_stop = false;
     // A stop requested before the browser starts (a parent already gone, or a
     // pending SIGTERM or SIGINT) starts nothing.
     match signals.wait(Duration::ZERO) {
@@ -1402,14 +1421,17 @@ fn supervise(prepared: Prepared, program: &OsString, args: &[OsString]) -> ExitC
                         run.non_fatal.insert(fault(&error));
                     }
                 }
-                if let Err(error) = run.running(&signals) {
-                    failure = Some(error);
+                match run.running(&signals) {
+                    Ok(natural) => exited_without_stop = natural,
+                    Err(error) => failure = Some(error),
                 }
             }
             Err(error) => failure = Some(fault(&error)),
         },
     }
-    let empty = run.drain(&signals);
+    let grace = clean_exit_grace
+        .filter(|_| exited_without_stop && run.root_exit == Some(0) && run.non_fatal.is_empty());
+    let empty = run.drain(&signals, grace);
     let complete = run.child.is_some() && run.root_exit.is_some() && empty;
     let normal =
         complete && run.root_exit == Some(0) && failure.is_none() && run.cleanup_errors.is_empty();

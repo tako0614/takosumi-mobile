@@ -326,11 +326,15 @@ jobs:
             cp src-tauri/Cargo.lock "src-tauri/plugins/$plugin/Cargo.lock"
             cargo test --manifest-path "src-tauri/plugins/$plugin/Cargo.toml"
           done
-      - name: Android app-screen JVM and instrumentation compile
+      - name: Prepare Android app-screen JVM test SDKs
         shell: bash
         run: |
           export TAURI_ANDROID_SOURCE="$(cargo metadata --format-version 1 --locked --manifest-path src-tauri/plugins/app-screen/Cargo.toml | python3 -c 'import json,sys,pathlib; data=json.load(sys.stdin); print(next(pathlib.Path(p["manifest_path"]).parent / "mobile/android" for p in data["packages"] if p["name"]=="tauri"))')"
           echo "TAURI_ANDROID_SOURCE=$TAURI_ANDROID_SOURCE" >> "$GITHUB_ENV"
+          gradle --project-dir native-tests/android :app-screen:prepareRobolectricSdks
+      - name: Android app-screen JVM and instrumentation compile
+        shell: bash
+        run: |
           gradle --project-dir native-tests/android :app-screen:testDebugUnitTest :app-screen:assembleDebugAndroidTest
       - name: Actual WebView profile isolation on Android emulator
         timeout-minutes: 10

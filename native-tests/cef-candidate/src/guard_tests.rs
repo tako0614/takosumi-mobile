@@ -81,6 +81,20 @@ if mode=='echo':
     os._exit(0 if sys.stdin.read()=='' else 92)
 record('root')
 if mode=='helper': helper('ignore'); os._exit(0)
+if mode in ('poll-clean', 'poll-failed', 'poll-stop'):
+    parent=os.getpid()
+    r,w=os.pipe()
+    if os.fork()==0:
+        os.close(r)
+        fd=os.pidfd_open(parent)
+        record('helper'); os.write(w,b'1'); os.close(w)
+        if not select.select([fd],[],[],15)[0]: os._exit(95)
+        time.sleep(0.9); os._exit(0)
+    os.close(w)
+    if not select.select([r],[],[],15)[0]: os._exit(90)
+    os.read(r,1); os.close(r)
+    if mode=='poll-stop': released()
+    os._exit(3 if mode=='poll-failed' else 0)
 if mode=='late': helper('late'); os._exit(0)
 if mode=='stop': helper('default'); time.sleep(30); os._exit(0)
 if mode=='stubborn':
@@ -154,6 +168,8 @@ const TESTS: &[Test] = tests![
     terminal_signal_owned_live_handler_exit_zero_stays_forced,
     stop_observation_is_bounded_and_uses_only_existing_results,
     normal_exit_writes_a_complete_normal_receipt,
+    only_the_android_fixture_allows_a_slow_poll_after_clean_exit,
+    a_stop_after_clean_exit_uses_the_standard_drain,
     a_non_zero_browser_exit_is_reported_and_fails,
     a_detached_helper_is_reaped_and_counted_as_forced_cleanup,
     a_late_fork_during_the_drain_is_reobserved_until_echild,
@@ -603,6 +619,42 @@ fn normal_exit_writes_a_complete_normal_receipt() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
+}
+
+fn only_the_android_fixture_allows_a_slow_poll_after_clean_exit() {
+    let android_fixture = env!("CARGO_BIN_NAME") == "sumi-android-emulator-guard";
+    for (mode, exit) in [("poll-clean", 0), ("poll-failed", 3)] {
+        let case = Case::new(mode);
+        let mut guard = case.start(mode);
+        guard.wait(Duration::from_secs(20));
+        let proof = case.proof();
+        assert_eq!(proof["rootExit"], exit, "{proof}");
+        assert_eq!(proof["complete"], true, "{proof}");
+        assert_eq!(proof["kernelNoChildren"], true, "{proof}");
+        let forced = if android_fixture && exit == 0 { 0 } else { 1 };
+        assert_eq!(proof["forcedCleanup"], forced, "{proof}");
+        assert!(ended(guard.records.wait("helper")), "the helper survived");
+    }
+}
+
+fn a_stop_after_clean_exit_uses_the_standard_drain() {
+    let case = Case::new("poll-stop");
+    let mut guard = case.start("poll-stop");
+    let root = guard.records.wait("root");
+    let helper = guard.records.wait("helper");
+    std::fs::write(case.path("release"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ended(root) {
+        assert!(Instant::now() < deadline, "the guard did not reap the root");
+        pause(10);
+    }
+    guard.signal(libc::SIGTERM);
+    guard.wait(Duration::from_secs(20));
+    let proof = case.proof();
+    assert_eq!(proof["rootExit"], 0, "{proof}");
+    assert_eq!(proof["kernelNoChildren"], true, "{proof}");
+    assert_eq!(proof["forcedCleanup"], 1, "{proof}");
+    assert!(ended(helper), "the helper survived");
 }
 
 fn a_non_zero_browser_exit_is_reported_and_fails() {
