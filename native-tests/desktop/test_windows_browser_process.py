@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -2518,13 +2519,25 @@ class RunnerTests(unittest.TestCase):
                 self.waited = True
                 return 0
 
+        matched = {"available": True, "reason": "pid_and_path_matched", "faultingModule": "runtime.dll",
+                   "exceptionCode": "0xC0000005", "faultingOffset": "0x10"}
+        path_unavailable = {"available": True, "reason": "pid_matched_path_unavailable",
+                            "faultingModule": "must-not-be-saved"}
         cases = (
-            ("exited", [3221225477, 3221225477], {"state": "exited", "exitCode": 3221225477}, False),
-            ("still-running", [None, None], {"state": "still_running"}, True),
+            ("access-violation", [3221225477, 3221225477], {"state": "exited", "exitCode": 3221225477},
+             False, matched, matched, 1),
+            ("access-violation-path-unavailable", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, path_unavailable,
+             {"available": False, "reason": "pid_matched_path_unavailable"}, 1),
+            ("access-violation-collection-failure", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, RuntimeError("private diagnostic detail"),
+             {"available": False, "reason": "event_query_unavailable"}, 1),
+            ("other-exit", [1, 1], {"state": "exited", "exitCode": 1}, False, None, None, 0),
+            ("still-running", [None, None], {"state": "still_running"}, True, None, None, 0),
             ("poll-error", [OSError("private poll detail"), None],
-             {"state": "poll_error", "errorType": "OSError"}, True),
+             {"state": "poll_error", "errorType": "OSError"}, True, None, None, 0),
         )
-        for name, observations, expected, cleanup_app in cases:
+        for name, observations, expected, cleanup_app, event_result, expected_diag, event_calls in cases:
             with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 session = root / "sumi-w3"
@@ -2532,6 +2545,8 @@ class RunnerTests(unittest.TestCase):
                 args = SimpleNamespace(session=session, data=root, binary=root / "app.exe", packaged=False,
                                        real_site=None, unsandboxed_candidate=False, site="https://fixture.invalid")
                 app, job = App(observations), Job()
+                diagnostic = mock.Mock(side_effect=event_result) if isinstance(event_result, BaseException) else \
+                    mock.Mock(return_value=event_result)
                 with mock.patch.object(runner, "WindowsJob", return_value=job), \
                         mock.patch.object(runner.subprocess, "Popen", return_value=app), \
                         mock.patch.object(runner.subprocess, "run",
@@ -2539,12 +2554,24 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(runner.subprocess, "check_output", return_value="head\n"), \
                         mock.patch.object(runner, "job_pids", return_value=[]), \
                         mock.patch.object(runner, "guard_records", return_value=[]), \
-                        mock.patch.object(runner, "tails"):
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "application_error_event", diagnostic):
                     with self.assertRaises(runner.subprocess.CalledProcessError):
                         runner.run_phase(args, {}, [], {}, "head", "")
 
                 execution = json.loads((session / "app-execution.json").read_text())
                 self.assertEqual(execution["appStateAtObserverFailure"], expected)
+                self.assertEqual(diagnostic.call_count, event_calls)
+                if event_calls:
+                    pid, executable, started_at = diagnostic.call_args.args
+                    self.assertEqual((pid, executable), (app.pid, args.binary))
+                    self.assertIsInstance(started_at, datetime)
+                    self.assertEqual(started_at.tzinfo, timezone.utc)
+                if expected_diag is not None:
+                    self.assertEqual(execution["applicationError"], expected_diag)
+                else:
+                    self.assertNotIn("applicationError", execution)
+                self.assertNotIn("private", json.dumps(execution))
                 self.assertTrue(execution["error"].startswith("CalledProcessError:"))
                 self.assertNotIn("appExit", execution)
                 self.assertEqual(app.terminated, cleanup_app)

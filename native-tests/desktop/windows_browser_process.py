@@ -69,6 +69,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -79,6 +80,7 @@ sys.path.insert(0, str(REPO / "native-tests" / "cef-candidate"))
 from windows_smoke import (CREATE_SUSPENDED, Failure, WindowsJob, browser_shutdown, describe_processes,  # noqa: E402
                            process_records, require, tail)
 from windows_browser_observer import REAL_SITES  # noqa: E402
+from windows_package import application_error_event  # noqa: E402
 
 WINDOWS = os.name == "nt"
 OBSERVER = HERE / "windows_browser_observer.py"
@@ -514,6 +516,25 @@ def app_state_at_observer_failure(app):
     return {"state": "exited", "exitCode": exit_code}
 
 
+def app_error_at_observer_failure(app, executable, started_at):
+    """Keep only the already-sanitized exact-path Application Error summary."""
+    try:
+        summary = application_error_event(app.pid, executable, started_at)
+    except Exception:
+        return {"available": False, "reason": "event_query_unavailable"}
+    if not isinstance(summary, dict):
+        return {"available": False, "reason": "event_query_unavailable"}
+    reason = summary.get("reason")
+    if summary.get("available") is True and reason == "pid_and_path_matched":
+        return summary
+    if reason == "pid_matched_path_unavailable":
+        return {"available": False, "reason": reason}
+    if reason in {"no_matching_event", "app_path_mismatch", "event_query_limit",
+                  "event_query_unavailable", "event_query_timeout"}:
+        return {"available": False, "reason": reason}
+    return {"available": False, "reason": "event_query_unavailable"}
+
+
 def run_phase(args, env, files, before, head, suffix):
     """One App launch on the case's data; returns its proof."""
     session, phase = args.session, suffix[1:]
@@ -528,6 +549,7 @@ def run_phase(args, env, files, before, head, suffix):
         job = WindowsJob()
         try:
             # Suspended until it is in the job, detached from any console.
+            started_at = datetime.now(timezone.utc)
             app = subprocess.Popen([str(args.binary)], cwd=session, env=env, stdin=subprocess.DEVNULL, stdout=log,
                                    stderr=subprocess.STDOUT, creationflags=CREATE_SUSPENDED | DETACHED_PROCESS)
         except BaseException:
@@ -563,7 +585,13 @@ def run_phase(args, env, files, before, head, suffix):
                 except Exception:
                     # Record whether the owned App had exited before finally
                     # terminates it; do not replace the observer's failure.
-                    execution["appStateAtObserverFailure"] = app_state_at_observer_failure(app)
+                    state = app_state_at_observer_failure(app)
+                    execution["appStateAtObserverFailure"] = state
+                    exit_code = state.get("exitCode")
+                    if state.get("state") == "exited" and type(exit_code) is int and \
+                            exit_code & 0xFFFFFFFF == 0xC0000005:
+                        execution["applicationError"] = app_error_at_observer_failure(
+                            app, args.binary, started_at)
                     raise
             execution["appExit"] = app.wait(timeout=APP_EXIT_WAIT)
             require(execution["appExit"] == 0, "The App must exit normally")
