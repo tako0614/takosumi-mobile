@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
@@ -16,17 +17,78 @@ import windows_native_fault_probe as probe  # noqa: E402
 
 
 class EventPolicyTests(unittest.TestCase):
-    def test_source_location_keeps_only_checkout_or_public_crate_relative_paths(self):
+    def test_source_location_keeps_only_checkout_or_public_rust_paths(self):
         repo = PureWindowsPath(r"D:\\a\\private-runner-path\\takosumi-mobile")
         self.assertEqual(probe.source_location(str(repo / "src-tauri/src/lib.rs"), 422, repo),
                          {"file": "src-tauri/src/lib.rs", "line": 422})
         self.assertEqual(probe.source_location(
             r"C:\\Users\\private\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\wry-0.55.1\\src\\lib.rs",
             34, repo), {"file": "wry-0.55.1/src/lib.rs", "line": 34})
+        rust_source = "/rustc/" + ("a" * 40) + "/library/std/src/sys/windows/mod.rs"
+        self.assertEqual(probe.source_location(rust_source, 128, repo),
+                         {"file": rust_source[1:], "line": 128})
         for name in (r"C:\\private\\token.rs", "src/lib.rs", "src-tauri/../private.rs",
+                     "C:" + rust_source, "/rustc/private/library/std/src/lib.rs",
                      r"C:\\.cargo\\registry\\src\\private-registry-12345678\\scope-1.2.3\\src\\lib.rs"):
             self.assertIsNone(probe.source_location(name, 34, repo))
         self.assertIsNone(probe.source_location(str(repo / "src-tauri/src/lib.rs"), 0, repo))
+
+    def test_local_symbol_index_needs_both_guid_and_age(self):
+        binary, first, second = map(Path, ("test.exe", "test.pdb", "test_fixture.pdb"))
+        guid = (301, 22, 19, 9)
+        indexes = {str(binary): (guid, 4), str(first): (guid, 3),
+                   str(second): ((302, 22, 19, 9), 4)}
+
+        def get_index(path, output, flags):
+            self.assertEqual(flags, 0)
+            result = output._obj
+            self.assertEqual(result.sizeofstruct, 1608)
+            entry = indexes.get(path)
+            if entry is None:
+                return False
+            result.guid[:], result.age = entry
+            return True
+
+        with patch.object(probe, "_declare", return_value=get_index):
+            self.assertEqual(probe.local_symbol_index_status(None, binary, [first, second]), "mismatched")
+            indexes[str(second)] = (guid, 4)
+            self.assertEqual(probe.local_symbol_index_status(None, binary, [first, second]), "matched")
+            del indexes[str(binary)]
+            self.assertEqual(probe.local_symbol_index_status(None, binary, [first, second]), "unreadable")
+
+    def test_symbol_line_evidence_distinguishes_no_line_and_filtered_path(self):
+        repo = PureWindowsPath(r"D:\a\takosumi-mobile")
+        binary = repo / "target/debug/takosumi-mobile.exe"
+        frames = [{"module": binary.name, "offset": hex(rva), "fixtureAppImage": True}
+                  for rva in (0x100, 0x200, 0x300)]
+
+        def get_line(_process, address, displacement, line):
+            if address == 0x11ff:
+                return False
+            line._obj.Address = address - 3
+            displacement._obj.value = 3
+            line._obj.LineNumber = 45
+            line._obj.FileName = str(repo / "src-tauri/src/lib.rs") if address == 0x10ff else r"C:\private\unknown.rs"
+            return True
+
+        native = {
+            "GetCurrentProcess": lambda: -1, "SymInitializeW": lambda *_: True,
+            "SymCleanup": lambda *_: True, "SymSetOptions": lambda *_: 0,
+            "SymLoadModuleExW": lambda *_: 0x1000, "SymGetLineFromAddrW64": get_line,
+        }
+        evidence = {}
+        with (patch.object(probe, "os", SimpleNamespace(name="nt")),
+              patch.object(probe.ctypes, "WinDLL", return_value=None, create=True),
+              patch.object(PureWindowsPath, "is_symlink", return_value=False, create=True),
+              patch.object(PureWindowsPath, "is_file", return_value=True, create=True),
+              patch.object(probe, "_declare", side_effect=lambda _dll, name, *_: native[name]),
+              patch.object(probe, "local_symbol_index_status", return_value="matched")):
+            probe.application_source_lines(frames, binary, repo, evidence)
+        self.assertEqual(evidence, {"stage": "completed", "pdbCandidates": 2, "pdbIndex": "matched",
+                                    "lookups": 3, "linesFound": 2, "addressMatches": 2, "projectedLines": 1})
+        self.assertEqual(frames[0]["source"], {"file": "src-tauri/src/lib.rs", "line": 45})
+        self.assertNotIn("source", frames[1])
+        self.assertNotIn("source", frames[2])
 
     def test_only_initial_breakpoint_is_handled_and_other_exceptions_fail_through(self):
         pid = 73

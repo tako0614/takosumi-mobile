@@ -390,8 +390,42 @@ class _ImageHlpLine64(ctypes.Structure):
                 ("FileName", wintypes.LPWSTR), ("Address", _U64)]
 
 
+class _SymbolIndexInfoW(ctypes.Structure):
+    # Windows WCHAR and GUID have fixed widths independent of the test host.
+    _fields_ = [("sizeofstruct", _U32), ("file", ctypes.c_uint16 * 261),
+                ("stripped", _U32), ("timestamp", _U32), ("size", _U32),
+                ("dbgfile", ctypes.c_uint16 * 261), ("pdbfile", ctypes.c_uint16 * 261),
+                ("guid", _U32 * 4), ("sig", _U32), ("age", _U32)]
+
+
+def local_symbol_index_status(dbghelp, binary: Path, pdbs: list[Path]) -> str:
+    """Compare local PDB indexes without retaining identifiers or paths."""
+    if ctypes.sizeof(_SymbolIndexInfoW) != 1608:
+        return "unreadable"
+    try:
+        get_index = _declare(dbghelp, "SymSrvGetFileIndexInfoW", wintypes.BOOL,
+                             wintypes.LPCWSTR, ctypes.POINTER(_SymbolIndexInfoW), _U32)
+    except AttributeError:
+        return "unreadable"
+
+    def index(path):
+        info = _SymbolIndexInfoW()
+        info.sizeofstruct = ctypes.sizeof(info)
+        if get_index(str(path), ctypes.byref(info), 0) and any(info.guid) and not info.sig and info.age:
+            return tuple(info.guid), info.age
+        return None
+
+    expected = index(binary)
+    if expected is None:
+        return "unreadable"
+    candidates = [index(path) for path in pdbs]
+    if expected in candidates:
+        return "matched"
+    return "unreadable" if None in candidates else "mismatched"
+
+
 def source_location(file_name: str | None, line: int, repo: PureWindowsPath) -> dict[str, object] | None:
-    """Retain checkout-relative or crate-relative Rust paths only."""
+    """Retain checkout-relative and public Rust paths only."""
     if not file_name or len(file_name) > 1024 or not 1 <= line <= 200_000:
         return None
     path = PureWindowsPath(file_name)
@@ -401,6 +435,11 @@ def source_location(file_name: str | None, line: int, repo: PureWindowsPath) -> 
         parts = path.relative_to(repo).parts
     elif not path.anchor and path.parts[:1] == ("src-tauri",):
         parts = path.parts
+    elif (path.anchor == "\\" and path.parts[1:2] == ("rustc",) and
+          len(path.parts) >= 6 and re.fullmatch(r"[a-f0-9]{40}", path.parts[2]) and
+          path.parts[3] == "library"):
+        # rustc's virtual sysroot, with its public revision for source lookup.
+        parts = path.parts[1:]
     else:
         lowered = tuple(part.lower() for part in path.parts)
         try:
@@ -419,17 +458,25 @@ def source_location(file_name: str | None, line: int, repo: PureWindowsPath) -> 
     return {"file": "/".join(parts), "line": line}
 
 
-def application_source_lines(frames: list[dict[str, object]], binary: Path, repo: PureWindowsPath):
+def application_source_lines(frames: list[dict[str, object]], binary: Path, repo: PureWindowsPath,
+                             evidence: dict[str, object]) -> None:
     """Read matched line tables from the exact fixture EXE after the child exited."""
+    evidence["stage"] = "platform"
     if os.name != "nt" or ctypes.sizeof(_ImageHlpLine64) != 40:
         return
+    evidence["stage"] = "local_sidecar"
     search_path = str(binary.parent)
     if not re.fullmatch(r"[A-Za-z]:\\[^;*]*", search_path):
         return
-    pdbs = (binary.with_suffix(".pdb"), binary.with_name(binary.stem.replace("-", "_") + ".pdb"))
-    if not any(path.is_file() and not path.is_symlink() for path in pdbs):
+    names = (binary.with_suffix(".pdb"), binary.with_name(binary.stem.replace("-", "_") + ".pdb"))
+    pdbs = [path for path in dict.fromkeys(names) if not path.is_symlink() and path.is_file()]
+    evidence["pdbCandidates"] = len(pdbs)
+    if not pdbs:
         return
+    evidence["stage"] = "symbol_index"
     dbghelp = ctypes.WinDLL("dbghelp.dll", winmode=_SYSTEM32)
+    evidence["pdbIndex"] = local_symbol_index_status(dbghelp, binary, pdbs)
+    evidence["stage"] = "initialize"
     kernel = ctypes.WinDLL("kernel32", winmode=_SYSTEM32)
     current_process = _declare(kernel, "GetCurrentProcess", _HANDLE)
     initialize = _declare(dbghelp, "SymInitializeW", wintypes.BOOL, _HANDLE, wintypes.LPCWSTR, wintypes.BOOL)
@@ -445,9 +492,12 @@ def application_source_lines(frames: list[dict[str, object]], binary: Path, repo
     if not initialize(process, search_path, False):
         return
     try:
+        evidence["stage"] = "load_module"
         base = load(process, None, str(binary), None, 0, 0, None, 0)
         if not base:
             return
+        evidence["stage"] = "find_line"
+        lookups = found = address_matches = projected = 0
         for frame in frames:
             module = frame.get("module")
             if (frame.get("fixtureAppImage") is not True or not isinstance(module, str)
@@ -464,13 +514,19 @@ def application_source_lines(frames: list[dict[str, object]], binary: Path, repo
             line = _ImageHlpLine64()
             line.SizeOfStruct = ctypes.sizeof(line)
             displacement = _U32()
+            lookups += 1
             if not get_line(process, address, ctypes.byref(displacement), ctypes.byref(line)):
                 continue
+            found += 1
             if not (base <= line.Address <= address and line.Address + displacement.value == address):
                 continue
+            address_matches += 1
             location = source_location(line.FileName, line.LineNumber, repo)
             if location is not None:
                 frame["source"] = location
+                projected += 1
+        evidence.update(stage="completed", lookups=lookups, linesFound=found,
+                        addressMatches=address_matches, projectedLines=projected)
     finally:
         cleanup(process)
 
@@ -742,15 +798,19 @@ def main() -> int:
             and report.get("ownedProcessReaped") is True
             and any(frame.get("fixtureAppImage") is True for frame in frames)):
         print(json.dumps({"stackObserved": report}, sort_keys=True), flush=True)
+        evidence: dict[str, object] = {"stage": "image_identity"}
         try:
             if identity is not None and image_identity() == identity:
-                application_source_lines(frames, args.binary.resolve(), PureWindowsPath(Path(__file__).resolve().parents[2]))
+                application_source_lines(frames, args.binary.resolve(),
+                                         PureWindowsPath(Path(__file__).resolve().parents[2]), evidence)
         except Exception:
-            pass
+            evidence["error"] = True
         if image_identity() != identity:
             for frame in frames:
                 frame.pop("source", None)
+            evidence = {"stage": "image_identity"}
         report["sourceResolution"] = "available" if any("source" in frame for frame in frames) else "unavailable"
+        report["sourceResolutionEvidence"] = evidence
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("diagnosticComplete") is True else 2
 
