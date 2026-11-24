@@ -2,8 +2,10 @@ package com.takosumi.fixture.webhome;
 
 import static org.junit.Assert.*;
 
+import android.app.UiAutomation;
 import android.content.Context;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -11,6 +13,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.uiautomator.By;
 import androidx.test.uiautomator.BySelector;
+import androidx.test.uiautomator.Configurator;
 import androidx.test.uiautomator.Direction;
 import androidx.test.uiautomator.StaleObjectException;
 import androidx.test.uiautomator.UiDevice;
@@ -36,6 +39,7 @@ import org.junit.runner.RunWith;
 public final class WebHomeOperationTest {
     private static final String TARGET = "com.takosumi.fixture.android";
     private static final String DRIVER = "com.takosumi.fixture.webhome";
+    private static final String WORK_HOME = "Fixture home Work";
     private UiDevice device;
     private Context context;
     private String origin, editor, launcher;
@@ -383,6 +387,44 @@ public final class WebHomeOperationTest {
         } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
     }
 
+    private BackWaitObservation.Outcome queryWorkHome() {
+        UiObject2 node = device.findObject(By.text(WORK_HOME).pkg(TARGET));
+        if (node == null) return BackWaitObservation.Outcome.QUERY_NULL;
+        if (!node.isEnabled()) return BackWaitObservation.Outcome.DISABLED;
+        return node.getVisibleBounds().isEmpty()
+            ? BackWaitObservation.Outcome.EMPTY_BOUNDS : BackWaitObservation.Outcome.VISIBLE;
+    }
+
+    private void compareAccountBackAccessibility() {
+        BackWaitObservation wait = backHomeObservation;
+        if (wait == null || backObservationIncomplete || wait.incomplete || wait.capReached
+                || wait.waitFinishedAtMs < 0 || wait.waitReturned || wait.samples == 0
+                || wait.queryNull != wait.samples || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return;
+        }
+        JSONObject metadata = new JSONObject();
+        diagnostic(result, "accountBackAccessibility", metadata);
+        diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "startedAtMs", SystemClock.elapsedRealtime());
+        try {
+            // Compare the same exact query after capturing the failure artifacts.
+            // If the node has already appeared, cache clearing adds no evidence.
+            BackWaitObservation.Outcome before = queryWorkHome();
+            diagnostic(metadata, "before", before.name());
+            if (before != BackWaitObservation.Outcome.QUERY_NULL) return;
+
+            UiAutomation automation = InstrumentationRegistry.getInstrumentation().getUiAutomation(
+                Configurator.getInstance().getUiAutomationFlags());
+            boolean cleared = automation.clearCache();
+            diagnostic(metadata, "cacheCleared", cleared);
+            if (cleared) diagnostic(metadata, "after", queryWorkHome().name());
+        } catch (RuntimeException error) {
+            diagnostic(metadata, "error", error.getClass().getSimpleName());
+        } finally {
+            diagnostic(metadata, "finishedAtMs", SystemClock.elapsedRealtime());
+        }
+    }
+
     // PERSONAL_HOME_WAIT_METHODS_BEGIN
     private void expectPersonalHomeAfterReset() {
         try { personalHomeWait = new PersonalHomeWaitObservation(); }
@@ -491,24 +533,95 @@ public final class WebHomeOperationTest {
         one(By.desc("表示中のサイト " + address.substring("https://".length())));
     }
 
-    private void draft(String value) {
+    private void draft(String value, String expectedProfile) {
         long end = SystemClock.elapsedRealtime() + 15000;
+        List<UiObject2> lastFields = new ArrayList<>();
+        int samples = 0;
         do {
             List<UiObject2> fields = device.findObjects(By.clazz("android.widget.EditText").pkg(TARGET));
+            lastFields = fields;
+            samples++;
             if (fields.size() == 1 && value.equals(fields.get(0).getText())) {
                 expect("Remote has no App IPC"); return;
             }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
+        captureEditorDraftFailure(expectedProfile, value, samples, lastFields);
         throw new AssertionError("Wrong profile's actual editor draft: " + value);
     }
 
-    private void writeDraft(String value) {
-        draft("");
+    private static String draftCategory(String value) {
+        if (value == null) return "unavailable";
+        if (value.isEmpty()) return "empty";
+        if ("work-draft".equals(value)) return "work_draft";
+        if ("personal-draft".equals(value)) return "personal_draft";
+        return "other";
+    }
+
+    private void captureEditorDraftFailure(String expectedProfile, String expectedValue, int samples,
+                                           List<UiObject2> fields) {
+        try {
+            JSONObject metadata = new JSONObject();
+            diagnostic(metadata, "diagnosticOnly", true);
+            diagnostic(metadata, "phase", "editor_draft_check");
+            diagnostic(metadata, "expectedFixtureProfile",
+                "Work".equals(expectedProfile) || "Personal".equals(expectedProfile) ? expectedProfile : "unknown");
+            diagnostic(metadata, "expectedValueCategory", draftCategory(expectedValue));
+            diagnostic(metadata, "samples", samples);
+            diagnostic(metadata, "candidateCount", fields.size());
+
+            JSONArray candidates = new JSONArray();
+            int limit = Math.min(fields.size(), 4);
+            for (int i = 0; i < limit; i++) {
+                UiObject2 field = fields.get(i);
+                JSONObject candidate = new JSONObject();
+                String category = "unavailable";
+                boolean valueRead = false;
+                try {
+                    CharSequence observed = field.getText();
+                    category = draftCategory(observed == null ? null : observed.toString());
+                    valueRead = true;
+                } catch (RuntimeException ignored) { }
+                diagnostic(candidate, "valueCategory", category);
+                diagnostic(candidate, "valueRead", valueRead);
+
+                boolean boundsRead = false;
+                try {
+                    Rect bounds = field.getVisibleBounds();
+                    boundsRead = bounds != null;
+                    diagnostic(candidate, "visible", bounds != null && !bounds.isEmpty());
+                    diagnostic(candidate, "boundsEmpty", bounds == null ? null : bounds.isEmpty());
+                    if (bounds != null && !bounds.isEmpty()) {
+                        diagnostic(candidate, "boundsWidth", bounds.width());
+                        diagnostic(candidate, "boundsHeight", bounds.height());
+                    }
+                } catch (RuntimeException ignored) { }
+                diagnostic(candidate, "boundsRead", boundsRead);
+
+                boolean focused = false;
+                boolean focusRead = false;
+                try {
+                    focused = field.isFocused();
+                    focusRead = true;
+                } catch (RuntimeException ignored) { }
+                diagnostic(candidate, "focused", focusRead ? focused : null);
+                diagnostic(candidate, "focusRead", focusRead);
+                candidates.put(candidate);
+            }
+            diagnostic(metadata, "candidates", candidates);
+            diagnostic(metadata, "candidatesOmitted", Math.max(0, fields.size() - limit));
+            diagnostic(result, "editorDraftFailure", metadata);
+        } catch (Exception ignored) {
+            diagnostic(result, "editorDraftObservationIncomplete", true);
+        }
+    }
+
+    private void writeDraft(String value, String expectedProfile) {
+        draft("", expectedProfile);
         UiObject2 field = one(By.clazz("android.widget.EditText"));
         field.click(); field.setText(value);
         hideKeyboardIfShown();
-        draft(value);
+        draft(value, expectedProfile);
     }
 
     private String document() {
@@ -549,27 +662,27 @@ public final class WebHomeOperationTest {
         beginHomeWaitObservation();
         boolean accountHomeReturned = false;
         try {
-            expect("Fixture home Work");
+            expect(WORK_HOME);
             accountHomeReturned = true;
         } finally { finishHomeWaitObservation(accountHomeReturned); }
         click("📝 Notes"); expect("Notes editor"); host(editor);
-        writeDraft("work-draft");
+        writeDraft("work-draft", "Work");
         click("Page two"); expect("Notes page two");
-        nativeButton("戻る"); expect("Notes editor"); draft("work-draft");
+        nativeButton("戻る"); expect("Notes editor"); draft("work-draft", "Work");
         menu("アプリホームへ"); expect("Fixture home Work");
-        nativeButton("戻る"); draft("work-draft");
+        nativeButton("戻る"); draft("work-draft", "Work");
         cases.put("connection-web-login-home-back").put("cross-origin-no-ipc");
         String warm = document(), warmPid = pid();
         assertFalse(warmPid.isEmpty());
-        picker(); reopen("Work"); draft("work-draft"); assertEquals(warm, document());
+        picker(); reopen("Work"); draft("work-draft", "Work"); assertEquals(warm, document());
         device.pressHome(); launch(); expect("接続先を追加"); reopen("Work");
-        draft("work-draft"); assertEquals(warmPid, pid()); assertEquals(warm, document());
+        draft("work-draft", "Work"); assertEquals(warmPid, pid()); assertEquals(warm, document());
         cases.put("warm-document-retained");
         picker(); add("Personal"); click("Sign in Personal"); expect("Fixture home Personal");
-        click("📝 Notes"); writeDraft("personal-draft");
-        picker(); reopen("Work"); draft("work-draft");
+        click("📝 Notes"); writeDraft("personal-draft", "Personal");
+        picker(); reopen("Work"); draft("work-draft", "Work");
         menu("アプリホームへ"); expect("Fixture home Work");
-        nativeButton("戻る"); draft("work-draft");
+        nativeButton("戻る"); draft("work-draft", "Work");
         cases.put("profile-auth-and-draft-isolated");
         String before = document(), oldPid = pid();
         picker();
@@ -578,12 +691,12 @@ public final class WebHomeOperationTest {
         while (!pid().isEmpty() && SystemClock.elapsedRealtime() < end) SystemClock.sleep(100);
         assertEquals("Original App must terminate", "", pid());
         launch(); expect("接続先を追加"); reopen("Work");
-        expect("Notes editor"); draft("work-draft"); host(editor);
+        expect("Notes editor"); draft("work-draft", "Work"); host(editor);
         String fresh = document(), freshPid = pid();
         assertFalse(freshPid.isEmpty()); assertNotEquals(oldPid, freshPid); assertNotEquals(before, fresh);
         result.put("oldPid", oldPid).put("newPid", freshPid).put("beforeColdDocument", before).put("afterColdDocument", fresh);
         menu("アプリホームへ"); expect("Fixture home Work");
-        picker(); reopen("Personal"); draft("personal-draft");
+        picker(); reopen("Personal"); draft("personal-draft", "Personal");
         menu("アプリホームへ"); expect("Fixture home Personal");
         cases.put("cold-process-and-profiles-restored");
         closeAndOpenMain(); reopen("Work"); closeAndOpenMain();
@@ -593,10 +706,10 @@ public final class WebHomeOperationTest {
         // owned-page scroll while still requiring the exact visible receipt.
         one(By.text("Workのサイトデータを消去しました。"), null, true);
         reopen("Work"); expect("Fixture signed out"); host(origin);
-        click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("");
+        click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("", "Work");
         closeAndOpenMain(); reopen("Personal");
         expectPersonalHomeAfterReset(); expect("Instance data instance-Personal");
-        click("📝 Notes"); draft("personal-draft"); closeAndOpenMain();
+        click("📝 Notes"); draft("personal-draft", "Personal"); closeAndOpenMain();
         cases.put("cleared-profile-reset").put("other-profile-preserved").put("native-views-closed");
         result.put("passed", true);
     }
@@ -619,6 +732,7 @@ public final class WebHomeOperationTest {
         } catch (Exception error) {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
+        compareAccountBackAccessibility();
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
         savePersonalHomeWait(); // personal-home-wait:result-delivery
