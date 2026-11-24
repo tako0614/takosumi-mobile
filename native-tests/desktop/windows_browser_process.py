@@ -503,6 +503,17 @@ def tails(session, suffix):
             print(tail(directory / name, 8192), file=sys.stderr)
 
 
+def app_state_at_observer_failure(app):
+    """Observe the owned App before failure cleanup can change its state."""
+    try:
+        exit_code = app.poll()
+    except Exception as error:
+        return {"state": "poll_error", "errorType": type(error).__name__}
+    if exit_code is None:
+        return {"state": "still_running"}
+    return {"state": "exited", "exitCode": exit_code}
+
+
 def run_phase(args, env, files, before, head, suffix):
     """One App launch on the case's data; returns its proof."""
     session, phase = args.session, suffix[1:]
@@ -543,11 +554,17 @@ def run_phase(args, env, files, before, head, suffix):
                     real += [f"--recovery-{role}", str(image)]
                 real += ["--recovery-app-data", str(app_data(session.name)[0])]
             with create_exclusive(session / f"observer{suffix}.log") as observer:
-                subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
-                                "--app-pid", str(app.pid), "--phase", phase, *real],
-                               env=observer_env, check=True,
-                               timeout=REAL_SITE_OBSERVER_WAIT if args.real_site else OBSERVER_WAIT,
-                               stdout=observer, stderr=subprocess.STDOUT)
+                try:
+                    subprocess.run([sys.executable, "-B", str(OBSERVER), "--data", str(session), "--site", args.site,
+                                    "--app-pid", str(app.pid), "--phase", phase, *real],
+                                   env=observer_env, check=True,
+                                   timeout=REAL_SITE_OBSERVER_WAIT if args.real_site else OBSERVER_WAIT,
+                                   stdout=observer, stderr=subprocess.STDOUT)
+                except Exception:
+                    # Record whether the owned App had exited before finally
+                    # terminates it; do not replace the observer's failure.
+                    execution["appStateAtObserverFailure"] = app_state_at_observer_failure(app)
+                    raise
             execution["appExit"] = app.wait(timeout=APP_EXIT_WAIT)
             require(execution["appExit"] == 0, "The App must exit normally")
             require(read_json(session / f"app-browser-process{suffix}-complete.json")["passed"] is True,

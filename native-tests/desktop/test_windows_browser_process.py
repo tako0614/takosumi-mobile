@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -2477,6 +2478,79 @@ class RunnerTests(unittest.TestCase):
             runner.read_session(file, 4)
         with self.assertRaises(Failure):
             runner.read_session(HERE)
+
+    def test_observer_failure_records_owned_app_before_existing_cleanup(self):
+        class Job:
+            def __init__(self):
+                self.closed = False
+                self.terminated = False
+
+            def adopt(self, pid):
+                self.adopted = pid
+
+            def processes(self):
+                return 0, 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def close(self):
+                self.closed = True
+
+        class App:
+            pid = 456
+
+            def __init__(self, observations):
+                self.observations = iter(observations)
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                observation = next(self.observations)
+                if isinstance(observation, BaseException):
+                    raise observation
+                return observation
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return 0
+
+        cases = (
+            ("exited", [3221225477, 3221225477], {"state": "exited", "exitCode": 3221225477}, False),
+            ("still-running", [None, None], {"state": "still_running"}, True),
+            ("poll-error", [OSError("private poll detail"), None],
+             {"state": "poll_error", "errorType": "OSError"}, True),
+        )
+        for name, observations, expected, cleanup_app in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "app.exe", packaged=False,
+                                       real_site=None, unsandboxed_candidate=False, site="https://fixture.invalid")
+                app, job = App(observations), Job()
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run",
+                                          side_effect=runner.subprocess.CalledProcessError(1, ["observer"])), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value="head\n"), \
+                        mock.patch.object(runner, "job_pids", return_value=[]), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "tails"):
+                    with self.assertRaises(runner.subprocess.CalledProcessError):
+                        runner.run_phase(args, {}, [], {}, "head", "")
+
+                execution = json.loads((session / "app-execution.json").read_text())
+                self.assertEqual(execution["appStateAtObserverFailure"], expected)
+                self.assertTrue(execution["error"].startswith("CalledProcessError:"))
+                self.assertNotIn("appExit", execution)
+                self.assertEqual(app.terminated, cleanup_app)
+                self.assertEqual(app.waited, cleanup_app)
+                self.assertTrue(job.closed)
+                self.assertFalse(job.terminated)
 
 
 if __name__ == "__main__":
