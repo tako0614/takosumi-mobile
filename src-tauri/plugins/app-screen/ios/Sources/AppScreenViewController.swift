@@ -12,6 +12,8 @@ private enum AppScreenNavigationWitness {
         case failedProvisional = "fail_provisional", failed = "fail", cap
         case policyAllow = "policy_allow"
         case policyAllowReturned = "policy_allow_returned"
+        case responsePolicyEntered = "response_policy_entered"
+        case responsePolicyAllowReturned = "response_policy_allow_returned"
         case contentTerminated = "content_terminated"
     }
     enum Target: String {
@@ -512,11 +514,12 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         witnessRecord(.returned, relation: navigation == nil ? 0 : 1, sameView: true)
     }
 
-    private func witnessPolicyAllowed(_ url: URL?, mainFrame: Bool, webView: WKWebView)
+    private func witnessPolicy(_ event: AppScreenNavigationWitness.Event, url: @autoclosure () -> URL?,
+                               mainFrame: @autoclosure () -> Bool, webView: WKWebView)
         -> (view: Int, target: AppScreenNavigationWitness.Target)? {
-        guard mainFrame, witnessView > 0, webView === witnessWebView else { return nil }
-        let target = AppScreenNavigationWitness.policyTarget(url)
-        AppScreenNavigationWitness.record(.policyAllow, view: witnessView, request: 0, relation: 0,
+        guard witnessView > 0, webView === witnessWebView, mainFrame() else { return nil }
+        let target = AppScreenNavigationWitness.policyTarget(url())
+        AppScreenNavigationWitness.record(event, view: witnessView, request: 0, relation: 0,
             target: target, reused: false, kept: false, resume: false, initial: false, sameView: true)
         // Capture only the already-validated scalar context, never a URL or WebKit object.
         return (witnessView, target)
@@ -570,7 +573,7 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         {
         case .inApp:
 #if DEBUG
-            let policyWitness = witnessPolicyAllowed(url, mainFrame: mainFrame, webView: webView)
+            let policyWitness = witnessPolicy(.policyAllow, url: url, mainFrame: mainFrame, webView: webView)
 #endif
             decisionHandler(.allow)
 #if DEBUG
@@ -609,6 +612,10 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
+#if DEBUG
+        let responseWitness = witnessPolicy(.responsePolicyEntered, url: navigationResponse.response.url,
+            mainFrame: navigationResponse.isForMainFrame, webView: webView)
+#endif
         if #available(iOS 14.5, *), isDownloadResponse(navigationResponse),
            screen?.isWebHomeDownloadScreen(webView, navigator: self) == true {
             let url = navigationResponse.response.url
@@ -629,6 +636,14 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             return
         }
         decisionHandler(.allow)
+#if DEBUG
+        if let responseWitness = responseWitness {
+            // Record the policy handler's return independently of didCommit.
+            AppScreenNavigationWitness.record(.responsePolicyAllowReturned, view: responseWitness.view,
+                request: 0, relation: 0, target: responseWitness.target, reused: false, kept: false,
+                resume: false, initial: false, sameView: true)
+        }
+#endif
     }
 
     @available(iOS 14.5, *)

@@ -835,6 +835,39 @@ class Controls(unittest.TestCase):
         self.assertEqual(empty["records"], [])
         self.assertTrue(empty["absenceIsUnknown"])
 
+    def test_response_policy_witness_uses_the_same_clock_without_binding_navigation(self):
+        header = (b"2026-11-24 19:58:28.200 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+
+        def packet(event, seq, time_ms, target="editor"):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq={seq} event={event} "
+                             f"view=1 request=0 relation=0 target={target} reused=0 kept=0 "
+                             f"resume=0 initial=0 sameView=1 timeMs={time_ms}\n").encode()
+
+        entered = packet("response_policy_entered", 38, 1057250)
+        allowed = packet("response_policy_allow_returned", 39, 1057251)
+        result = runner.navigation_witness(
+            packet("provisional", 37, 1057214, "unknown") + entered + allowed
+            + packet("commit", 40, 1095344, "unknown"))
+        self.assertEqual(result["clockDomain"], "ios_system_uptime")
+        self.assertEqual([(row["event"], row["timeMs"], row["target"]) for row in result["records"]], [
+            ("provisional", 1057214, "unknown"), ("response_policy_entered", 1057250, "editor"),
+            ("response_policy_allow_returned", 1057251, "editor"), ("commit", 1095344, "unknown"),
+        ])
+        self.assertTrue(result["diagnosticOnly"] and result["absenceIsUnknown"])
+        self.assertNotIn("passed", result)
+        for event in (entered, allowed):
+            for old, new in ((b"request=0", b"request=7"), (b"relation=0", b"relation=1"),
+                             (b"sameView=1", b"sameView=0"), (b"view=1 ", b"view=0 "),
+                             (b"resume=0", b"resume=1"),
+                             (b"target=editor", b"target=https://private.invalid/?token=secret"),
+                             (b".navigation:navigation", b".WebKit:network")):
+                with self.subTest(event=event, field=old):
+                    rejected = runner.navigation_witness(event.replace(old, new))
+                    self.assertEqual(rejected["records"], [])
+                    self.assertEqual(rejected["malformed"], 1)
+                    self.assertNotIn("secret", json.dumps(rejected))
+
     def test_content_termination_witness_is_owner_bound_and_context_free(self):
         header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
                   b"[com.takosumi.fixture.simulator.navigation:navigation] ")
