@@ -2,8 +2,10 @@ package com.takosumi.fixture.webhome;
 
 import static org.junit.Assert.*;
 
+import android.app.UiAutomation;
 import android.content.Context;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -11,6 +13,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.uiautomator.By;
 import androidx.test.uiautomator.BySelector;
+import androidx.test.uiautomator.Configurator;
 import androidx.test.uiautomator.Direction;
 import androidx.test.uiautomator.StaleObjectException;
 import androidx.test.uiautomator.UiDevice;
@@ -36,6 +39,7 @@ import org.junit.runner.RunWith;
 public final class WebHomeOperationTest {
     private static final String TARGET = "com.takosumi.fixture.android";
     private static final String DRIVER = "com.takosumi.fixture.webhome";
+    private static final String WORK_HOME = "Fixture home Work";
     private UiDevice device;
     private Context context;
     private String origin, editor, launcher;
@@ -383,6 +387,44 @@ public final class WebHomeOperationTest {
         } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
     }
 
+    private BackWaitObservation.Outcome queryWorkHome() {
+        UiObject2 node = device.findObject(By.text(WORK_HOME).pkg(TARGET));
+        if (node == null) return BackWaitObservation.Outcome.QUERY_NULL;
+        if (!node.isEnabled()) return BackWaitObservation.Outcome.DISABLED;
+        return node.getVisibleBounds().isEmpty()
+            ? BackWaitObservation.Outcome.EMPTY_BOUNDS : BackWaitObservation.Outcome.VISIBLE;
+    }
+
+    private void compareAccountBackAccessibility() {
+        BackWaitObservation wait = backHomeObservation;
+        if (wait == null || backObservationIncomplete || wait.incomplete || wait.capReached
+                || wait.waitFinishedAtMs < 0 || wait.waitReturned || wait.samples == 0
+                || wait.queryNull != wait.samples || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return;
+        }
+        JSONObject metadata = new JSONObject();
+        diagnostic(result, "accountBackAccessibility", metadata);
+        diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "startedAtMs", SystemClock.elapsedRealtime());
+        try {
+            // Compare the same exact query after capturing the failure artifacts.
+            // If the node has already appeared, cache clearing adds no evidence.
+            BackWaitObservation.Outcome before = queryWorkHome();
+            diagnostic(metadata, "before", before.name());
+            if (before != BackWaitObservation.Outcome.QUERY_NULL) return;
+
+            UiAutomation automation = InstrumentationRegistry.getInstrumentation().getUiAutomation(
+                Configurator.getInstance().getUiAutomationFlags());
+            boolean cleared = automation.clearCache();
+            diagnostic(metadata, "cacheCleared", cleared);
+            if (cleared) diagnostic(metadata, "after", queryWorkHome().name());
+        } catch (RuntimeException error) {
+            diagnostic(metadata, "error", error.getClass().getSimpleName());
+        } finally {
+            diagnostic(metadata, "finishedAtMs", SystemClock.elapsedRealtime());
+        }
+    }
+
     // PERSONAL_HOME_WAIT_METHODS_BEGIN
     private void expectPersonalHomeAfterReset() {
         try { personalHomeWait = new PersonalHomeWaitObservation(); }
@@ -549,7 +591,7 @@ public final class WebHomeOperationTest {
         beginHomeWaitObservation();
         boolean accountHomeReturned = false;
         try {
-            expect("Fixture home Work");
+            expect(WORK_HOME);
             accountHomeReturned = true;
         } finally { finishHomeWaitObservation(accountHomeReturned); }
         click("📝 Notes"); expect("Notes editor"); host(editor);
@@ -619,6 +661,7 @@ public final class WebHomeOperationTest {
         } catch (Exception error) {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
+        compareAccountBackAccessibility();
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
         savePersonalHomeWait(); // personal-home-wait:result-delivery
