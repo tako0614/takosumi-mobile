@@ -23,6 +23,8 @@ mod shell;
 #[cfg(any(windows, target_os = "macos"))]
 #[path = "browser_process_windows.rs"]
 mod shell;
+#[cfg(windows)]
+use shell::bootstrap_stage;
 pub use shell::{run, start};
 
 static EXIT: AtomicI32 = AtomicI32::new(1);
@@ -670,8 +672,14 @@ async fn relaunch_flow(app: &AppHandle, view: &impl Shell, case: &Path, kind: &s
 /// only a subsequent explicit action may create a new native generation.
 #[cfg(any(target_os = "linux", windows))]
 async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
+    #[cfg(windows)]
+    bootstrap_stage(case, "open-work");
     add(view, "Work", 1).await?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "open-personal");
     add(view, "Personal", 2).await?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "read-connections");
     let connections = eval(
         view,
         "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
@@ -681,12 +689,17 @@ async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Resul
         std::fs::write(case.join(name), serde_json::to_vec_pretty(value).unwrap())
             .map_err(|error| error.to_string())
     };
+    #[cfg(windows)]
+    bootstrap_stage(case, "read-process-status");
+    let processes = browser_status(app)?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "write-initial-checkpoint");
     record(
         "app-browser-process-recover-initial.json",
-        &serde_json::json!({
-            "connections":connections,"processes":browser_status(app)?
-        }),
+        &serde_json::json!({"connections": connections, "processes": processes}),
     )?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "initial-checkpoint-written");
     // The observer first saves and normally closes Work. Reopening it proves
     // this case's data was durable before inducing the crash.
     checkpoint(view, case, "recover-seeded").await?;
@@ -738,6 +751,8 @@ async fn recovery_flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Resul
 }
 
 async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
+    #[cfg(windows)]
+    bootstrap_stage(case, "home-readiness");
     ready(
         view,
         "document.querySelector('#connection-url') && window.__TAURI_INTERNALS__",
@@ -767,15 +782,23 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     {
         return Err("A new Mac fixture case must have a fresh home store".into());
     }
+    #[cfg(windows)]
+    bootstrap_stage(case, "open-work");
     add(view, "Work", 1).await?;
     println!("first: Work added and opened");
+    #[cfg(windows)]
+    bootstrap_stage(case, "open-personal");
     add(view, "Personal", 2).await?;
     println!("first: Personal added and opened");
+    #[cfg(windows)]
+    bootstrap_stage(case, "read-connections");
     let connections = eval(
         view,
         "JSON.parse(localStorage.getItem('takosumi.web-connections.v2'))",
     )
     .await?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "read-process-status");
     let before = tauri_plugin_app_screen::browser_process_experiment_status(app)
         .map_err(|error| error.to_string())?;
     let array = before.as_array().ok_or("Missing process array")?;
@@ -799,13 +822,17 @@ async fn flow(app: &AppHandle, case: &Path, view: &impl Shell) -> Result<()> {
     // back to through the OS (the owner's decision: no in-browser home button).
     #[cfg(windows)]
     {
+        bootstrap_stage(case, "read-home-hwnd");
         open["homeWindow"] = shell::home_window(app)?;
+        bootstrap_stage(case, "write-initial-checkpoint");
     }
     std::fs::write(
         case.join("app-browser-process-open.json"),
         serde_json::to_vec_pretty(&open).unwrap(),
     )
     .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    bootstrap_stage(case, "initial-checkpoint-written");
     println!("first: both browsers recorded; waiting for the observer");
     checkpoint_within(view, case, "inspect-ready", inspect_bound()).await?;
     println!("first: observer ready; reopening Work from the home");
