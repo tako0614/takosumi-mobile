@@ -34,10 +34,15 @@ Each command prints one JSON report line and writes it to --report; it never
 removes anything besides what the installer and uninstaller do.
 """
 import argparse
+import base64
 import ctypes
+from datetime import datetime, timezone
 import hashlib
 import json
+import ntpath
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -142,6 +147,141 @@ def sha256(path):
 def clean_env():
     return {key: value for key, value in os.environ.items()
             if not key.upper().startswith(("TAKOSUMI_", "WEBVIEW2_"))}
+
+
+def _ntstatus(value, width):
+    """A bounded hexadecimal Windows exception/status field, or None."""
+    text = str(value or "").strip()
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    if not re.fullmatch(rf"[0-9a-fA-F]{{1,{width}}}", text):
+        return None
+    return "0x" + text.upper()
+
+
+def application_error_summary(events, pid, executable):
+    """Keep only a same-process Application Error's safe diagnostic fields.
+
+    Event XML and its paths are transient query inputs; neither is returned.
+    Application Error 1000 can omit AppPath, so exact PID remains mandatory
+    and a present path must match the launched executable.
+    """
+    if isinstance(events, dict):
+        reason = events.get("reason")
+        if isinstance(reason, str) and reason in {"no_matching_event", "event_query_unavailable", "event_query_timeout"}:
+            return {"available": False, "reason": reason}
+    if not isinstance(events, list):
+        return {"available": False, "reason": "event_query_unavailable"}
+
+    expected_path = ntpath.normcase(ntpath.normpath(str(executable)))
+    pid_match = False
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        try:
+            raw_pid = str(event.get("processId", "")).strip()
+            event_pid = int(raw_pid, 16) if raw_pid.lower().startswith("0x") else int(raw_pid, 10)
+        except (TypeError, ValueError):
+            continue
+        if event_pid != pid:
+            continue
+        pid_match = True
+        event_path = str(event.get("appPath") or "").strip()
+        if event_path and ntpath.normcase(ntpath.normpath(event_path)) != expected_path:
+            continue
+
+        raw_module = str(event.get("faultingModule") or "").strip()
+        module = ntpath.basename(raw_module.replace("/", "\\")) or None
+        if module is not None and not re.fullmatch(r"[\x20-\x7e]{1,96}", module):
+            module = None
+        return {
+            "available": True,
+            "reason": "pid_matched_path_unavailable" if not event_path else "pid_and_path_matched",
+            "faultingModule": module,
+            "exceptionCode": _ntstatus(event.get("exceptionCode"), 8),
+            "faultingOffset": _ntstatus(event.get("faultingOffset"), 16),
+        }
+    return {"available": False,
+            "reason": "app_path_mismatch" if pid_match else "no_matching_event"}
+
+
+def application_error_event(pid, executable, started_at):
+    """Best-effort, bounded read of Application Error event 1000 for this launch."""
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        return {"available": False, "reason": "event_reader_unavailable"}
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$start = [DateTimeOffset]::Parse([string]$payload.startedAt).LocalDateTime
+try {
+  $events = @(Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; `
+      Id=1000; StartTime=$start} `
+    -MaxEvents 64 -ErrorAction Stop)
+} catch {
+  if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+    [Console]::Out.Write('{"reason":"no_matching_event"}')
+  } else {
+    [Console]::Out.Write('{"reason":"event_query_unavailable"}')
+  }
+  exit 0
+}
+$foundEvents = @()
+foreach ($event in $events) {
+  try { [xml]$xml = $event.ToXml() } catch { continue }
+  $data = @{}
+  foreach ($item in $xml.Event.EventData.Data) {
+    if ($item.Name) { $data[[string]$item.Name] = [string]$item.InnerText }
+  }
+  $rawPid = [string]$data['ProcessId']
+  try {
+    if ($rawPid -match '^0[xX]([0-9a-fA-F]+)$') {
+      $eventPid = [Convert]::ToInt64($Matches[1], 16)
+    } else {
+      $eventPid = [Convert]::ToInt64($rawPid, 10)
+    }
+  } catch { continue }
+  if ($eventPid -ne [long]$payload.pid) { continue }
+  $foundEvents += [pscustomobject]@{
+    processId = [string]$eventPid
+    appPath = [string]$data['AppPath']
+    faultingModule = [string]$data['ModuleName']
+    exceptionCode = [string]$data['ExceptionCode']
+    faultingOffset = [string]$data['FaultingOffset']
+  }
+}
+ConvertTo-Json -InputObject @($foundEvents) -Compress -Depth 2
+"""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    payload = json.dumps({"pid": pid, "startedAt": started_at.isoformat()})
+    try:
+        result = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+             "-EncodedCommand", encoded],
+            input=payload, capture_output=True, text=True, timeout=2, env=clean_env(), check=False)
+    except subprocess.TimeoutExpired:
+        return {"available": False, "reason": "event_query_timeout"}
+    except OSError:
+        return {"available": False, "reason": "event_reader_unavailable"}
+    except UnicodeError:
+        return {"available": False, "reason": "event_query_unavailable"}
+    if result.returncode != 0:
+        return {"available": False, "reason": "event_query_unavailable"}
+    try:
+        events = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "event_query_unavailable"}
+    return application_error_summary(events, pid, executable)
+
+
+def require_app_running(app, value, executable, started_at, message_suffix):
+    """Preserve the smoke verdict while adding a bounded diagnostic on crash."""
+    exit_code = app.poll()
+    if exit_code is not None:
+        if exit_code != 0:
+            value["applicationError"] = application_error_event(app.pid, executable, started_at)
+        require(False, f"The App exited with {exit_code} {message_suffix}")
 
 
 def user32():
@@ -252,6 +392,7 @@ def smoke(args, value):
     library = user32()
     with open(args.log, "xb") as log:
         job = WindowsJob()
+        started_at = datetime.now(timezone.utc)
         app = subprocess.Popen([str(exe)], cwd=str(exe.parent), env=clean_env(), stdin=subprocess.DEVNULL,
                                stdout=log, stderr=subprocess.STDOUT,
                                creationflags=CREATE_SUSPENDED | DETACHED_PROCESS)
@@ -260,7 +401,8 @@ def smoke(args, value):
             started = time.monotonic()
             windows = []
             while not windows:
-                require(app.poll() is None, f"The App exited with {app.returncode} before its window appeared")
+                require_app_running(app, value, exe, started_at,
+                                    "before its window appeared")
                 require(time.monotonic() - started < WINDOW_WAIT, f"No App window within {WINDOW_WAIT} s")
                 time.sleep(0.2)
                 windows = app_windows(library, app.pid)
@@ -268,8 +410,8 @@ def smoke(args, value):
             value["windows"] = [title for _, title in windows]
             up = time.monotonic()
             while time.monotonic() - up < args.seconds:
-                require(app.poll() is None, f"The App exited with {app.returncode} after "
-                                            f"{round(time.monotonic() - up, 1)} s up")
+                require_app_running(app, value, exe, started_at,
+                                    f"after {round(time.monotonic() - up, 1)} s up")
                 time.sleep(0.2)
             value["upSeconds"] = args.seconds
             text = Path(args.log).read_bytes().decode("utf-8", "replace")

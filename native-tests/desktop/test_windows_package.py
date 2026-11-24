@@ -5,6 +5,7 @@ and what remains after an uninstall. Standard library only; runs on Linux
 and Windows."""
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +46,93 @@ class InstallTests(unittest.TestCase):
 
 
 class SmokeTests(unittest.TestCase):
+    def test_application_error_keeps_only_a_pid_and_path_matched_summary(self):
+        summary = package.application_error_summary([{
+            "processId": "0x1234",
+            "appPath": r"c:\program files\takosumi\takosumi-mobile.exe",
+            "faultingModule": r"C:\Windows\System32\KERNELBASE.dll",
+            "exceptionCode": "0xc0000005",
+            "faultingOffset": "0x00000000000010AB",
+        }], 0x1234, r"C:\Program Files\Takosumi\Takosumi-Mobile.exe")
+        self.assertEqual(summary, {
+            "available": True,
+            "reason": "pid_and_path_matched",
+            "faultingModule": "KERNELBASE.dll",
+            "exceptionCode": "0xC0000005",
+            "faultingOffset": "0x00000000000010AB",
+        })
+        self.assertNotIn("appPath", summary)
+        self.assertNotIn("processId", summary)
+
+    def test_application_error_requires_pid_and_rejects_a_different_executable(self):
+        event = {"processId": "4660", "appPath": r"C:\other\app.exe",
+                 "faultingModule": r"C:\Windows\other.dll", "exceptionCode": "0xc0000005",
+                 "faultingOffset": "0x10"}
+        self.assertEqual(package.application_error_summary([event], 0x1235, r"C:\app.exe"),
+                         {"available": False, "reason": "no_matching_event"})
+        self.assertEqual(package.application_error_summary([event], 4660, r"C:\app.exe"),
+                         {"available": False, "reason": "app_path_mismatch"})
+
+    def test_application_error_can_use_pid_when_event_has_no_executable_path(self):
+        summary = package.application_error_summary([{
+            "processId": "4660", "faultingModule": r"D:/app/runtime.dll",
+            "exceptionCode": "c0000005", "faultingOffset": "0x10",
+        }], 4660, r"C:\app.exe")
+        self.assertEqual(summary, {
+            "available": True,
+            "reason": "pid_matched_path_unavailable",
+            "faultingModule": "runtime.dll",
+            "exceptionCode": "0xC0000005",
+            "faultingOffset": "0x10",
+        })
+
+    def test_application_error_omits_nonprintable_or_oversized_module_names(self):
+        for module in ("bad\nmodule.dll", "x" * 97):
+            summary = package.application_error_summary([{
+                "processId": "4660", "appPath": r"C:\app.exe", "faultingModule": module,
+                "exceptionCode": "0xc0000005", "faultingOffset": "0x10",
+            }], 4660, r"C:\app.exe")
+            self.assertTrue(summary["available"])
+            self.assertIsNone(summary["faultingModule"])
+
+    def test_crash_diagnostic_is_best_effort_and_keeps_the_smoke_failure(self):
+        self.assertEqual(package.application_error_summary({"reason": []}, 72, r"C:\app.exe"),
+                         {"available": False, "reason": "event_query_unavailable"})
+
+        class Process:
+            pid = 72
+
+            def __init__(self, code):
+                self.code = code
+                # A child can exit after a caller has already formatted an
+                # error message. The helper must report the value from poll().
+                self.returncode = None
+
+            def poll(self):
+                return self.code
+
+        with patch.object(package, "application_error_event",
+                          return_value={"available": False, "reason": "no_matching_event"}) as read_event:
+            report = {}
+            with self.assertRaisesRegex(Failure, "App exited with 3221225477 after 0.6 s up"):
+                package.require_app_running(Process(3221225477), report, r"C:\app.exe", None,
+                                            "after 0.6 s up")
+            read_event.assert_called_once()
+            self.assertEqual(report["applicationError"],
+                             {"available": False, "reason": "no_matching_event"})
+
+            read_event.reset_mock()
+            with self.assertRaisesRegex(Failure, "App exited with 7 before its window appeared"):
+                package.require_app_running(Process(7), {}, r"C:\app.exe", None,
+                                            "before its window appeared")
+            read_event.assert_called_once()
+
+            read_event.reset_mock()
+            with self.assertRaisesRegex(Failure, "App exited with 0 after 0.6 s up"):
+                package.require_app_running(Process(0), {}, r"C:\app.exe", None,
+                                            "after 0.6 s up")
+            read_event.assert_not_called()
+
     def test_processes_left_in_the_apps_job_are_named_in_the_failure(self):
         leftovers = [{"pid": 4120, "image": "msedgewebview2.exe", "parent": 3900,
                       "created": "2026-11-07T11:49:40.123Z"},
