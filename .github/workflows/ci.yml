@@ -1337,6 +1337,7 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1405,11 +1406,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
-            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -1424,7 +1423,14 @@ jobs:
           } else {
             ninja --version
           }
-          rustc --version
+          # Rust issue #165915 affects 1.100.0 with the locked Windows import library.
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the comparison Rust toolchain' }
+          $compiler = @(rustc --version --verbose)
+          if ($LASTEXITCODE -ne 0 -or $compiler[0] -notmatch '^rustc 1\.99\.1 \(' -or $compiler -notcontains 'host: x86_64-pc-windows-msvc') {
+            throw 'Expected active Rust 1.99.1 for x86_64-pc-windows-msvc'
+          }
+          $compiler
           cargo --version
           python --version
       # From native-tests/cef-candidate (static C runtime, .cargo/config.toml).
@@ -1598,6 +1604,7 @@ jobs:
     env:
       # The W3 job's compiler cache (restored, never saved here).
       CARGO_TARGET_DIR: ${{ github.workspace }}\target-w3
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1660,11 +1667,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-w3
-          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
+          key: cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('takosumi-mobile/native-tests/cef-candidate/Cargo.lock', 'takosumi-mobile/src-tauri/Cargo.lock') }}
           restore-keys: |
-            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-crt-${{ runner.os }}-${{ runner.arch }}-
-            cef-windows-app-cargo-${{ runner.os }}-${{ runner.arch }}-
+            cef-windows-app-cargo-w7-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-
       - name: CMake and Ninja for the CEF wrapper
         shell: pwsh
         run: |
@@ -1679,7 +1684,14 @@ jobs:
           } else {
             ninja --version
           }
-          rustc --version
+          # Rust issue #165915 affects 1.100.0 with the locked Windows import library.
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the comparison Rust toolchain' }
+          $compiler = @(rustc --version --verbose)
+          if ($LASTEXITCODE -ne 0 -or $compiler[0] -notmatch '^rustc 1\.99\.1 \(' -or $compiler -notcontains 'host: x86_64-pc-windows-msvc') {
+            throw 'Expected active Rust 1.99.1 for x86_64-pc-windows-msvc'
+          }
+          $compiler
           cargo --version
           python --version
           node --version

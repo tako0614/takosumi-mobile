@@ -177,86 +177,15 @@ impl Shell for Home {
             })
             .map_err(|error| error.to_string())?;
         // A script that could not be started drops the callback (and the
-        // sender) without calling it. The receiver reports that immediately
-        // when checked.
-        #[cfg(windows)]
-        let reply = script_reply::receive(&receive, SCRIPT_BOUND);
-        #[cfg(not(windows))]
-        let reply = receive.recv_timeout(SCRIPT_BOUND);
-        let json = reply.map_err(|error| format!("The home did not answer a script: {error}"))?;
+        // sender) without calling it, which ends this wait at once.
+        let json = receive
+            .recv_timeout(SCRIPT_BOUND)
+            .map_err(|error| format!("The home did not answer a script: {error}"))?;
         answer(&json)
     }
     /// The flow has this thread to itself (see `start`).
     async fn pause(&self, duration: Duration) {
         std::thread::sleep(duration);
-    }
-}
-
-#[cfg(windows)]
-mod script_reply {
-    use std::{
-        sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError},
-        thread,
-        time::{Duration, Instant},
-    };
-
-    pub(super) fn receive<T>(
-        receiver: &Receiver<T>,
-        bound: Duration,
-    ) -> Result<T, RecvTimeoutError> {
-        // The Windows fixture fault stack ends in the channel's timed park.
-        // Poll on the fixture thread, clamping each sleep to the remaining bound.
-        let deadline = Instant::now() + bound;
-        loop {
-            match receiver.try_recv() {
-                Ok(value) => return Ok(value),
-                Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
-                Err(TryRecvError::Empty) => {}
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(RecvTimeoutError::Timeout);
-            }
-            thread::sleep(Duration::from_millis(5).min(remaining));
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::mpsc::sync_channel;
-
-        #[test]
-        fn queued_reply_can_be_read_after_sender_disconnects() {
-            let (sender, receiver) = sync_channel(1);
-            sender.try_send("answer").unwrap();
-            drop(sender);
-            assert_eq!(receive(&receiver, Duration::ZERO), Ok("answer"));
-            assert_eq!(
-                receive(&receiver, Duration::ZERO),
-                Err(RecvTimeoutError::Disconnected)
-            );
-        }
-
-        #[test]
-        fn receives_an_answer_from_another_thread_while_waiting() {
-            let (sender, receiver) = sync_channel(1);
-            let callback = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(10));
-                sender.try_send("answer").unwrap();
-            });
-            assert_eq!(receive(&receiver, Duration::from_secs(2)), Ok("answer"));
-            callback.join().unwrap();
-        }
-
-        #[test]
-        fn absent_reply_waits_to_the_deadline() {
-            let (_sender, receiver) = sync_channel::<()>(1);
-            let bound = Duration::from_millis(20);
-            let started = Instant::now();
-            assert_eq!(receive(&receiver, bound), Err(RecvTimeoutError::Timeout));
-            assert!(started.elapsed() >= bound);
-        }
     }
 }
 
