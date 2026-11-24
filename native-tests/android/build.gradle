@@ -13,5 +13,57 @@ allprojects { repositories { google(); mavenCentral() } }
 project(':app-screen') {
     plugins.withId('com.android.library') {
         android.defaultConfig.targetSdk = 36
+
+        // Robolectric 4.14.1 uses API 34 for the annotated tests and API 35
+        // for its compile-time resources. Separate resolutions keep both
+        // versions instead of selecting the newest version of one module.
+        def sdkChecksums = [
+            '14-robolectric-10818077-i7': '7cdc0b1306e7865f1acd25a363073149654caee5b8e278c5ae37ff4724185724eff39f0b0111800b521e640bb28698d9d2e655134a801569a0f07470e7b5f455',
+            '15-robolectric-12650502-i7': '87bdd0341838f5f630e1ff412ab29cb2f06e0f8cb7751f14679d11b4ee6084873001f8f6a8581ae6e139fa7c9a654b632412827430f984ebecc3c2588674f7e7',
+        ]
+        // Maven Central returned HTTP 429 for SDK metadata on hosted CI.
+        // Resolve only these checksum-pinned SDKs through Google's mirror.
+        repositories.exclusiveContent {
+            forRepository {
+                repositories.maven {
+                    name = 'RobolectricSdkMirror'
+                    url = uri('https://maven-central.storage-download.googleapis.com/maven2/')
+                }
+            }
+            filter {
+                sdkChecksums.keySet().each { version ->
+                    includeVersion('org.robolectric', 'android-all-instrumented', version)
+                }
+            }
+        }
+        def sdkJars = sdkChecksums.keySet().collect { version ->
+            configurations.detachedConfiguration(
+                dependencies.create("org.robolectric:android-all-instrumented:${version}@jar")
+            )
+        }
+        def sdkDirectory = layout.buildDirectory.dir('robolectric-sdks')
+        def prepareSdkJars = tasks.register('prepareRobolectricSdks', Sync) {
+            from sdkJars
+            into sdkDirectory
+            inputs.property('sdkSha512', sdkChecksums)
+            doLast {
+                // Preserve the SHA-512 check performed by Robolectric's downloader.
+                sdkChecksums.each { version, expected ->
+                    def jar = sdkDirectory.get().file("android-all-instrumented-${version}.jar").asFile
+                    def sha512 = java.security.MessageDigest.getInstance('SHA-512')
+                    jar.withInputStream { input ->
+                        new java.security.DigestInputStream(input, sha512).transferTo(OutputStream.nullOutputStream())
+                    }
+                    if (sha512.digest().encodeHex().toString() != expected) {
+                        throw new GradleException("Robolectric SDK checksum mismatch: ${version}")
+                    }
+                }
+            }
+        }
+        android.testOptions.unitTests.all { testTask ->
+            testTask.dependsOn(prepareSdkJars)
+            testTask.inputs.dir(sdkDirectory)
+            testTask.systemProperty 'robolectric.dependency.dir', sdkDirectory.get().asFile.absolutePath
+        }
     }
 }
