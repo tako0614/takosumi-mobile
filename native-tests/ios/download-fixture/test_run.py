@@ -244,10 +244,20 @@ class HarnessTests(unittest.TestCase):
                     ["xcrun", "simctl", "get_app_container", udid, fixture_runner.BUNDLE, "data"],
                     out / "observation-container.log", timeout=20)
                 self.assertEqual(json.loads((out / source.name).read_bytes()), value)
+                early = {**value, "samples": [], "lifecycle": [
+                    {"unixSeconds": 1794203999.0, "event": "created", "state": "waiting"},
+                    {"unixSeconds": 1794203999.1, "event": "state", "state": "confirming"},
+                    {"unixSeconds": 1794203999.2, "event": "present-confirmed", "state": "confirming"},
+                ]}
+                source.write_text(json.dumps(early))
+                self.assertEqual(fixture_runner.preserve_export_observations(
+                    {"dataPath": str(data)}, udid, out),
+                    {"diagnosticOnly": True, "status": "retained", "samples": 0})
+                self.assertEqual(json.loads((out / source.name).read_bytes()), early)
             retained = (out / source.name).read_bytes()
             for mode in ("extra-field", "oversized", "symlink", "hardlink", "foreign-container",
                          "unknown-event", "unknown-state", "event-extra-field", "event-overflow",
-                         "event-time", "sample-type", "truncation-type"):
+                         "event-time", "sample-type", "sample-overflow", "empty-lifecycle", "truncation-type"):
                 with self.subTest(mode=mode):
                     source.unlink()
                     source.write_text(json.dumps(value))
@@ -270,6 +280,7 @@ class HarnessTests(unittest.TestCase):
                         elif mode == "unknown-state":
                             invalid["lifecycle"][0]["state"] = "unexpected"
                         elif mode == "event-extra-field":
+                            invalid["samples"] = []
                             invalid["lifecycle"][0]["url"] = "must not copy"
                         elif mode == "event-overflow":
                             invalid["lifecycle"] *= 65
@@ -277,6 +288,11 @@ class HarnessTests(unittest.TestCase):
                             invalid["lifecycle"][0]["unixSeconds"] = float("nan")
                         elif mode == "sample-type":
                             invalid["samples"][0]["sourceReadable"] = 1
+                        elif mode == "sample-overflow":
+                            invalid["samples"] *= 33
+                        elif mode == "empty-lifecycle":
+                            invalid["samples"] = []
+                            invalid["lifecycle"] = []
                         else:
                             invalid["lifecycleTruncated"] = 1
                         source.write_text(json.dumps(invalid))

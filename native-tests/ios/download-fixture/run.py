@@ -611,7 +611,7 @@ def preserve_export_observations(created, udid, out):
         if (not isinstance(value, dict) or
                 set(value) != {"diagnosticOnly", "samples", "lifecycle", "lifecycleTruncated"} or
                 value["diagnosticOnly"] is not True or not isinstance(value["samples"], list) or
-                not 1 <= len(value["samples"]) <= 32 or
+                len(value["samples"]) > 32 or
                 not isinstance(value["lifecycle"], list) or not 1 <= len(value["lifecycle"]) <= 64 or
                 type(value["lifecycleTruncated"]) is not bool):
             raise RuntimeError("Invalid fixture observations")
