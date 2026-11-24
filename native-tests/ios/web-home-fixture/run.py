@@ -1052,9 +1052,10 @@ def main():
                                        "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1",
                                        "-only-testing:WebHomeUITests/WebHomeUITests/" + METHOD, "CODE_SIGNING_ALLOWED=NO"],
                                       out / "xcodebuild.log", timeout=600, env=env)
-            finally:
+                result["xctest"] = require_ui_pass(log)
+            except Exception:
                 completed_xcode = completed_xcode_failure_summary(out)
-            result["xctest"] = require_ui_pass(log)
+                raise
             result["installedAfter"] = installed_app(out, udid, created, app_proof, "after")
             require(bundle_proof(app, BUILD) == app_proof and source_hashes() == result["source"],
                     "App or source changed during native execution")
