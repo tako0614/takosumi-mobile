@@ -16,7 +16,9 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -1957,6 +1959,9 @@ class RunnerTests(unittest.TestCase):
         workflow = (root / "ci.yml").read_text(encoding="utf-8")
         w3 = workflow[workflow.index("\n  cef-windows-app:\n"):workflow.index("\n  cef-windows-package:\n")]
         w4 = (root / "windows-real-sites.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("--native-fault-probe"), 1)
+        self.assertIn("--restart --reset --native-fault-probe | Tee-Object", w3)
+        self.assertNotIn("--native-fault-probe", w4)
         for job, stage, runs in ((w3, "w3-stage", 2), (w4, "w4-stage", 2)):
             self.assertNotIn("unsandboxed-candidate", job)
             self.assertIn("cargo build --locked --features fixture-inspection,windows-sandbox --lib "
@@ -2477,6 +2482,305 @@ class RunnerTests(unittest.TestCase):
             runner.read_session(file, 4)
         with self.assertRaises(Failure):
             runner.read_session(HERE)
+
+    def test_observer_failure_records_owned_app_before_existing_cleanup(self):
+        class Job:
+            def __init__(self):
+                self.closed = False
+                self.terminated = False
+
+            def adopt(self, pid):
+                self.adopted = pid
+
+            def processes(self):
+                return 0, 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def close(self):
+                self.closed = True
+
+        class App:
+            pid = 456
+
+            def __init__(self, observations):
+                self.observations = iter(observations)
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                observation = next(self.observations)
+                if isinstance(observation, BaseException):
+                    raise observation
+                return observation
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return 0
+
+        matched = {"available": True, "reason": "pid_and_path_matched", "faultingModule": "runtime.dll",
+                   "exceptionCode": "0xC0000005", "faultingOffset": "0x10"}
+        matched_with_extra = {**matched, "unrecognized": "private diagnostic detail"}
+        path_unavailable = {"available": True, "reason": "pid_matched_path_unavailable",
+                            "faultingModule": "must-not-be-saved"}
+        cases = (
+            ("access-violation", [3221225477, 3221225477], {"state": "exited", "exitCode": 3221225477},
+             False, matched, matched, 1),
+            ("access-violation-extra-field", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, matched_with_extra, matched, 1),
+            ("access-violation-malformed-reason", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False,
+             {**matched, "reason": ["pid_and_path_matched"]},
+             {"available": False, "reason": "event_query_unavailable"}, 1),
+            ("access-violation-path-unavailable", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, path_unavailable,
+             {"available": False, "reason": "pid_matched_path_unavailable"}, 1),
+            ("access-violation-collection-failure", [3221225477, 3221225477],
+             {"state": "exited", "exitCode": 3221225477}, False, RuntimeError("private diagnostic detail"),
+             {"available": False, "reason": "event_query_unavailable"}, 1),
+            ("other-exit", [1, 1], {"state": "exited", "exitCode": 1}, False, None, None, 0),
+            ("still-running", [None, None], {"state": "still_running"}, True, None, None, 0),
+            ("poll-error", [OSError("private poll detail"), None],
+             {"state": "poll_error", "errorType": "OSError"}, True, None, None, 0),
+        )
+        for name, observations, expected, cleanup_app, event_result, expected_diag, event_calls in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "app.exe", packaged=False,
+                                       real_site=None, unsandboxed_candidate=False, site="https://fixture.invalid")
+                app, job = App(observations), Job()
+                diagnostic = mock.Mock(side_effect=event_result) if isinstance(event_result, BaseException) else \
+                    mock.Mock(return_value=event_result)
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run",
+                                          side_effect=runner.subprocess.CalledProcessError(1, ["observer"])), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value="head\n"), \
+                        mock.patch.object(runner, "job_pids", return_value=[]), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "application_error_event", diagnostic):
+                    with self.assertRaises(runner.subprocess.CalledProcessError):
+                        runner.run_phase(args, {}, [], {}, "head", "")
+
+                execution = json.loads((session / "app-execution.json").read_text())
+                self.assertEqual(execution["appStateAtObserverFailure"], expected)
+                self.assertEqual(diagnostic.call_count, event_calls)
+                if event_calls:
+                    pid, executable, started_at = diagnostic.call_args.args
+                    self.assertEqual((pid, executable), (app.pid, args.binary))
+                    self.assertIsInstance(started_at, datetime)
+                    self.assertEqual(started_at.tzinfo, timezone.utc)
+                if expected_diag is not None:
+                    self.assertEqual(execution["applicationError"], expected_diag)
+                else:
+                    self.assertNotIn("applicationError", execution)
+                self.assertNotIn("private", json.dumps(execution))
+                self.assertTrue(execution["error"].startswith("CalledProcessError:"))
+                self.assertNotIn("appExit", execution)
+                self.assertEqual(app.terminated, cleanup_app)
+                self.assertEqual(app.waited, cleanup_app)
+                self.assertTrue(job.closed)
+                self.assertFalse(job.terminated)
+
+    def test_native_fault_probe_requires_exact_first_exit_and_empty_owned_job(self):
+        av = runner.EXCEPTION_ACCESS_VIOLATION
+        cases = (
+            ("probe-succeeds", "", av, 0, "head", True, None, 1),
+            ("probe-fails", "", av - (1 << 32), 0, "head", True, OSError("private probe failure"), 1),
+            ("disabled", "", av, 0, "head", False, None, 0),
+            ("restart", "-restart", av, 0, "head", True, None, 0),
+            ("recovery", "-recover", av, 0, "head", True, None, 0),
+            ("other-exit", "", 1, 0, "head", True, None, 0),
+            ("non-dword-exit", "", av + (1 << 32), 0, "head", True, None, 0),
+            ("app-running", "", None, 0, "head", True, None, 0),
+            ("descendant-running", "", av, 1, "head", True, None, 0),
+            ("unknown-cleanup", "", av, None, "head", True, None, 0),
+            ("changed-source", "", av, 0, "another-head", True, None, 0),
+        )
+        for name, suffix, code, active, head_after, enabled, probe_error, calls in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "takosumi-mobile.exe",
+                                       browser=root / "browser.exe", guard=root / "guard.exe", packaged=False,
+                                       real_site=None, unsandboxed_candidate=False, site="https://127.0.0.1:1234")
+                app = mock.Mock(pid=456)
+                app.poll.return_value = code
+                job = mock.Mock()
+                job.close.return_value = True
+                if active is None:
+                    job.processes.side_effect = OSError("cleanup state unavailable")
+                else:
+                    job.processes.return_value = (7, active)
+                original = runner.subprocess.CalledProcessError(1, ["observer"])
+                observations = []
+
+                def check_then_probe():
+                    proof = json.loads((root / "execution.json").read_text())
+                    observations.append((job.close.call_count, job.terminate.called, app.terminate.called,
+                                         proof["sessionJob"], proof["error"], proof["passed"]))
+                    if probe_error is not None:
+                        raise probe_error
+
+                probe = mock.Mock(side_effect=check_then_probe)
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=original), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value=head_after), \
+                        mock.patch.object(runner, "app_data", return_value=[root]), \
+                        mock.patch.object(runner, "job_pids", return_value=[]), \
+                        mock.patch.object(runner, "leftover_records", return_value={}), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "LEFTOVER_WAIT", 0 if active else 10), \
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "app_error_at_observer_failure", return_value={}):
+                    with self.assertRaises(runner.subprocess.CalledProcessError) as error:
+                        runner.run_phase(args, {}, [], {}, "head", suffix,
+                                         after_access_violation=probe if enabled else None)
+                self.assertIs(error.exception, original)
+                self.assertEqual(probe.call_count, calls)
+                self.assertEqual(observations, [
+                    (1, False, False, {"observed": 7, "remaining": []}, f"CalledProcessError: {original}", False)
+                ] if calls else [])
+
+    def test_native_fault_probe_requires_confirmed_drain_after_existing_forced_cleanup(self):
+        av = runner.EXCEPTION_ACCESS_VIOLATION
+        cases = (
+            ("confirmed", [(7, 4), (7, 0), (7, 0)], True, None, True),
+            ("timeout", [(7, 3)], True, None, False),
+            ("read-failed", [OSError("accounting unavailable")], True, None, False),
+            ("confirm-failed", [(7, 0), OSError("accounting unavailable")], True, None, False),
+            ("reappeared", [(7, 0), (8, 1)], True, None, False),
+            ("appeared-and-exited", [(7, 0), (8, 0)], True, None, False),
+            ("changed-before-zero", [(8, 0)], True, None, False),
+            ("terminate-failed", [], True, OSError("terminate unavailable"), False),
+            ("close-refused", [(7, 0), (7, 0)], False, None, False),
+            ("close-failed", [(7, 0), (7, 0)], OSError("close unavailable"), None, False),
+        )
+        for name, readback, close, terminate_error, should_probe in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / "sumi-w3"
+                session.mkdir()
+                args = SimpleNamespace(session=session, data=root, binary=root / "takosumi-mobile.exe",
+                                       packaged=False, real_site=None, unsandboxed_candidate=False,
+                                       site="https://127.0.0.1:1234")
+                app = mock.Mock(pid=456)
+                app.poll.return_value = av
+                job = mock.Mock()
+                job.processes.side_effect = [(7, 6), *readback]
+                job.terminate.side_effect = terminate_error
+                if isinstance(close, OSError):
+                    job.close.side_effect = close
+                else:
+                    job.close.return_value = close
+                original = runner.subprocess.CalledProcessError(1, ["observer"])
+                pids = list(range(500, 506))
+                records = [{"pid": pid, "image": "msedgewebview2.exe"} for pid in pids]
+                original_job = {"observed": 7, "remaining": pids, "remainingProcesses": records, "forcedCleanup": 6}
+                observed = []
+
+                def observe_probe():
+                    observed.append((job.mock_calls.copy(), json.loads((root / "execution.json").read_text())))
+
+                with mock.patch.object(runner, "WindowsJob", return_value=job), \
+                        mock.patch.object(runner.subprocess, "Popen", return_value=app), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=original), \
+                        mock.patch.object(runner.subprocess, "check_output", return_value="head"), \
+                        mock.patch.object(runner, "job_pids", return_value=pids), \
+                        mock.patch.object(runner, "leftover_records", return_value={"remainingProcesses": records}), \
+                        mock.patch.object(runner, "guard_records", return_value=[]), \
+                        mock.patch.object(runner, "LEFTOVER_WAIT", 0 if name == "timeout" else 10), \
+                        mock.patch.object(runner.time, "sleep"), \
+                        mock.patch.object(runner, "tails"), \
+                        mock.patch.object(runner, "app_error_at_observer_failure", return_value={}):
+                    with self.assertRaises(runner.subprocess.CalledProcessError) as error:
+                        runner.run_phase(args, {}, [], {}, "head", "", after_access_violation=observe_probe)
+                self.assertIs(error.exception, original)
+                self.assertEqual(len(observed), int(should_probe))
+                self.assertEqual(job.mock_calls, [mock.call.adopt(app.pid), mock.call.processes(), mock.call.terminate(),
+                                                  *[mock.call.processes()] * len(readback), mock.call.close()])
+                app.terminate.assert_not_called()
+                proof = json.loads((root / "execution.json").read_text())
+                self.assertEqual(proof["sessionJob"], original_job)
+                self.assertEqual(proof["error"], f"CalledProcessError: {original}")
+                self.assertFalse(proof["passed"])
+                if should_probe:
+                    self.assertEqual(observed, [(job.mock_calls, proof)])
+
+    def test_windows_job_close_reports_the_native_result(self):
+        for native_result in (0, 1):
+            with self.subTest(native_result=native_result):
+                job = runner.WindowsJob.__new__(runner.WindowsJob)
+                job.handle = 41
+                job.kernel32 = mock.Mock()
+                job.kernel32.CloseHandle.return_value = native_result
+                self.assertIs(job.close(), bool(native_result))
+                self.assertFalse(job.close())
+                job.kernel32.CloseHandle.assert_called_once_with(41)
+
+    def test_native_fault_probe_uses_fresh_case_and_bounds_the_diagnostic_process(self):
+        receipt = {"diagnosticComplete": True, "observed": True, "reason": "last_chance_access_violation",
+                   "faultingModule": "runtime.dll", "faultingOffset": "0x10", "exceptionCode": "0xC0000005",
+                   "jobHandleClosed": True, "ownedProcessReaped": True}
+        module = dict(faultingModule="runtime.dll", faultingOffset="0x10", moduleReason="module_mapped")
+        prefix = json.dumps({"moduleObserved": module}) + "\n"
+        stack = dict(receipt, callerFrames=[{"module": "takosumi-mobile.exe", "offset": "0x22"}])
+        for mode in ("captured", "timeout", "timeout-after-module", "timeout-after-stack",
+                     "non-loopback", "unproven-fixture"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                data = root / "sumi-w3"
+                data.mkdir()
+                if mode != "unproven-fixture":
+                    (data / "app-bootstrap-first.log").write_bytes(b"app-build\r\nhome-window\r\n")
+                site = "https://fixture.invalid" if mode == "non-loopback" else "https://127.0.0.1:1234"
+                args = SimpleNamespace(data=data, session=data, binary=root / "takosumi-mobile.exe", site=site)
+
+                def launch(argv, **options):
+                    self.assertEqual(argv[:4], [sys.executable, "-I", "-B", str(runner.NATIVE_FAULT_PROBE)])
+                    self.assertEqual(argv[4:6], ["--binary", str(args.binary)])
+                    self.assertEqual(argv[-2:], ["--site", site])
+                    self.assertEqual(argv[6], "--case")
+                    case = Path(argv[7])
+                    self.assertEqual(case.parent, root)
+                    self.assertNotEqual(case, data)
+                    self.assertEqual((case / ".owned-browser-reference").read_text(), case.name)
+                    self.assertTrue((case / "tmp").is_dir())
+                    self.assertEqual(options["timeout"], runner.NATIVE_FAULT_PROBE_WAIT)
+                    self.assertEqual(options["env"]["TEMP"], str(case / "tmp"))
+                    self.assertNotIn("GITHUB_TOKEN", options["env"])
+                    if mode == "timeout":
+                        raise runner.subprocess.TimeoutExpired(argv, options["timeout"], output="private timeout")
+                    if mode == "timeout-after-module":
+                        raise runner.subprocess.TimeoutExpired(argv, options["timeout"], output=prefix.encode("utf8"))
+                    if mode == "timeout-after-stack":
+                        raise runner.subprocess.TimeoutExpired(argv, options["timeout"],
+                             output=(prefix + json.dumps({"stackObserved": stack}) + "\n").encode("utf8"))
+                    return runner.subprocess.CompletedProcess(argv, 0, prefix + json.dumps(receipt))
+
+                with mock.patch.dict(runner.os.environ, {"USERPROFILE": str(root), "LOCALAPPDATA": str(root / "local"),
+                                                        "APPDATA": str(root / "roaming"), "GITHUB_TOKEN": "private"}), \
+                        mock.patch.object(runner.subprocess, "run", side_effect=launch) as command:
+                    runner.record_native_fault_probe(args)
+                self.assertEqual(command.call_count, int(mode == "captured" or mode.startswith("timeout")))
+                observed = json.loads((data / "native-fault-probe.json").read_text())
+                expected = receipt if mode == "captured" else {
+                    "observed": False, "diagnosticComplete": False,
+                    "reason": "probe_process_timeout" if mode.startswith("timeout") else "probe_unavailable"}
+                if mode == "timeout-after-module":
+                    expected.update(observed=True, exceptionCode="0xC0000005", **module)
+                if mode == "timeout-after-stack":
+                    expected = dict(stack, sourceResolution="timeout")
+                self.assertEqual(observed, dict(expected, diagnosticOnly=True))
 
 
 if __name__ == "__main__":

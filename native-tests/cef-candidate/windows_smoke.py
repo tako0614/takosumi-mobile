@@ -760,10 +760,12 @@ class WindowsJob:
             raise last_error("TerminateJobObject")
 
     def close(self):
-        """Closing the last handle kills whatever is still in the job."""
-        if self.handle:
-            self.kernel32.CloseHandle(self.handle)
-            self.handle = None
+        """Close the owned handle and report whether Windows confirmed the close."""
+        if not self.handle:
+            return False
+        closed = bool(self.kernel32.CloseHandle(self.handle))
+        self.handle = None
+        return closed
 
 
 def sha256(path):

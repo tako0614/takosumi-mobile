@@ -3,8 +3,12 @@
 command, the installed App's name, the comparison with the stage manifest
 and what remains after an uninstall. Standard library only; runs on Linux
 and Windows."""
+import json
 import sys
+from types import SimpleNamespace
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +49,222 @@ class InstallTests(unittest.TestCase):
 
 
 class SmokeTests(unittest.TestCase):
+    @staticmethod
+    def event_xml(system_time, process_id="4660", app_path=r"C:\app.exe", provider="Application Error",
+                  event_id="1000"):
+        return f"""<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+          <System><Provider Name="{provider}"/><EventID>{event_id}</EventID>
+            <TimeCreated SystemTime="{system_time}"/></System>
+          <EventData>
+            <Data Name="ProcessId">{process_id}</Data><Data Name="AppPath">{app_path}</Data>
+            <Data Name="ModuleName">C:\\Windows\\System32\\KERNELBASE.dll</Data>
+            <Data Name="ExceptionCode">0xc0000005</Data><Data Name="FaultingOffset">0x10</Data>
+          </EventData>
+        </Event>"""
+
+    class FakeEventLog:
+        def __init__(self, events=(), query_error=None, next_error=None, render_error=None):
+            self.events = list(events)
+            self.query_error = query_error
+            self.next_error = next_error
+            self.render_error = render_error
+            self.closed = []
+            self.timeouts = []
+
+        def query(self):
+            if self.query_error:
+                raise self.query_error
+            return "query"
+
+        def next_event(self, query, timeout_ms):
+            self.timeouts.append(timeout_ms)
+            if self.next_error:
+                raise self.next_error
+            return self.events.pop(0) if self.events else None
+
+        def render_xml(self, event):
+            if self.render_error:
+                raise self.render_error
+            return event[1]
+
+        def close(self, handle):
+            self.closed.append(handle[0] if isinstance(handle, tuple) else handle)
+
+    def test_native_event_reader_matches_only_recent_application_error_for_exact_process(self):
+        started = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+        events = [
+            ("old", self.event_xml((started - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"))),
+            ("other-provider", self.event_xml((started + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                                               provider="Other")),
+            ("wrong-app", self.event_xml((started + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                                          app_path=r"C:\other.exe")),
+            ("match", self.event_xml((started + timedelta(seconds=3)).isoformat().replace("+00:00", "Z"))),
+            ("unread", self.event_xml((started + timedelta(seconds=4)).isoformat().replace("+00:00", "Z"))),
+        ]
+        api = self.FakeEventLog(events)
+        result = package.read_application_error(api, 4660, r"C:\app.exe", started)
+        self.assertEqual(result, {
+            "available": True, "reason": "pid_and_path_matched", "faultingModule": "KERNELBASE.dll",
+            "exceptionCode": "0xC0000005", "faultingOffset": "0x10",
+        })
+        self.assertEqual(api.closed, ["old", "other-provider", "wrong-app", "match", "query"])
+        self.assertEqual(api.timeouts, [200, 200, 200, 200])
+
+    def test_native_event_reader_reports_bounded_unknown_timeout_and_always_closes_handles(self):
+        started = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+        unavailable = self.FakeEventLog(query_error=package.EventLogUnavailable())
+        self.assertEqual(package.read_application_error(unavailable, 1, r"C:\app.exe", started),
+                         {"available": False, "reason": "event_query_unavailable"})
+        self.assertEqual(unavailable.closed, [])
+
+        timeout = self.FakeEventLog(next_error=package.EventLogTimeout())
+        self.assertEqual(package.read_application_error(timeout, 1, r"C:\app.exe", started),
+                         {"available": False, "reason": "event_query_timeout"})
+        self.assertEqual(timeout.closed, ["query"])
+        self.assertEqual(timeout.timeouts, [200])
+
+        malformed = self.FakeEventLog(events=[("bad", "<not-an-event")])
+        self.assertEqual(package.read_application_error(malformed, 1, r"C:\app.exe", started),
+                         {"available": False, "reason": "no_matching_event"})
+        self.assertEqual(malformed.closed, ["bad", "query"])
+
+    def test_native_evt_next_distinguishes_empty_results_from_timeout(self):
+        api = package.WindowsEventLogApi.__new__(package.WindowsEventLogApi)
+        api.handle_type = package.ctypes.c_void_p
+        api.dword_type = package.ctypes.c_uint32
+        api.library = SimpleNamespace(EvtNext=lambda *_args: False)
+        api._last_error = lambda: package.WindowsEventLogApi.ERROR_NO_MORE_ITEMS
+        self.assertIsNone(api.next_event("query", 200))
+
+        api._last_error = lambda: package.WindowsEventLogApi.ERROR_TIMEOUT
+        with self.assertRaises(package.EventLogTimeout):
+            api.next_event("query", 200)
+
+    def test_parent_event_reader_timeout_is_an_allowlisted_summary(self):
+        with patch.object(package.subprocess, "run", side_effect=package.subprocess.TimeoutExpired("reader", 2)):
+            self.assertEqual(package.application_error_event(
+                4660, r"C:\app.exe", datetime.now(timezone.utc)),
+                {"available": False, "reason": "event_query_timeout"})
+
+    def test_parent_rejects_malformed_reason_without_overwriting_smoke_failure(self):
+        malformed = ('{"available":false,"reason":[]}',
+                     '{"available":true,"reason":[],"faultingModule":"safe.dll"}')
+        for stdout in malformed:
+            with self.subTest(stdout=stdout):
+                result = package.subprocess.CompletedProcess("reader", 0, stdout, "")
+                with patch.object(package.subprocess, "run", return_value=result):
+                    self.assertEqual(package.application_error_event(
+                        4660, r"C:\app.exe", datetime.now(timezone.utc)),
+                        {"available": False, "reason": "event_query_unavailable"})
+
+    def test_parent_drops_child_extra_fields_and_redacts_absolute_module_path(self):
+        result = package.subprocess.CompletedProcess("reader", 0, json.dumps({
+            "available": True,
+            "reason": "pid_and_path_matched",
+            "faultingModule": r"C:\Windows\System32\KERNELBASE.dll",
+            "exceptionCode": "0xc0000005",
+            "faultingOffset": "0x10",
+            "appPath": r"C:\Users\private\Takosumi.exe",
+            "processId": 4660,
+        }), "")
+        with patch.object(package.subprocess, "run", return_value=result):
+            summary = package.application_error_event(
+                4660, r"C:\app.exe", datetime.now(timezone.utc))
+        self.assertEqual(summary, {
+            "available": True,
+            "reason": "pid_and_path_matched",
+            "faultingModule": "KERNELBASE.dll",
+            "exceptionCode": "0xC0000005",
+            "faultingOffset": "0x10",
+        })
+
+    def test_application_error_keeps_only_a_pid_and_path_matched_summary(self):
+        summary = package.application_error_summary([{
+            "processId": "0x1234",
+            "appPath": r"c:\program files\takosumi\takosumi-mobile.exe",
+            "faultingModule": r"C:\Windows\System32\KERNELBASE.dll",
+            "exceptionCode": "0xc0000005",
+            "faultingOffset": "0x00000000000010AB",
+        }], 0x1234, r"C:\Program Files\Takosumi\Takosumi-Mobile.exe")
+        self.assertEqual(summary, {
+            "available": True,
+            "reason": "pid_and_path_matched",
+            "faultingModule": "KERNELBASE.dll",
+            "exceptionCode": "0xC0000005",
+            "faultingOffset": "0x00000000000010AB",
+        })
+        self.assertNotIn("appPath", summary)
+        self.assertNotIn("processId", summary)
+
+    def test_application_error_requires_pid_and_rejects_a_different_executable(self):
+        event = {"processId": "4660", "appPath": r"C:\other\app.exe",
+                 "faultingModule": r"C:\Windows\other.dll", "exceptionCode": "0xc0000005",
+                 "faultingOffset": "0x10"}
+        self.assertEqual(package.application_error_summary([event], 0x1235, r"C:\app.exe"),
+                         {"available": False, "reason": "no_matching_event"})
+        self.assertEqual(package.application_error_summary([event], 4660, r"C:\app.exe"),
+                         {"available": False, "reason": "app_path_mismatch"})
+
+    def test_application_error_can_use_pid_when_event_has_no_executable_path(self):
+        summary = package.application_error_summary([{
+            "processId": "4660", "faultingModule": r"D:/app/runtime.dll",
+            "exceptionCode": "c0000005", "faultingOffset": "0x10",
+        }], 4660, r"C:\app.exe")
+        self.assertEqual(summary, {
+            "available": True,
+            "reason": "pid_matched_path_unavailable",
+            "faultingModule": "runtime.dll",
+            "exceptionCode": "0xC0000005",
+            "faultingOffset": "0x10",
+        })
+
+    def test_application_error_omits_nonprintable_or_oversized_module_names(self):
+        for module in ("bad\nmodule.dll", "x" * 97):
+            summary = package.application_error_summary([{
+                "processId": "4660", "appPath": r"C:\app.exe", "faultingModule": module,
+                "exceptionCode": "0xc0000005", "faultingOffset": "0x10",
+            }], 4660, r"C:\app.exe")
+            self.assertTrue(summary["available"])
+            self.assertIsNone(summary["faultingModule"])
+
+    def test_crash_diagnostic_is_best_effort_and_keeps_the_smoke_failure(self):
+        self.assertEqual(package.application_error_summary({"reason": []}, 72, r"C:\app.exe"),
+                         {"available": False, "reason": "event_query_unavailable"})
+
+        class Process:
+            pid = 72
+
+            def __init__(self, code):
+                self.code = code
+                # A child can exit after a caller has already formatted an
+                # error message. The helper must report the value from poll().
+                self.returncode = None
+
+            def poll(self):
+                return self.code
+
+        with patch.object(package, "application_error_event",
+                          return_value={"available": False, "reason": "no_matching_event"}) as read_event:
+            report = {}
+            with self.assertRaisesRegex(Failure, "App exited with 3221225477 after 0.6 s up"):
+                package.require_app_running(Process(3221225477), report, r"C:\app.exe", None,
+                                            "after 0.6 s up")
+            read_event.assert_called_once()
+            self.assertEqual(report["applicationError"],
+                             {"available": False, "reason": "no_matching_event"})
+
+            read_event.reset_mock()
+            with self.assertRaisesRegex(Failure, "App exited with 7 before its window appeared"):
+                package.require_app_running(Process(7), {}, r"C:\app.exe", None,
+                                            "before its window appeared")
+            read_event.assert_called_once()
+
+            read_event.reset_mock()
+            with self.assertRaisesRegex(Failure, "App exited with 0 after 0.6 s up"):
+                package.require_app_running(Process(0), {}, r"C:\app.exe", None,
+                                            "after 0.6 s up")
+            read_event.assert_not_called()
+
     def test_processes_left_in_the_apps_job_are_named_in_the_failure(self):
         leftovers = [{"pid": 4120, "image": "msedgewebview2.exe", "parent": 3900,
                       "created": "2026-11-07T11:49:40.123Z"},

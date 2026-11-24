@@ -42,6 +42,9 @@ pub fn run(builder: tauri::Builder<tauri::Wry>, mut context: tauri::Context<taur
     // and its phases share it.
     #[cfg(windows)]
     {
+        if let Ok(case) = owned_case() {
+            bootstrap_stage(&case, "app-build");
+        }
         context.config_mut().identifier = match case_identifier() {
             Ok(identifier) => identifier,
             Err(error) => {
@@ -104,12 +107,43 @@ pub fn start(app: AppHandle) {
         .spawn(move || {
             let result = block_on(async {
                 let case = owned_case()?;
-                let view = home(&app)?;
-                flow(&app, &case, &view).await
+                #[cfg(windows)]
+                bootstrap_stage(&case, "home-window");
+                let result = async {
+                    let view = home(&app)?;
+                    flow(&app, &case, &view).await
+                }
+                .await;
+                #[cfg(windows)]
+                if result.is_err() {
+                    bootstrap_stage(&case, "flow-error");
+                }
+                result
             });
             finish(&app, result);
         })
         .expect("Browser process fixture thread");
+}
+
+/// Preserve the last fixture stage when detached App stdout is empty. These
+/// fixed labels are diagnostic only and do not stand in for any checkpoint.
+#[cfg(windows)]
+pub(super) fn bootstrap_stage(case: &std::path::Path, stage: &'static str) {
+    use std::{fs::OpenOptions, io::Write};
+
+    let phase = std::env::var("TAKOSUMI_BROWSER_PROCESS_PHASE");
+    let name = match phase.as_deref() {
+        Err(std::env::VarError::NotPresent) => "first",
+        Ok(phase) if super::PHASES.contains(&phase) => phase,
+        _ => return,
+    };
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(case.join(format!("app-bootstrap-{name}.log")))
+    {
+        let _ = writeln!(file, "{stage}");
+    }
 }
 
 fn home(app: &AppHandle) -> Result<Home> {
