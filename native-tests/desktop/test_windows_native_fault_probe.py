@@ -90,6 +90,50 @@ class EventPolicyTests(unittest.TestCase):
         self.assertNotIn("source", frames[1])
         self.assertNotIn("source", frames[2])
 
+    def test_caller_frame_limit_counts_unwind_frames_before_module_projection(self):
+        case = PureWindowsPath(r"C:\fixture")
+        context = probe._Amd64Context(Rip=0x1000, Rsp=0x2000)
+        event = probe.DebugEvent(probe.DEBUG_EVENT_EXCEPTION, 73, 1,
+                                 probe.EXCEPTION_ACCESS_VIOLATION, False, context.Rip)
+
+        def module_for_address(_pid, address):
+            return (None, None) if address == 0xA010 else ("takosumi-mobile.exe", 0xA000)
+
+        api = SimpleNamespace(kernel32=None, module_for_address=module_for_address)
+        for available, expected, reached, calls in ((4, 4, False, 6), (18, 16, True, 17)):
+            with self.subTest(available=available):
+                # A successful initial step can repeat the fault PC/SP.
+                raw_frames = iter([(context.Rip, context.Rsp)] + [
+                    (0xA000 + 16 * index, 0x2000 + 16 * index) for index in range(1, available + 1)
+                ])
+                walk_calls = []
+                cleaned = []
+
+                def walk(_machine, _process, _thread, frame, *_):
+                    current = next(raw_frames, None)
+                    walk_calls.append(current)
+                    if current is None:
+                        return False
+                    frame._obj.AddrPC.Offset, frame._obj.AddrStack.Offset = current
+                    return True
+
+                native = {
+                    "SymInitializeW": lambda *_: True, "SymCleanup": cleaned.append,
+                    "SymSetOptions": lambda *_: 0, "StackWalk64": walk,
+                    "SymFunctionTableAccess64": None, "SymGetModuleBase64": None,
+                }
+                with (patch.object(probe.ctypes, "WinDLL", return_value=None, create=True),
+                      patch.object(probe, "_declare", side_effect=lambda _dll, name, *_: native[name]),
+                      patch.object(probe, "stopped_amd64_frames",
+                                   side_effect=lambda *_: probe._unwind(2, 3, context, case))):
+                    frames, limit_reached = probe.caller_frame_projection(api, event, case, 0xA000)
+                self.assertEqual(len(frames), expected - 1)  # The first caller was unmapped.
+                self.assertEqual(frames[-1], {"module": "takosumi-mobile.exe",
+                                              "offset": hex(16 * expected), "fixtureAppImage": True})
+                self.assertIs(limit_reached, reached)
+                self.assertEqual(len(walk_calls), calls)
+                self.assertEqual(cleaned, [2])
+
     def test_only_initial_breakpoint_is_handled_and_other_exceptions_fail_through(self):
         pid = 73
         created = probe.DebugEvent(probe.DEBUG_EVENT_CREATE_PROCESS, pid, 1)
@@ -251,6 +295,7 @@ class ProbeLifecycleTests(unittest.TestCase):
                                          {"module": "takosumi-mobile.exe", "offset": "0x420", "fixtureAppImage": True},
                                          {"module": "takosumi-mobile.exe", "offset": "0x420"},
                                      ],
+                                     "callerFrameLimitReached": False,
                                      "processExitCode": 3221225477,
                                      "jobHandleClosed": True, "ownedProcessReaped": True})
             self.assertNotIn("passed", report)

@@ -229,7 +229,7 @@ _AMD64 = 0x8664
 _CONTEXT_FULL = 0x0010000B
 _ADDR_MODE_FLAT = 3
 _SYSTEM32 = 0x00000800
-_FRAME_LIMIT = 8
+_FRAME_LIMIT = 16
 _LOCAL_SYMBOL_OPTIONS = (
     0x00000004  # SYMOPT_DEFERRED_LOADS
     | 0x00000080  # SYMOPT_IGNORE_CVREC
@@ -363,13 +363,15 @@ def _unwind(process, thread, context: _Amd64Context, case_dir: Path):
 
 
 def caller_frame_projection(api, event: DebugEvent, case_dir: Path,
-                            app_image_base: int | None) -> list[dict[str, object]]:
-    """Project only mapped module-relative frames. Missing unwind keeps the fault."""
+                            app_image_base: int | None) -> tuple[list[dict[str, object]], bool]:
+    """Project mapped callers and record whether the unwind reached the frame limit."""
     if event.exception_address is None:
-        return []
+        return [], False
+    limit_reached = False
     try:
         addresses = list(stopped_amd64_frames(api.kernel32, event.process_id, event.thread_id,
                                                event.exception_address, case_dir))
+        limit_reached = len(addresses) == _FRAME_LIMIT
         frames = []
         for address in addresses:
             name, base = api.module_for_address(event.process_id, address)
@@ -380,9 +382,9 @@ def caller_frame_projection(api, event: DebugEvent, case_dir: Path,
                 if app_image_base and base == app_image_base:
                     frame["fixtureAppImage"] = True
                 frames.append(frame)
-        return frames
+        return frames, limit_reached
     except Exception:
-        return []
+        return [], limit_reached
 
 
 class _ImageHlpLine64(ctypes.Structure):
@@ -674,9 +676,11 @@ def run_probe(binary: Path, case_dir: Path, *, timeout_seconds: int = WAIT_TIMEO
                     module = module_projection(module_name, image_base, event.exception_address)
                     if on_module_observed and module["moduleReason"] == "module_mapped":
                         on_module_observed(module)
+                    frames, limit_reached = caller_frame_projection(api, event, case_dir, app_image_base)
                     fault = {
                         **module,
-                        "callerFrames": caller_frame_projection(api, event, case_dir, app_image_base),
+                        "callerFrames": frames,
+                        "callerFrameLimitReached": limit_reached,
                     }
                 status, initial_breakpoint_seen = continue_status(
                     event, process.pid, created, initial_breakpoint_seen)
