@@ -575,11 +575,20 @@ def record_native_fault_probe(args):
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                 timeout=NATIVE_FAULT_PROBE_WAIT, check=False)
         if result.returncode in (0, 2):
-            value = json.loads(result.stdout)
+            lines = result.stdout.splitlines()
+            value = json.loads(lines[-1] if lines else "")
             if isinstance(value, dict):
                 report = value
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         report["reason"] = "probe_process_timeout"
+        try:
+            prefix = json.loads((error.stdout or b"").splitlines()[0])
+            module = prefix.get("moduleObserved") if isinstance(prefix, dict) else None
+            if isinstance(module, dict) and module.get("moduleReason") == "module_mapped":
+                report.update(observed=True, exceptionCode="0xC0000005", moduleReason="module_mapped",
+                              faultingModule=module.get("faultingModule"), faultingOffset=module.get("faultingOffset"))
+        except (ValueError, IndexError):
+            pass
     except (OSError, ValueError, Failure):
         pass
     with create_exclusive(args.session / "native-fault-probe.json") as output:

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -126,6 +127,7 @@ class ProbeLifecycleTests(unittest.TestCase):
                     self.continues = []
                     self.closed_handles = []
                     self.wait_threads = []
+                    self.kernel32 = object()
 
                 def wait_for_debug_event(self, timeout_ms):
                     self.wait_threads.append(threading.get_ident())
@@ -138,6 +140,10 @@ class ProbeLifecycleTests(unittest.TestCase):
                     self.closed_handles.extend(event.close_handles)
 
                 def module_for_address(self, actual_pid, address):
+                    if address == 0xA420:
+                        return "takosumi-mobile.exe", 0xA000
+                    if address == 0xB425:
+                        return r"C:\\private\\bad.dll", 0xB000
                     self.lookup = (actual_pid, address)
                     return "WebView2Loader.dll", 0x1000
 
@@ -149,18 +155,28 @@ class ProbeLifecycleTests(unittest.TestCase):
                        "TAKOSUMI_BROWSER_PROCESS_EXTERNAL_LOG": r"C:\\private\\external.log",
                        "TEMP": r"C:\\outside\\temp", "TMP": r"C:\\outside\\tmp",
                        "SystemRoot": r"C:\\Windows", "LOCALAPPDATA": r"C:\\Users\\fixture\\AppData\\Local"}
-            report = probe.run_probe(binary, case, timeout_seconds=2, source_env=secrets,
-                                     site_url="https://127.0.0.1:44321",
-                                     popen_factory=popen, job_factory=lambda: job, api_factory=lambda: api)
+            published = []
+            def unwind(*_):
+                self.assertEqual(published, [{"faultingModule": "WebView2Loader.dll",
+                                              "faultingOffset": "0x190", "moduleReason": "module_mapped"}])
+                return iter((0xA420, 0xB425))
+            with patch.object(probe, "stopped_amd64_frames", side_effect=unwind) as stack:
+                report = probe.run_probe(binary, case, timeout_seconds=2, source_env=secrets,
+                                         site_url="https://127.0.0.1:44321",
+                                         popen_factory=popen, job_factory=lambda: job, api_factory=lambda: api,
+                                         on_module_observed=published.append)
+            stack.assert_called_once_with(api.kernel32, pid, 1, 0x1190, case.resolve())
 
             self.assertEqual(report, {"diagnosticComplete": True, "observed": True,
                                      "reason": "last_chance_access_violation",
                                      "exceptionCode": "0xC0000005", "faultingModule": "WebView2Loader.dll",
                                      "faultingOffset": "0x190", "moduleReason": "module_mapped",
+                                     "callerFrames": [{"module": "takosumi-mobile.exe", "offset": "0x420"}],
                                      "processExitCode": 3221225477,
                                      "jobHandleClosed": True, "ownedProcessReaped": True})
             self.assertNotIn("passed", report)
             self.assertNotIn("0x1190", json.dumps(report))
+            self.assertNotIn("0xa420", json.dumps(report))
             self.assertNotIn("C:\\private", json.dumps(report))
             self.assertNotIn(str(binary), json.dumps(report))
             self.assertNotIn(str(case), json.dumps(report))

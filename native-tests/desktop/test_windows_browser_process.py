@@ -2731,7 +2731,9 @@ class RunnerTests(unittest.TestCase):
         receipt = {"diagnosticComplete": True, "observed": True, "reason": "last_chance_access_violation",
                    "faultingModule": "runtime.dll", "faultingOffset": "0x10", "exceptionCode": "0xC0000005",
                    "jobHandleClosed": True, "ownedProcessReaped": True}
-        for mode in ("captured", "timeout", "non-loopback", "unproven-fixture"):
+        module = dict(faultingModule="runtime.dll", faultingOffset="0x10", moduleReason="module_mapped")
+        prefix = json.dumps({"moduleObserved": module}) + "\n"
+        for mode in ("captured", "timeout", "timeout-after-module", "non-loopback", "unproven-fixture"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 data = root / "sumi-w3"
@@ -2756,17 +2758,21 @@ class RunnerTests(unittest.TestCase):
                     self.assertNotIn("GITHUB_TOKEN", options["env"])
                     if mode == "timeout":
                         raise runner.subprocess.TimeoutExpired(argv, options["timeout"], output="private timeout")
-                    return runner.subprocess.CompletedProcess(argv, 0, json.dumps(receipt))
+                    if mode == "timeout-after-module":
+                        raise runner.subprocess.TimeoutExpired(argv, options["timeout"], output=prefix.encode("utf8"))
+                    return runner.subprocess.CompletedProcess(argv, 0, prefix + json.dumps(receipt))
 
                 with mock.patch.dict(runner.os.environ, {"USERPROFILE": str(root), "LOCALAPPDATA": str(root / "local"),
                                                         "APPDATA": str(root / "roaming"), "GITHUB_TOKEN": "private"}), \
                         mock.patch.object(runner.subprocess, "run", side_effect=launch) as command:
                     runner.record_native_fault_probe(args)
-                self.assertEqual(command.call_count, int(mode in ("captured", "timeout")))
+                self.assertEqual(command.call_count, int(mode in ("captured", "timeout", "timeout-after-module")))
                 observed = json.loads((data / "native-fault-probe.json").read_text())
                 expected = receipt if mode == "captured" else {
                     "observed": False, "diagnosticComplete": False,
-                    "reason": "probe_process_timeout" if mode == "timeout" else "probe_unavailable"}
+                    "reason": "probe_process_timeout" if mode.startswith("timeout") else "probe_unavailable"}
+                if mode == "timeout-after-module":
+                    expected.update(observed=True, exceptionCode="0xC0000005", **module)
                 self.assertEqual(observed, dict(expected, diagnosticOnly=True))
 
 
