@@ -143,14 +143,11 @@ def _sample_owned(processes, child, parent, browser, guard, output):
             timed_out = False
             with diagnostic.open("wb") as stderr:
                 try:
-                    # -mayDie grabs symbol locations first: the teardown watchdog
-                    # can kill the sampled browser mid-run. Three- and five-
-                    # second attempts expired before producing a report. This
-                    # seven-second command allowance excludes the preceding
-                    # state reads, ownership checks and filesystem work; it
-                    # cannot guarantee completion before the teardown watchdog.
+                    # Earlier attempts with -mayDie timed out without a report.
+                    # Use the normal symbol lookup order for the live process.
+                    # The seven-second command allowance starts after state capture.
                     completed = subprocess.run(["/usr/bin/sample", str(child["pid"]), "1", "100",
-                                                "-mayDie", "-file", str(raw)],
+                                                "-file", str(raw)],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                                stderr=stderr, timeout=7, check=False)
                     result["sampleExit"] = completed.returncode

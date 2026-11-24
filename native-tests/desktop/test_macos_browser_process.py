@@ -804,8 +804,7 @@ os.open(sys.argv[3],os.O_RDONLY)
             def sample(args, **options):
                 if args[0] != "/usr/bin/sample":
                     return mock.Mock(returncode=0, stdout=b"")
-                self.assertEqual(args[:4], ["/usr/bin/sample", "12", "1", "100"])
-                self.assertEqual(args[4:6], ["-mayDie", "-file"])
+                self.assertEqual(args[:-1], ["/usr/bin/sample", "12", "1", "100", "-file"])
                 self.assertEqual(options["timeout"], 7)
                 Path(args[-1]).write_bytes(b"x" * 33)
                 return mock.Mock(returncode=0)
