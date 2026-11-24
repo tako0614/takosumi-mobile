@@ -346,7 +346,7 @@ class Controls(unittest.TestCase):
     def test_failure_job_relay_is_after_final_save_and_never_replaces_refusal(self):
         identity = f"-[WebHomeUITests.WebHomeUITests {runner.METHOD}]"
         log = (f"Test Case '{identity}' started.\n"
-               f"/private/token/native-tests/ios/web-home-fixture/WebHomeUITests.swift:127: error: {identity} : private-value\n"
+               f"/private/token/native-tests/ios/web-home-fixture/WebHomeUITests.swift:69: error: {identity} : private-value\n"
                f"Test Case '{identity}' failed (171.686 seconds).\n")
         app, build, _ = self.app()
         proof = runner.bundle_proof(app, build)
@@ -355,7 +355,7 @@ class Controls(unittest.TestCase):
             "passed": True, "bundleIdentifier": runner.BUNDLE, "head": head, "tree": tree,
             "images": [{"path": proof["executable"], "sha256": proof["executableSHA256"]}]}))
         udid = "11111111-1111-4111-8111-111111111111"
-        for mode in ("normal", "sink", "serializer"):
+        for mode in ("normal", "later-interrupt", "sink", "serializer"):
             with self.subTest(mode=mode), ExitStack() as stack:
                 out, scratch = self.root / mode, self.root / (mode + "-scratch")
                 scratch.mkdir()
@@ -406,11 +406,16 @@ class Controls(unittest.TestCase):
                     lines.append(line)
                     if mode == "sink":
                         raise OSError("private sink failure")
+                def preserve_app_exit(*_):
+                    if mode == "later-interrupt":
+                        runtime.INTERRUPTED_COMMANDS.append({"log": str(out / "target-app-exit-raw.log"),
+                                                             "reaped": True, "originalErrorType": "TimeoutExpired"})
+                    return {}
                 for target, name, value in (
                         (runner, "BUILD", build), (runner, "product_app", lambda: (app, proof)),
                         (runner, "source_hashes", lambda: {}), (runner, "installed_app", lambda *args: proof),
                         (runner, "Site", Site), (runner, "retire_device", lambda *args: retired.append(args)),
-                        (runner, "preserve_app_exit", lambda *args: {}), (runner, "require", require),
+                        (runner, "preserve_app_exit", preserve_app_exit), (runner, "require", require),
                         (runner.platform, "system", lambda: "Darwin"), (runner.shutil, "which", lambda _: "/mock/tool"),
                         (runtime, "owned_scratch", owned_scratch), (runtime, "command", command),
                         (runtime, "select_runtime", lambda _: ("runtime", "type")),
@@ -432,7 +437,8 @@ class Controls(unittest.TestCase):
                 self.assertIs(saved["functionalPassed"], False)
                 self.assertEqual(saved["error"], str(inner))
                 self.assertTrue(saved["cleanup"] and saved["scratchCleanup"]["removed"])
-                self.assertEqual(saved["interruptedCommands"], [])
+                self.assertEqual([item["log"] for item in saved["interruptedCommands"]],
+                                 [str(out / "target-app-exit-raw.log")] if mode == "later-interrupt" else [])
                 self.assertEqual(len(retired), 1)
                 self.assertEqual(events.count("scratch-cleanup"), 1)
                 self.assertEqual(events.count("server-stop"), 2)
@@ -445,7 +451,7 @@ class Controls(unittest.TestCase):
                     self.assertEqual(events[-3:], ["final-save", "relay", "refuse"])
                     record = json.loads(lines[0].split(" ", 1)[1])
                     self.assertEqual((record["category"], record["sourceLine"], record["started"], record["failed"], record["passed"]),
-                                     ("xctest_failure", 127, 1, 1, 0))
+                                     ("xctest_failure", 69, 1, 1, 0))
                     self.assertNotIn("private", lines[0])
 
     def test_failure_job_projection_is_closed_bounded_and_optional(self):
@@ -459,6 +465,8 @@ class Controls(unittest.TestCase):
         self.assertEqual((known["category"], known["sourceLine"], known["started"], known["failed"]),
                          ("xctest_failure", 127, 1, 1))
         self.assertNotIn("secret", json.dumps(known))
+        actual_shape = (started + location.replace(":127:", ":69:") + secret + failed).encode()
+        self.assertEqual(runner.failure_job_summary(actual_shape)["sourceLine"], 69)
         for bad in (None, "secret", b"", b"\xff", b"\x00", b"x" * (256 * 1024 + 1),
                     (started + failed.replace("1.000", "1..0")).encode(),
                     (started + failed.replace(runner.METHOD, "foreign")).encode()):
@@ -475,7 +483,8 @@ class Controls(unittest.TestCase):
         out = self.root / "relay-input"
         out.mkdir(); log = out / "xcodebuild.log"
         result = {"passed": False, "interruptedCommands": []}
-        for mode in ("valid", "missing", "oversized", "linked", "interrupted", "active", "structured"):
+        for mode in ("valid", "missing", "oversized", "linked", "hardlinked", "foreign",
+                     "interrupted", "active", "structured"):
             with self.subTest(mode=mode):
                 if log.exists() or log.is_symlink():
                     log.unlink()
@@ -486,6 +495,12 @@ class Controls(unittest.TestCase):
                     private = self.root / "private-log"
                     private.write_bytes(data)
                     log.symlink_to(private)
+                elif mode == "hardlinked":
+                    private = self.root / "private-hardlink"
+                    private.write_bytes(data)
+                    os.link(private, log)
+                elif mode == "foreign":
+                    log.write_bytes(data.replace(identity.encode(), b"-[ForeignTest foreign]"))
                 elif mode != "missing":
                     log.write_bytes(data)
                 if mode == "interrupted":
@@ -514,6 +529,17 @@ class Controls(unittest.TestCase):
             for value in ({"passed": True}, {"passed": "secret"}, None):
                 runner.emit_failure_job_summary(out, value)
             self.assertEqual((opened.call_count, printed.call_count), (0, 0))
+        log.write_bytes(actual_shape)
+        with patch.object(runtime, "INTERRUPTED_COMMANDS", [{"log": str(log), "reaped": True}]):
+            self.assertIsNone(runner.completed_xcode_failure_summary(out))
+            stdout = io.StringIO()
+            with patch.object(sys, "stdout", stdout):
+                runner.emit_failure_job_summary(out, {"passed": False,
+                    "interruptedCommands": [{"log": str(log), "reaped": True}]},
+                    runner.failure_job_summary(actual_shape))
+            self.assertEqual(json.loads(stdout.getvalue().split(" ", 1)[1])["category"], "unknown")
+        with patch.object(runtime, "UNREAPED_COMMANDS", [{"log": "owned-live-command"}]):
+            self.assertIsNone(runner.completed_xcode_failure_summary(out))
 
     def test_server_oracle_requires_authenticated_profiles_and_no_cookie_at_other_host(self):
         instance = [{"path": "/", "user": None} for _ in range(3)]
@@ -808,6 +834,39 @@ class Controls(unittest.TestCase):
         empty = runner.navigation_witness(b"")
         self.assertEqual(empty["records"], [])
         self.assertTrue(empty["absenceIsUnknown"])
+
+    def test_response_policy_witness_uses_the_same_clock_without_binding_navigation(self):
+        header = (b"2026-11-24 19:58:28.200 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+
+        def packet(event, seq, time_ms, target="editor"):
+            return header + (f"com.takosumi.fixture.simulator.nav v=1 seq={seq} event={event} "
+                             f"view=1 request=0 relation=0 target={target} reused=0 kept=0 "
+                             f"resume=0 initial=0 sameView=1 timeMs={time_ms}\n").encode()
+
+        entered = packet("response_policy_entered", 38, 1057250)
+        allowed = packet("response_policy_allow_returned", 39, 1057251)
+        result = runner.navigation_witness(
+            packet("provisional", 37, 1057214, "unknown") + entered + allowed
+            + packet("commit", 40, 1095344, "unknown"))
+        self.assertEqual(result["clockDomain"], "ios_system_uptime")
+        self.assertEqual([(row["event"], row["timeMs"], row["target"]) for row in result["records"]], [
+            ("provisional", 1057214, "unknown"), ("response_policy_entered", 1057250, "editor"),
+            ("response_policy_allow_returned", 1057251, "editor"), ("commit", 1095344, "unknown"),
+        ])
+        self.assertTrue(result["diagnosticOnly"] and result["absenceIsUnknown"])
+        self.assertNotIn("passed", result)
+        for event in (entered, allowed):
+            for old, new in ((b"request=0", b"request=7"), (b"relation=0", b"relation=1"),
+                             (b"sameView=1", b"sameView=0"), (b"view=1 ", b"view=0 "),
+                             (b"resume=0", b"resume=1"),
+                             (b"target=editor", b"target=https://private.invalid/?token=secret"),
+                             (b".navigation:navigation", b".WebKit:network")):
+                with self.subTest(event=event, field=old):
+                    rejected = runner.navigation_witness(event.replace(old, new))
+                    self.assertEqual(rejected["records"], [])
+                    self.assertEqual(rejected["malformed"], 1)
+                    self.assertNotIn("secret", json.dumps(rejected))
 
     def test_content_termination_witness_is_owner_bound_and_context_free(self):
         header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "

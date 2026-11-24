@@ -419,6 +419,22 @@ def command(argv, path, timeout=60, env=None, boot_status=False, trust_trace=Fal
     return path.read_text(errors="replace") if read_output else ""
 
 
+def import_simulator_ca_with_one_timeout_retry(out, udid, ca, result):
+    """Import the same root CA on this owned Simulator, retrying one timeout only."""
+    argv = ["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)]
+    try:
+        command(argv, out / "trust.log", timeout=60, trust_trace=True)
+    except subprocess.TimeoutExpired as stalled:
+        # Preserve the first timeout and its custody notes before the one settle
+        # interval. The stalled pair after a 287 s boot needed real settling;
+        # retry once on the same Simulator/CA, still at the 60-second bound.
+        (out / "trust-stalled.txt").write_text(
+            f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
+        time.sleep(30)
+        command(argv, out / "trust-retry.log", timeout=60, trust_trace=True)
+        result["simulator"]["trustRetry"] = "stalled-retried"
+
+
 def certificate(directory, *, localhost=False):
     """Private key files stay outside uploaded evidence and source."""
     ca, cert, key = directory / "ca.pem", directory / "server.pem", directory / "server.key"
@@ -595,7 +611,7 @@ def preserve_export_observations(created, udid, out):
         if (not isinstance(value, dict) or
                 set(value) != {"diagnosticOnly", "samples", "lifecycle", "lifecycleTruncated"} or
                 value["diagnosticOnly"] is not True or not isinstance(value["samples"], list) or
-                not 1 <= len(value["samples"]) <= 32 or
+                len(value["samples"]) > 32 or
                 not isinstance(value["lifecycle"], list) or not 1 <= len(value["lifecycle"]) <= 64 or
                 type(value["lifecycleTruncated"]) is not bool):
             raise RuntimeError("Invalid fixture observations")
@@ -759,24 +775,7 @@ def main():
                     out, stalled, udid, name, device_type, runtime, result, created_device)
                 preserve_stage_checkpoint(out, result, "boot-retry-returned", udid, name, created_device)  # stage-checkpoint:retry
             # Trust only on this exact disposable Simulator, never host trust.
-            try:
-                command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
-                        out / "trust.log", trust_trace=True)
-            except subprocess.TimeoutExpired as stalled:
-                # A freshly booted Simulator's keychain service can still be
-                # settling past the fixed 60-second bound; retry the exact same
-                # owned CA import once at the same bound before failing. The
-                # harness's trust_trace contract keeps 60s either way.
-                (out / "trust-stalled.txt").write_text(
-                    f"first attempt: {stalled!r}\nnotes: {getattr(stalled, '__notes__', [])}\n")
-                # Two back-to-back attempts give the service only the attempt
-                # bound itself; the observed stall pair (run 42843941116:
-                # two empty 60 s hangs right after a 287 s reboot) needed real
-                # settle time between them. Bounded, recorded, still one retry.
-                time.sleep(30)
-                command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)],
-                        out / "trust-retry.log", trust_trace=True)
-                result["simulator"]["trustRetry"] = "stalled-retried"
+            import_simulator_ca_with_one_timeout_retry(out, udid, ca, result)
             preserve_stage_checkpoint(out, result, "trust-returned", udid, name, created_device)  # stage-checkpoint:trust
             server = FixtureServer(cert, key)
             server.start()

@@ -66,11 +66,11 @@ final class WebHomeUITests: XCTestCase {
         let urlInput = app.webViews.textFields.matching(NSPredicate(format: "placeholderValue == %@", "https://app.takosumi.com")).firstMatch
         XCTAssertTrue(nameInput.waitForExistence(timeout: 10))
         nameInput.tap()
-        nameInput.typeText(name)
+        app.typeText(name)
         entered(nameInput, name)
         XCTAssertTrue(urlInput.exists)
         urlInput.tap()
-        urlInput.typeText(origin)
+        app.typeText(origin)
         entered(urlInput, origin)
         app.buttons["保存して開く"].tap()
         expect("Fixture signed out")

@@ -46,6 +46,7 @@ public final class WebHomeOperationTest {
     private final JSONObject result = new JSONObject();
     private final JSONArray cases = new JSONArray();
     private int connectionAttempts;
+    private JSONObject coldHeadingTrace;
     private BackWaitObservation backHomeObservation;
     private boolean backObservationIncomplete;
     // INITIAL_SAVE_OBSERVATION_FIELDS_BEGIN
@@ -91,6 +92,7 @@ public final class WebHomeOperationTest {
     private UiObject2 one(BySelector selector, JSONObject trace, boolean scrollConnectionForm) {
         BySelector inApp = selector.pkg(TARGET);
         long end = SystemClock.elapsedRealtime() + 15000;
+        if (coldHeadingTrace != null) diagnostic(coldHeadingTrace, "headingWaitStartedAtMs", end - 15000);
         // PERSONAL_HOME_WAIT_DEADLINE_BEGIN
         if (personalHomeWait != null && personalHomeWait.waiting) {
             try { personalHomeWait.begin(end - 15000, end); }
@@ -305,6 +307,7 @@ public final class WebHomeOperationTest {
     }
 
     private void observeHomeQuery(BackWaitObservation.Outcome outcome) {
+        if (coldHeadingTrace != null) diagnostic(coldHeadingTrace, "lastHeadingOutcome", outcome.name());
         observePersonalHomeQuery(outcome); // personal-home-wait:existing-outcome
         observeInitialSaveQuery(outcome); // initial-save-observation:existing-outcome
         if (backHomeObservation == null || !backHomeObservation.waiting) return;
@@ -637,8 +640,39 @@ public final class WebHomeOperationTest {
     }
 
     private void launch() throws Exception {
+        launch(null);
+    }
+
+    private void launch(JSONObject trace) throws Exception {
+        if (trace != null) diagnostic(trace, "launchStartedAtMs", SystemClock.elapsedRealtime());
         String reply = device.executeShellCommand("am start -W -n " + launcher);
-        assertTrue("Actual App launcher refused", reply.contains("Status: ok"));
+        boolean accepted = reply.contains("Status: ok");
+        if (trace != null) {
+            diagnostic(trace, "launchReturnedAtMs", SystemClock.elapsedRealtime());
+            diagnostic(trace, "launchStatus", accepted ? "STATUS_OK" : "STATUS_NOT_OK");
+        }
+        assertTrue("Actual App launcher refused", accepted);
+    }
+
+    private void launchColdRoot() throws Exception {
+        JSONObject trace = new JSONObject();
+        diagnostic(trace, "diagnosticOnly", true);
+        diagnostic(trace, "clockDomain", "android_elapsed_realtime");
+        diagnostic(trace, "launchStatus", "NO_REPLY");
+        diagnostic(trace, "lastHeadingOutcome", "NOT_SAMPLED");
+        boolean headingReady = false;
+        try {
+            launch(trace);
+            coldHeadingTrace = trace;
+            expect("接続先を追加");
+            headingReady = true;
+        } finally {
+            coldHeadingTrace = null;
+            if (!headingReady) {
+                diagnostic(trace, "failedAtMs", SystemClock.elapsedRealtime());
+                diagnostic(result, "coldRelaunch", trace);
+            }
+        }
     }
 
     private void closeAndOpenMain() throws Exception {
@@ -690,7 +724,7 @@ public final class WebHomeOperationTest {
         long end = SystemClock.elapsedRealtime() + 10000;
         while (!pid().isEmpty() && SystemClock.elapsedRealtime() < end) SystemClock.sleep(100);
         assertEquals("Original App must terminate", "", pid());
-        launch(); expect("接続先を追加"); reopen("Work");
+        launchColdRoot(); reopen("Work");
         expect("Notes editor"); draft("work-draft", "Work"); host(editor);
         String fresh = document(), freshPid = pid();
         assertFalse(freshPid.isEmpty()); assertNotEquals(oldPid, freshPid); assertNotEquals(before, fresh);

@@ -31,6 +31,8 @@ final class FixtureHome: UIViewController {
     private var exportObservations: [[String: Any]] = []
     private var downloadLifecycle: [[String: Any]] = []
     private var lifecycleTruncated = false
+    private var lifecycleSaveScheduled = false
+    private let exportObservationWriter = DispatchQueue(label: "fixture-export-observations")
     private var closedDuringTransfer = false
     private var closeTimedOut = false
     private var closedDuringExport = false
@@ -50,6 +52,7 @@ final class FixtureHome: UIViewController {
                 self.closeOnBytesKey = nil
                 self.closeDuringTransfer(key: key)
             }
+            guard !self.lifecycleTruncated else { return }
             if self.downloadLifecycle.count < 64 {
                 self.downloadLifecycle.append([
                     "unixSeconds": Date().timeIntervalSince1970,
@@ -225,13 +228,34 @@ final class FixtureHome: UIViewController {
     }
 
     private func saveExportObservations() {
-        guard !exportObservations.isEmpty else { return }
+        guard !downloadLifecycle.isEmpty else { return }
+        if !exportObservations.isEmpty {
+            writeExportObservations(lifecycleOnly: false)
+        } else if !lifecycleSaveScheduled {
+            // Combine callbacks such as confirming and present-confirmed before writing off-main.
+            lifecycleSaveScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.lifecycleSaveScheduled = false
+                guard self.exportObservations.isEmpty else { return }
+                self.writeExportObservations(lifecycleOnly: true)
+            }
+        }
+    }
+
+    private func writeExportObservations(lifecycleOnly: Bool) {
         let value: [String: Any] = ["diagnosticOnly": true, "samples": exportObservations,
                                   "lifecycle": downloadLifecycle, "lifecycleTruncated": lifecycleTruncated]
         // No file bytes, URLs, paths or credentials enter this receipt.
         // Failure to save diagnostics does not alter any export assertion.
-        if let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) {
-            try? bytes.write(to: documents.appendingPathComponent("fixture-export-observations.json"), options: .atomic)
+        guard let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return }
+        let output = documents.appendingPathComponent("fixture-export-observations.json")
+        let write: @Sendable () -> Void = { _ = try? bytes.write(to: output, options: .atomic) }
+        if lifecycleOnly {
+            exportObservationWriter.async(execute: write)
+        } else {
+            // Preserve completed export snapshots and order them after earlier lifecycle writes.
+            exportObservationWriter.sync(execute: write)
         }
     }
 

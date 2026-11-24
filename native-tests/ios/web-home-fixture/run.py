@@ -120,7 +120,8 @@ def navigation_witness(data):
         result["errorType"] = "InputBoundExceeded"
         return result
     marker = b"com.takosumi.fixture.simulator.nav "
-    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap|policy_allow|policy_allow_returned|content_terminated) "
+    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap|policy_allow|policy_allow_returned|"
+                         rb"response_policy_entered|response_policy_allow_returned|content_terminated) "
                          rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown|editor_page_two) "
                          rb"reused=([01]) kept=([01]) resume=([01]) initial=([01]) sameView=([01]) timeMs=([0-9]{1,15})")
     for line in data.splitlines():
@@ -141,7 +142,8 @@ def navigation_witness(data):
                   "relation": int(match[5]), "target": match[6].decode("ascii"),
                   "reused": match[7] == b"1", "kept": match[8] == b"1", "resume": match[9] == b"1",
                   "initial": match[10] == b"1", "sameView": match[11] == b"1", "timeMs": int(match[12])}
-        policy = record["event"] in ("policy_allow", "policy_allow_returned")
+        policy = record["event"] in ("policy_allow", "policy_allow_returned",
+                                     "response_policy_entered", "response_policy_allow_returned")
         if ((policy and (record["seq"] == 513 or record["view"] == 0 or record["request"] != 0
                          or record["relation"] != 0 or not record["sameView"]
                          or any(record[key] for key in ("reused", "kept", "resume", "initial"))))
@@ -859,7 +861,7 @@ def failure_job_summary(data):
         result["category"] = "xctest_failure"
         # Only current public fixture assertion/call sites, never arbitrary
         # filenames, messages, titles, URLs or values from XCTest diagnostics.
-        allowed = {"15", "18", "22", "30", "44", "51", "60", "67", "71", "82", "89", "95", "100",
+        allowed = {"15", "18", "22", "30", "44", "51", "60", "67", "69", "71", "82", "89", "95", "100",
                    "107", "111", "127", "129", "161", "165", "187", "189", "190", "195", "204", "207",
                    "212", "215", "226", "233"}
         sources = []
@@ -879,12 +881,40 @@ def failure_job_summary(data):
     return result
 
 
-def emit_failure_job_summary(out, result):
+def completed_xcode_failure_summary(out):
+    """Snapshot only this completed command's regular, bounded owned log."""
+    path = out / "xcodebuild.log"
+    try:
+        if (any(item.get("log") == str(path) for item in runtime.INTERRUPTED_COMMANDS)
+                or runtime.UNREAPED_COMMANDS):
+            return None
+        with ExitStack() as stack:
+            directory = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, directory)
+            fd = os.open("xcodebuild.log", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+            stack.callback(os.close, fd)
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+                    before.st_size < 1 or before.st_size > 256 * 1024):
+                return None
+            with os.fdopen(os.dup(fd), "rb") as source:
+                data = source.read(256 * 1024 + 1)
+            after = os.fstat(fd)
+            identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+            if len(data) != before.st_size or identity(before) != identity(after):
+                return None
+            return failure_job_summary(data)
+    except Exception:
+        # Optional evidence cannot replace the original XCTest or CLI failure.
+        return None
+
+
+def emit_failure_job_summary(out, result, completed_xcode=None):
     """One optional line after final result/cleanup; failures cannot replace refusal."""
     try:
         if type(result) is not dict or result.get("passed") is not False:
             return
-        data = b""
         summary = None
         known = result.get("xctest")
         if (type(known) is dict and known.get("method") == METHOD and
@@ -892,15 +922,13 @@ def emit_failure_job_summary(out, result):
                 type(known.get("failures")) is int and known["failures"] == 0):
             summary = failure_job_summary(b"")
             summary.update(category="post_xctest", started=1, failed=0, passed=1)
-        try:
-            if summary is None and result.get("interruptedCommands") == [] and not result.get("activeOwnedCommands"):
-                fd = os.open(out / "xcodebuild.log", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(fd, "rb") as source:
-                    if stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                        data = source.read(256 * 1024 + 1)
-        except Exception:
-            pass  # Missing, linked, partial or oversized input stays unknown.
-        line = "IOS_WEB_HOME_FAILURE " + json.dumps(summary or failure_job_summary(data), separators=(",", ":"))
+        if summary is None and not result.get("activeOwnedCommands") and not any(
+                item.get("log") == str(out / "xcodebuild.log")
+                for item in result.get("interruptedCommands", [])):
+            summary = completed_xcode
+            if summary is None and result.get("interruptedCommands") == []:
+                summary = completed_xcode_failure_summary(out)
+        line = "IOS_WEB_HOME_FAILURE " + json.dumps(summary or failure_job_summary(b""), separators=(",", ":"))
         if len(line.encode("ascii")) <= 512:
             print(line, flush=True)
     except Exception:
@@ -974,6 +1002,7 @@ def main():
               "source": source_hashes(), "app": app_proof, "installBudgetSeconds": INSTALL_WAIT,
               "cleanup": False, "functionalPassed": False}
     diagnostic_context = {}
+    completed_xcode = None
     udid, created, servers, failure = None, None, [], None
     with runtime.owned_scratch(scratch_parent) as (scratch, scratch_state):
         try:
@@ -1000,7 +1029,7 @@ def main():
             ca, cert, key = runtime.certificate(scratch, localhost=True)
             runtime.command(["xcrun", "simctl", "boot", udid], out / "boot.log", timeout=30)
             runtime.command(["xcrun", "simctl", "bootstatus", udid, "-b"], out / "bootstatus.log", timeout=180, boot_status=True)
-            runtime.command(["xcrun", "simctl", "keychain", udid, "add-root-cert", str(ca)], out / "trust.log", trust_trace=True)
+            runtime.import_simulator_ca_with_one_timeout_retry(out, udid, ca, result)
             runtime.command(["xcrun", "simctl", "install", udid, str(app)], out / "install.log", timeout=INSTALL_WAIT)
             result["installedBefore"] = installed_app(out, udid, created, app_proof, "before")
             diagnostic_context = watchdog_context_from_saved_install(out / "installed-before.log", created,
@@ -1018,13 +1047,17 @@ def main():
                              "--project-root", str(scratch), "--project", str(scratch)],
                             out / "project.log", env=env, timeout=30)
             shutil.copyfile(scratch / "WebHomeDriver.xcodeproj/project.pbxproj", out / "project.pbxproj")
-            log = runtime.command(["xcodebuild", "test", "-project", str(scratch / "WebHomeDriver.xcodeproj"),
-                                   "-scheme", "WebHomeDriver", "-destination", f"id={udid}",
-                                   "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),
-                                   "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1",
-                                   "-only-testing:WebHomeUITests/WebHomeUITests/" + METHOD, "CODE_SIGNING_ALLOWED=NO"],
-                                  out / "xcodebuild.log", timeout=600, env=env)
-            result["xctest"] = require_ui_pass(log)
+            try:
+                log = runtime.command(["xcodebuild", "test", "-project", str(scratch / "WebHomeDriver.xcodeproj"),
+                                       "-scheme", "WebHomeDriver", "-destination", f"id={udid}",
+                                       "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),
+                                       "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1",
+                                       "-only-testing:WebHomeUITests/WebHomeUITests/" + METHOD, "CODE_SIGNING_ALLOWED=NO"],
+                                      out / "xcodebuild.log", timeout=600, env=env)
+                result["xctest"] = require_ui_pass(log)
+            except Exception:
+                completed_xcode = completed_xcode_failure_summary(out)
+                raise
             result["installedAfter"] = installed_app(out, udid, created, app_proof, "after")
             require(bundle_proof(app, BUILD) == app_proof and source_hashes() == result["source"],
                     "App or source changed during native execution")
@@ -1069,7 +1102,7 @@ def main():
     if scratch_state["retain"]:
         result["scratchRetained"] = str(scratch)
     runtime.save(out / "result.json", result)
-    emit_failure_job_summary(out, result)
+    emit_failure_job_summary(out, result, completed_xcode)
     require(result["passed"], "Whole App iOS Web-home fixture failed; inspect its original result.json")
     print("PASS: whole installed Tauri App connection, synthetic Web login/home, app, Back, profile switch, resume and reset")
     print("Disposable Simulator only; real IdP, physical devices, files/notifications and distribution remain separate")

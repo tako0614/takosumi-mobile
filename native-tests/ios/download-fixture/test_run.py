@@ -244,10 +244,20 @@ class HarnessTests(unittest.TestCase):
                     ["xcrun", "simctl", "get_app_container", udid, fixture_runner.BUNDLE, "data"],
                     out / "observation-container.log", timeout=20)
                 self.assertEqual(json.loads((out / source.name).read_bytes()), value)
+                early = {**value, "samples": [], "lifecycle": [
+                    {"unixSeconds": 1794203999.0, "event": "created", "state": "waiting"},
+                    {"unixSeconds": 1794203999.1, "event": "state", "state": "confirming"},
+                    {"unixSeconds": 1794203999.2, "event": "present-confirmed", "state": "confirming"},
+                ]}
+                source.write_text(json.dumps(early))
+                self.assertEqual(fixture_runner.preserve_export_observations(
+                    {"dataPath": str(data)}, udid, out),
+                    {"diagnosticOnly": True, "status": "retained", "samples": 0})
+                self.assertEqual(json.loads((out / source.name).read_bytes()), early)
             retained = (out / source.name).read_bytes()
             for mode in ("extra-field", "oversized", "symlink", "hardlink", "foreign-container",
                          "unknown-event", "unknown-state", "event-extra-field", "event-overflow",
-                         "event-time", "sample-type", "truncation-type"):
+                         "event-time", "sample-type", "sample-overflow", "empty-lifecycle", "truncation-type"):
                 with self.subTest(mode=mode):
                     source.unlink()
                     source.write_text(json.dumps(value))
@@ -270,6 +280,7 @@ class HarnessTests(unittest.TestCase):
                         elif mode == "unknown-state":
                             invalid["lifecycle"][0]["state"] = "unexpected"
                         elif mode == "event-extra-field":
+                            invalid["samples"] = []
                             invalid["lifecycle"][0]["url"] = "must not copy"
                         elif mode == "event-overflow":
                             invalid["lifecycle"] *= 65
@@ -277,6 +288,11 @@ class HarnessTests(unittest.TestCase):
                             invalid["lifecycle"][0]["unixSeconds"] = float("nan")
                         elif mode == "sample-type":
                             invalid["samples"][0]["sourceReadable"] = 1
+                        elif mode == "sample-overflow":
+                            invalid["samples"] *= 33
+                        elif mode == "empty-lifecycle":
+                            invalid["samples"] = []
+                            invalid["lifecycle"] = []
                         else:
                             invalid["lifecycleTruncated"] = 1
                         source.write_text(json.dumps(invalid))
@@ -553,6 +569,78 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(stage["configuredWaitSeconds"], 60)
             self.assertTrue(stage["diagnosticOnly"])
             self.assertGreaterEqual(stage["stageElapsedSeconds"], 0)
+
+    def test_simulator_ca_import_retries_one_timeout_on_the_same_device_and_ca(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired(argv, 60)
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                    out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            expected = ["xcrun", "simctl", "keychain", "owned-simulator",
+                        "add-root-cert", "owned-ca.pem"]
+            self.assertEqual(calls, [
+                (expected, "trust.log", {"timeout": 60, "trust_trace": True}),
+                (expected, "trust-retry.log", {"timeout": 60, "trust_trace": True}),
+            ])
+            sleep.assert_called_once_with(30)
+            self.assertIn("first attempt:", (out / "trust-stalled.txt").read_text())
+            self.assertEqual(result["simulator"]["trustRetry"], "stalled-retried")
+
+    def test_simulator_ca_import_success_does_not_settle_or_retry(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                    out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1:], ("trust.log", {"timeout": 60, "trust_trace": True}))
+            sleep.assert_not_called()
+            self.assertNotIn("trustRetry", result["simulator"])
+            self.assertFalse((out / "trust-stalled.txt").exists())
+
+    def test_simulator_ca_import_does_not_retry_a_refused_retry(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/root/dev/tmp")) as raw:
+            out = Path(raw)
+            result = {"simulator": {"udid": "owned-simulator"}}
+            calls = []
+            refusal = RuntimeError("retry refused")
+
+            def command(argv, path, **kwargs):
+                calls.append((argv, Path(path).name, kwargs))
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired(argv, 60)
+                raise refusal
+
+            with patch.object(fixture_runner, "command", side_effect=command), \
+                 patch.object(fixture_runner.time, "sleep") as sleep:
+                with self.assertRaises(RuntimeError) as raised:
+                    fixture_runner.import_simulator_ca_with_one_timeout_retry(
+                        out, "owned-simulator", Path("owned-ca.pem"), result)
+
+            self.assertIs(raised.exception, refusal)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][0], calls[1][0])
+            self.assertEqual([call[1] for call in calls], ["trust.log", "trust-retry.log"])
+            sleep.assert_called_once_with(30)
+            self.assertNotIn("trustRetry", result["simulator"])
 
     def test_owned_snapshot_rejects_changed_birth_or_foreign_parent(self):
         ctypes = fixture_runner.ctypes
