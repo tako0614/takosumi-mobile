@@ -33,6 +33,8 @@ METHOD = "testWholeAppConnectionsWebHomeAndResumeStayProfileBound"
 # allowance. One bounded setup attempt; functional XCTest still gets 600 s
 # and installation must finish normally before exact bundle readback.
 INSTALL_WAIT = 120
+NAVIGATION_LOG_LIMIT = 512 * 1024
+FILTERED_NAVIGATION_WAIT = 8
 SOURCES = runtime.FROZEN_SOURCES + [HERE / name for name in (
     "run.py", "test_run.py", "harness.py", "web_site.py", "Driver.swift", "WebHomeUITests.swift", "project.yml")]
 SOURCES += [ROOT / name for name in (
@@ -116,7 +118,7 @@ def navigation_witness(data):
     result = {"diagnosticOnly": True, "clockDomain": "ios_system_uptime", "clockUnit": "ms",
               "records": [], "recordLimit": 513, "dropped": 0, "malformed": 0,
               "capStatus": "not_observed", "absenceIsUnknown": True}
-    if len(data) > 512 * 1024:
+    if len(data) > NAVIGATION_LOG_LIMIT:
         result["errorType"] = "InputBoundExceeded"
         return result
     marker = b"com.takosumi.fixture.simulator.nav "
@@ -752,6 +754,57 @@ def preserve_watchdog_diagnostics(out, scratch, original, context):
 # watchdog-diagnostics-end
 
 
+def require_target_log_owner(path, udid, device, name, selected_runtime, timeout):
+    inventory = json.loads(runtime.command(["xcrun", "simctl", "list", "devices", "--json"], path, timeout=timeout))
+    current = runtime.owned_device(inventory, udid, name, selected_runtime)
+    require(current.get("state") == "Booted" and current.get("dataPath") == device.get("dataPath")
+            and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
+
+
+def filtered_navigation_witness(scratch, udid, device, name, selected_runtime):
+    """Read only the owned App's fixture navigation producer after a broad timeout."""
+    result = {"diagnosticOnly": True, "absenceIsUnknown": True, "status": "unknown", "queryReturned": False}
+    deadline = runtime.time.monotonic() + FILTERED_NAVIGATION_WAIT
+    try:
+        require_target_log_owner(scratch / "before-filtered-navigation.log", udid, device, name, selected_runtime, timeout=2)
+        remaining = deadline - runtime.time.monotonic()
+        if remaining <= 0:
+            return result
+        raw = scratch / "filtered-navigation-raw.log"
+        predicate = '(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")'
+        try:
+            runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                             "--timezone", "UTC", "--last", "10m", "--predicate", predicate],
+                            raw, timeout=remaining, read_output=False)
+            result["queryReturned"] = True
+        except subprocess.TimeoutExpired:
+            result["partial"] = True
+            if runtime.UNREAPED_COMMANDS:
+                return result
+        # Keep raw output in scratch. Freeze the observed length and feed only
+        # a bounded tail into the same closed projection as the broad read.
+        with os.fdopen(os.open(raw, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return result
+            size = info.st_size
+            source.seek(max(0, size - NAVIGATION_LOG_LIMIT))
+            data = source.read(min(size, NAVIGATION_LOG_LIMIT))
+            after = os.fstat(source.fileno())
+            if len(data) != min(size, NAVIGATION_LOG_LIMIT) or (size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                result["partial"] = True
+                return result
+        partial = not result["queryReturned"] or size > len(data)
+        result.update(navigation_witness(data), partial=partial, sourceBytes=size, keptBytes=len(data))
+        if result["records"]:
+            result["status"] = "partial" if partial else "retained"
+    except Exception:
+        # The optional read, ownership check and parser never change the
+        # broad receipt or replace the original XCTest failure.
+        pass
+    return result
+
+
 def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
@@ -760,11 +813,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     try:
         # Recheck inventory before spawn. Never query a host-wide log store or
         # a Simulator selected by its display name alone.
-        inventory = json.loads(runtime.command(["xcrun", "simctl", "list", "devices", "--json"],
-                                               out / "before-target-logs.log", timeout=20))
-        current = runtime.owned_device(inventory, udid, name, selected_runtime)
-        require(current.get("state") == "Booted" and current.get("dataPath") == device.get("dataPath")
-                and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
+        require_target_log_owner(out / "before-target-logs.log", udid, device, name, selected_runtime, timeout=20)
         # No custom/remote process name or predicate input. The bundle is the
         # preinstalled private Tauri App, not the minimal XCTest driver.
         # XCTest's verbose AX traversal can consume the query's entire budget
@@ -776,6 +825,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         result["errorType"] = type(error).__name__
         return result
+    timed_out = False
     try:
         runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
                          "--timezone", "UTC", "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
@@ -784,6 +834,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
         # command() handles its direct child before raising. A retained tail
         # is only a partial snapshot; interrupted-command scratch stays held.
         result.update(queryReturned=False, errorType=type(error).__name__)
+        timed_out = isinstance(error, subprocess.TimeoutExpired)
     try:
         with raw.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
@@ -815,6 +866,9 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         # Missing/failed diagnostics never replace the original test failure.
         result["retentionErrorType"] = type(error).__name__
+    if (timed_out and not runtime.UNREAPED_COMMANDS and
+            any(item.get("log") == str(raw) and item.get("reaped") is True for item in runtime.INTERRUPTED_COMMANDS)):
+        result["filteredNavigationWitness"] = filtered_navigation_witness(scratch, udid, device, name, selected_runtime)
     return result
 
 

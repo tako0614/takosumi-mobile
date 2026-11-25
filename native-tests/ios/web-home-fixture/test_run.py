@@ -645,7 +645,7 @@ class Controls(unittest.TestCase):
             raise subprocess.TimeoutExpired(argv, 15)
         with patch.object(runtime, "command", side_effect=command) as query:
             result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
-        self.assertEqual(query.call_count, 2, "No second query after interruption")
+        self.assertEqual(query.call_count, 2, "No second query without an owned retirement receipt")
         self.assertEqual(result["errorType"], "TimeoutExpired")
         self.assertTrue((out / "target-app-exit.log").is_file(), "Keep output already written before interruption")
         self.assertFalse(result["queryReturned"])
@@ -654,6 +654,92 @@ class Controls(unittest.TestCase):
         self.assertEqual(result["keptBytes"], 512 * 1024)
         self.assertTrue((out / "target-app-exit.log").read_bytes().endswith(b"last partial event"))
         self.assertNotIn("passed", result)
+
+    def test_filtered_navigation_witness_follows_only_an_owned_reaped_timeout(self):
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        packet = (b"2026-11-25 00:03:50.001 Df Takosumi[10:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] "
+                  b"com.takosumi.fixture.simulator.nav v=1 seq=2 event=provisional view=1 request=1 "
+                  b"relation=1 target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123\n")
+        broad = b"x" * (512 * 1024) + b"\noriginal partial tail\n"
+        live = object()
+        for mode in ("retained", "oversize", "filtered-timeout", "filtered-live", "filtered-error",
+                     "changed-owner", "broad-live", "foreign-receipt", "other-broad-error"):
+            with self.subTest(mode=mode):
+                out, scratch = self.root / f"evidence-{mode}", self.root / f"scratch-{mode}"
+                out.mkdir(); scratch.mkdir()
+                calls = []
+                def command(argv, path, **options):
+                    calls.append((argv, path, options))
+                    if argv == ["xcrun", "simctl", "list", "devices", "--json"]:
+                        current = dict(device, logPath="/foreign/logs") if len(calls) > 1 and mode == "changed-owner" else device
+                        return json.dumps({"devices": {"runtime": [current]}})
+                    if len(calls) == 2:
+                        path.write_bytes(broad)
+                        runtime.INTERRUPTED_COMMANDS.append({
+                            "log": str(path) if mode != "foreign-receipt" else str(scratch / "different.log"),
+                            "reaped": mode != "broad-live", "originalErrorType": "TimeoutExpired",
+                        })
+                        if mode == "broad-live":
+                            runtime.UNREAPED_COMMANDS.append({"process": live, "log": str(path)})
+                        if mode == "other-broad-error":
+                            raise OSError("private broad query error")
+                        raise subprocess.TimeoutExpired(argv, 15)
+                    filtered = b"private raw canary\n" + packet
+                    if mode == "oversize":
+                        filtered = b"x" * (512 * 1024) + b"\n" + filtered
+                    path.write_bytes(filtered)
+                    if mode == "filtered-error":
+                        raise OSError("private filtered query error")
+                    if mode in ("filtered-timeout", "filtered-live"):
+                        runtime.INTERRUPTED_COMMANDS.append({"log": str(path), "reaped": mode != "filtered-live"})
+                        if mode == "filtered-live":
+                            runtime.UNREAPED_COMMANDS.append({"process": live, "log": str(path)})
+                        raise subprocess.TimeoutExpired(argv, 8)
+                    return ""
+                with patch.object(runtime, "command", side_effect=command), \
+                        patch.object(runtime, "INTERRUPTED_COMMANDS", []), patch.object(runtime, "UNREAPED_COMMANDS", []):
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+                self.assertFalse(result["queryReturned"])
+                self.assertEqual(result["errorType"], "OSError" if mode == "other-broad-error" else "TimeoutExpired")
+                self.assertTrue(result["partial"] and result["truncated"])
+                self.assertEqual(result["sourceBytes"], len(broad))
+                self.assertEqual((out / "target-app-exit.log").read_bytes(), broad[-512 * 1024:])
+                self.assertEqual(result["navigationWitness"]["records"], [])
+                self.assertEqual(list(out.glob("*.log")), [out / "target-app-exit.log"])
+                for canary in ("private raw canary", "private broad query error", "private filtered query error"):
+                    self.assertNotIn(canary, json.dumps(result))
+                self.assertNotIn("passed", result)
+                if mode in ("broad-live", "foreign-receipt", "other-broad-error"):
+                    self.assertEqual(len(calls), 2)
+                    self.assertNotIn("filteredNavigationWitness", result)
+                    continue
+                witness = result["filteredNavigationWitness"]
+                self.assertTrue(witness["diagnosticOnly"] and witness["absenceIsUnknown"])
+                self.assertEqual(calls[2][1:], (scratch / "before-filtered-navigation.log", {"timeout": 2}))
+                if mode == "changed-owner":
+                    self.assertEqual(len(calls), 3)
+                    self.assertEqual(witness["status"], "unknown")
+                    continue
+                self.assertEqual(len(calls), 4)
+                argv, path, options = calls[3]
+                self.assertEqual(argv, ["xcrun", "simctl", "spawn", "owned", "log", "show", "--style", "compact",
+                                        "--timezone", "UTC", "--last", "10m", "--predicate",
+                                        '(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")'])
+                self.assertEqual(path, scratch / "filtered-navigation-raw.log")
+                self.assertLessEqual(options["timeout"], 8)
+                self.assertGreater(options["timeout"], 0)
+                self.assertIs(options["read_output"], False)
+                if mode in ("filtered-error", "filtered-live"):
+                    self.assertEqual(witness["status"], "unknown")
+                    self.assertNotIn("records", witness)
+                    self.assertFalse(witness["queryReturned"])
+                    continue
+                self.assertEqual(witness["status"], "retained" if mode == "retained" else "partial")
+                self.assertEqual(witness["queryReturned"], mode != "filtered-timeout")
+                self.assertEqual(witness["partial"], mode != "retained")
+                self.assertEqual([record["event"] for record in witness["records"]], ["provisional"])
+                self.assertLessEqual(witness["keptBytes"], 512 * 1024)
 
     def test_navigation_witness_has_only_closed_metadata_and_separates_process_view_identity(self):
         payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=request view=1 request=1 relation=0 "
