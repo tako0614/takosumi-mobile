@@ -50,6 +50,8 @@ public final class WebHomeOperationTest {
     private JSONObject coldHeadingTrace;
     private BackWaitObservation backHomeObservation;
     private boolean backObservationIncomplete;
+    private BackWaitObservation menuHomeWait;
+    private boolean menuHomeWaitTimedOut;
     // INITIAL_SAVE_OBSERVATION_FIELDS_BEGIN
     private InitialSaveObservation initialSaveObservation;
     private boolean initialSaveObservationIncomplete;
@@ -162,6 +164,7 @@ public final class WebHomeOperationTest {
             }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
+        if (menuHomeWait != null && menuHomeWait.waiting) menuHomeWaitTimedOut = true;
         throw new AssertionError("Actual App control did not become ready: " + selector);
     }
 
@@ -326,6 +329,7 @@ public final class WebHomeOperationTest {
         if (coldHeadingTrace != null) diagnostic(coldHeadingTrace, "lastHeadingOutcome", outcome.name());
         observePersonalHomeQuery(outcome); // personal-home-wait:existing-outcome
         observeInitialSaveQuery(outcome); // initial-save-observation:existing-outcome
+        if (menuHomeWait != null && menuHomeWait.waiting) menuHomeWait.sample(outcome, SystemClock.elapsedRealtime());
         if (backHomeObservation == null || !backHomeObservation.waiting) return;
         try { backHomeObservation.sample(outcome, SystemClock.elapsedRealtime()); }
         catch (RuntimeException ignored) { backObservationIncomplete = true; }
@@ -416,12 +420,40 @@ public final class WebHomeOperationTest {
 
     private void compareAccountBackAccessibility() {
         BackWaitObservation wait = backHomeObservation;
-        if (wait == null || backObservationIncomplete || wait.incomplete || wait.capReached
-                || wait.waitFinishedAtMs < 0 || wait.waitReturned || wait.samples == 0
-                || wait.queryNull != wait.samples) {
-            return;
+        if (wait != null && !backObservationIncomplete && wait.onlyMissingAfterWait()) {
+            compareHomeAccessibility(WORK_HOME, "accountBackAccessibility", true);
         }
-        compareHomeAccessibility(WORK_HOME, "accountBackAccessibility", true);
+    }
+
+    private void expectWorkHomeFromEditorMenu() {
+        menu("アプリホームへ");
+        BackWaitObservation wait = new BackWaitObservation();
+        menuHomeWait = wait;
+        wait.beginWait(SystemClock.elapsedRealtime());
+        boolean returned = false;
+        try {
+            expect(WORK_HOME);
+            returned = true;
+        } finally {
+            wait.endWait(SystemClock.elapsedRealtime(), returned);
+        }
+    }
+
+    private void saveMenuHomeFailure(boolean captured) {
+        if (!menuHomeWaitTimedOut) return;
+        BackWaitObservation wait = menuHomeWait;
+        JSONObject metadata = new JSONObject();
+        diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "clockDomain", "android_elapsed_realtime");
+        diagnostic(metadata, "waitStartedAtMs", wait.waitStartedAtMs);
+        diagnostic(metadata, "waitFinishedAtMs", wait.waitFinishedAtMs);
+        diagnostic(metadata, "samples", wait.samples);
+        diagnostic(metadata, "queryNull", wait.queryNull);
+        diagnostic(metadata, "recordingIncomplete", wait.incomplete || wait.capReached);
+        diagnostic(result, "menuHomeWait", metadata);
+        if (captured && wait.onlyMissingAfterWait()) {
+            compareHomeAccessibility(WORK_HOME, "menuHomeAccessibility", false);
+        }
     }
 
     private void comparePersonalHomeAccessibility() {
@@ -754,7 +786,7 @@ public final class WebHomeOperationTest {
             }
         }
         nativeButton("戻る"); expect("Notes editor"); draft("work-draft", "Work");
-        menu("アプリホームへ"); expect("Fixture home Work");
+        expectWorkHomeFromEditorMenu();
         nativeButton("戻る"); draft("work-draft", "Work");
         cases.put("connection-web-login-home-back").put("cross-origin-no-ipc");
         String warm = document(), warmPid = pid();
@@ -819,6 +851,7 @@ public final class WebHomeOperationTest {
         }
         compareAccountBackAccessibility();
         if (saved) comparePersonalHomeAccessibility();
+        saveMenuHomeFailure(saved);
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
         savePersonalHomeWait(); // personal-home-wait:result-delivery
