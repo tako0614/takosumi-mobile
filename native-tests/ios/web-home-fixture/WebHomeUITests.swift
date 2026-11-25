@@ -103,13 +103,13 @@ final class WebHomeUITests: XCTestCase {
 
     private var draft: XCUIElement { app.webViews.textFields["Draft"].firstMatch }
 
-    private func expectDraft(_ value: String, postResume: Bool = false) {
-        XCTAssertTrue(waitForDraftReadiness(postResume: postResume))
+    private func expectDraft(_ value: String, resumeDeadline: TimeInterval? = nil) {
+        XCTAssertTrue(waitForDraftReadiness(resumeDeadline: resumeDeadline))
         let stored = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             draft.value as? String == value
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [stored], timeout: 10), .completed, "Wrong profile's editor state")
-        expect("Remote has no App IPC", captureResumeRejection: postResume)
+        expect("Remote has no App IPC", captureResumeRejection: resumeDeadline != nil)
     }
 
     private func writeDraft(_ value: String) {
@@ -160,8 +160,8 @@ final class WebHomeUITests: XCTestCase {
         expectDraft("work-draft")
         XCTAssertEqual(liveDocument(), workDocument, "Reopening the same connection replaced its live page")
         XCUIDevice.shared.press(.home)
-        activateAndAttachResumeState()
-        expectDraft("work-draft", postResume: true)
+        guard let resumeDeadline = activateAfterBackground() else { return }
+        expectDraft("work-draft", resumeDeadline: resumeDeadline)
         XCTAssertEqual(liveDocument(), workDocument, "Foreground resume replaced its live page")
 
         picker()
@@ -247,9 +247,19 @@ final class WebHomeUITests: XCTestCase {
         add(attachment)
     }
 
-    private func activateAndAttachResumeState() {
+    private func activateAfterBackground() -> TimeInterval? {
+        // Both waits share the original Draft readiness budget, including time spent activating.
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        guard waitForResumePhase(until: deadline, matching: { [self] in
+            let state = app.state
+            return state == .runningBackground || state == .runningBackgroundSuspended
+        }) else {
+            XCTFail("The whole App did not enter the background after pressing Home")
+            return nil
+        }
         app.activate()
         attachResumeState(.activateReturned)
+        return deadline
     }
 
     private func resumeIPCResult(_ matched: Bool, captureRejection: Bool) -> Bool {
@@ -259,15 +269,21 @@ final class WebHomeUITests: XCTestCase {
         return matched
     }
 
-    private func waitForDraftReadiness(postResume: Bool) -> Bool {
-        if !postResume {
+    private func waitForDraftReadiness(resumeDeadline: TimeInterval?) -> Bool {
+        guard let deadline = resumeDeadline else {
             return draft.waitForExistence(timeout: 15)
         }
-        // Reuse the first Draft wait's budget for the joint readiness check.
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        return waitForResumePhase(until: deadline) { [self] in
             guard app.state == .runningForeground else { return false }
             return draft.exists
-        }, object: nil)
-        return XCTWaiter.wait(for: [ready], timeout: 15) == .completed
+        }
+    }
+
+    private func waitForResumePhase(until deadline: TimeInterval, matching: @escaping () -> Bool) -> Bool {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in matching() }, object: nil)
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { return false }
+        return XCTWaiter.wait(for: [ready], timeout: remaining) == .completed
+            && ProcessInfo.processInfo.systemUptime <= deadline
     }
 }

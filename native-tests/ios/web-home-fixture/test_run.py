@@ -467,6 +467,11 @@ class Controls(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(known))
         actual_shape = (started + location.replace(":127:", ":69:") + secret + failed).encode()
         self.assertEqual(runner.failure_job_summary(actual_shape)["sourceLine"], 69)
+        source = Path(runner.__file__).with_name("WebHomeUITests.swift").read_text()
+        background_assertion = next(number for number, line in enumerate(source.splitlines(), 1)
+                                    if 'XCTFail("The whole App did not enter the background' in line)
+        background_shape = (started + location.replace(":127:", f":{background_assertion}:") + secret + failed).encode()
+        self.assertEqual(runner.failure_job_summary(background_shape)["sourceLine"], background_assertion)
         for bad in (None, "secret", b"", b"\xff", b"\x00", b"x" * (256 * 1024 + 1),
                     (started + failed.replace("1.000", "1..0")).encode(),
                     (started + failed.replace(runner.METHOD, "foreign")).encode()):

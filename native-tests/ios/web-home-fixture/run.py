@@ -917,7 +917,7 @@ def failure_job_summary(data):
         # filenames, messages, titles, URLs or values from XCTest diagnostics.
         allowed = {"15", "18", "22", "30", "44", "51", "60", "67", "69", "71", "82", "89", "95", "100",
                    "107", "111", "127", "129", "161", "165", "187", "189", "190", "195", "204", "207",
-                   "212", "215", "226", "233"}
+                   "212", "215", "226", "233", "257"}
         sources = []
         for line in text.splitlines():
             location, separator, _ = line.partition(f": error: {identity} : ")
