@@ -882,8 +882,8 @@ class Controls(unittest.TestCase):
                 self.assertEqual((len(records), rejected, cut), (1, 0, False))
                 self.assertEqual(records[0]["backAction"], action)
                 self.assertEqual(records[0]["physical"], "unknown")
-        for stage in ("BACK_ENTER", "BACK_RETURN", "PAGE_COMMIT"):
-            with self.subTest(legacy_stage=stage):
+        for stage in ("BACK_ENTER", "BACK_RETURN", "PAGE_COMMIT", "WEB_CONTENT_CHANGED"):
+            with self.subTest(stage=stage):
                 records, rejected, cut = runner.parse_native_observation(self.native_line(stage=stage))
                 self.assertEqual((len(records), rejected, cut), (1, 0, False))
                 self.assertIsNone(records[0]["backAction"])
@@ -893,7 +893,8 @@ class Controls(unittest.TestCase):
                 records, rejected, cut = runner.parse_native_observation(
                     self.native_line(stage="BACK_RETURN").rstrip() + suffix + b"\n")
                 self.assertEqual((records, rejected, cut), ([], 1, False))
-        for stage, seq, cap in (("BACK_ENTER", 1, 0), ("PAGE_FINISH", 1, 0), ("CAP_EXHAUSTED", 64, 1)):
+        for stage, seq, cap in (("BACK_ENTER", 1, 0), ("PAGE_FINISH", 1, 0),
+                                ("WEB_CONTENT_CHANGED", 1, 0), ("CAP_EXHAUSTED", 64, 1)):
             with self.subTest(foreign_stage=stage):
                 records, rejected, cut = runner.parse_native_observation(
                     self.native_line(seq, stage, cap).rstrip() + b" back=NO_VIEW\n")

@@ -18,6 +18,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
 import android.webkit.GeolocationPermissions
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
@@ -74,6 +75,7 @@ class AppScreenActivity : AppCompatActivity() {
     // native-observation-begin:fields
     private var nativeObservation: AppScreenObservation? = null
     private var nativeBoundViewIdentity = 0
+    private var nativeAwaitingContentChange = false
     // native-observation-end:fields
 
     private lateinit var container: FrameLayout
@@ -431,6 +433,7 @@ class AppScreenActivity : AppCompatActivity() {
         entry = current
         // native-observation-begin:bind-return
         nativeBoundViewIdentity = nativeViewId
+        nativeAwaitingContentChange = false
         nativeRecord(AppScreenObservation.Stage.BIND_RETURN, current, nativeViewId)
         // native-observation-end:bind-return
     }
@@ -850,6 +853,7 @@ class AppScreenActivity : AppCompatActivity() {
             if (view !== entry?.webView) return
             // native-observation-begin:page_start
             nativeRecord(AppScreenObservation.Stage.PAGE_START, bound, nativeViewIdentity(view))
+            nativeAwaitingContentChange = nativeObservation != null
             // native-observation-end:page_start
             mediaConsent.cancel()
             fileSelection.cancel()
@@ -884,7 +888,10 @@ class AppScreenActivity : AppCompatActivity() {
 
         override fun onPageCommitVisible(view: WebView, url: String?) {
             // native-observation-begin:page-commit
-            if (view === entry?.webView) nativeRecord(AppScreenObservation.Stage.PAGE_COMMIT, bound, nativeViewIdentity(view))
+            if (view === entry?.webView) {
+                nativeRecord(AppScreenObservation.Stage.PAGE_COMMIT, bound, nativeViewIdentity(view))
+                nativeAwaitingContentChange = nativeObservation != null
+            }
             // native-observation-end:page-commit
             if (view === entry?.webView && url == view.url) bound.resumeState.committed(url)
         }
@@ -1091,7 +1098,21 @@ class AppScreenActivity : AppCompatActivity() {
         }
         root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2)))
 
-        container = FrameLayout(this).apply { setBackgroundColor(Color.WHITE) }
+        // native-observation-begin:web-content-change
+        container = if (nativeObservation == null) FrameLayout(this) else object : FrameLayout(this) {
+            override fun onRequestSendAccessibilityEvent(child: View, event: AccessibilityEvent): Boolean {
+                val current = entry
+                // Keep just the first matching request after each page boundary.
+                if (nativeAwaitingContentChange && current != null && child === current.webView &&
+                    event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+                    nativeAwaitingContentChange = false
+                    nativeRecord(AppScreenObservation.Stage.WEB_CONTENT_CHANGED, current, nativeBoundViewIdentity)
+                }
+                return super.onRequestSendAccessibilityEvent(child, event)
+            }
+        }
+        // native-observation-end:web-content-change
+        container.setBackgroundColor(Color.WHITE)
         root.addView(container, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
