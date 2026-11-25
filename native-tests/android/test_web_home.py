@@ -1306,6 +1306,35 @@ class Controls(unittest.TestCase):
         self.assertEqual(emulator.command.call_count, 1)
         self.assertEqual(emulator.command.call_args.args[0][-3:], ["emu", "avd", "name"])
 
+    def test_whole_app_avd_leaves_runner_cpu_headroom(self):
+        cases = (
+            ([], 4, None, 3), (["hw.cpu.ncore = 2"], 4, 2, 3), (["hw.cpu.ncore=1"], 8, 1, 3),
+            ([], 3, None, None), (["hw.cpu.ncore=3"], 4, 3, None), (["hw.cpu.ncore=4"], 8, 4, None),
+            (["hw.cpu.ncore=2", "hw.cpu.ncore=4"], 4, None, None), (["hw.cpu.ncore=unknown"], 4, None, None),
+        )
+        for rows, affinity_count, declared, requested in cases:
+            with self.subTest(rows=rows, affinity_count=affinity_count):
+                self.assertEqual(runner.fixture_cpu_configuration(rows, affinity_count), {
+                    "hostAffinityCpuCount": affinity_count, "declaredGuestCpuCount": declared,
+                    "requestedGuestCpuCount": requested, "onlineGuestCpuCount": None,
+                })
+
+    def test_guest_cpu_readback_uses_owned_emulator_and_one_budget(self):
+        command = Mock(return_value="0-2\n")
+        emulator = runner.Emulator(self.root, self.root, self.root, command)
+        emulator.owned = Mock()
+        with patch.object(runner.time, "monotonic", side_effect=[100, 101.5]):
+            self.assertEqual(emulator.online_cpu_count(), 3)
+        emulator.owned.assert_called_once_with(timeout=2)
+        command.assert_called_once_with(
+            [str(emulator.adb), "-s", runner.SERIAL, "shell", "cat", "/sys/devices/system/cpu/online"],
+            "guest-online-cpus", timeout=3.5,
+        )
+        command.reset_mock()
+        with patch.object(runner.time, "monotonic", side_effect=[100, 105]):
+            self.assertIsNone(emulator.online_cpu_count())
+        command.assert_not_called()
+
     def test_apk_restore_uses_bound_plain_files_and_refuses_same_hash_replacement(self):
         original, variant = b"normal SDK APK bytes", b"fixture SDK APK bytes"
         baseline_hash, variant_hash = (hashlib.sha256(value).hexdigest() for value in (original, variant))

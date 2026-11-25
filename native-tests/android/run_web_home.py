@@ -388,6 +388,17 @@ def preserve_sdk_candidate_witness(emulator, proof):
 # sdk-candidate-witness-end
 
 
+def fixture_cpu_configuration(avd_rows, affinity_count):
+    """Leave room for the runner, adb, and software rendering on the host."""
+    configured = [value.strip() for key, _, value in (row.partition("=") for row in avd_rows)
+                  if key.strip() == "hw.cpu.ncore"]
+    declared = int(configured[0]) if len(configured) == 1 and re.fullmatch(r"[1-9][0-9]?", configured[0]) else None
+    # The emulator's hardware default is 2. Keep larger or ambiguous profiles.
+    requested = 3 if affinity_count >= 4 and (not configured or declared in (1, 2)) else None
+    return {"hostAffinityCpuCount": affinity_count, "declaredGuestCpuCount": declared,
+            "requestedGuestCpuCount": requested, "onlineGuestCpuCount": None}
+
+
 class Emulator:
     def __init__(self, sdk, scratch, out, command):
         self.sdk, self.out, self.command = sdk, out, command
@@ -425,12 +436,15 @@ class Emulator:
         (self.out / "keyboard-mode.json").write_text(json.dumps({
             "scope": "Fresh private whole-App AVD only", "hardwareKeyboard": False,
         }) + "\n")
+        cpu = fixture_cpu_configuration(rows, len(os.sched_getaffinity(0)))
+        guest_cores = cpu["requestedGuestCpuCount"]
+        cpu_args = ["-cores", str(guest_cores)] if guest_cores is not None else []
         guard = ROOT / "src-tauri/target/debug/sumi-android-emulator-guard"
         require(guard.is_file() and not guard.is_symlink(), "Build the existing-source emulator guard first")
         self.output = (self.out / "emulator.log").open("xb")
         self.process = subprocess.Popen([str(guard), str(self.proof), str(self.sdk / "emulator/emulator"),
             "-avd", self.name, "-port", "5582", "-memory", "4096", "-no-window", "-no-audio",
-            "-gpu", "swiftshader_indirect", "-no-boot-anim", "-no-snapshot", "-wipe-data"],
+            "-gpu", "swiftshader_indirect", "-no-boot-anim", "-no-snapshot", "-wipe-data", *cpu_args],
             env=dict(self.env, TAKOSUMI_GUARD_LAUNCH_CONTEXT="android_fixture_sdk"),
             stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True)
         self.fd = os.pidfd_open(self.process.pid)
@@ -447,7 +461,7 @@ class Emulator:
                 self.owned()
                 if self.run("shell", "getprop", "sys.boot_completed").strip() == "1":
                     self.run("shell", "input", "keyevent", "82")
-                    return
+                    return cpu
             time.sleep(1)
         raise TimeoutError("Owned emulator did not boot within 180 seconds")
 
@@ -494,9 +508,10 @@ class Emulator:
                 continue
         require(found, "No SDK emulator with the owned AVD/port and guard ancestry")
 
-    def owned(self):
+    def owned(self, *, timeout=60):
         self.owned_process()
-        name = self.command([str(self.adb), "-s", SERIAL, "emu", "avd", "name"], "avd-name").splitlines()
+        name = self.command([str(self.adb), "-s", SERIAL, "emu", "avd", "name"],
+                            "avd-name", timeout=timeout).splitlines()
         require(name == [self.name, "OK"], "ADB serial no longer names the owned AVD")
         self.owned_process()
 
@@ -504,6 +519,16 @@ class Emulator:
         self.owned()
         return self.command([str(self.adb), "-s", SERIAL, *map(str, args)],
                             "adb", timeout=timeout, binary=binary)
+
+    def online_cpu_count(self):
+        deadline = time.monotonic() + 5
+        self.owned(timeout=2)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        online = self.command([str(self.adb), "-s", SERIAL, "shell", "cat", "/sys/devices/system/cpu/online"],
+                              "guest-online-cpus", timeout=remaining).strip()
+        return int(online.rsplit("-", 1)[-1]) + 1 if re.fullmatch(r"0(?:-[1-9][0-9]?)?", online) else None
 
     def stop(self):
         observe_stop(self, "start")
@@ -1026,7 +1051,7 @@ def main():
         apks = list((driver / "build/outputs/apk").rglob("*.apk"))
         proof["driverAPKs"] = driver_apks(sorted(apks), sdk, command)
         emulator = Emulator(sdk, scratch, out, command)
-        emulator.start()
+        proof["emulatorCpu"] = emulator.start()
         for server in servers:
             port = f"tcp:{server.server_port}"
             emulator.run("reverse", port, port)
@@ -1075,6 +1100,13 @@ def main():
     finally:
         cleanup_errors = []
         if emulator is not None:
+            cpu = proof.get("emulatorCpu")
+            if cpu is not None and cpu["requestedGuestCpuCount"] is not None:
+                # Read after the UI verdict so observation doesn't affect boot or input.
+                try:
+                    cpu["onlineGuestCpuCount"] = emulator.online_cpu_count()
+                except Exception:
+                    pass  # Missing observation leaves the existing verdict and cleanup path.
             try:
                 proof["emulatorGuard"] = emulator.stop()
                 receipt(proof["emulatorGuard"], normal=proof["functionalPassed"])
