@@ -112,6 +112,7 @@ class MacObserver(Observer):
         super().__init__(data, REAL_SITES[site]["origin"], 0, phase, real_site=site)
         self.processes, self.browser, self.guard = processes, browser, guard
         self.identities = []
+        self._failed_contended_page = None
         self.quit_helper = quit_helper
         self.sample_shutdowns = sample_shutdowns
         self.proof["shutdownSampling"] = sample_shutdowns
@@ -187,6 +188,13 @@ class MacObserver(Observer):
         key = json.dumps(self.key)
         return self.read_evaluate(page, f"({{document:globalThis[{key}]??null,storage:localStorage.getItem({key}),"
                              f"cookie:{self.cookie_of()},origin:location.origin}})")
+
+    def contended_sample(self, page, mark):
+        try:
+            return super().contended_sample(page, mark)
+        except Exception:
+            self._failed_contended_page = page
+            raise
 
     def beforeunload(self, page):
         self.step("beforeunload setup", page)
@@ -490,7 +498,10 @@ class MacObserver(Observer):
             attempted = {item.get("pid") for item in self.proof.get("shutdownSamples", [])}
             # The fixture opens two profiles. Never discover or sample by name,
             # and do not repeat a shutdown watcher's already attempted sample.
-            for process in self.proof.get("opened", {}).get("processes", [])[:2]:
+            opened = self.proof.get("opened", {}).get("processes", [])[:2]
+            failed_process = getattr(self._failed_contended_page, "process", None)
+            # Only the exact opened record can move ahead of the other target.
+            for process in sorted(opened, key=lambda item: item is not failed_process):
                 try:
                     pid = process["opened"]["nativePid"]
                     if pid in attempted:

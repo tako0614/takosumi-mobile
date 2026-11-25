@@ -689,6 +689,36 @@ os.open(sys.argv[3],os.O_RDONLY)
                         self.assertEqual(item["observationError"], broken == "classifier")
         # CDP_COMMAND_OBSERVATION_CONTROLS_END
 
+    def test_failed_contended_read_prioritizes_only_an_existing_sample_target(self):
+        cases = (("personal", [22, 12]), ("foreign", [12, 22]), ("outside bound", [12, 22]),
+                 ("personal already sampled", [12]))
+        for case, expected in cases:
+            with self.subTest(case=case):
+                observer = self.failed_observer()
+                opened = observer.proof["opened"]["processes"]
+                opened.append({"pid": 31, "opened": {"nativePid": 32}})
+                observer.identities.extend([
+                    {"pid": 31, "parent": 10, "start": 104}, {"pid": 32, "parent": 31, "start": 105}])
+                target = opened[1]
+                if case == "foreign":
+                    target = copy.deepcopy(target)
+                elif case == "outside bound":
+                    target = opened[2]
+                elif case == "personal already sampled":
+                    observer.proof["shutdownSamples"] = [{"pid": 22, "status": "sample-error"}]
+                page = SimpleNamespace(process=target)
+                mark = object()
+                failure = runner.Failure("CDP timeout Page.getFrameTree")
+                observer.first_launch.side_effect = lambda: observer.contended_sample(page, mark)
+                with mock.patch.object(runner.Observer, "contended_sample", side_effect=failure) as read, \
+                        mock.patch.object(runner, "sample_owned", return_value={"diagnosticOnly": True}) as sample, \
+                        self.assertRaises(runner.Failure) as error:
+                    observer.run()
+                read.assert_called_once_with(page, mark)
+                self.assertEqual([call.args[1]["pid"] for call in sample.call_args_list], expected)
+                self.assertIs(error.exception, failure)
+                self.assertFalse(observer.proof["passed"])
+
     def test_failure_stack_capture_requires_identity_and_does_not_repeat_shutdown_sample(self):
         observer = self.failed_observer()
         observer.proof["shutdownSamples"] = [{"pid": 12, "status": "sample-error"}]
