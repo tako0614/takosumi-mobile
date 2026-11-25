@@ -170,6 +170,15 @@ def retire_cli(process, path, original):
     outcome = {"pid": process.pid, "log": str(path), "originalErrorType": type(original).__name__,
                "reaped": False, "signals": []}
     INTERRUPTED_COMMANDS.append(outcome)
+    if (isinstance(original, subprocess.TimeoutExpired) and
+            original.cmd == ["xcrun", "simctl", "list", "runtimes", "--json"]):
+        # Capture the direct child before poll can reap it. This phase runs
+        # before a Simulator is created and can stop in xcrun or simctl.
+        outcome["phase"] = "runtime-inventory"
+        try:
+            outcome["child"] = owned_cli_snapshot(process.pid)
+        except Exception as error:
+            outcome["snapshotErrorType"] = type(error).__name__
     code = process.poll()
     if code is not None:
         outcome.update(reaped=True, exit=code)

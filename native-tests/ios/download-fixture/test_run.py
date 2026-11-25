@@ -506,6 +506,50 @@ class HarnessTests(unittest.TestCase):
             # This test's Python child spawned none and was reaped above, so
             # the test's outer TemporaryDirectory may retire its own fixture.
 
+    def test_runtime_inventory_timeout_describes_only_its_unreaped_child(self):
+        inventory = ["xcrun", "simctl", "list", "runtimes", "--json"]
+        other = ["xcrun", "simctl", "list", "devices", "--json"]
+        for argv, image in ((inventory, "xcrun"), (inventory, "simctl"),
+                            (inventory, None), (other, None)):
+            with self.subTest(argv=argv, image=image), tempfile.TemporaryDirectory() as raw:
+                original = subprocess.TimeoutExpired(argv, 60)
+                process = Mock(pid=424242)
+                process.wait.side_effect = [original, -15]
+                process.poll.return_value = None
+                path = Path(raw) / "inventory.log"
+
+                def snapshot(pid):
+                    self.assertEqual(pid, process.pid)
+                    process.poll.assert_not_called()
+                    process.terminate.assert_not_called()
+                    if image is None:
+                        raise OSError("diagnostic unavailable")
+                    return {"pid": pid, "birthMicros": 123, "imageClass": image, "diagnosticOnly": True}
+
+                with patch.object(fixture_runner.subprocess, "Popen", return_value=process) as spawn, \
+                     patch.object(fixture_runner, "owned_cli_snapshot", side_effect=snapshot) as observer:
+                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        fixture_runner.command(argv, path)
+                self.assertIs(caught.exception, original)
+                spawn.assert_called_once()
+                process.terminate.assert_called_once_with()
+                self.assertEqual([call.kwargs for call in process.wait.call_args_list],
+                                 [{"timeout": 60}, {"timeout": 5}])
+                receipt = json.loads(path.with_suffix(".process.json").read_text())
+                self.assertTrue(receipt["reaped"])
+                if argv == other:
+                    observer.assert_not_called()
+                    self.assertNotIn("phase", receipt)
+                    self.assertNotIn("child", receipt)
+                else:
+                    observer.assert_called_once_with(process.pid)
+                    self.assertEqual(receipt["phase"], "runtime-inventory")
+                    if image is None:
+                        self.assertEqual(receipt["snapshotErrorType"], "OSError")
+                    else:
+                        self.assertEqual(receipt["child"]["imageClass"], image)
+                        self.assertNotIn("snapshotErrorType", receipt)
+
     def test_trust_timeout_snapshot_precedes_retirement_and_cannot_mask_failure(self):
         argv = ["xcrun", "simctl", "keychain", "owned-id", "add-root-cert", "owned-ca.pem"]
         for snapshot_failure, write_failure in ((False, False), (True, False), (False, True)):
