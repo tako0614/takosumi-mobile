@@ -750,7 +750,7 @@ def main():
             if len(checkout) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in checkout):
                 raise RuntimeError("Missing checkout head/tree identity")
             result["checkout"] = {"head": checkout[0], "tree": checkout[1]}
-            inventory = json.loads(command(["xcrun", "simctl", "list", "--json"], out / "inventory.log"))
+            inventory = json.loads(command(["xcrun", "simctl", "list", "runtimes", "--json"], out / "inventory.log"))
             runtime, device_type = select_runtime(inventory)
             name = "sumi-download-" + str(uuid.uuid4())
             udid = command(["xcrun", "simctl", "create", name, device_type, runtime], out / "create.log").strip()
