@@ -277,15 +277,41 @@ final class DownloadUITests: XCTestCase {
         add(attachment)
     }
 
+    private final class FilesReturnTrace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var phase = "predicate-not-started"
+
+        func record(_ phase: String) {
+            lock.lock()
+            self.phase = phase
+            lock.unlock()
+        }
+
+        var lastPhase: String {
+            lock.lock()
+            defer { lock.unlock() }
+            return phase
+        }
+    }
+
     private func waitForFilesDismissal() {
         // The underlying close button exists while Files still covers it
         // (43202312305). Save must return control to the native host before
         // a later Close tap exercises the product; keep the same bound.
+        let trace = FilesReturnTrace()
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            !exportSurfaceBlocksHost(requiringHostReturn: true)
+            let blocked = exportSurfaceBlocksHost(requiringHostReturn: true, trace: trace)
+            if !blocked { trace.record("host-ready") }
+            return !blocked
         }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed,
-                       "Save did not return control from the OS export surface")
+        let result = XCTWaiter.wait(for: [dismissed], timeout: 10)
+        if result != .completed {
+            let attachment = XCTAttachment(string: trace.lastPhase)
+            attachment.name = "Files return last observed gate"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        XCTAssertEqual(result, .completed, "Save did not return control from the OS export surface")
     }
 
     private func exportSurfaces(_ host: XCUIApplication) -> XCUIElementQuery {
@@ -295,12 +321,32 @@ final class DownloadUITests: XCTestCase {
             names, names, XCUIElement.ElementType.popover.rawValue))
     }
 
-    private func nativeHostReady() -> Bool {
+    private func nativeHostReady(trace: FilesReturnTrace?) -> Bool {
         let close = app.buttons["閉じる"].firstMatch
-        return app.state == .runningForeground && close.exists && close.isEnabled && close.isHittable
+        trace?.record("host-foreground-query")
+        guard app.state == .runningForeground else {
+            trace?.record("host-not-foreground")
+            return false
+        }
+        trace?.record("host-close-exists-query")
+        guard close.exists else {
+            trace?.record("host-close-missing")
+            return false
+        }
+        trace?.record("host-close-enabled-query")
+        guard close.isEnabled else {
+            trace?.record("host-close-disabled")
+            return false
+        }
+        trace?.record("host-close-hittable-query")
+        guard close.isHittable else {
+            trace?.record("host-close-not-hittable")
+            return false
+        }
+        return true
     }
 
-    private func exportSurfaceBlocksHost(requiringHostReturn: Bool = false) -> Bool {
+    private func exportSurfaceBlocksHost(requiringHostReturn: Bool = false, trace: FilesReturnTrace? = nil) -> Bool {
         // 43224385576: the Blob picker visibly dismissed inside this wait,
         // yet the absence gate still matched. Provider AX retention is an
         // inference; that run did not record its teardown hierarchy. Host
@@ -308,28 +354,40 @@ final class DownloadUITests: XCTestCase {
         // while visible. Keep any host surface blocking; provider-only AX
         // can stop blocking only with a positive native-host return and no
         // interactive provider surface. Non-hittable alone proves nothing.
-        if exportSurfaces(app).firstMatch.exists { return true }
+        trace?.record("host-export-surface-query")
+        if exportSurfaces(app).firstMatch.exists {
+            trace?.record("host-export-surface-present")
+            return true
+        }
         // The post-Save wait must positively return to the host. Ordinary
         // Close keeps its separate existing readiness wait when Files is absent.
-        if requiringHostReturn && !nativeHostReady() { return true }
+        if requiringHostReturn && !nativeHostReady(trace: trace) { return true }
         // 43248197436: Files exited after OS Save. Enumerating its AX roots
         // then fails the test itself. The post-Save wait requires the positive
         // host return above; ordinary Close retains its own readiness wait.
         // Neither caller should resolve the ended provider's dead AX tree.
+        trace?.record("files-app-state-query")
         switch filesApp.state {
         case .notRunning: return false
-        case .unknown: return true
+        case .unknown:
+            trace?.record("files-app-state-unknown")
+            return true
         default: break
         }
+        trace?.record("files-export-surface-query")
         let surfaces = exportSurfaces(filesApp)
         guard surfaces.firstMatch.exists else { return false }
+        trace?.record("files-export-surface-enumeration")
         let provider = surfaces.allElementsBoundByIndex
         if provider.isEmpty { return false }
-        guard nativeHostReady() else { return true }
-        return provider.contains { surface in
+        guard nativeHostReady(trace: trace) else { return true }
+        trace?.record("files-export-interactivity-query")
+        let interactive = provider.contains { surface in
             surface.isHittable || surface.descendants(matching: .any)
                 .allElementsBoundByIndex.contains { $0.isHittable }
         }
+        if interactive { trace?.record("files-export-surface-interactive") }
+        return interactive
     }
 
     // The iOS 26 Files export picker is hosted by com.apple.DocumentsApp. Its
