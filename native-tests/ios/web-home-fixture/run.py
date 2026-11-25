@@ -122,8 +122,9 @@ def navigation_witness(data):
         result["errorType"] = "InputBoundExceeded"
         return result
     marker = b"com.takosumi.fixture.simulator.nav "
-    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap|policy_allow|policy_allow_returned|"
-                         rb"response_policy_entered|response_policy_allow_returned|content_terminated) "
+    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|home_request|returned|provisional|commit|finish|"
+                         rb"fail_provisional|fail|cap|policy_allow|policy_allow_returned|response_policy_entered|"
+                         rb"response_policy_allow_returned|content_terminated) "
                          rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown|editor_page_two) "
                          rb"reused=([01]) kept=([01]) resume=([01]) initial=([01]) sameView=([01]) timeMs=([0-9]{1,15})")
     for line in data.splitlines():
@@ -158,6 +159,12 @@ def navigation_witness(data):
                            or any(record[key] for key in ("reused", "kept", "resume", "initial"))):
             result["malformed"] = min(513, result["malformed"] + 1)
             continue  # An owner-bound delegate event is never navigation context or a liveness verdict.
+        if record["event"] == "home_request" and (
+                record["seq"] == 513 or record["view"] == 0 or record["request"] == 0
+                or record["relation"] != 0 or record["target"] == "unknown" or not record["sameView"]
+                or not record["reused"] or record["kept"] or record["resume"] or not record["initial"]):
+            result["malformed"] = min(513, result["malformed"] + 1)
+            continue  # The menu requests a launch URL in an already-bound view.
         callback = record["event"] in ("provisional", "commit", "finish", "fail_provisional", "fail")
         matched = record["relation"] == 1 and record["sameView"]
         context = (record["request"] != 0 or record["target"] != "unknown"

@@ -793,6 +793,28 @@ class Controls(unittest.TestCase):
         self.assertEqual(len(returned["records"]), 1, "A nil return may retain the already-selected request context")
         self.assertNotIn("passed", unknown)
 
+    def test_home_menu_witness_is_request_context_for_the_bound_view(self):
+        header = (b"2026-11-25 00:00:00.001 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+        payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=4 event=home_request view=2 request=7 "
+                   b"relation=0 target=instance reused=1 kept=0 resume=0 initial=1 sameView=1 timeMs=234\n")
+        returned = payload.replace(b"seq=4 event=home_request", b"seq=5 event=returned").replace(b"relation=0", b"relation=1")
+        callback = returned.replace(b"seq=5 event=returned", b"seq=6 event=provisional")
+        value = runner.navigation_witness(b"".join(header + line for line in (payload, returned, callback)))
+        self.assertEqual(value["malformed"], 0)
+        self.assertEqual([(record["event"], record["view"], record["request"], record["relation"])
+                          for record in value["records"]],
+                         [("home_request", 2, 7, 0), ("returned", 2, 7, 1), ("provisional", 2, 7, 1)])
+        for old, bad in ((b"seq=4", b"seq=513"), (b"view=2", b"view=0"), (b"request=7", b"request=0"),
+                         (b"relation=0", b"relation=1"), (b"target=instance", b"target=unknown"),
+                         (b"sameView=1", b"sameView=0"), (b"reused=1", b"reused=0"),
+                         (b"kept=0", b"kept=1"), (b"resume=0", b"resume=1"), (b"initial=1", b"initial=0"),
+                         (b"timeMs=234", b"timeMs=234 url=secret")):
+            with self.subTest(bad=bad):
+                value = runner.navigation_witness(header + payload.replace(old, bad))
+                self.assertEqual(value["records"], [])
+                self.assertEqual(value["malformed"], 1)
+
     def test_navigation_policy_allow_is_independent_and_never_binds_callbacks(self):
         header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
                   b"[com.takosumi.fixture.simulator.navigation:navigation] ")
