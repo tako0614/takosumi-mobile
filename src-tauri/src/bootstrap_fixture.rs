@@ -144,40 +144,118 @@ fn android_packet(pid: u32, start_tick: u64, boot: &str, line: &str) -> String {
 }
 
 #[cfg(target_os = "android")]
-pub fn install_android<R: tauri::Runtime>(app: &tauri::App<R>) {
-    use std::io::Read;
-    use std::sync::{Arc, Mutex};
-    use tauri::Listener;
+const ANDROID_FIXTURE: &str = "com.takosumi.fixture.android";
 
-    if !cfg!(debug_assertions) || app.config().identifier != "com.takosumi.fixture.android" {
-        return;
+#[cfg(target_os = "android")]
+struct AndroidRoot {
+    pid: u32,
+    start_tick: u64,
+    boot: String,
+    page_started: std::sync::atomic::AtomicBool,
+    page_finished: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidRoot {
+    fn current() -> Option<&'static Self> {
+        use std::io::Read;
+        use std::sync::OnceLock;
+
+        static ROOT: OnceLock<Option<AndroidRoot>> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let pid = std::process::id();
+            let mut stat = Vec::new();
+            std::fs::File::open("/proc/self/stat")
+                .ok()?
+                .take(4097)
+                .read_to_end(&mut stat)
+                .ok()?;
+            let mut boot = Vec::new();
+            std::fs::File::open("/proc/sys/kernel/random/boot_id")
+                .ok()?
+                .take(38)
+                .read_to_end(&mut boot)
+                .ok()?;
+            Some(Self {
+                pid,
+                start_tick: process_start_tick(&stat, pid)?,
+                boot: kernel_boot_id(&boot)?,
+                page_started: Default::default(),
+                page_finished: Default::default(),
+            })
+        })
+        .as_ref()
     }
-    let pid = std::process::id();
-    let mut stat = Vec::new();
-    let Some(start_tick) = std::fs::File::open("/proc/self/stat").ok()
-        .and_then(|file| file.take(4097).read_to_end(&mut stat).ok())
-        .and_then(|_| process_start_tick(&stat, pid)) else { return };
-    let mut boot = Vec::new();
-    let Some(boot) = std::fs::File::open("/proc/sys/kernel/random/boot_id").ok()
-        .and_then(|file| file.take(38).read_to_end(&mut boot).ok())
-        .and_then(|_| kernel_boot_id(&boot)) else { return };
-    let recorder = Arc::new(Mutex::new(Recorder::new(true)));
-    app.listen("takosumi-fixture-bootstrap", move |event| {
-        let line = recorder.lock().ok().and_then(|mut r| r.record(event.payload()));
-        if let Some(line) = line {
-            let packet = android_packet(pid, start_tick, &boot, &line);
-            if let Ok(message) = std::ffi::CString::new(packet) {
-                // Private diagnostic only. Log loss/blocking must not alter the
-                // Root event or UI verdict; no new invoke command/permission.
-                #[link(name = "log")]
-                unsafe extern "C" {
-                    fn __android_log_write(priority: i32, tag: *const std::ffi::c_char,
-                                           text: *const std::ffi::c_char) -> i32;
-                }
-                unsafe { __android_log_write(4, c"TakosRootBootstrap".as_ptr(), message.as_ptr()); }
+
+    fn emit(&self, line: &str) {
+        let packet = android_packet(self.pid, self.start_tick, &self.boot, line);
+        if let Ok(message) = std::ffi::CString::new(packet) {
+            // Log loss must leave the fixture verdict unchanged.
+            #[link(name = "log")]
+            unsafe extern "C" {
+                fn __android_log_write(
+                    priority: i32,
+                    tag: *const std::ffi::c_char,
+                    text: *const std::ffi::c_char,
+                ) -> i32;
+            }
+            unsafe {
+                __android_log_write(4, c"TakosRootBootstrap".as_ptr(), message.as_ptr());
             }
         }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn install_android<R: tauri::Runtime>(app: &tauri::App<R>) {
+    use std::sync::Mutex;
+    use tauri::Listener;
+
+    if !cfg!(debug_assertions) || app.config().identifier != ANDROID_FIXTURE {
+        return;
+    }
+    let Some(root) = AndroidRoot::current() else {
+        return;
+    };
+    let recorder = Mutex::new(Recorder::new(true));
+    app.listen("takosumi-fixture-bootstrap", move |event| {
+        let line = recorder
+            .lock()
+            .ok()
+            .and_then(|mut r| r.record(event.payload()));
+        if let Some(line) = line {
+            root.emit(&line);
+        }
     });
+    root.emit("nativeStage=listener_ready");
+}
+
+#[cfg(target_os = "android")]
+pub fn observe_android_page<R: tauri::Runtime>(
+    webview: &tauri::Webview<R>,
+    event: tauri::webview::PageLoadEvent,
+) {
+    use std::sync::atomic::Ordering;
+    use tauri::{Manager, webview::PageLoadEvent};
+
+    if !cfg!(debug_assertions)
+        || webview.label() != "main"
+        || webview.config().identifier != ANDROID_FIXTURE
+    {
+        return;
+    }
+    let Some(root) = AndroidRoot::current() else {
+        return;
+    };
+    let (seen, stage) = match event {
+        PageLoadEvent::Started => (&root.page_started, "nativeStage=page_started"),
+        PageLoadEvent::Finished => (&root.page_finished, "nativeStage=page_finished"),
+    };
+    // First receipt of each signal for this process. Page events are not
+    // correlated to a document and cannot prove render or readiness.
+    if !seen.swap(true, Ordering::Relaxed) {
+        root.emit(stage);
+    }
 }
 
 #[cfg(target_os = "ios")]

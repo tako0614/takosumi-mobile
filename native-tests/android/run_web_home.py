@@ -791,13 +791,16 @@ ROOT_BOOTSTRAP_TAG = "TakosRootBootstrap"
 # messages from the retained main buffer; unrelated later noise cannot spend
 # this budget. -d stays finite and the existing read/identity bounds still apply.
 ROOT_BOOTSTRAP_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-m", "64")
-ROOT_BOOTSTRAP_PACKET = re.compile(
-    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
+ROOT_BOOTSTRAP_IDENTITY = (
+    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) ")
+ROOT_BOOTSTRAP_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
     rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
     rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
     rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
     rb"render_returned|connection_name_(?:click|focus|blur)|unknown|cap) "
     rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1 rootEnd=1")
+ROOT_NATIVE_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
+    rb"nativeStage=(listener_ready|page_started|page_finished) rootEnd=1")
 
 
 def root_activity_pid(data, *, truncated=False):
@@ -872,8 +875,15 @@ def root_guest_identity(data, pid):
 
 
 def parse_root_bootstrap(data, identity):
-    records, rejected, cut = [], 0, False
+    records, native_stages, rejected, cut = [], [], 0, False
     for line in data.splitlines():
+        native = ROOT_NATIVE_PACKET.fullmatch(line)
+        if native:
+            stage = native[4].decode("ascii")
+            if (int(native[1]) == identity["pid"] and int(native[2]) == identity["startTick"]
+                    and native[3].decode("ascii") == identity["bootId"] and stage not in native_stages):
+                native_stages.append(stage)
+                continue
         match = ROOT_BOOTSTRAP_PACKET.fullmatch(line) if len(line) <= 384 else None
         if match:
             pid, tick, receipt, seq = (int(match[v]) for v in (1, 2, 4, 5))
@@ -892,7 +902,7 @@ def parse_root_bootstrap(data, identity):
                                 "elapsedMs": None if elapsed == -1 else elapsed})
                 continue
         rejected = min(65, rejected + 1)
-    return records, rejected, cut
+    return records, rejected, cut, native_stages
 
 
 def preserve_root_bootstrap(emulator, scratch, out, prior):
@@ -900,7 +910,8 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
     result = {"diagnosticOnly": True, "phase": "root_main_snapshot", "absenceIsUnknown": True,
               "clockDomain": "browser_performance_time_origin_ms", "birthDomain": "guest_kernel_start_ticks",
               "timestampsComparableAcrossDomains": False, "sequenceMayRepeatAcrossRealms": True,
-              "coverage": "unknown", "records": [], "queryReturned": False, "identityBookendsMatch": False,
+              "coverage": "unknown", "records": [], "nativeStages": [],
+              "queryReturned": False, "identityBookendsMatch": False,
               "commandWaitSeconds": 10, "matchingPacketLimit": 64,
               "captureWindow": "pid_main_closed_tag_then_first64", "rawReadCapBytes": 65536,
               "recordLimit": 33, "lineLimitBytes": 384, "savedByteLimit": 16384}
@@ -938,12 +949,13 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
                                  "-s", ROOT_BOOTSTRAP_TAG + ":I", "*:S"), 65536)
         after = root_guest_identity(query("after", identity_query, 8192), pid)
         require(after == before, "Root guest identity changed")
-        records, rejected, cut = parse_root_bootstrap(data, before)
+        records, rejected, cut, native_stages = parse_root_bootstrap(data, before)
         result.update(guestIdentity=before, identityBookendsMatch=True, queryReturned=True,
-                      records=records, rejectedPackets=rejected, recordLimitReached=cut,
+                      records=records, nativeStages=native_stages, rejectedPackets=rejected, recordLimitReached=cut,
                       sourceBytes=len(data), nativeCapSeen=any(row["stage"] == "cap" for row in records))
     except BaseException as error:
         result["records"] = []
+        result["nativeStages"] = []
         result["error"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "capture_or_identity_refused"
     try:
         payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("ascii")
