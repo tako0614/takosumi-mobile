@@ -260,6 +260,9 @@ export function WebHome(props: {
           <label for="connection-name">名前 <span>（任意）</span></label>
           <input id="connection-name" type="text" maxlength={80} value={name()}
             placeholder="自分のTakosumi" disabled={locked()}
+            onClick={props.observeBootstrap ? () => observe("connection_name_click") : undefined}
+            onFocus={props.observeBootstrap ? () => observe("connection_name_focus") : undefined}
+            onBlur={props.observeBootstrap ? () => observe("connection_name_blur") : undefined}
             onInput={(event) => setName(event.currentTarget.value)} />
           <button class="web-primary" type="submit" disabled={locked()}
             ref={() => observe("save_element")}>保存して開く</button>

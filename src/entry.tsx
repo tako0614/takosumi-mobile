@@ -12,9 +12,10 @@ import "./web-home.css";
 
 // Static dependencies have already evaluated. Times stay in this document's
 // browser Performance domain; neither this event nor a JSX ref proves paint/AX.
+const bootstrapFixtureEnabled = (import.meta as ImportMeta & { readonly env?: Readonly<Record<string, unknown>> })
+  .env?.VITE_TAKOSUMI_FIXTURE_BOOTSTRAP === "1";
 const observeBootstrap = createBootstrapObserver({
-  enabled: (import.meta as ImportMeta & { readonly env?: Readonly<Record<string, unknown>> })
-    .env?.VITE_TAKOSUMI_FIXTURE_BOOTSTRAP === "1",
+  enabled: bootstrapFixtureEnabled,
   send: (payload) => invoke("plugin:event|emit", { event: BOOTSTRAP_EVENT, payload }),
   now: () => performance.now(),
 });
@@ -64,7 +65,8 @@ if (!web) {
       allowLegacyMobile = os === "android" || os === "ios";
     } catch { /* An unavailable OS hint must not prevent opening Web home. */ }
   }
-  render(() => <WebHome storage={storage} allowLegacyMobile={allowLegacyMobile} observeBootstrap={observeBootstrap}
+  render(() => <WebHome storage={storage} allowLegacyMobile={allowLegacyMobile}
+    observeBootstrap={bootstrapFixtureEnabled ? observeBootstrap : undefined}
     clearData={canClearData() ? (connection) => clearWebProfileData(connection, invoke) : undefined}
     recover={canRecover() ? (connection, ticket) => recoverWebProfile(connection, ticket, invoke) : undefined}
     permissionPrompts={permissionPrompts()}

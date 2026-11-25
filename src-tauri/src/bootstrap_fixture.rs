@@ -16,6 +16,9 @@ const STAGES: &[&str] = &[
     "connections_failed",
     "save_element",
     "render_returned",
+    "connection_name_click",
+    "connection_name_focus",
+    "connection_name_blur",
 ];
 
 fn number(value: &str, max: u32) -> Option<u32> {

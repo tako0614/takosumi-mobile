@@ -266,7 +266,9 @@ def bootstrap_witness(data, size, *, partial):
                         rb"Takosumi\[([1-9][0-9]{0,9}):[0-9a-fA-Fx]+\]\s+"
                         rb"\[com\.takosumi\.fixture\.simulator:app\]\s+\[stderr\] ")
     packet = re.compile(rb"v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
-                        rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
+                        rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
+                        rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
+                        rb"render_returned|connection_name_(?:click|focus|blur)|unknown|cap) "
                         rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1")
     anchor = None
     for line in lines[:result["scanLineLimit"]]:

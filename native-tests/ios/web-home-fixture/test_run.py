@@ -1183,6 +1183,12 @@ class Controls(unittest.TestCase):
         self.assertTrue(decoded["absenceIsUnknown"])
         self.assertFalse(decoded["timestampsComparableAcrossDomains"])
         self.assertTrue(decoded["sequenceMayRepeatAcrossRealms"])
+        field = b"".join(packet(b"connection_name_" + event, index, index)
+                         for index, event in enumerate((b"focus", b"click", b"blur"), start=1))
+        self.assertEqual(
+            [v["stage"] for v in parse(header + field)["records"]],
+            ["connection_name_focus", "connection_name_click", "connection_name_blur"],
+        )
         for bad in (second, header.replace(b":app]", b":foreign]") + first,
                     header + first.replace(b"stage=entry", b"stage=SECRET"), header + first + b"\n" + second,
                     header + first + b"unrelated\n" + second, header + packet(receipt=34),
