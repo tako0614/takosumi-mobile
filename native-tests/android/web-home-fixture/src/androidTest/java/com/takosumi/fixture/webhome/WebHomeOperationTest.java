@@ -40,6 +40,7 @@ public final class WebHomeOperationTest {
     private static final String TARGET = "com.takosumi.fixture.android";
     private static final String DRIVER = "com.takosumi.fixture.webhome";
     private static final String WORK_HOME = "Fixture home Work";
+    private static final String PERSONAL_HOME = "Fixture home Personal";
     private UiDevice device;
     private Context context;
     private String origin, editor, launcher;
@@ -405,8 +406,8 @@ public final class WebHomeOperationTest {
         } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
     }
 
-    private BackWaitObservation.Outcome queryWorkHome() {
-        UiObject2 node = device.findObject(By.text(WORK_HOME).pkg(TARGET));
+    private BackWaitObservation.Outcome queryHome(String heading) {
+        UiObject2 node = device.findObject(By.text(heading).pkg(TARGET));
         if (node == null) return BackWaitObservation.Outcome.QUERY_NULL;
         if (!node.isEnabled()) return BackWaitObservation.Outcome.DISABLED;
         return node.getVisibleBounds().isEmpty()
@@ -417,29 +418,47 @@ public final class WebHomeOperationTest {
         BackWaitObservation wait = backHomeObservation;
         if (wait == null || backObservationIncomplete || wait.incomplete || wait.capReached
                 || wait.waitFinishedAtMs < 0 || wait.waitReturned || wait.samples == 0
-                || wait.queryNull != wait.samples || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                || wait.queryNull != wait.samples) {
             return;
         }
+        compareHomeAccessibility(WORK_HOME, "accountBackAccessibility", true);
+    }
+
+    private void comparePersonalHomeAccessibility() {
+        PersonalHomeWaitObservation wait = personalHomeWait;
+        if (wait == null || personalHomeWaitIncomplete || wait.incomplete || wait.capped || wait.contextCapped
+                || wait.finished < 0 || wait.returned || wait.samples == 0 || wait.queryNull != wait.samples) {
+            return;
+        }
+        compareHomeAccessibility(PERSONAL_HOME, "personalHomeAccessibility", false);
+    }
+
+    private void compareHomeAccessibility(String heading, String resultKey, boolean accountBackFormat) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return;
         JSONObject metadata = new JSONObject();
-        diagnostic(result, "accountBackAccessibility", metadata);
+        diagnostic(result, resultKey, metadata);
         diagnostic(metadata, "diagnosticOnly", true);
-        diagnostic(metadata, "startedAtMs", SystemClock.elapsedRealtime());
+        long startedAtMs = SystemClock.elapsedRealtime();
+        if (accountBackFormat) diagnostic(metadata, "startedAtMs", startedAtMs);
         try {
             // Compare the same exact query after capturing the failure artifacts.
             // If the node has already appeared, cache clearing adds no evidence.
-            BackWaitObservation.Outcome before = queryWorkHome();
+            BackWaitObservation.Outcome before = queryHome(heading);
             diagnostic(metadata, "before", before.name());
             if (before != BackWaitObservation.Outcome.QUERY_NULL) return;
 
             UiAutomation automation = InstrumentationRegistry.getInstrumentation().getUiAutomation(
                 Configurator.getInstance().getUiAutomationFlags());
             boolean cleared = automation.clearCache();
-            diagnostic(metadata, "cacheCleared", cleared);
-            if (cleared) diagnostic(metadata, "after", queryWorkHome().name());
+            if (accountBackFormat) diagnostic(metadata, "cacheCleared", cleared);
+            else diagnostic(metadata, "cacheClear", cleared ? "CLEARED" : "NOT_CLEARED");
+            if (cleared) diagnostic(metadata, "after", queryHome(heading).name());
         } catch (RuntimeException error) {
-            diagnostic(metadata, "error", error.getClass().getSimpleName());
+            diagnostic(metadata, "error", accountBackFormat ? error.getClass().getSimpleName() : "UNAVAILABLE");
         } finally {
-            diagnostic(metadata, "finishedAtMs", SystemClock.elapsedRealtime());
+            long finishedAtMs = SystemClock.elapsedRealtime();
+            if (accountBackFormat) diagnostic(metadata, "finishedAtMs", finishedAtMs);
+            else diagnostic(metadata, "elapsedMs", finishedAtMs - startedAtMs);
         }
     }
 
@@ -448,7 +467,7 @@ public final class WebHomeOperationTest {
         try { personalHomeWait = new PersonalHomeWaitObservation(); }
         catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
         boolean returned = false;
-        try { expect("Fixture home Personal"); returned = true; }
+        try { expect(PERSONAL_HOME); returned = true; }
         catch (RuntimeException error) { personalHomeWaitIncomplete = true; throw error; }
         finally {
             try { if (personalHomeWait != null) personalHomeWait.finish(SystemClock.elapsedRealtime(), returned); }
@@ -799,6 +818,7 @@ public final class WebHomeOperationTest {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
         compareAccountBackAccessibility();
+        if (saved) comparePersonalHomeAccessibility();
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
         savePersonalHomeWait(); // personal-home-wait:result-delivery
