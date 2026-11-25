@@ -384,9 +384,9 @@ class MacObserver(Observer):
             # A real site's ad storm can starve a renderer read through the
             # whole claimed-position bound (run 43068513364: the never-quieted
             # Personal profile's single send starved all 60 s under ~20
-            # renderer helper spawns). The same oracle is read through
-            # browser-serviced channels: storage, cookies, the live frame's
-            # origin, and no main-frame navigation since each mark.
+            # renderer helper spawns). Separate CDP commands read storage,
+            # cookies, and the live frame's origin. Page and Inspector events
+            # cover navigation and renderer crashes since each mark.
             cancelled = [self.contended_sample(work, mark),
                          self.contended_sample(personal, other)]
             unchanged = ([item["storage"] for item in cancelled] == [item["storage"] for item in expected]
