@@ -9,6 +9,7 @@ import os
 private enum AppScreenNavigationWitness {
     enum Event: String {
         case opened = "open", request, returned, provisional, commit, finish
+        case homeRequest = "home_request"
         case failedProvisional = "fail_provisional", failed = "fail", cap
         case policyAllow = "policy_allow"
         case policyAllowReturned = "policy_allow_returned"
@@ -499,14 +500,14 @@ final class AppScreenNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             reused: reused, kept: kept, resume: resume, initial: false, sameView: true)
     }
 
-    func witnessRequestStart(_ start: URL, initial: URL, reused: Bool, resume: Bool) {
+    func witnessRequestStart(_ start: URL, initial: URL, reused: Bool, resume: Bool, fromHomeMenu: Bool = false) {
         witnessRequest = min(65_535, witnessRequest + 1)
         witnessNavigation = nil
         witnessTarget = AppScreenNavigationWitness.target(start)
         witnessReused = reused
         witnessResume = resume
         witnessInitial = start == initial
-        witnessRecord(.request, relation: 0, sameView: true)
+        witnessRecord(fromHomeMenu ? .homeRequest : .request, relation: 0, sameView: true)
     }
 
     func witnessReturned(_ navigation: WKNavigation?) {
@@ -1298,7 +1299,13 @@ final class AppScreenViewController: UIViewController {
         if !session.popup && session.webHome {
             actions.insert(UIAction(title: "アプリホームへ", image: UIImage(systemName: "square.grid.2x2")) { [weak self] _ in
                 guard let self = self, let url = self.session.launchURL else { return }
+#if DEBUG
+                self.session.navigator.witnessRequestStart(url, initial: url, reused: true, resume: false, fromHomeMenu: true)
+                let navigation = self.session.webView.load(URLRequest(url: url))
+                self.session.navigator.witnessReturned(navigation)
+#else
                 self.session.webView.load(URLRequest(url: url))
+#endif
             }, at: 0)
             actions.append(UIAction(title: "接続先を切り替える", image: UIImage(systemName: "arrow.triangle.swap")) { [weak self] _ in
                 self?.switchApps()

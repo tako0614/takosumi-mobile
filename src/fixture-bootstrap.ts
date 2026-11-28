@@ -3,7 +3,8 @@ export const BOOTSTRAP_EVENT = "takosumi-fixture-bootstrap";
 export const BOOTSTRAP_STAGES = [
   "entry", "storage_begin", "storage_end", "storage_unavailable", "selection_begin", "selection_end",
   "legacy", "home_init", "connections_begin", "connections_end", "connections_failed", "save_element",
-  "render_returned",
+  "render_returned", "connection_name_click", "connection_name_focus", "connection_name_blur",
+  "connection_name_input",
 ] as const;
 export type BootstrapStage = typeof BOOTSTRAP_STAGES[number];
 type Packet = readonly [1, number, BootstrapStage | "cap", number | null];

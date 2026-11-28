@@ -112,6 +112,7 @@ class MacObserver(Observer):
         super().__init__(data, REAL_SITES[site]["origin"], 0, phase, real_site=site)
         self.processes, self.browser, self.guard = processes, browser, guard
         self.identities = []
+        self._failed_contended_page = None
         self.quit_helper = quit_helper
         self.sample_shutdowns = sample_shutdowns
         self.proof["shutdownSampling"] = sample_shutdowns
@@ -187,6 +188,13 @@ class MacObserver(Observer):
         key = json.dumps(self.key)
         return self.read_evaluate(page, f"({{document:globalThis[{key}]??null,storage:localStorage.getItem({key}),"
                              f"cookie:{self.cookie_of()},origin:location.origin}})")
+
+    def contended_sample(self, page, mark):
+        try:
+            return super().contended_sample(page, mark)
+        except Exception:
+            self._failed_contended_page = page
+            raise
 
     def beforeunload(self, page):
         self.step("beforeunload setup", page)
@@ -384,17 +392,22 @@ class MacObserver(Observer):
             # A real site's ad storm can starve a renderer read through the
             # whole claimed-position bound (run 43068513364: the never-quieted
             # Personal profile's single send starved all 60 s under ~20
-            # renderer helper spawns). The same oracle is read through
-            # browser-serviced channels: storage, cookies, the live frame's
-            # origin, and no main-frame navigation since each mark.
-            cancelled = [self.contended_sample(work, mark),
-                         self.contended_sample(personal, other)]
+            # renderer helper spawns). Separate CDP commands read storage,
+            # cookies, and the live frame's origin. Page and Inspector events
+            # cover navigation and renderer crashes since each mark.
+            self.step("read Work after cancelled quit", work)
+            retained_work = self.contended_sample(work, mark)
+            self.step("read Personal after cancelled quit", personal)
+            retained_personal = self.contended_sample(personal, other)
+            cancelled = [retained_work, retained_personal]
             unchanged = ([item["storage"] for item in cancelled] == [item["storage"] for item in expected]
                          and [item["cookie"] for item in cancelled] == [item["cookie"] for item in expected]
                          and [item["origin"] for item in cancelled] == [item["origin"] for item in expected])
         else:
             unchanged = [self.sample(page) for page in pages] == expected
+        self.step("verify documents after cancelled quit")
         require(unchanged, "Cancelled quit changed a document")
+        self.step("remove Work beforeunload after cancelled quit", work)
         self.remove_beforeunload(work)
         self.case("quit-cancel-stops", {"cancelledBy": cancelled_by})
         mark = self.beforeunload(personal)
@@ -490,7 +503,10 @@ class MacObserver(Observer):
             attempted = {item.get("pid") for item in self.proof.get("shutdownSamples", [])}
             # The fixture opens two profiles. Never discover or sample by name,
             # and do not repeat a shutdown watcher's already attempted sample.
-            for process in self.proof.get("opened", {}).get("processes", [])[:2]:
+            opened = self.proof.get("opened", {}).get("processes", [])[:2]
+            failed_process = getattr(self._failed_contended_page, "process", None)
+            # Only the exact opened record can move ahead of the other target.
+            for process in sorted(opened, key=lambda item: item is not failed_process):
                 try:
                     pid = process["opened"]["nativePid"]
                     if pid in attempted:

@@ -388,6 +388,17 @@ def preserve_sdk_candidate_witness(emulator, proof):
 # sdk-candidate-witness-end
 
 
+def fixture_cpu_configuration(avd_rows, affinity_count):
+    """Leave room for the runner, adb, and software rendering on the host."""
+    configured = [value.strip() for key, _, value in (row.partition("=") for row in avd_rows)
+                  if key.strip() == "hw.cpu.ncore"]
+    declared = int(configured[0]) if len(configured) == 1 and re.fullmatch(r"[1-9][0-9]?", configured[0]) else None
+    # The emulator's hardware default is 2. Keep larger or ambiguous profiles.
+    requested = 3 if affinity_count >= 4 and (not configured or declared in (1, 2)) else None
+    return {"hostAffinityCpuCount": affinity_count, "declaredGuestCpuCount": declared,
+            "requestedGuestCpuCount": requested, "onlineGuestCpuCount": None}
+
+
 class Emulator:
     def __init__(self, sdk, scratch, out, command):
         self.sdk, self.out, self.command = sdk, out, command
@@ -425,12 +436,15 @@ class Emulator:
         (self.out / "keyboard-mode.json").write_text(json.dumps({
             "scope": "Fresh private whole-App AVD only", "hardwareKeyboard": False,
         }) + "\n")
+        cpu = fixture_cpu_configuration(rows, len(os.sched_getaffinity(0)))
+        guest_cores = cpu["requestedGuestCpuCount"]
+        cpu_args = ["-cores", str(guest_cores)] if guest_cores is not None else []
         guard = ROOT / "src-tauri/target/debug/sumi-android-emulator-guard"
         require(guard.is_file() and not guard.is_symlink(), "Build the existing-source emulator guard first")
         self.output = (self.out / "emulator.log").open("xb")
         self.process = subprocess.Popen([str(guard), str(self.proof), str(self.sdk / "emulator/emulator"),
             "-avd", self.name, "-port", "5582", "-memory", "4096", "-no-window", "-no-audio",
-            "-gpu", "swiftshader_indirect", "-no-boot-anim", "-no-snapshot", "-wipe-data"],
+            "-gpu", "swiftshader_indirect", "-no-boot-anim", "-no-snapshot", "-wipe-data", *cpu_args],
             env=dict(self.env, TAKOSUMI_GUARD_LAUNCH_CONTEXT="android_fixture_sdk"),
             stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True)
         self.fd = os.pidfd_open(self.process.pid)
@@ -447,7 +461,7 @@ class Emulator:
                 self.owned()
                 if self.run("shell", "getprop", "sys.boot_completed").strip() == "1":
                     self.run("shell", "input", "keyevent", "82")
-                    return
+                    return cpu
             time.sleep(1)
         raise TimeoutError("Owned emulator did not boot within 180 seconds")
 
@@ -494,9 +508,10 @@ class Emulator:
                 continue
         require(found, "No SDK emulator with the owned AVD/port and guard ancestry")
 
-    def owned(self):
+    def owned(self, *, timeout=60):
         self.owned_process()
-        name = self.command([str(self.adb), "-s", SERIAL, "emu", "avd", "name"], "avd-name").splitlines()
+        name = self.command([str(self.adb), "-s", SERIAL, "emu", "avd", "name"],
+                            "avd-name", timeout=timeout).splitlines()
         require(name == [self.name, "OK"], "ADB serial no longer names the owned AVD")
         self.owned_process()
 
@@ -504,6 +519,16 @@ class Emulator:
         self.owned()
         return self.command([str(self.adb), "-s", SERIAL, *map(str, args)],
                             "adb", timeout=timeout, binary=binary)
+
+    def online_cpu_count(self):
+        deadline = time.monotonic() + 5
+        self.owned(timeout=2)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        online = self.command([str(self.adb), "-s", SERIAL, "shell", "cat", "/sys/devices/system/cpu/online"],
+                              "guest-online-cpus", timeout=remaining).strip()
+        return int(online.rsplit("-", 1)[-1]) + 1 if re.fullmatch(r"0(?:-[1-9][0-9]?)?", online) else None
 
     def stop(self):
         observe_stop(self, "start")
@@ -606,7 +631,7 @@ NATIVE_OBSERVATION_TAG = "TakosWebHomeNative"
 NATIVE_OBSERVATION_STAGES = (
     "BACK_ENTER", "BACK_RETURN", "BIND_ENTER", "ADD_RETURN", "BIND_RETURN",
     "UNBIND_ENTER", "REMOVE_RETURN", "UNBIND_RETURN", "RESUME", "PAUSE",
-    "PAGE_START", "PAGE_COMMIT", "PAGE_FINISH", "RENDER_GONE", "CAP_EXHAUSTED",
+    "PAGE_START", "PAGE_COMMIT", "PAGE_FINISH", "WEB_CONTENT_CHANGED", "RENDER_GONE", "CAP_EXHAUSTED",
 )
 NATIVE_OBSERVATION_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-t", "64")
 NATIVE_OBSERVATION_READ_BYTES = 64 * 1024
@@ -766,11 +791,16 @@ ROOT_BOOTSTRAP_TAG = "TakosRootBootstrap"
 # messages from the retained main buffer; unrelated later noise cannot spend
 # this budget. -d stays finite and the existing read/identity bounds still apply.
 ROOT_BOOTSTRAP_QUERY = ("logcat", "-b", "main", "-d", "-v", "raw", "-m", "64")
-ROOT_BOOTSTRAP_PACKET = re.compile(
-    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) "
+ROOT_BOOTSTRAP_IDENTITY = (
+    rb"v=1 phase=ROOT_MAIN pid=([1-9][0-9]{0,9}) startTick=([1-9][0-9]{0,18}) boot=([0-9a-f]{32}) ")
+ROOT_BOOTSTRAP_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
     rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
-    rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
+    rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
+    rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
+    rb"render_returned|connection_name_(?:click|focus|blur|input)|unknown|cap) "
     rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1 rootEnd=1")
+ROOT_NATIVE_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
+    rb"nativeStage=(listener_ready|page_started|page_finished) rootEnd=1")
 
 
 def root_activity_pid(data, *, truncated=False):
@@ -845,8 +875,15 @@ def root_guest_identity(data, pid):
 
 
 def parse_root_bootstrap(data, identity):
-    records, rejected, cut = [], 0, False
+    records, native_stages, rejected, cut = [], [], 0, False
     for line in data.splitlines():
+        native = ROOT_NATIVE_PACKET.fullmatch(line)
+        if native:
+            stage = native[4].decode("ascii")
+            if (int(native[1]) == identity["pid"] and int(native[2]) == identity["startTick"]
+                    and native[3].decode("ascii") == identity["bootId"] and stage not in native_stages):
+                native_stages.append(stage)
+                continue
         match = ROOT_BOOTSTRAP_PACKET.fullmatch(line) if len(line) <= 384 else None
         if match:
             pid, tick, receipt, seq = (int(match[v]) for v in (1, 2, 4, 5))
@@ -865,7 +902,7 @@ def parse_root_bootstrap(data, identity):
                                 "elapsedMs": None if elapsed == -1 else elapsed})
                 continue
         rejected = min(65, rejected + 1)
-    return records, rejected, cut
+    return records, rejected, cut, native_stages
 
 
 def preserve_root_bootstrap(emulator, scratch, out, prior):
@@ -873,7 +910,8 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
     result = {"diagnosticOnly": True, "phase": "root_main_snapshot", "absenceIsUnknown": True,
               "clockDomain": "browser_performance_time_origin_ms", "birthDomain": "guest_kernel_start_ticks",
               "timestampsComparableAcrossDomains": False, "sequenceMayRepeatAcrossRealms": True,
-              "coverage": "unknown", "records": [], "queryReturned": False, "identityBookendsMatch": False,
+              "coverage": "unknown", "records": [], "nativeStages": [],
+              "queryReturned": False, "identityBookendsMatch": False,
               "commandWaitSeconds": 10, "matchingPacketLimit": 64,
               "captureWindow": "pid_main_closed_tag_then_first64", "rawReadCapBytes": 65536,
               "recordLimit": 33, "lineLimitBytes": 384, "savedByteLimit": 16384}
@@ -911,12 +949,13 @@ def preserve_root_bootstrap(emulator, scratch, out, prior):
                                  "-s", ROOT_BOOTSTRAP_TAG + ":I", "*:S"), 65536)
         after = root_guest_identity(query("after", identity_query, 8192), pid)
         require(after == before, "Root guest identity changed")
-        records, rejected, cut = parse_root_bootstrap(data, before)
+        records, rejected, cut, native_stages = parse_root_bootstrap(data, before)
         result.update(guestIdentity=before, identityBookendsMatch=True, queryReturned=True,
-                      records=records, rejectedPackets=rejected, recordLimitReached=cut,
+                      records=records, nativeStages=native_stages, rejectedPackets=rejected, recordLimitReached=cut,
                       sourceBytes=len(data), nativeCapSeen=any(row["stage"] == "cap" for row in records))
     except BaseException as error:
         result["records"] = []
+        result["nativeStages"] = []
         result["error"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "capture_or_identity_refused"
     try:
         payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("ascii")
@@ -1024,7 +1063,7 @@ def main():
         apks = list((driver / "build/outputs/apk").rglob("*.apk"))
         proof["driverAPKs"] = driver_apks(sorted(apks), sdk, command)
         emulator = Emulator(sdk, scratch, out, command)
-        emulator.start()
+        proof["emulatorCpu"] = emulator.start()
         for server in servers:
             port = f"tcp:{server.server_port}"
             emulator.run("reverse", port, port)
@@ -1073,6 +1112,13 @@ def main():
     finally:
         cleanup_errors = []
         if emulator is not None:
+            cpu = proof.get("emulatorCpu")
+            if cpu is not None and cpu["requestedGuestCpuCount"] is not None:
+                # Read after the UI verdict so observation doesn't affect boot or input.
+                try:
+                    cpu["onlineGuestCpuCount"] = emulator.online_cpu_count()
+                except Exception:
+                    pass  # Missing observation leaves the existing verdict and cleanup path.
             try:
                 proof["emulatorGuard"] = emulator.stop()
                 receipt(proof["emulatorGuard"], normal=proof["functionalPassed"])

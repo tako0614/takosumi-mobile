@@ -1164,34 +1164,17 @@ class Observer:
         return value
 
     def contended_sample(self, page, mark):
-        """A post-quit state read that never waits on the renderer's task
-        queue. A sustained ad-helper storm can starve a Runtime.evaluate
-        through its whole claimed-position bound (run 43068513364: the
-        Personal profile's single claimed position starved all 60 s while
-        ~20 renderer helpers kept spawning on the real site; run
-        43061069602 starved ELEVEN re-sent evaluates on Work). Every
-        element here is serviced by the browser process instead: the
-        frame tree's root frame gives the live document's origin, the
-        storage service answers localStorage, the network service answers
-        cookies, and the already-recorded event stream proves no
-        main-frame navigation committed or began and no renderer crash
-        landed since the given mark — together the same oracle the
-        evaluate sample proves: this document and its synthetic state are
-        unchanged (a killed-and-never-reloaded renderer would pass the
-        browser-serviced reads, so targetCrashed is part of the scan). A
-        frameRequestedNavigation alone is not a commit and
-        navigatedWithinDocument keeps the document, so neither counts; a
-        same-document fragment load on the root is refused rather than
-        risk a load in flight. An engine without the storage read
-        domains falls back to the claimed-position renderer read; the
-        oracle is unchanged."""
-        # Browser-serviced reads still ride the same DevTools channel: under
-        # the same storm that dispatched and answered every control-pipe
-        # command, run 43090171027 starved Page.getFrameTree's flat
-        # SETTLE_WAIT on Work. Each send here claims its queue position and
-        # waits on it against ONE shared storm bound; a timeout is recorded
-        # and re-sent only while the bound lasts, then raised on its own
-        # name — never masked by the storage-domain fallback below.
+        """Read post-quit state through separate frame, storage, and cookie
+        commands. A sustained ad-helper storm can starve Runtime.evaluate for
+        its entire bound (run 43068513364). DOMStorage.getDOMStorageItems
+        reads the inspected frame's storage without enabling storage events.
+        The event stream separately rules out a root-frame navigation or
+        renderer crash since the mark. An engine without the storage domain
+        falls back to the claimed-position renderer read."""
+        # Run 43090171027 starved Page.getFrameTree while the control-pipe
+        # commands still answered. Each read claims a queue position within
+        # the same bound. Its timeout is recorded and retried while the
+        # bound lasts, then raised with the failing method's name.
         deadline = time.monotonic() + STARVED_READ_WAIT
         hard_deadline = time.monotonic() + STARVED_MAX_WAIT
         def starved(method, params=None):
@@ -1228,7 +1211,6 @@ class Observer:
             split = urlsplit(tree.get("url", ""))
             origin = f"{split.scheme}://{split.netloc}"
         try:
-            starved("DOMStorage.enable")
             items = dict(starved("DOMStorage.getDOMStorageItems",
                                  {"storageId": {"securityOrigin": origin, "isLocalStorage": True}})
                          .get("entries") or [])
@@ -1242,12 +1224,10 @@ class Observer:
             state = self.sample(page)
         require(page.cdp.base <= mark,
                 "Events covering the quit window were dropped; document continuity is unproven")
-        # A crashed renderer that never reloads still answers every
-        # browser-serviced read above while its document is gone — targetCrashed
-        # is session-scoped and emitted without Inspector.enable, so the stream
-        # already holds it. A same-document fragment change can fire
-        # frameStartedLoading on the root: refused rather than risk a load in
-        # flight, and hash churn is not part of the quit window's contract.
+        # Storage and cookie values alone cannot establish document continuity.
+        # Inspector.targetCrashed is session-scoped and needs no subscription.
+        # Even a fragment change can emit frameStartedLoading on the root.
+        # Reject that event because a load may still be in progress.
         nav = next((event for event in page.cdp.since(mark)
                     if event.get("sessionId") == page.session
                     and (event["method"] == "Inspector.targetCrashed"

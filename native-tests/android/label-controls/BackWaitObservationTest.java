@@ -30,11 +30,29 @@ public final class BackWaitObservationTest {
         failed.sample(BackWaitObservation.Outcome.EMPTY_BOUNDS, 24); failed.endWait(15022, false);
         check(!failed.waitReturned && failed.emptyBounds == 1 && failed.visible == 0 && failed.lastAtMs == 24);
 
+        BackWaitObservation missing = new BackWaitObservation();
+        check(!missing.onlyMissingAfterWait());
+        missing.beginWait(26);
+        missing.sample(BackWaitObservation.Outcome.QUERY_NULL, 27);
+        check(!missing.onlyMissingAfterWait());
+        missing.endWait(15026, false);
+        check(missing.onlyMissingAfterWait());
+
+        BackWaitObservation mixed = new BackWaitObservation();
+        mixed.beginWait(26);
+        mixed.sample(BackWaitObservation.Outcome.QUERY_NULL, 27);
+        mixed.sample(BackWaitObservation.Outcome.DISABLED, 28);
+        mixed.endWait(15026, false);
+        check(!mixed.onlyMissingAfterWait() && !failed.onlyMissingAfterWait());
+
         BackWaitObservation capped = new BackWaitObservation(); capped.beginWait(30);
         for (int i = 0; i < BackWaitObservation.LIMIT + 1000; i++) capped.sample(BackWaitObservation.Outcome.QUERY_NULL, 31 + i);
         check(capped.samples == BackWaitObservation.LIMIT && capped.queryNull == BackWaitObservation.LIMIT);
         check(capped.dropped == BackWaitObservation.LIMIT && capped.capReached && capped.firstAtMs == 31);
         check(capped.lastAtMs == 30 + BackWaitObservation.LIMIT && !capped.waitReturned);
+        capped.endWait(5000, false);
+        check(!capped.onlyMissingAfterWait());
+        capped.beginWait(6000);
         capped.sample(BackWaitObservation.Outcome.VISIBLE, 9999); capped.endWait(10000, true);
         check(capped.visible == 0 && capped.waitReturned && capped.capReached && capped.lastAtMs == 30 + BackWaitObservation.LIMIT);
         System.out.println("PASS: back wait metadata checks=" + checks);

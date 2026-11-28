@@ -882,8 +882,8 @@ class Controls(unittest.TestCase):
                 self.assertEqual((len(records), rejected, cut), (1, 0, False))
                 self.assertEqual(records[0]["backAction"], action)
                 self.assertEqual(records[0]["physical"], "unknown")
-        for stage in ("BACK_ENTER", "BACK_RETURN", "PAGE_COMMIT"):
-            with self.subTest(legacy_stage=stage):
+        for stage in ("BACK_ENTER", "BACK_RETURN", "PAGE_COMMIT", "WEB_CONTENT_CHANGED"):
+            with self.subTest(stage=stage):
                 records, rejected, cut = runner.parse_native_observation(self.native_line(stage=stage))
                 self.assertEqual((len(records), rejected, cut), (1, 0, False))
                 self.assertIsNone(records[0]["backAction"])
@@ -893,7 +893,8 @@ class Controls(unittest.TestCase):
                 records, rejected, cut = runner.parse_native_observation(
                     self.native_line(stage="BACK_RETURN").rstrip() + suffix + b"\n")
                 self.assertEqual((records, rejected, cut), ([], 1, False))
-        for stage, seq, cap in (("BACK_ENTER", 1, 0), ("PAGE_FINISH", 1, 0), ("CAP_EXHAUSTED", 64, 1)):
+        for stage, seq, cap in (("BACK_ENTER", 1, 0), ("PAGE_FINISH", 1, 0),
+                                ("WEB_CONTENT_CHANGED", 1, 0), ("CAP_EXHAUSTED", 64, 1)):
             with self.subTest(foreign_stage=stage):
                 records, rejected, cut = runner.parse_native_observation(
                     self.native_line(seq, stage, cap).rstrip() + b" back=NO_VIEW\n")
@@ -1306,6 +1307,35 @@ class Controls(unittest.TestCase):
         self.assertEqual(emulator.command.call_count, 1)
         self.assertEqual(emulator.command.call_args.args[0][-3:], ["emu", "avd", "name"])
 
+    def test_whole_app_avd_leaves_runner_cpu_headroom(self):
+        cases = (
+            ([], 4, None, 3), (["hw.cpu.ncore = 2"], 4, 2, 3), (["hw.cpu.ncore=1"], 8, 1, 3),
+            ([], 3, None, None), (["hw.cpu.ncore=3"], 4, 3, None), (["hw.cpu.ncore=4"], 8, 4, None),
+            (["hw.cpu.ncore=2", "hw.cpu.ncore=4"], 4, None, None), (["hw.cpu.ncore=unknown"], 4, None, None),
+        )
+        for rows, affinity_count, declared, requested in cases:
+            with self.subTest(rows=rows, affinity_count=affinity_count):
+                self.assertEqual(runner.fixture_cpu_configuration(rows, affinity_count), {
+                    "hostAffinityCpuCount": affinity_count, "declaredGuestCpuCount": declared,
+                    "requestedGuestCpuCount": requested, "onlineGuestCpuCount": None,
+                })
+
+    def test_guest_cpu_readback_uses_owned_emulator_and_one_budget(self):
+        command = Mock(return_value="0-2\n")
+        emulator = runner.Emulator(self.root, self.root, self.root, command)
+        emulator.owned = Mock()
+        with patch.object(runner.time, "monotonic", side_effect=[100, 101.5]):
+            self.assertEqual(emulator.online_cpu_count(), 3)
+        emulator.owned.assert_called_once_with(timeout=2)
+        command.assert_called_once_with(
+            [str(emulator.adb), "-s", runner.SERIAL, "shell", "cat", "/sys/devices/system/cpu/online"],
+            "guest-online-cpus", timeout=3.5,
+        )
+        command.reset_mock()
+        with patch.object(runner.time, "monotonic", side_effect=[100, 105]):
+            self.assertIsNone(emulator.online_cpu_count())
+        command.assert_not_called()
+
     def test_apk_restore_uses_bound_plain_files_and_refuses_same_hash_replacement(self):
         original, variant = b"normal SDK APK bytes", b"fixture SDK APK bytes"
         baseline_hash, variant_hash = (hashlib.sha256(value).hexdigest() for value in (original, variant))
@@ -1378,25 +1408,42 @@ class Controls(unittest.TestCase):
             with self.subTest(raw=raw[:20]):
                 self.assertIsNone(runner.root_guest_identity(raw, 3169))
         packet = self.root_packet()
-        rows, rejected, cut = runner.parse_root_bootstrap(packet, identity)
-        self.assertEqual((len(rows), rejected, cut), (1, 0, False))
+        rows, rejected, cut, native = runner.parse_root_bootstrap(packet, identity)
+        self.assertEqual((len(rows), rejected, cut, native), (1, 0, False, []))
         self.assertEqual(rows[0]["elapsedMs"], 600000)
+        input_packet = self.root_packet(stage="connection_name_input", receipt=13, seq=13)
+        self.assertEqual([row["stage"] for row in runner.parse_root_bootstrap(input_packet, identity)[0]],
+                         ["connection_name_input"])
         for raw in (self.root_packet(pid=3170), self.root_packet(tick=1235),
                     self.root_packet(stage="SECRET"), self.root_packet(seq=17), self.root_packet(receipt=34),
                     self.root_packet(elapsed=600001), packet.replace(b"boot=0", b"boot=1"),
-                    packet.rstrip() + b" SECRET\n"):
+                    packet.rstrip() + b" SECRET\n", input_packet.rstrip() + b" SECRET\n"):
             with self.subTest(raw=raw[:25]):
                 self.assertEqual(runner.parse_root_bootstrap(raw, identity)[0], [])
         for length in range(len(packet.rstrip())):
             with self.subTest(prefix=length):
                 self.assertEqual(runner.parse_root_bootstrap(packet[:length] + b"\n", identity)[0], [])
-        rows, _, cut = runner.parse_root_bootstrap(packet * 34, identity)
+        rows, _, cut, _ = runner.parse_root_bootstrap(packet * 34, identity)
         self.assertEqual(len(rows), 33); self.assertTrue(cut)
-        rows, rejected, _ = runner.parse_root_bootstrap(
+        rows, rejected, _, _ = runner.parse_root_bootstrap(
             self.root_packet(stage="unknown", seq=0, elapsed=-1)
             + self.root_packet(stage="cap", seq=0, elapsed=-1, receipt=33), identity)
         self.assertEqual([row["stage"] for row in rows], ["unknown", "cap"])
         self.assertEqual(rejected, 0)
+
+    def test_root_native_stages_keep_the_same_birth_fence_and_js_budget(self):
+        identity = runner.root_guest_identity(self.root_identity(), 3169)
+        prefix = self.root_packet().split(b"com.takosumi.fixture.simulator")[0]
+        started = prefix + b"nativeStage=page_started rootEnd=1\n"
+        ready = prefix + b"nativeStage=listener_ready rootEnd=1\n"
+        finished = prefix + b"nativeStage=page_finished rootEnd=1\n"
+        refused = (started.replace(b"pid=3169", b"pid=3170") + ready.replace(b"startTick=1234", b"startTick=1235")
+                   + finished.replace(b"boot=0", b"boot=1") + started.replace(b"page_started", b"SECRET")
+                   + started.replace(b" rootEnd=1", b" SECRET rootEnd=1"))
+        rows, rejected, cut, native = runner.parse_root_bootstrap(
+            refused + started + started + ready + self.root_packet() * 33 + finished, identity)
+        self.assertEqual(native, ["page_started", "listener_ready", "page_finished"])
+        self.assertEqual((len(rows), rejected, cut), (33, 6, False))
 
     def test_root_bootstrap_capture_binds_main_package_and_birth_without_changing_verdict(self):
         scratch, out = self.root / "scratch", self.root / "out"
@@ -1411,12 +1458,15 @@ class Controls(unittest.TestCase):
         calls = []
         def capture(argv, path, **options):
             calls.append(argv)
-            path.write_bytes(self.root_packet() if "logcat" in argv else self.root_identity())
+            packet = self.root_packet()
+            ready = packet.split(b"com.takosumi.fixture.simulator")[0] + b"nativeStage=listener_ready rootEnd=1\n"
+            path.write_bytes(ready + packet if "logcat" in argv else self.root_identity())
         with patch.object(runner.runtime, "command", side_effect=capture):
             value = runner.preserve_root_bootstrap(emulator, scratch, out, prior)
         self.assertEqual(len(calls), 3)
         self.assertEqual(calls[0][-4:], ["cat", "/proc/3169/stat", "/proc/3169/cmdline", "/proc/sys/kernel/random/boot_id"])
         self.assertEqual(calls[-1], calls[0])
+        self.assertEqual(value["nativeStages"], ["listener_ready"])
         self.assertIn("--pid=3169", calls[1]); self.assertIn("TakosRootBootstrap:I", calls[1])
         self.assertEqual(value["guestIdentity"], {"pid": 3169, "startTick": 1234, "bootId": "0123456789abcdef0123456789abcdef"})
         self.assertTrue(value["identityBookendsMatch"])

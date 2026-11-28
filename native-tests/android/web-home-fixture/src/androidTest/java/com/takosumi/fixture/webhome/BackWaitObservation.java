@@ -20,6 +20,11 @@ final class BackWaitObservation {
         waiting = false;
     }
 
+    boolean onlyMissingAfterWait() {
+        return !incomplete && !capReached && waitFinishedAtMs >= 0 && !waitReturned
+            && samples > 0 && samples == queryNull;
+    }
+
     void sample(Outcome outcome, long now) {
         if (!waiting) return;
         if (outcome == null) { incomplete = true; return; }

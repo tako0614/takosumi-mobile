@@ -406,7 +406,8 @@ class Controls(unittest.TestCase):
                     lines.append(line)
                     if mode == "sink":
                         raise OSError("private sink failure")
-                def preserve_app_exit(*_):
+                def preserve_app_exit(*_, navigation_first):
+                    self.assertTrue(navigation_first)
                     if mode == "later-interrupt":
                         runtime.INTERRUPTED_COMMANDS.append({"log": str(out / "target-app-exit-raw.log"),
                                                              "reaped": True, "originalErrorType": "TimeoutExpired"})
@@ -467,6 +468,11 @@ class Controls(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(known))
         actual_shape = (started + location.replace(":127:", ":69:") + secret + failed).encode()
         self.assertEqual(runner.failure_job_summary(actual_shape)["sourceLine"], 69)
+        source = Path(runner.__file__).with_name("WebHomeUITests.swift").read_text()
+        background_assertion = next(number for number, line in enumerate(source.splitlines(), 1)
+                                    if 'XCTFail("The whole App did not enter the background' in line)
+        background_shape = (started + location.replace(":127:", f":{background_assertion}:") + secret + failed).encode()
+        self.assertEqual(runner.failure_job_summary(background_shape)["sourceLine"], background_assertion)
         for bad in (None, "secret", b"", b"\xff", b"\x00", b"x" * (256 * 1024 + 1),
                     (started + failed.replace("1.000", "1..0")).encode(),
                     (started + failed.replace(runner.METHOD, "foreign")).encode()):
@@ -645,7 +651,7 @@ class Controls(unittest.TestCase):
             raise subprocess.TimeoutExpired(argv, 15)
         with patch.object(runtime, "command", side_effect=command) as query:
             result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
-        self.assertEqual(query.call_count, 2, "No second query after interruption")
+        self.assertEqual(query.call_count, 2, "No second query without an owned retirement receipt")
         self.assertEqual(result["errorType"], "TimeoutExpired")
         self.assertTrue((out / "target-app-exit.log").is_file(), "Keep output already written before interruption")
         self.assertFalse(result["queryReturned"])
@@ -654,6 +660,138 @@ class Controls(unittest.TestCase):
         self.assertEqual(result["keptBytes"], 512 * 1024)
         self.assertTrue((out / "target-app-exit.log").read_bytes().endswith(b"last partial event"))
         self.assertNotIn("passed", result)
+
+    def test_filtered_navigation_witness_follows_only_an_owned_reaped_timeout(self):
+        device = {"udid": "owned", "name": "expected", "state": "Booted", "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        packet = (b"2026-11-25 00:03:50.001 Df Takosumi[10:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] "
+                  b"com.takosumi.fixture.simulator.nav v=1 seq=2 event=provisional view=1 request=1 "
+                  b"relation=1 target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123\n")
+        broad = b"x" * (512 * 1024) + b"\noriginal partial tail\n"
+        live = object()
+        for mode in ("retained", "oversize", "filtered-timeout", "filtered-live", "filtered-error",
+                     "changed-owner", "broad-live", "foreign-receipt", "other-broad-error"):
+            with self.subTest(mode=mode):
+                out, scratch = self.root / f"evidence-{mode}", self.root / f"scratch-{mode}"
+                out.mkdir(); scratch.mkdir()
+                calls = []
+                def command(argv, path, **options):
+                    calls.append((argv, path, options))
+                    if argv == ["xcrun", "simctl", "list", "devices", "--json"]:
+                        current = dict(device, logPath="/foreign/logs") if len(calls) > 1 and mode == "changed-owner" else device
+                        return json.dumps({"devices": {"runtime": [current]}})
+                    if len(calls) == 2:
+                        path.write_bytes(broad)
+                        runtime.INTERRUPTED_COMMANDS.append({
+                            "log": str(path) if mode != "foreign-receipt" else str(scratch / "different.log"),
+                            "reaped": mode != "broad-live", "originalErrorType": "TimeoutExpired",
+                        })
+                        if mode == "broad-live":
+                            runtime.UNREAPED_COMMANDS.append({"process": live, "log": str(path)})
+                        if mode == "other-broad-error":
+                            raise OSError("private broad query error")
+                        raise subprocess.TimeoutExpired(argv, 15)
+                    filtered = b"private raw canary\n" + packet
+                    if mode == "oversize":
+                        filtered = b"x" * (512 * 1024) + b"\n" + filtered
+                    path.write_bytes(filtered)
+                    if mode == "filtered-error":
+                        raise OSError("private filtered query error")
+                    if mode in ("filtered-timeout", "filtered-live"):
+                        runtime.INTERRUPTED_COMMANDS.append({"log": str(path), "reaped": mode != "filtered-live"})
+                        if mode == "filtered-live":
+                            runtime.UNREAPED_COMMANDS.append({"process": live, "log": str(path)})
+                        raise subprocess.TimeoutExpired(argv, 8)
+                    return ""
+                with patch.object(runtime, "command", side_effect=command), \
+                        patch.object(runtime, "INTERRUPTED_COMMANDS", []), patch.object(runtime, "UNREAPED_COMMANDS", []):
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime")
+                self.assertFalse(result["queryReturned"])
+                self.assertEqual(result["errorType"], "OSError" if mode == "other-broad-error" else "TimeoutExpired")
+                self.assertTrue(result["partial"] and result["truncated"])
+                self.assertEqual(result["sourceBytes"], len(broad))
+                self.assertEqual((out / "target-app-exit.log").read_bytes(), broad[-512 * 1024:])
+                self.assertEqual(result["navigationWitness"]["records"], [])
+                self.assertEqual(list(out.glob("*.log")), [out / "target-app-exit.log"])
+                for canary in ("private raw canary", "private broad query error", "private filtered query error"):
+                    self.assertNotIn(canary, json.dumps(result))
+                self.assertNotIn("passed", result)
+                if mode in ("broad-live", "foreign-receipt", "other-broad-error"):
+                    self.assertEqual(len(calls), 2)
+                    self.assertNotIn("filteredNavigationWitness", result)
+                    continue
+                witness = result["filteredNavigationWitness"]
+                self.assertTrue(witness["diagnosticOnly"] and witness["absenceIsUnknown"])
+                self.assertEqual(calls[2][1:], (scratch / "before-filtered-navigation.log", {"timeout": 2}))
+                if mode == "changed-owner":
+                    self.assertEqual(len(calls), 3)
+                    self.assertEqual(witness["status"], "unknown")
+                    continue
+                self.assertEqual(len(calls), 4)
+                argv, path, options = calls[3]
+                self.assertEqual(argv, ["xcrun", "simctl", "spawn", "owned", "log", "show", "--style", "compact",
+                                        "--timezone", "UTC", "--last", "10m", "--predicate",
+                                        '(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")'])
+                self.assertEqual(path, scratch / "filtered-navigation-raw.log")
+                self.assertLessEqual(options["timeout"], 8)
+                self.assertGreater(options["timeout"], 0)
+                self.assertIs(options["read_output"], False)
+                if mode in ("filtered-error", "filtered-live"):
+                    self.assertEqual(witness["status"], "unknown")
+                    self.assertNotIn("records", witness)
+                    self.assertFalse(witness["queryReturned"])
+                    continue
+                self.assertEqual(witness["status"], "retained" if mode == "retained" else "partial")
+                self.assertEqual(witness["queryReturned"], mode != "filtered-timeout")
+                self.assertEqual(witness["partial"], mode != "retained")
+                self.assertEqual([record["event"] for record in witness["records"]], ["provisional"])
+                self.assertLessEqual(witness["keptBytes"], 512 * 1024)
+
+    def test_completed_xctest_failure_captures_navigation_before_the_broad_query(self):
+        device = {"udid": "owned", "name": "expected", "state": "Booted",
+                  "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        for mode in ("broad-timeout", "changed-owner", "navigation-live"):
+            with self.subTest(mode=mode):
+                out, scratch = self.root / f"out-{mode}", self.root / f"scratch-{mode}"
+                out.mkdir()
+                scratch.mkdir()
+                calls = []
+
+                def command(argv, path, **options):
+                    calls.append(path.name)
+                    if "spawn" not in argv:
+                        current = dict(device, logPath="/foreign/logs") if mode == "changed-owner" else device
+                        return json.dumps({"devices": {"runtime": [current]}})
+                    self.assertEqual(argv[3], "owned")
+                    if path.name == "filtered-navigation-raw.log":
+                        self.assertIn('(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")', argv)
+                        path.write_bytes(b"private unrelated log\n"
+                            b"2026-11-28 00:00:00.001 Df Takosumi[10:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+                            b"com.takosumi.fixture.simulator.nav v=1 seq=2 event=commit view=1 request=1 "
+                            b"relation=1 target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123\n")
+                        if mode != "navigation-live":
+                            return ""
+                        runtime.UNREAPED_COMMANDS.append({"log": str(path)})
+                    else:
+                        path.write_bytes(b"partial broad query\n")
+                        runtime.INTERRUPTED_COMMANDS.append({"log": str(path), "reaped": True})
+                    raise subprocess.TimeoutExpired(argv, options["timeout"])
+
+                with patch.object(runtime, "command", side_effect=command), \
+                        patch.object(runtime, "INTERRUPTED_COMMANDS", []), patch.object(runtime, "UNREAPED_COMMANDS", []):
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime",
+                                                      navigation_first=True)
+                expected = ["before-target-logs.log"]
+                if mode != "changed-owner":
+                    expected.append("filtered-navigation-raw.log")
+                    self.assertEqual(result["filteredNavigationWitness"]["queryReturned"], mode != "navigation-live")
+                if mode == "broad-timeout":
+                    expected.append("target-app-exit-raw.log")
+                    self.assertTrue(result["partial"])
+                    self.assertEqual([row["event"] for row in result["filteredNavigationWitness"]["records"]], ["commit"])
+                self.assertEqual(calls, expected)
+                self.assertNotIn("private unrelated log", json.dumps(result))
+                self.assertNotIn("passed", result)
 
     def test_navigation_witness_has_only_closed_metadata_and_separates_process_view_identity(self):
         payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=request view=1 request=1 relation=0 "
@@ -701,6 +839,28 @@ class Controls(unittest.TestCase):
         returned = runner.navigation_witness(packet(event="returned", relation=0))
         self.assertEqual(len(returned["records"]), 1, "A nil return may retain the already-selected request context")
         self.assertNotIn("passed", unknown)
+
+    def test_home_menu_witness_is_request_context_for_the_bound_view(self):
+        header = (b"2026-11-25 00:00:00.001 Df Takosumi[42:ab] "
+                  b"[com.takosumi.fixture.simulator.navigation:navigation] ")
+        payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=4 event=home_request view=2 request=7 "
+                   b"relation=0 target=instance reused=1 kept=0 resume=0 initial=1 sameView=1 timeMs=234\n")
+        returned = payload.replace(b"seq=4 event=home_request", b"seq=5 event=returned").replace(b"relation=0", b"relation=1")
+        callback = returned.replace(b"seq=5 event=returned", b"seq=6 event=provisional")
+        value = runner.navigation_witness(b"".join(header + line for line in (payload, returned, callback)))
+        self.assertEqual(value["malformed"], 0)
+        self.assertEqual([(record["event"], record["view"], record["request"], record["relation"])
+                          for record in value["records"]],
+                         [("home_request", 2, 7, 0), ("returned", 2, 7, 1), ("provisional", 2, 7, 1)])
+        for old, bad in ((b"seq=4", b"seq=513"), (b"view=2", b"view=0"), (b"request=7", b"request=0"),
+                         (b"relation=0", b"relation=1"), (b"target=instance", b"target=unknown"),
+                         (b"sameView=1", b"sameView=0"), (b"reused=1", b"reused=0"),
+                         (b"kept=0", b"kept=1"), (b"resume=0", b"resume=1"), (b"initial=1", b"initial=0"),
+                         (b"timeMs=234", b"timeMs=234 url=secret")):
+            with self.subTest(bad=bad):
+                value = runner.navigation_witness(header + payload.replace(old, bad))
+                self.assertEqual(value["records"], [])
+                self.assertEqual(value["malformed"], 1)
 
     def test_navigation_policy_allow_is_independent_and_never_binds_callbacks(self):
         header = (b"2026-11-13 00:00:00.001 Df Takosumi[42:ab] "
@@ -1092,10 +1252,17 @@ class Controls(unittest.TestCase):
         self.assertTrue(decoded["absenceIsUnknown"])
         self.assertFalse(decoded["timestampsComparableAcrossDomains"])
         self.assertTrue(decoded["sequenceMayRepeatAcrossRealms"])
+        field = b"".join(packet(b"connection_name_" + event, index, index)
+                         for index, event in enumerate((b"focus", b"click", b"input", b"blur"), start=1))
+        self.assertEqual(
+            [v["stage"] for v in parse(header + field)["records"]],
+            ["connection_name_focus", "connection_name_click", "connection_name_input", "connection_name_blur"],
+        )
         for bad in (second, header.replace(b":app]", b":foreign]") + first,
                     header + first.replace(b"stage=entry", b"stage=SECRET"), header + first + b"\n" + second,
                     header + first + b"unrelated\n" + second, header + packet(receipt=34),
                     header + packet(seq=17), header + packet(elapsed=600001),
+                    header + packet(b"connection_name_input").rstrip() + b" SECRET\n",
                     header + first.rstrip() + b" SECRET\n", header + b"x" * 600 + first):
             with self.subTest(malformed=hashlib.sha256(bad).hexdigest()):
                 saved = parse(bad)
@@ -1311,13 +1478,49 @@ class TLSTransportControls(unittest.TestCase):
         # A client read can finish before its worker publishes the write snapshot.
         self.server.stop()
         self.assertTrue(all(e["response"]["state"] == "written" for e in self.server.events))
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 3, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 2,
+        })
         self.assertTrue(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_verified_tls_without_http_has_its_own_transport_count(self):
+        context = ssl.create_default_context(cafile=str(self.ca))
+        self.server.connection_timeout = 1
+        with socket.create_connection(self.address, timeout=2) as connection:
+            with context.wrap_socket(connection, server_hostname="localhost") as secure:
+                self.assertEqual(secure.recv(1), b"")
+        self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 0, "handlerEndedAfterTls": 1,
+        })
+        self.assertEqual(self.server.events, [])
 
     def test_idle_tls_is_closed_by_the_connection_deadline_without_a_request_event(self):
         self.server.connection_timeout = 0.15
         with socket.create_connection(self.address, timeout=1) as pending:
             self.assertEqual(pending.recv(1), b"")
+        self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 0,
+            "preTlsFailures": {"timeout": 1},
+        })
+        self.assertEqual(self.server.events, [])
+
+    def test_peer_unknown_ca_alert_is_distinct_from_an_idle_tls_connection(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        # This context deliberately has no trust root for the fixture's CA.
+        with patch("socketserver.BaseServer.handle_error"):
+            with socket.create_connection(self.address, timeout=2) as pending:
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    context.wrap_socket(pending, server_hostname="localhost")
+            self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 0,
+            "preTlsFailures": {"unknownCaAlert": 1},
+        })
         self.assertEqual(self.server.events, [])
 
     def test_stop_joins_an_unfinished_tls_worker_and_closes_its_socket(self):

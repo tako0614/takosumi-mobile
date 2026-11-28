@@ -40,6 +40,9 @@ public final class WebHomeOperationTest {
     private static final String TARGET = "com.takosumi.fixture.android";
     private static final String DRIVER = "com.takosumi.fixture.webhome";
     private static final String WORK_HOME = "Fixture home Work";
+    private static final String PERSONAL_HOME = "Fixture home Personal";
+    private static final String EDITOR_HEADING = "Notes editor";
+    private static final int EDITOR_DRAFT_CANDIDATE_LIMIT = 4;
     private UiDevice device;
     private Context context;
     private String origin, editor, launcher;
@@ -49,6 +52,10 @@ public final class WebHomeOperationTest {
     private JSONObject coldHeadingTrace;
     private BackWaitObservation backHomeObservation;
     private boolean backObservationIncomplete;
+    private BackWaitObservation menuHomeWait;
+    private boolean menuHomeWaitTimedOut;
+    private enum PersonalEditorDraftCheck { INITIAL, AFTER_WORK_CLEAR }
+    private PersonalEditorDraftCheck timedOutPersonalEditorDraft;
     // INITIAL_SAVE_OBSERVATION_FIELDS_BEGIN
     private InitialSaveObservation initialSaveObservation;
     private boolean initialSaveObservationIncomplete;
@@ -161,6 +168,7 @@ public final class WebHomeOperationTest {
             }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
+        if (menuHomeWait != null && menuHomeWait.waiting) menuHomeWaitTimedOut = true;
         throw new AssertionError("Actual App control did not become ready: " + selector);
     }
 
@@ -173,9 +181,14 @@ public final class WebHomeOperationTest {
     }
 
     private void click(String text) {
+        click(text, null);
+    }
+
+    private void click(String text, JSONObject trace) {
         long end = SystemClock.elapsedRealtime() + 15000;
         do {
             UiObject2 ready = null;
+            boolean selectedClickable = false;
             try {
                 // One snapshot avoids counting a node twice when text and
                 // description both expose the same exact action name.
@@ -200,14 +213,24 @@ public final class WebHomeOperationTest {
                 }
                 int selected = AccessibleName.unique(names, TARGET, text);
                 assertTrue("Ambiguous actual App action: " + text, selected != AccessibleName.AMBIGUOUS);
-                if (selected >= 0 && AccessibleName.matches(nameSnapshot(values.get(selected)), TARGET, text)) {
-                    ready = values.get(selected);
+                if (selected >= 0) {
+                    UiObject2 value = values.get(selected);
+                    AccessibleName.Candidate candidate = nameSnapshot(value);
+                    if (AccessibleName.matches(candidate, TARGET, text)) {
+                        ready = value;
+                        selectedClickable = candidate.clickable;
+                    }
                 }
             } catch (StaleObjectException ignored) {
                 // No gesture occurred. Reacquire within the same deadline.
             }
             if (ready != null && SystemClock.elapsedRealtime() < end) {
+                if (trace != null) {
+                    diagnostic(trace, "selectedNode", selectedClickable ? "CLICKABLE_ACTION" : "NONCLICKABLE_LABEL");
+                    diagnostic(trace, "tapStartedAtMs", SystemClock.elapsedRealtime());
+                }
                 ready.click(); // Never catch/retry a possibly delivered gesture.
+                if (trace != null) diagnostic(trace, "tapReturnedAtMs", SystemClock.elapsedRealtime());
                 return;
             }
             SystemClock.sleep(100);
@@ -253,8 +276,8 @@ public final class WebHomeOperationTest {
     private void menu(String text) { nativeButton("メニュー"); click(text); }
     private void picker() { menu("接続先を切り替える"); expect("接続先を追加"); }
 
-    private void hideKeyboardIfShown() {
-        if (keyboardShown(null)) device.pressBack();
+    private void hideKeyboardIfShown(JSONObject trace) {
+        if (keyboardShown(trace)) device.pressBack();
     }
 
     private boolean keyboardShown(JSONObject trace) {
@@ -310,6 +333,7 @@ public final class WebHomeOperationTest {
         if (coldHeadingTrace != null) diagnostic(coldHeadingTrace, "lastHeadingOutcome", outcome.name());
         observePersonalHomeQuery(outcome); // personal-home-wait:existing-outcome
         observeInitialSaveQuery(outcome); // initial-save-observation:existing-outcome
+        if (menuHomeWait != null && menuHomeWait.waiting) menuHomeWait.sample(outcome, SystemClock.elapsedRealtime());
         if (backHomeObservation == null || !backHomeObservation.waiting) return;
         try { backHomeObservation.sample(outcome, SystemClock.elapsedRealtime()); }
         catch (RuntimeException ignored) { backObservationIncomplete = true; }
@@ -390,8 +414,8 @@ public final class WebHomeOperationTest {
         } catch (RuntimeException ignored) { diagnostic(result, "backObservationIncomplete", true); }
     }
 
-    private BackWaitObservation.Outcome queryWorkHome() {
-        UiObject2 node = device.findObject(By.text(WORK_HOME).pkg(TARGET));
+    private BackWaitObservation.Outcome queryHeading(String heading) {
+        UiObject2 node = device.findObject(By.text(heading).pkg(TARGET));
         if (node == null) return BackWaitObservation.Outcome.QUERY_NULL;
         if (!node.isEnabled()) return BackWaitObservation.Outcome.DISABLED;
         return node.getVisibleBounds().isEmpty()
@@ -400,31 +424,82 @@ public final class WebHomeOperationTest {
 
     private void compareAccountBackAccessibility() {
         BackWaitObservation wait = backHomeObservation;
-        if (wait == null || backObservationIncomplete || wait.incomplete || wait.capReached
-                || wait.waitFinishedAtMs < 0 || wait.waitReturned || wait.samples == 0
-                || wait.queryNull != wait.samples || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        if (wait != null && !backObservationIncomplete && wait.onlyMissingAfterWait()) {
+            compareHomeAccessibility(WORK_HOME, "accountBackAccessibility", true);
+        }
+    }
+
+    private void expectWorkHomeFromEditorMenu() {
+        menu("アプリホームへ");
+        BackWaitObservation wait = new BackWaitObservation();
+        menuHomeWait = wait;
+        wait.beginWait(SystemClock.elapsedRealtime());
+        boolean returned = false;
+        try {
+            expect(WORK_HOME);
+            returned = true;
+        } finally {
+            wait.endWait(SystemClock.elapsedRealtime(), returned);
+        }
+    }
+
+    private void saveMenuHomeFailure(boolean captured) {
+        if (!menuHomeWaitTimedOut) return;
+        BackWaitObservation wait = menuHomeWait;
+        JSONObject metadata = new JSONObject();
+        diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "clockDomain", "android_elapsed_realtime");
+        diagnostic(metadata, "waitStartedAtMs", wait.waitStartedAtMs);
+        diagnostic(metadata, "waitFinishedAtMs", wait.waitFinishedAtMs);
+        diagnostic(metadata, "samples", wait.samples);
+        diagnostic(metadata, "queryNull", wait.queryNull);
+        diagnostic(metadata, "recordingIncomplete", wait.incomplete || wait.capReached);
+        diagnostic(result, "menuHomeWait", metadata);
+        if (captured && wait.onlyMissingAfterWait()) {
+            compareHomeAccessibility(WORK_HOME, "menuHomeAccessibility", false);
+        }
+    }
+
+    private void comparePersonalHomeAccessibility() {
+        PersonalHomeWaitObservation wait = personalHomeWait;
+        if (wait == null || personalHomeWaitIncomplete || wait.incomplete || wait.capped || wait.contextCapped
+                || wait.finished < 0 || wait.returned || wait.samples == 0 || wait.queryNull != wait.samples) {
             return;
         }
+        compareHomeAccessibility(PERSONAL_HOME, "personalHomeAccessibility", false);
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private boolean clearAccessibilityCache() {
+        UiAutomation automation = InstrumentationRegistry.getInstrumentation().getUiAutomation(
+            Configurator.getInstance().getUiAutomationFlags());
+        return automation.clearCache();
+    }
+
+    private void compareHomeAccessibility(String heading, String resultKey, boolean accountBackFormat) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return;
         JSONObject metadata = new JSONObject();
-        diagnostic(result, "accountBackAccessibility", metadata);
+        diagnostic(result, resultKey, metadata);
         diagnostic(metadata, "diagnosticOnly", true);
-        diagnostic(metadata, "startedAtMs", SystemClock.elapsedRealtime());
+        long startedAtMs = SystemClock.elapsedRealtime();
+        if (accountBackFormat) diagnostic(metadata, "startedAtMs", startedAtMs);
         try {
             // Compare the same exact query after capturing the failure artifacts.
             // If the node has already appeared, cache clearing adds no evidence.
-            BackWaitObservation.Outcome before = queryWorkHome();
+            BackWaitObservation.Outcome before = queryHeading(heading);
             diagnostic(metadata, "before", before.name());
             if (before != BackWaitObservation.Outcome.QUERY_NULL) return;
 
-            UiAutomation automation = InstrumentationRegistry.getInstrumentation().getUiAutomation(
-                Configurator.getInstance().getUiAutomationFlags());
-            boolean cleared = automation.clearCache();
-            diagnostic(metadata, "cacheCleared", cleared);
-            if (cleared) diagnostic(metadata, "after", queryWorkHome().name());
+            boolean cleared = clearAccessibilityCache();
+            if (accountBackFormat) diagnostic(metadata, "cacheCleared", cleared);
+            else diagnostic(metadata, "cacheClear", cleared ? "CLEARED" : "NOT_CLEARED");
+            if (cleared) diagnostic(metadata, "after", queryHeading(heading).name());
         } catch (RuntimeException error) {
-            diagnostic(metadata, "error", error.getClass().getSimpleName());
+            diagnostic(metadata, "error", accountBackFormat ? error.getClass().getSimpleName() : "UNAVAILABLE");
         } finally {
-            diagnostic(metadata, "finishedAtMs", SystemClock.elapsedRealtime());
+            long finishedAtMs = SystemClock.elapsedRealtime();
+            if (accountBackFormat) diagnostic(metadata, "finishedAtMs", finishedAtMs);
+            else diagnostic(metadata, "elapsedMs", finishedAtMs - startedAtMs);
         }
     }
 
@@ -433,7 +508,7 @@ public final class WebHomeOperationTest {
         try { personalHomeWait = new PersonalHomeWaitObservation(); }
         catch (RuntimeException ignored) { personalHomeWaitIncomplete = true; }
         boolean returned = false;
-        try { expect("Fixture home Personal"); returned = true; }
+        try { expect(PERSONAL_HOME); returned = true; }
         catch (RuntimeException error) { personalHomeWaitIncomplete = true; throw error; }
         finally {
             try { if (personalHomeWait != null) personalHomeWait.finish(SystemClock.elapsedRealtime(), returned); }
@@ -536,12 +611,20 @@ public final class WebHomeOperationTest {
         one(By.desc("表示中のサイト " + address.substring("https://".length())));
     }
 
+    private List<UiObject2> editorDraftFields() {
+        return device.findObjects(By.clazz("android.widget.EditText").pkg(TARGET));
+    }
+
     private void draft(String value, String expectedProfile) {
+        draft(value, expectedProfile, null);
+    }
+
+    private void draft(String value, String expectedProfile, PersonalEditorDraftCheck comparison) {
         long end = SystemClock.elapsedRealtime() + 15000;
         List<UiObject2> lastFields = new ArrayList<>();
         int samples = 0;
         do {
-            List<UiObject2> fields = device.findObjects(By.clazz("android.widget.EditText").pkg(TARGET));
+            List<UiObject2> fields = editorDraftFields();
             lastFields = fields;
             samples++;
             if (fields.size() == 1 && value.equals(fields.get(0).getText())) {
@@ -549,6 +632,7 @@ public final class WebHomeOperationTest {
             }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
+        timedOutPersonalEditorDraft = comparison;
         captureEditorDraftFailure(expectedProfile, value, samples, lastFields);
         throw new AssertionError("Wrong profile's actual editor draft: " + value);
     }
@@ -559,6 +643,47 @@ public final class WebHomeOperationTest {
         if ("work-draft".equals(value)) return "work_draft";
         if ("personal-draft".equals(value)) return "personal_draft";
         return "other";
+    }
+
+    private JSONObject readEditorAccessibility() {
+        JSONObject snapshot = new JSONObject();
+        diagnostic(snapshot, "heading", "UNKNOWN");
+        try {
+            diagnostic(snapshot, "heading", queryHeading(EDITOR_HEADING).name());
+        } catch (RuntimeException ignored) { }
+
+        JSONArray categories = new JSONArray();
+        diagnostic(snapshot, "draftCandidateCount", JSONObject.NULL);
+        diagnostic(snapshot, "draftValueCategories", categories);
+        try {
+            List<UiObject2> fields = editorDraftFields();
+            diagnostic(snapshot, "draftCandidateCount", fields.size());
+            for (int i = 0; i < Math.min(fields.size(), EDITOR_DRAFT_CANDIDATE_LIMIT); i++) {
+                String category = "unavailable";
+                try { category = draftCategory(fields.get(i).getText()); }
+                catch (RuntimeException ignored) { }
+                categories.put(category);
+            }
+        } catch (RuntimeException ignored) { }
+        return snapshot;
+    }
+
+    private void comparePersonalEditorAccessibility() {
+        if (timedOutPersonalEditorDraft == null) return;
+        JSONObject metadata = new JSONObject();
+        diagnostic(result, "personalEditorAccessibility", metadata);
+        diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "phase", timedOutPersonalEditorDraft.name());
+        diagnostic(metadata, "cacheClear", "UNKNOWN");
+        diagnostic(metadata, "before", JSONObject.NULL);
+        diagnostic(metadata, "after", JSONObject.NULL);
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return;
+        diagnostic(metadata, "before", readEditorAccessibility());
+        try {
+            boolean cleared = clearAccessibilityCache();
+            diagnostic(metadata, "cacheClear", cleared ? "CLEARED" : "NOT_CLEARED");
+            if (cleared) diagnostic(metadata, "after", readEditorAccessibility());
+        } catch (RuntimeException ignored) { }
     }
 
     private void captureEditorDraftFailure(String expectedProfile, String expectedValue, int samples,
@@ -574,7 +699,7 @@ public final class WebHomeOperationTest {
             diagnostic(metadata, "candidateCount", fields.size());
 
             JSONArray candidates = new JSONArray();
-            int limit = Math.min(fields.size(), 4);
+            int limit = Math.min(fields.size(), EDITOR_DRAFT_CANDIDATE_LIMIT);
             for (int i = 0; i < limit; i++) {
                 UiObject2 field = fields.get(i);
                 JSONObject candidate = new JSONObject();
@@ -619,11 +744,10 @@ public final class WebHomeOperationTest {
         }
     }
 
-    private void writeDraft(String value, String expectedProfile) {
-        draft("", expectedProfile);
+    private void writeDraft(String value, String expectedProfile, JSONObject trace) {
         UiObject2 field = one(By.clazz("android.widget.EditText"));
         field.click(); field.setText(value);
-        hideKeyboardIfShown();
+        hideKeyboardIfShown(trace);
         draft(value, expectedProfile);
     }
 
@@ -699,11 +823,25 @@ public final class WebHomeOperationTest {
             expect(WORK_HOME);
             accountHomeReturned = true;
         } finally { finishHomeWaitObservation(accountHomeReturned); }
-        click("📝 Notes"); expect("Notes editor"); host(editor);
-        writeDraft("work-draft", "Work");
-        click("Page two"); expect("Notes page two");
-        nativeButton("戻る"); expect("Notes editor"); draft("work-draft", "Work");
-        menu("アプリホームへ"); expect("Fixture home Work");
+        click("📝 Notes"); expect(EDITOR_HEADING); host(editor);
+        JSONObject pageTwoTap = new JSONObject();
+        draft("", "Work");
+        writeDraft("work-draft", "Work", pageTwoTap);
+        click("Page two", pageTwoTap);
+        boolean pageTwoReady = false;
+        try {
+            expect("Notes page two");
+            pageTwoReady = true;
+        } finally {
+            if (!pageTwoReady) {
+                diagnostic(pageTwoTap, "diagnosticOnly", true);
+                diagnostic(pageTwoTap, "clockDomain", "android_elapsed_realtime");
+                diagnostic(pageTwoTap, "headingWaitFailedAtMs", SystemClock.elapsedRealtime());
+                diagnostic(result, "pageTwoTap", pageTwoTap);
+            }
+        }
+        nativeButton("戻る"); expect(EDITOR_HEADING); draft("work-draft", "Work");
+        expectWorkHomeFromEditorMenu();
         nativeButton("戻る"); draft("work-draft", "Work");
         cases.put("connection-web-login-home-back").put("cross-origin-no-ipc");
         String warm = document(), warmPid = pid();
@@ -713,7 +851,9 @@ public final class WebHomeOperationTest {
         draft("work-draft", "Work"); assertEquals(warmPid, pid()); assertEquals(warm, document());
         cases.put("warm-document-retained");
         picker(); add("Personal"); click("Sign in Personal"); expect("Fixture home Personal");
-        click("📝 Notes"); writeDraft("personal-draft", "Personal");
+        click("📝 Notes");
+        draft("", "Personal", PersonalEditorDraftCheck.INITIAL);
+        writeDraft("personal-draft", "Personal", null);
         picker(); reopen("Work"); draft("work-draft", "Work");
         menu("アプリホームへ"); expect("Fixture home Work");
         nativeButton("戻る"); draft("work-draft", "Work");
@@ -725,7 +865,7 @@ public final class WebHomeOperationTest {
         while (!pid().isEmpty() && SystemClock.elapsedRealtime() < end) SystemClock.sleep(100);
         assertEquals("Original App must terminate", "", pid());
         launchColdRoot(); reopen("Work");
-        expect("Notes editor"); draft("work-draft", "Work"); host(editor);
+        expect(EDITOR_HEADING); draft("work-draft", "Work"); host(editor);
         String fresh = document(), freshPid = pid();
         assertFalse(freshPid.isEmpty()); assertNotEquals(oldPid, freshPid); assertNotEquals(before, fresh);
         result.put("oldPid", oldPid).put("newPid", freshPid).put("beforeColdDocument", before).put("afterColdDocument", fresh);
@@ -743,7 +883,9 @@ public final class WebHomeOperationTest {
         click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("", "Work");
         closeAndOpenMain(); reopen("Personal");
         expectPersonalHomeAfterReset(); expect("Instance data instance-Personal");
-        click("📝 Notes"); draft("personal-draft", "Personal"); closeAndOpenMain();
+        click("📝 Notes");
+        draft("personal-draft", "Personal", PersonalEditorDraftCheck.AFTER_WORK_CLEAR);
+        closeAndOpenMain();
         cases.put("cleared-profile-reset").put("other-profile-preserved").put("native-views-closed");
         result.put("passed", true);
     }
@@ -766,7 +908,12 @@ public final class WebHomeOperationTest {
         } catch (Exception error) {
             result.put("diagnosticError", error.getClass().getSimpleName());
         }
+        // Clearing the test connection's cache could change later queries.
+        // Compare only after both original failure artifacts have been captured.
+        if (saved) comparePersonalEditorAccessibility();
         compareAccountBackAccessibility();
+        if (saved) comparePersonalHomeAccessibility();
+        saveMenuHomeFailure(saved);
         saveBackObservation();
         saveInitialSaveObservation(); // initial-save-observation:result-delivery
         savePersonalHomeWait(); // personal-home-wait:result-delivery

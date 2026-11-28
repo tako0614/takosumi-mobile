@@ -27,6 +27,7 @@ export function WebHome(props: {
   const [connections, setConnections] = createSignal<readonly WebConnection[]>([]);
   const [url, setUrl] = createSignal("");
   const [name, setName] = createSignal("");
+  let observedNameInput = false;
   const [error, setError] = createSignal("");
   const [opening, setOpening] = createSignal<string>();
   const [lastOpened, setLastOpened] = createSignal<string>();
@@ -260,7 +261,17 @@ export function WebHome(props: {
           <label for="connection-name">名前 <span>（任意）</span></label>
           <input id="connection-name" type="text" maxlength={80} value={name()}
             placeholder="自分のTakosumi" disabled={locked()}
-            onInput={(event) => setName(event.currentTarget.value)} />
+            onClick={props.observeBootstrap ? () => observe("connection_name_click") : undefined}
+            onFocus={props.observeBootstrap ? () => observe("connection_name_focus") : undefined}
+            onBlur={props.observeBootstrap ? () => observe("connection_name_blur") : undefined}
+            onInput={(event) => {
+              setName(event.currentTarget.value);
+              // Observe delivery once. Later input events add no field data to the witness.
+              if (props.observeBootstrap && !observedNameInput) {
+                observedNameInput = true;
+                observe("connection_name_input");
+              }
+            }} />
           <button class="web-primary" type="submit" disabled={locked()}
             ref={() => observe("save_element")}>保存して開く</button>
         </form>

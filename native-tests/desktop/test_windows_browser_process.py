@@ -863,21 +863,20 @@ class CdpTests(unittest.TestCase):
             {"frameTree": {"frame": {"id": "F", "securityOrigin": "https://site.test"}}})
         return FakePage()
 
-    def test_a_contended_sample_reads_state_off_the_renderer_queue(self):
+    def test_a_contended_sample_reads_state_without_enabling_storage_events(self):
         key = "sumi_app_process_no-such-case"
         page = self.contended_page(
-            {"DOMStorage.enable": {},
-             "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"], ["other", "x"]]},
+            {"DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"], ["other", "x"]]},
              "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}}, [])
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
         self.assertEqual(watch.contended_sample(page, 0),
                          {"storage": "0:n", "cookie": "0:n", "origin": "https://site.test"})
-        self.assertNotIn("Runtime.evaluate", page.calls)
+        self.assertEqual(page.calls, ["Page.getFrameTree", "DOMStorage.getDOMStorageItems",
+                                      "Network.getCookies"])
 
     def test_a_contended_sample_refuses_a_main_frame_navigation(self):
         page = self.contended_page(
-            {"DOMStorage.enable": {},
-             "DOMStorage.getDOMStorageItems": {"entries": []},
+            {"DOMStorage.getDOMStorageItems": {"entries": []},
              "Network.getCookies": {"cookies": []}},
             [{"method": "Page.frameNavigated", "sessionId": "S1",
               "params": {"frame": {"id": "F2", "parentId": "F"}}},
@@ -889,8 +888,7 @@ class CdpTests(unittest.TestCase):
 
     def test_a_contended_sample_refuses_a_main_frame_load(self):
         page = self.contended_page(
-            {"DOMStorage.enable": {},
-             "DOMStorage.getDOMStorageItems": {"entries": []},
+            {"DOMStorage.getDOMStorageItems": {"entries": []},
              "Network.getCookies": {"cookies": []}},
             [{"method": "Page.frameStartedLoading", "sessionId": "S1",
               "params": {"frameId": "F"}}])
@@ -900,8 +898,7 @@ class CdpTests(unittest.TestCase):
 
     def test_a_contended_sample_refuses_a_crashed_renderer(self):
         page = self.contended_page(
-            {"DOMStorage.enable": {},
-             "DOMStorage.getDOMStorageItems": {"entries": []},
+            {"DOMStorage.getDOMStorageItems": {"entries": []},
              "Network.getCookies": {"cookies": []}},
             [{"method": "Inspector.targetCrashed", "sessionId": "S1", "params": {}}])
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
@@ -910,8 +907,7 @@ class CdpTests(unittest.TestCase):
 
     def test_a_contended_sample_refuses_dropped_event_coverage(self):
         page = self.contended_page(
-            {"DOMStorage.enable": {},
-             "DOMStorage.getDOMStorageItems": {"entries": []},
+            {"DOMStorage.getDOMStorageItems": {"entries": []},
              "Network.getCookies": {"cookies": []}}, [], base=5)
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
         with self.assertRaisesRegex(Failure, "were dropped"):
@@ -919,11 +915,11 @@ class CdpTests(unittest.TestCase):
         self.assertTrue(page.calls, "the sends precede the coverage check")
 
     def test_a_contended_sample_falls_back_when_the_storage_domains_are_missing(self):
-        missing = observer.CdpError("CDP DOMStorage.enable failed (P): method missing",
-                                  {"message": "method missing"})
+        missing = observer.CdpError(
+            "CDP DOMStorage.getDOMStorageItems failed (P): method missing",
+            {"message": "method missing"})
         page = self.contended_page(
-            {"DOMStorage.enable": missing,
-             "DOMStorage.getDOMStorageItems": {"entries": []},
+            {"DOMStorage.getDOMStorageItems": missing,
              "Network.getCookies": {"cookies": []}}, [])
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
         self.assertEqual(watch.contended_sample(page, 0)["storage"], "0:n")
@@ -950,8 +946,7 @@ class CdpTests(unittest.TestCase):
                 return default if key == "Page.getFrameTree" else super().setdefault(key, default)
             def __missing__(self, method):
                 return flaky(method) if method == "Page.getFrameTree" else {}
-        sends = Sends({"DOMStorage.enable": {},
-                       "DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
+        sends = Sends({"DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
                        "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
         page = self.contended_page(sends, [])
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
@@ -965,7 +960,6 @@ class CdpTests(unittest.TestCase):
     def test_a_contended_sample_names_a_starved_browser_read_after_the_bound(self):
         page = self.contended_page(
             {"Page.getFrameTree": Failure("CDP timeout Page.getFrameTree (P)"),
-             "DOMStorage.enable": {},
              "DOMStorage.getDOMStorageItems": {"entries": []},
              "Network.getCookies": {"cookies": []}}, [])
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
@@ -981,25 +975,22 @@ class CdpTests(unittest.TestCase):
         return page
 
     def test_a_starved_read_extends_only_while_the_storm_stays_live(self):
-        # Run 43173821786: DOMStorage.enable starved the full base bound
-        # while renderer churn kept the event stream alive. A stream still
-        # receiving events names a starved channel, so the bound extends in
-        # quiet-window steps and the late answer still lands.
+        # CDP events keep arriving while the storage read is starved.
+        # The shared bound extends in quiet-window steps until it answers.
         key = "sumi_app_process_no-such-case"
         attempts = {"n": 0}
 
         def flaky(method):
             attempts["n"] += 1
             if attempts["n"] <= 3:
-                return Failure("CDP timeout DOMStorage.enable (P)")
-            return {}
+                return Failure("CDP timeout DOMStorage.getDOMStorageItems (P)")
+            return {"entries": [[key, "0:n"]]}
 
         class Sends(dict):
             def __missing__(self, method):
-                return flaky(method) if method == "DOMStorage.enable" else {}
+                return flaky(method) if method == "DOMStorage.getDOMStorageItems" else {}
 
-        sends = Sends({"DOMStorage.getDOMStorageItems": {"entries": [[key, "0:n"]]},
-                       "Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
+        sends = Sends({"Network.getCookies": {"cookies": [{"name": key, "value": "0:n"}]}})
         events = [{"method": "Target.targetCreated", observer.RECEIVED_AT: time.monotonic()}]
         page = self.contended_page_with_events(sends, events)
         watch = observer.Observer(HERE / "no-such-case", "https://127.0.0.1:1", 1, "", real_site="excalidraw")
@@ -1009,7 +1000,7 @@ class CdpTests(unittest.TestCase):
         self.assertEqual(attempts["n"], 4)
         retries = watch.proof["starvedBrowserReadRetries"]
         self.assertEqual(len(retries), 3)
-        self.assertTrue(all(retry["method"] == "DOMStorage.enable" for retry in retries))
+        self.assertTrue(all(retry["method"] == "DOMStorage.getDOMStorageItems" for retry in retries))
         self.assertTrue(all(retry["channelQuietSeconds"] == 0.0 for retry in retries))
 
     def test_a_starved_read_still_names_the_method_past_the_hard_cap(self):

@@ -689,6 +689,36 @@ os.open(sys.argv[3],os.O_RDONLY)
                         self.assertEqual(item["observationError"], broken == "classifier")
         # CDP_COMMAND_OBSERVATION_CONTROLS_END
 
+    def test_failed_contended_read_prioritizes_only_an_existing_sample_target(self):
+        cases = (("personal", [22, 12]), ("foreign", [12, 22]), ("outside bound", [12, 22]),
+                 ("personal already sampled", [12]))
+        for case, expected in cases:
+            with self.subTest(case=case):
+                observer = self.failed_observer()
+                opened = observer.proof["opened"]["processes"]
+                opened.append({"pid": 31, "opened": {"nativePid": 32}})
+                observer.identities.extend([
+                    {"pid": 31, "parent": 10, "start": 104}, {"pid": 32, "parent": 31, "start": 105}])
+                target = opened[1]
+                if case == "foreign":
+                    target = copy.deepcopy(target)
+                elif case == "outside bound":
+                    target = opened[2]
+                elif case == "personal already sampled":
+                    observer.proof["shutdownSamples"] = [{"pid": 22, "status": "sample-error"}]
+                page = SimpleNamespace(process=target)
+                mark = object()
+                failure = runner.Failure("CDP timeout Page.getFrameTree")
+                observer.first_launch.side_effect = lambda: observer.contended_sample(page, mark)
+                with mock.patch.object(runner.Observer, "contended_sample", side_effect=failure) as read, \
+                        mock.patch.object(runner, "sample_owned", return_value={"diagnosticOnly": True}) as sample, \
+                        self.assertRaises(runner.Failure) as error:
+                    observer.run()
+                read.assert_called_once_with(page, mark)
+                self.assertEqual([call.args[1]["pid"] for call in sample.call_args_list], expected)
+                self.assertIs(error.exception, failure)
+                self.assertFalse(observer.proof["passed"])
+
     def test_failure_stack_capture_requires_identity_and_does_not_repeat_shutdown_sample(self):
         observer = self.failed_observer()
         observer.proof["shutdownSamples"] = [{"pid": 12, "status": "sample-error"}]
@@ -1060,7 +1090,7 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
         # Drive the actual first_launch caller: a ready abnormal Work receipt
         # must prevent futile extra Personal waits, while pending/normal Work
         # cannot turn a missing Personal event into success.
-        def first_launch_with_preceding_receipt(receipt):
+        def first_launch_with_preceding_receipt(receipt, fail_read=False):
             work_receipt = self.root / "preceding-work.json"
             if receipt is None:
                 work_receipt.unlink(missing_ok=True)
@@ -1092,7 +1122,14 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
 
             observer.read_evaluate.side_effect = seed
             observer.sample.side_effect = lambda page: state[id(page)].copy()
-            observer.contended_sample.side_effect = lambda page, mark: state[id(page)].copy()
+            read_error = runner.Failure("Post-cancel read timed out")
+
+            def read_after_cancel(page, mark):
+                if fail_read and page is personal:
+                    raise read_error
+                return state[id(page)].copy()
+
+            observer.contended_sample.side_effect = read_after_cancel
             observer.marker.side_effect = lambda name: ({"after": [None, None]}
                                                         if name == "app-browser-process.json"
                                                         else [None, None])
@@ -1116,8 +1153,23 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
                 try:
                     runner.MacObserver.first_launch(observer)
                 except runner.Failure as error:
+                    if fail_read:
+                        self.assertIs(error, read_error)
+                        self.assertEqual(observer.step.call_args, mock.call("read Personal after cancelled quit", personal))
+                        observer.remove_beforeunload.assert_not_called()
+                        self.assertNotIn(mock.call("request-partial-exit"), observer.checkpoint.call_args_list)
+                    else:
+                        observer.step.assert_has_calls([
+                            mock.call("read Work after cancelled quit", work),
+                            mock.call("read Personal after cancelled quit", personal),
+                            mock.call("verify documents after cancelled quit"),
+                            mock.call("remove Work beforeunload after cancelled quit", work),
+                        ])
                     return error, waits, errors
             self.fail("The missing Personal event must remain a failure")
+
+        _, waits, _ = first_launch_with_preceding_receipt(None, fail_read=True)
+        self.assertEqual(waits, [])
 
         normal = {"rootExit": 0, "complete": True, "kernelNoChildren": True,
                   "forcedCleanup": 0, "remaining": [], "cleanupErrors": [], "error": None}

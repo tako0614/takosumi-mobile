@@ -33,6 +33,8 @@ METHOD = "testWholeAppConnectionsWebHomeAndResumeStayProfileBound"
 # allowance. One bounded setup attempt; functional XCTest still gets 600 s
 # and installation must finish normally before exact bundle readback.
 INSTALL_WAIT = 120
+NAVIGATION_LOG_LIMIT = 512 * 1024
+FILTERED_NAVIGATION_WAIT = 8
 SOURCES = runtime.FROZEN_SOURCES + [HERE / name for name in (
     "run.py", "test_run.py", "harness.py", "web_site.py", "Driver.swift", "WebHomeUITests.swift", "project.yml")]
 SOURCES += [ROOT / name for name in (
@@ -116,12 +118,13 @@ def navigation_witness(data):
     result = {"diagnosticOnly": True, "clockDomain": "ios_system_uptime", "clockUnit": "ms",
               "records": [], "recordLimit": 513, "dropped": 0, "malformed": 0,
               "capStatus": "not_observed", "absenceIsUnknown": True}
-    if len(data) > 512 * 1024:
+    if len(data) > NAVIGATION_LOG_LIMIT:
         result["errorType"] = "InputBoundExceeded"
         return result
     marker = b"com.takosumi.fixture.simulator.nav "
-    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|returned|provisional|commit|finish|fail_provisional|fail|cap|policy_allow|policy_allow_returned|"
-                         rb"response_policy_entered|response_policy_allow_returned|content_terminated) "
+    pattern = re.compile(rb"v=1 seq=([1-9][0-9]{0,2}) event=(open|request|home_request|returned|provisional|commit|finish|"
+                         rb"fail_provisional|fail|cap|policy_allow|policy_allow_returned|response_policy_entered|"
+                         rb"response_policy_allow_returned|content_terminated) "
                          rb"view=([0-9]{1,5}) request=([0-9]{1,5}) relation=([012]) target=(instance|editor|other|unknown|editor_page_two) "
                          rb"reused=([01]) kept=([01]) resume=([01]) initial=([01]) sameView=([01]) timeMs=([0-9]{1,15})")
     for line in data.splitlines():
@@ -156,6 +159,12 @@ def navigation_witness(data):
                            or any(record[key] for key in ("reused", "kept", "resume", "initial"))):
             result["malformed"] = min(513, result["malformed"] + 1)
             continue  # An owner-bound delegate event is never navigation context or a liveness verdict.
+        if record["event"] == "home_request" and (
+                record["seq"] == 513 or record["view"] == 0 or record["request"] == 0
+                or record["relation"] != 0 or record["target"] == "unknown" or not record["sameView"]
+                or not record["reused"] or record["kept"] or record["resume"] or not record["initial"]):
+            result["malformed"] = min(513, result["malformed"] + 1)
+            continue  # The menu requests a launch URL in an already-bound view.
         callback = record["event"] in ("provisional", "commit", "finish", "fail_provisional", "fail")
         matched = record["relation"] == 1 and record["sameView"]
         context = (record["request"] != 0 or record["target"] != "unknown"
@@ -264,7 +273,9 @@ def bootstrap_witness(data, size, *, partial):
                         rb"Takosumi\[([1-9][0-9]{0,9}):[0-9a-fA-Fx]+\]\s+"
                         rb"\[com\.takosumi\.fixture\.simulator:app\]\s+\[stderr\] ")
     packet = re.compile(rb"v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
-                        rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|legacy|home_init|connections_begin|connections_end|connections_failed|save_element|render_returned|unknown|cap) "
+                        rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
+                        rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
+                        rb"render_returned|connection_name_(?:click|focus|blur|input)|unknown|cap) "
                         rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1")
     anchor = None
     for line in lines[:result["scanLineLimit"]]:
@@ -752,7 +763,59 @@ def preserve_watchdog_diagnostics(out, scratch, original, context):
 # watchdog-diagnostics-end
 
 
-def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
+def require_target_log_owner(path, udid, device, name, selected_runtime, timeout):
+    inventory = json.loads(runtime.command(["xcrun", "simctl", "list", "devices", "--json"], path, timeout=timeout))
+    current = runtime.owned_device(inventory, udid, name, selected_runtime)
+    require(current.get("state") == "Booted" and current.get("dataPath") == device.get("dataPath")
+            and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
+
+
+def filtered_navigation_witness(scratch, udid, device, name, selected_runtime, *, owner_already_checked=False):
+    """Read only this owned App's fixture navigation producer."""
+    result = {"diagnosticOnly": True, "absenceIsUnknown": True, "status": "unknown", "queryReturned": False}
+    deadline = runtime.time.monotonic() + FILTERED_NAVIGATION_WAIT
+    try:
+        if not owner_already_checked:
+            require_target_log_owner(scratch / "before-filtered-navigation.log", udid, device, name, selected_runtime, timeout=2)
+        remaining = deadline - runtime.time.monotonic()
+        if remaining <= 0:
+            return result
+        raw = scratch / "filtered-navigation-raw.log"
+        predicate = '(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")'
+        try:
+            runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
+                             "--timezone", "UTC", "--last", "10m", "--predicate", predicate],
+                            raw, timeout=remaining, read_output=False)
+            result["queryReturned"] = True
+        except subprocess.TimeoutExpired:
+            result["partial"] = True
+            if runtime.UNREAPED_COMMANDS:
+                return result
+        # Keep raw output in scratch. Freeze the observed length and feed only
+        # a bounded tail into the same closed projection as the broad read.
+        with os.fdopen(os.open(raw, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return result
+            size = info.st_size
+            source.seek(max(0, size - NAVIGATION_LOG_LIMIT))
+            data = source.read(min(size, NAVIGATION_LOG_LIMIT))
+            after = os.fstat(source.fileno())
+            if len(data) != min(size, NAVIGATION_LOG_LIMIT) or (size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                result["partial"] = True
+                return result
+        partial = not result["queryReturned"] or size > len(data)
+        result.update(navigation_witness(data), partial=partial, sourceBytes=size, keptBytes=len(data))
+        if result["records"]:
+            result["status"] = "partial" if partial else "retained"
+    except Exception:
+        # The optional read, ownership check and parser never change the
+        # broad receipt or replace the original XCTest failure.
+        pass
+    return result
+
+
+def preserve_app_exit(out, scratch, udid, device, name, selected_runtime, *, navigation_first=False):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
               "scope": "Owned Simulator only; Takosumi process or private fixture bundle events",
@@ -760,11 +823,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     try:
         # Recheck inventory before spawn. Never query a host-wide log store or
         # a Simulator selected by its display name alone.
-        inventory = json.loads(runtime.command(["xcrun", "simctl", "list", "devices", "--json"],
-                                               out / "before-target-logs.log", timeout=20))
-        current = runtime.owned_device(inventory, udid, name, selected_runtime)
-        require(current.get("state") == "Booted" and current.get("dataPath") == device.get("dataPath")
-                and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
+        require_target_log_owner(out / "before-target-logs.log", udid, device, name, selected_runtime, timeout=20)
         # No custom/remote process name or predicate input. The bundle is the
         # preinstalled private Tauri App, not the minimal XCTest driver.
         # XCTest's verbose AX traversal can consume the query's entire budget
@@ -776,6 +835,15 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         result["errorType"] = type(error).__name__
         return result
+    if navigation_first:
+        # An XCTest assertion already identifies a functional failure. Start
+        # the narrow capture at the just-verified Simulator identity, before
+        # the broad query can delay or prevent it.
+        result["filteredNavigationWitness"] = filtered_navigation_witness(
+            scratch, udid, device, name, selected_runtime, owner_already_checked=True)
+        if runtime.UNREAPED_COMMANDS:
+            return result
+    timed_out = False
     try:
         runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
                          "--timezone", "UTC", "--last", "10m", "--predicate", predicate], raw, timeout=15, read_output=False)
@@ -784,6 +852,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
         # command() handles its direct child before raising. A retained tail
         # is only a partial snapshot; interrupted-command scratch stays held.
         result.update(queryReturned=False, errorType=type(error).__name__)
+        timed_out = isinstance(error, subprocess.TimeoutExpired)
     try:
         with raw.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
@@ -815,6 +884,9 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         # Missing/failed diagnostics never replace the original test failure.
         result["retentionErrorType"] = type(error).__name__
+    if (not navigation_first and timed_out and not runtime.UNREAPED_COMMANDS and
+            any(item.get("log") == str(raw) and item.get("reaped") is True for item in runtime.INTERRUPTED_COMMANDS)):
+        result["filteredNavigationWitness"] = filtered_navigation_witness(scratch, udid, device, name, selected_runtime)
     return result
 
 
@@ -863,7 +935,7 @@ def failure_job_summary(data):
         # filenames, messages, titles, URLs or values from XCTest diagnostics.
         allowed = {"15", "18", "22", "30", "44", "51", "60", "67", "69", "71", "82", "89", "95", "100",
                    "107", "111", "127", "129", "161", "165", "187", "189", "190", "195", "204", "207",
-                   "212", "215", "226", "233"}
+                   "212", "215", "226", "233", "257"}
         sources = []
         for line in text.splitlines():
             location, separator, _ = line.partition(f": error: {identity} : ")
@@ -1069,13 +1141,16 @@ def main():
             if created is not None:
                 result["deviceLogs"] = runtime.preserve_device_logs(
                     created, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
-                result["targetAppExit"] = preserve_app_exit(out, scratch, udid, created, name, selected_runtime)
+                result["targetAppExit"] = preserve_app_exit(out, scratch, udid, created, name, selected_runtime,
+                    navigation_first=(completed_xcode or {}).get("category") == "xctest_failure")
         finally:
             result["testAttachments"] = runtime.export_test_attachments(out)
             for server in servers:
                 try:
                     server.stop()
                     runtime.save(out / (server.kind + "-events.json"), server.events)
+                    if failure is not None:
+                        result.setdefault("fixtureTransport", {"diagnosticOnly": True})[server.kind] = server.transport_summary()
                 except Exception as error:
                     failure = failure or error
                     result["serverCleanupError"] = type(error).__name__

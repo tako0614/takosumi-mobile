@@ -81,7 +81,7 @@ def save(path, value):
 def preserve_stage_checkpoint(out, result, stage, udid, name, created_device):
     temporary = None
     try:
-        if stage not in ("boot-retry-returned", "trust-returned", "before-test-returned"):
+        if stage not in ("boot-retry-returned", "trust-returned", "before-test"):
             return
         value = dict(result)
         value["diagnosticCheckpoint"] = {
@@ -170,6 +170,15 @@ def retire_cli(process, path, original):
     outcome = {"pid": process.pid, "log": str(path), "originalErrorType": type(original).__name__,
                "reaped": False, "signals": []}
     INTERRUPTED_COMMANDS.append(outcome)
+    if (isinstance(original, subprocess.TimeoutExpired) and
+            original.cmd == ["xcrun", "simctl", "list", "runtimes", "--json"]):
+        # Capture the direct child before poll can reap it. This phase runs
+        # before a Simulator is created and can stop in xcrun or simctl.
+        outcome["phase"] = "runtime-inventory"
+        try:
+            outcome["child"] = owned_cli_snapshot(process.pid)
+        except Exception as error:
+            outcome["snapshotErrorType"] = type(error).__name__
     code = process.poll()
     if code is not None:
         outcome.update(reaped=True, exit=code)
@@ -750,7 +759,7 @@ def main():
             if len(checkout) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in checkout):
                 raise RuntimeError("Missing checkout head/tree identity")
             result["checkout"] = {"head": checkout[0], "tree": checkout[1]}
-            inventory = json.loads(command(["xcrun", "simctl", "list", "--json"], out / "inventory.log"))
+            inventory = json.loads(command(["xcrun", "simctl", "list", "runtimes", "--json"], out / "inventory.log"))
             runtime, device_type = select_runtime(inventory)
             name = "sumi-download-" + str(uuid.uuid4())
             udid = command(["xcrun", "simctl", "create", name, device_type, runtime], out / "create.log").strip()
@@ -788,14 +797,9 @@ def main():
                      "--project-root", str(scratch), "--project", str(scratch)],
                     out / "project.log", env=env)
             shutil.copyfile(scratch / "DownloadFixture.xcodeproj/project.pbxproj", out / "project.pbxproj")
-            # Destination evidence BEFORE xcodebuild: run 43100058856's
-            # "Unable to find a device matching id=<just-booted udid>" could
-            # not discriminate a vanished device from an xcodebuild-side
-            # matching failure on the degraded host. The pre-test inventory
-            # names which of the two it was.
-            command(["xcrun", "simctl", "list", "devices", "--json"],
-                    out / "before-test.log")
-            preserve_stage_checkpoint(out, result, "before-test-returned", udid, name, created_device)  # stage-checkpoint:before-test
+            # Record the exact destination from the owned creation readback.
+            # xcodebuild resolves it and cleanup checks the current inventory.
+            preserve_stage_checkpoint(out, result, "before-test", udid, name, created_device)  # stage-checkpoint:before-test
             log = command(["xcodebuild", "test", "-project", str(scratch / "DownloadFixture.xcodeproj"),
                            "-scheme", "DownloadFixture", "-destination", f"id={udid}",
                            "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),
