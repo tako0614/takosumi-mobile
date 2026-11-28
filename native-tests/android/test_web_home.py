@@ -1411,10 +1411,13 @@ class Controls(unittest.TestCase):
         rows, rejected, cut, native = runner.parse_root_bootstrap(packet, identity)
         self.assertEqual((len(rows), rejected, cut, native), (1, 0, False, []))
         self.assertEqual(rows[0]["elapsedMs"], 600000)
+        input_packet = self.root_packet(stage="connection_name_input", receipt=13, seq=13)
+        self.assertEqual([row["stage"] for row in runner.parse_root_bootstrap(input_packet, identity)[0]],
+                         ["connection_name_input"])
         for raw in (self.root_packet(pid=3170), self.root_packet(tick=1235),
                     self.root_packet(stage="SECRET"), self.root_packet(seq=17), self.root_packet(receipt=34),
                     self.root_packet(elapsed=600001), packet.replace(b"boot=0", b"boot=1"),
-                    packet.rstrip() + b" SECRET\n"):
+                    packet.rstrip() + b" SECRET\n", input_packet.rstrip() + b" SECRET\n"):
             with self.subTest(raw=raw[:25]):
                 self.assertEqual(runner.parse_root_bootstrap(raw, identity)[0], [])
         for length in range(len(packet.rstrip())):

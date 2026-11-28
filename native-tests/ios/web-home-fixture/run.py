@@ -275,7 +275,7 @@ def bootstrap_witness(data, size, *, partial):
     packet = re.compile(rb"v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
                         rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
                         rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
-                        rb"render_returned|connection_name_(?:click|focus|blur)|unknown|cap) "
+                        rb"render_returned|connection_name_(?:click|focus|blur|input)|unknown|cap) "
                         rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1")
     anchor = None
     for line in lines[:result["scanLineLimit"]]:

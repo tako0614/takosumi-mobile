@@ -27,6 +27,7 @@ export function WebHome(props: {
   const [connections, setConnections] = createSignal<readonly WebConnection[]>([]);
   const [url, setUrl] = createSignal("");
   const [name, setName] = createSignal("");
+  let observedNameInput = false;
   const [error, setError] = createSignal("");
   const [opening, setOpening] = createSignal<string>();
   const [lastOpened, setLastOpened] = createSignal<string>();
@@ -263,7 +264,14 @@ export function WebHome(props: {
             onClick={props.observeBootstrap ? () => observe("connection_name_click") : undefined}
             onFocus={props.observeBootstrap ? () => observe("connection_name_focus") : undefined}
             onBlur={props.observeBootstrap ? () => observe("connection_name_blur") : undefined}
-            onInput={(event) => setName(event.currentTarget.value)} />
+            onInput={(event) => {
+              setName(event.currentTarget.value);
+              // Observe delivery once. Later input events add no field data to the witness.
+              if (props.observeBootstrap && !observedNameInput) {
+                observedNameInput = true;
+                observe("connection_name_input");
+              }
+            }} />
           <button class="web-primary" type="submit" disabled={locked()}
             ref={() => observe("save_element")}>保存して開く</button>
         </form>

@@ -797,7 +797,7 @@ ROOT_BOOTSTRAP_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
     rb"com\.takosumi\.fixture\.simulator\.bootstrap v=1 receipt=([1-9][0-9]?) seq=(0|[1-9][0-9]?) "
     rb"stage=(entry|storage_begin|storage_end|storage_unavailable|selection_begin|selection_end|"
     rb"legacy|home_init|connections_begin|connections_end|connections_failed|save_element|"
-    rb"render_returned|connection_name_(?:click|focus|blur)|unknown|cap) "
+    rb"render_returned|connection_name_(?:click|focus|blur|input)|unknown|cap) "
     rb"elapsedMs=(-1|0|[1-9][0-9]{0,5}) end=1 rootEnd=1")
 ROOT_NATIVE_PACKET = re.compile(ROOT_BOOTSTRAP_IDENTITY +
     rb"nativeStage=(listener_ready|page_started|page_finished) rootEnd=1")

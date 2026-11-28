@@ -25,6 +25,14 @@ describe("private root bootstrap hints", () => {
     expect(JSON.stringify(packets)).not.toContain("ready");
   });
 
+  test("connection name input is a fixed stage without a field payload", () => {
+    const packets: unknown[] = [];
+    const note = createBootstrapObserver({ enabled: true, send: (packet) => { packets.push(packet); }, now: () => 5 });
+    note("connection_name_input");
+    note("connection_name_input_SECRET" as never);
+    expect(packets).toEqual([[1, 1, "connection_name_input", 5]]);
+  });
+
   test("failed or rejected diagnostics preserve storage behavior and the original failure", async () => {
     for (const send of [() => { throw new Error("SECRET"); }, () => Promise.reject(new Error("SECRET"))]) {
       const reads: string[] = [];

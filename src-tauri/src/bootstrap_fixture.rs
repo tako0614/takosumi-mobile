@@ -19,6 +19,7 @@ const STAGES: &[&str] = &[
     "connection_name_click",
     "connection_name_focus",
     "connection_name_blur",
+    "connection_name_input",
 ];
 
 fn number(value: &str, max: u32) -> Option<u32> {
@@ -304,13 +305,12 @@ mod tests {
         assert_eq!(boot, "0123456789abcdef0123456789abcdef");
         assert_eq!(kernel_boot_id(&raw_boot[..36]), None);
         assert_eq!(kernel_boot_id(b"SECRET"), None);
-        for (i, stage) in STAGES.iter().enumerate() {
+        for stage in STAGES {
             let line = Recorder::new(true).record(&format!("[1,1,\"{stage}\",600000]")).unwrap();
             let packet = android_packet(42, 1234, &boot, &line);
             assert!(packet.ends_with(" end=1 rootEnd=1"));
             assert!(packet.len() < 320);
             println!("{packet}");
-            assert!(i < 16);
         }
         let unknown = Recorder::new(true).record("[1,1,\"SECRET\",0]").unwrap();
         assert!(!unknown.contains("SECRET"));
@@ -325,10 +325,11 @@ mod tests {
     fn closed_payloads_and_browser_clock_do_not_serialize_private_input() {
         let mut recorder = Recorder::new(true);
         for (i, stage) in STAGES.iter().enumerate() {
+            let sequence = i % 16 + 1;
             let line = recorder
-                .record(&format!("[1,{},\"{stage}\",{i}]", i + 1))
+                .record(&format!("[1,{sequence},\"{stage}\",{i}]"))
                 .unwrap();
-            assert!(line.ends_with(&format!("seq={} stage={stage} elapsedMs={i} end=1", i + 1)));
+            assert!(line.ends_with(&format!("seq={sequence} stage={stage} elapsedMs={i} end=1")));
             println!("{line}");
         }
         let wide = recorder.record("[1,14,\"entry\",600000]").unwrap();
@@ -338,6 +339,7 @@ mod tests {
             "[1,1,\"SECRET\",0]",
             "[1,1,\"entry\",\"SECRET\"]",
             "[1,1,\"entry\",0,\"SECRET\"]",
+            "[1,1,\"connection_name_input\",0,\"SECRET\"]",
             "{\"SECRET\":true}",
             "[1,true,\"entry\",0]",
             "[2,1,\"entry\",0]",
