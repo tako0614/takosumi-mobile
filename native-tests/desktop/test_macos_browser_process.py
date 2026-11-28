@@ -1090,7 +1090,7 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
         # Drive the actual first_launch caller: a ready abnormal Work receipt
         # must prevent futile extra Personal waits, while pending/normal Work
         # cannot turn a missing Personal event into success.
-        def first_launch_with_preceding_receipt(receipt):
+        def first_launch_with_preceding_receipt(receipt, fail_read=False):
             work_receipt = self.root / "preceding-work.json"
             if receipt is None:
                 work_receipt.unlink(missing_ok=True)
@@ -1122,7 +1122,14 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
 
             observer.read_evaluate.side_effect = seed
             observer.sample.side_effect = lambda page: state[id(page)].copy()
-            observer.contended_sample.side_effect = lambda page, mark: state[id(page)].copy()
+            read_error = runner.Failure("Post-cancel read timed out")
+
+            def read_after_cancel(page, mark):
+                if fail_read and page is personal:
+                    raise read_error
+                return state[id(page)].copy()
+
+            observer.contended_sample.side_effect = read_after_cancel
             observer.marker.side_effect = lambda name: ({"after": [None, None]}
                                                         if name == "app-browser-process.json"
                                                         else [None, None])
@@ -1146,8 +1153,23 @@ sampler.capture_state({'pid':12},Path(sys.argv[2]))
                 try:
                     runner.MacObserver.first_launch(observer)
                 except runner.Failure as error:
+                    if fail_read:
+                        self.assertIs(error, read_error)
+                        self.assertEqual(observer.step.call_args, mock.call("read Personal after cancelled quit", personal))
+                        observer.remove_beforeunload.assert_not_called()
+                        self.assertNotIn(mock.call("request-partial-exit"), observer.checkpoint.call_args_list)
+                    else:
+                        observer.step.assert_has_calls([
+                            mock.call("read Work after cancelled quit", work),
+                            mock.call("read Personal after cancelled quit", personal),
+                            mock.call("verify documents after cancelled quit"),
+                            mock.call("remove Work beforeunload after cancelled quit", work),
+                        ])
                     return error, waits, errors
             self.fail("The missing Personal event must remain a failure")
+
+        _, waits, _ = first_launch_with_preceding_receipt(None, fail_read=True)
+        self.assertEqual(waits, [])
 
         normal = {"rootExit": 0, "complete": True, "kernelNoChildren": True,
                   "forcedCleanup": 0, "remaining": [], "cleanupErrors": [], "error": None}

@@ -395,14 +395,19 @@ class MacObserver(Observer):
             # renderer helper spawns). Separate CDP commands read storage,
             # cookies, and the live frame's origin. Page and Inspector events
             # cover navigation and renderer crashes since each mark.
-            cancelled = [self.contended_sample(work, mark),
-                         self.contended_sample(personal, other)]
+            self.step("read Work after cancelled quit", work)
+            retained_work = self.contended_sample(work, mark)
+            self.step("read Personal after cancelled quit", personal)
+            retained_personal = self.contended_sample(personal, other)
+            cancelled = [retained_work, retained_personal]
             unchanged = ([item["storage"] for item in cancelled] == [item["storage"] for item in expected]
                          and [item["cookie"] for item in cancelled] == [item["cookie"] for item in expected]
                          and [item["origin"] for item in cancelled] == [item["origin"] for item in expected])
         else:
             unchanged = [self.sample(page) for page in pages] == expected
+        self.step("verify documents after cancelled quit")
         require(unchanged, "Cancelled quit changed a document")
+        self.step("remove Work beforeunload after cancelled quit", work)
         self.remove_beforeunload(work)
         self.case("quit-cancel-stops", {"cancelledBy": cancelled_by})
         mark = self.beforeunload(personal)
