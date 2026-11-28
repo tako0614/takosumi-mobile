@@ -54,7 +54,8 @@ public final class WebHomeOperationTest {
     private boolean backObservationIncomplete;
     private BackWaitObservation menuHomeWait;
     private boolean menuHomeWaitTimedOut;
-    private boolean personalInitialDraftTimedOut;
+    private enum PersonalEditorDraftCheck { INITIAL, AFTER_WORK_CLEAR }
+    private PersonalEditorDraftCheck timedOutPersonalEditorDraft;
     // INITIAL_SAVE_OBSERVATION_FIELDS_BEGIN
     private InitialSaveObservation initialSaveObservation;
     private boolean initialSaveObservationIncomplete;
@@ -615,6 +616,10 @@ public final class WebHomeOperationTest {
     }
 
     private void draft(String value, String expectedProfile) {
+        draft(value, expectedProfile, null);
+    }
+
+    private void draft(String value, String expectedProfile, PersonalEditorDraftCheck comparison) {
         long end = SystemClock.elapsedRealtime() + 15000;
         List<UiObject2> lastFields = new ArrayList<>();
         int samples = 0;
@@ -627,7 +632,7 @@ public final class WebHomeOperationTest {
             }
             SystemClock.sleep(100);
         } while (SystemClock.elapsedRealtime() < end);
-        personalInitialDraftTimedOut = "Personal".equals(expectedProfile) && value.isEmpty();
+        timedOutPersonalEditorDraft = comparison;
         captureEditorDraftFailure(expectedProfile, value, samples, lastFields);
         throw new AssertionError("Wrong profile's actual editor draft: " + value);
     }
@@ -664,10 +669,11 @@ public final class WebHomeOperationTest {
     }
 
     private void comparePersonalEditorAccessibility() {
-        if (!personalInitialDraftTimedOut) return;
+        if (timedOutPersonalEditorDraft == null) return;
         JSONObject metadata = new JSONObject();
         diagnostic(result, "personalEditorAccessibility", metadata);
         diagnostic(metadata, "diagnosticOnly", true);
+        diagnostic(metadata, "phase", timedOutPersonalEditorDraft.name());
         diagnostic(metadata, "cacheClear", "UNKNOWN");
         diagnostic(metadata, "before", JSONObject.NULL);
         diagnostic(metadata, "after", JSONObject.NULL);
@@ -738,12 +744,7 @@ public final class WebHomeOperationTest {
         }
     }
 
-    private void writeDraft(String value, String expectedProfile) {
-        writeDraft(value, expectedProfile, null);
-    }
-
     private void writeDraft(String value, String expectedProfile, JSONObject trace) {
-        draft("", expectedProfile);
         UiObject2 field = one(By.clazz("android.widget.EditText"));
         field.click(); field.setText(value);
         hideKeyboardIfShown(trace);
@@ -824,6 +825,7 @@ public final class WebHomeOperationTest {
         } finally { finishHomeWaitObservation(accountHomeReturned); }
         click("📝 Notes"); expect(EDITOR_HEADING); host(editor);
         JSONObject pageTwoTap = new JSONObject();
+        draft("", "Work");
         writeDraft("work-draft", "Work", pageTwoTap);
         click("Page two", pageTwoTap);
         boolean pageTwoReady = false;
@@ -849,7 +851,9 @@ public final class WebHomeOperationTest {
         draft("work-draft", "Work"); assertEquals(warmPid, pid()); assertEquals(warm, document());
         cases.put("warm-document-retained");
         picker(); add("Personal"); click("Sign in Personal"); expect("Fixture home Personal");
-        click("📝 Notes"); writeDraft("personal-draft", "Personal");
+        click("📝 Notes");
+        draft("", "Personal", PersonalEditorDraftCheck.INITIAL);
+        writeDraft("personal-draft", "Personal", null);
         picker(); reopen("Work"); draft("work-draft", "Work");
         menu("アプリホームへ"); expect("Fixture home Work");
         nativeButton("戻る"); draft("work-draft", "Work");
@@ -879,7 +883,9 @@ public final class WebHomeOperationTest {
         click("Sign in Work"); expect("Fixture home Work"); click("📝 Notes"); draft("", "Work");
         closeAndOpenMain(); reopen("Personal");
         expectPersonalHomeAfterReset(); expect("Instance data instance-Personal");
-        click("📝 Notes"); draft("personal-draft", "Personal"); closeAndOpenMain();
+        click("📝 Notes");
+        draft("personal-draft", "Personal", PersonalEditorDraftCheck.AFTER_WORK_CLEAR);
+        closeAndOpenMain();
         cases.put("cleared-profile-reset").put("other-profile-preserved").put("native-views-closed");
         result.put("passed", true);
     }
