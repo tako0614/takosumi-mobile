@@ -770,12 +770,13 @@ def require_target_log_owner(path, udid, device, name, selected_runtime, timeout
             and current.get("logPath") == device.get("logPath"), "Owned Simulator changed before target log read")
 
 
-def filtered_navigation_witness(scratch, udid, device, name, selected_runtime):
-    """Read only the owned App's fixture navigation producer after a broad timeout."""
+def filtered_navigation_witness(scratch, udid, device, name, selected_runtime, *, owner_already_checked=False):
+    """Read only this owned App's fixture navigation producer."""
     result = {"diagnosticOnly": True, "absenceIsUnknown": True, "status": "unknown", "queryReturned": False}
     deadline = runtime.time.monotonic() + FILTERED_NAVIGATION_WAIT
     try:
-        require_target_log_owner(scratch / "before-filtered-navigation.log", udid, device, name, selected_runtime, timeout=2)
+        if not owner_already_checked:
+            require_target_log_owner(scratch / "before-filtered-navigation.log", udid, device, name, selected_runtime, timeout=2)
         remaining = deadline - runtime.time.monotonic()
         if remaining <= 0:
             return result
@@ -814,7 +815,7 @@ def filtered_navigation_witness(scratch, udid, device, name, selected_runtime):
     return result
 
 
-def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
+def preserve_app_exit(out, scratch, udid, device, name, selected_runtime, *, navigation_first=False):
     """Optional, bounded target logs from this exact newly created Simulator."""
     result = {"diagnosticOnly": True, "udid": udid, "bundleIdentifier": BUNDLE,
               "scope": "Owned Simulator only; Takosumi process or private fixture bundle events",
@@ -834,6 +835,14 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         result["errorType"] = type(error).__name__
         return result
+    if navigation_first:
+        # An XCTest assertion already identifies a functional failure. Start
+        # the narrow capture at the just-verified Simulator identity, before
+        # the broad query can delay or prevent it.
+        result["filteredNavigationWitness"] = filtered_navigation_witness(
+            scratch, udid, device, name, selected_runtime, owner_already_checked=True)
+        if runtime.UNREAPED_COMMANDS:
+            return result
     timed_out = False
     try:
         runtime.command(["xcrun", "simctl", "spawn", udid, "log", "show", "--style", "compact",
@@ -875,7 +884,7 @@ def preserve_app_exit(out, scratch, udid, device, name, selected_runtime):
     except Exception as error:
         # Missing/failed diagnostics never replace the original test failure.
         result["retentionErrorType"] = type(error).__name__
-    if (timed_out and not runtime.UNREAPED_COMMANDS and
+    if (not navigation_first and timed_out and not runtime.UNREAPED_COMMANDS and
             any(item.get("log") == str(raw) and item.get("reaped") is True for item in runtime.INTERRUPTED_COMMANDS)):
         result["filteredNavigationWitness"] = filtered_navigation_witness(scratch, udid, device, name, selected_runtime)
     return result
@@ -1132,7 +1141,8 @@ def main():
             if created is not None:
                 result["deviceLogs"] = runtime.preserve_device_logs(
                     created, udid, out / "owned-device-logs", Path.home() / "Library/Logs/CoreSimulator")
-                result["targetAppExit"] = preserve_app_exit(out, scratch, udid, created, name, selected_runtime)
+                result["targetAppExit"] = preserve_app_exit(out, scratch, udid, created, name, selected_runtime,
+                    navigation_first=(completed_xcode or {}).get("category") == "xctest_failure")
         finally:
             result["testAttachments"] = runtime.export_test_attachments(out)
             for server in servers:

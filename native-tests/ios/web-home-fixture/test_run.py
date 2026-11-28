@@ -406,7 +406,8 @@ class Controls(unittest.TestCase):
                     lines.append(line)
                     if mode == "sink":
                         raise OSError("private sink failure")
-                def preserve_app_exit(*_):
+                def preserve_app_exit(*_, navigation_first):
+                    self.assertTrue(navigation_first)
                     if mode == "later-interrupt":
                         runtime.INTERRUPTED_COMMANDS.append({"log": str(out / "target-app-exit-raw.log"),
                                                              "reaped": True, "originalErrorType": "TimeoutExpired"})
@@ -745,6 +746,52 @@ class Controls(unittest.TestCase):
                 self.assertEqual(witness["partial"], mode != "retained")
                 self.assertEqual([record["event"] for record in witness["records"]], ["provisional"])
                 self.assertLessEqual(witness["keptBytes"], 512 * 1024)
+
+    def test_completed_xctest_failure_captures_navigation_before_the_broad_query(self):
+        device = {"udid": "owned", "name": "expected", "state": "Booted",
+                  "dataPath": "/owned/data", "logPath": "/owned/logs"}
+        for mode in ("broad-timeout", "changed-owner", "navigation-live"):
+            with self.subTest(mode=mode):
+                out, scratch = self.root / f"out-{mode}", self.root / f"scratch-{mode}"
+                out.mkdir()
+                scratch.mkdir()
+                calls = []
+
+                def command(argv, path, **options):
+                    calls.append(path.name)
+                    if "spawn" not in argv:
+                        current = dict(device, logPath="/foreign/logs") if mode == "changed-owner" else device
+                        return json.dumps({"devices": {"runtime": [current]}})
+                    self.assertEqual(argv[3], "owned")
+                    if path.name == "filtered-navigation-raw.log":
+                        self.assertIn('(process == "Takosumi") AND (subsystem == "com.takosumi.fixture.simulator.navigation")', argv)
+                        path.write_bytes(b"private unrelated log\n"
+                            b"2026-11-28 00:00:00.001 Df Takosumi[10:ab] [com.takosumi.fixture.simulator.navigation:navigation] "
+                            b"com.takosumi.fixture.simulator.nav v=1 seq=2 event=commit view=1 request=1 "
+                            b"relation=1 target=editor reused=0 kept=0 resume=1 initial=0 sameView=1 timeMs=123\n")
+                        if mode != "navigation-live":
+                            return ""
+                        runtime.UNREAPED_COMMANDS.append({"log": str(path)})
+                    else:
+                        path.write_bytes(b"partial broad query\n")
+                        runtime.INTERRUPTED_COMMANDS.append({"log": str(path), "reaped": True})
+                    raise subprocess.TimeoutExpired(argv, options["timeout"])
+
+                with patch.object(runtime, "command", side_effect=command), \
+                        patch.object(runtime, "INTERRUPTED_COMMANDS", []), patch.object(runtime, "UNREAPED_COMMANDS", []):
+                    result = runner.preserve_app_exit(out, scratch, "owned", device, "expected", "runtime",
+                                                      navigation_first=True)
+                expected = ["before-target-logs.log"]
+                if mode != "changed-owner":
+                    expected.append("filtered-navigation-raw.log")
+                    self.assertEqual(result["filteredNavigationWitness"]["queryReturned"], mode != "navigation-live")
+                if mode == "broad-timeout":
+                    expected.append("target-app-exit-raw.log")
+                    self.assertTrue(result["partial"])
+                    self.assertEqual([row["event"] for row in result["filteredNavigationWitness"]["records"]], ["commit"])
+                self.assertEqual(calls, expected)
+                self.assertNotIn("private unrelated log", json.dumps(result))
+                self.assertNotIn("passed", result)
 
     def test_navigation_witness_has_only_closed_metadata_and_separates_process_view_identity(self):
         payload = (b"com.takosumi.fixture.simulator.nav v=1 seq=1 event=request view=1 request=1 relation=0 "
