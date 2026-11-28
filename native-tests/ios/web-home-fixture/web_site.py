@@ -4,9 +4,22 @@ import http.server
 from http.cookies import SimpleCookie
 import secrets
 import ssl
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
+
+
+def tls_established(connection):
+    # This checks negotiation state without another read. The fixture does
+    # not request client certificates, so a successful call returns None.
+    try:
+        connection.getpeercert()
+    except ValueError:
+        return False
+    except OSError:
+        return None
+    return True
 
 
 class Site(http.server.ThreadingHTTPServer):
@@ -23,6 +36,7 @@ class Site(http.server.ThreadingHTTPServer):
         self.editor = None
         self._transport_lock = threading.Lock()
         self._transport = {"accepted": 0, "handlerEndedBeforeTls": 0, "handlerEndedAfterTls": 0}
+        self._pre_tls_failures = {}
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate, key)
         self.tls_context = context
@@ -44,23 +58,34 @@ class Site(http.server.ThreadingHTTPServer):
             raise
 
     def record_handler_end(self, connection):
-        # SSL exposes handshake state here without another read. The fixture
-        # doesn't request a client certificate, so a completed TLS session
-        # returns None. Only retain whether the call succeeded.
-        try:
-            connection.getpeercert()
-        except ValueError:
-            field = "handlerEndedBeforeTls"
-        except OSError:
+        established = tls_established(connection)
+        if established is None:
             return  # Accepted, with no usable observation at handler teardown.
-        else:
-            field = "handlerEndedAfterTls"
+        field = "handlerEndedAfterTls" if established else "handlerEndedBeforeTls"
         with self._transport_lock:
             self._transport[field] += 1
 
+    def record_pre_tls_failure(self, connection, category):
+        if tls_established(connection) is False:
+            with self._transport_lock:
+                self._pre_tls_failures[category] = self._pre_tls_failures.get(category, 0) + 1
+
+    def handle_error(self, request, client_address):
+        error = sys.exception()
+        if isinstance(error, ssl.SSLError):
+            # Keep a closed category, never a peer address or the raw error.
+            category = "unknownCaAlert" if error.reason == "TLSV1_ALERT_UNKNOWN_CA" else "otherTlsError"
+            self.record_pre_tls_failure(request, category)
+        elif isinstance(error, ConnectionResetError):
+            self.record_pre_tls_failure(request, "connectionReset")
+        super().handle_error(request, client_address)
+
     def transport_summary(self):
         with self._transport_lock:
-            return self._transport.copy()
+            result = self._transport.copy()
+            if self._pre_tls_failures:
+                result["preTlsFailures"] = self._pre_tls_failures.copy()
+            return result
 
     @property
     def url(self):
@@ -83,6 +108,11 @@ class Site(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Never log cookie headers or disposable tokens.
+
+    def log_error(self, message, *args):
+        if message == "Request timed out: %r" and args and isinstance(args[0], TimeoutError):
+            self.server.record_pre_tls_failure(self.connection, "timeout")
+        super().log_error(message, *args)
 
     def finish(self):
         try:

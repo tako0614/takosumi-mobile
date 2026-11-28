@@ -1500,6 +1500,27 @@ class TLSTransportControls(unittest.TestCase):
         self.server.connection_timeout = 0.15
         with socket.create_connection(self.address, timeout=1) as pending:
             self.assertEqual(pending.recv(1), b"")
+        self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 0,
+            "preTlsFailures": {"timeout": 1},
+        })
+        self.assertEqual(self.server.events, [])
+
+    def test_peer_unknown_ca_alert_is_distinct_from_an_idle_tls_connection(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        # This context deliberately has no trust root for the fixture's CA.
+        with patch("socketserver.BaseServer.handle_error"):
+            with socket.create_connection(self.address, timeout=2) as pending:
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    context.wrap_socket(pending, server_hostname="localhost")
+            self.server.stop()
+        self.assertEqual(self.server.transport_summary(), {
+            "accepted": 1, "handlerEndedBeforeTls": 1, "handlerEndedAfterTls": 0,
+            "preTlsFailures": {"unknownCaAlert": 1},
+        })
         self.assertEqual(self.server.events, [])
 
     def test_stop_joins_an_unfinished_tls_worker_and_closes_its_socket(self):
