@@ -37,15 +37,19 @@ pub enum Step {
 }
 
 /// One look: whether the screen is still open, whether the browser is
-/// stopping, whether the window is there, and how long the wait has taken.
-/// A closed screen or a stopping browser decides first; a window that is
-/// there wins over the bound.
-pub fn step(screen_open: bool, stopping: bool, window: bool, waited: Duration) -> Step {
+/// stopping, and how long the wait has taken. Only a live, non-stopping
+/// browser needs a native window lookup. A visible window wins over the bound.
+pub fn step(
+    screen_open: bool,
+    stopping: bool,
+    window: impl FnOnce() -> bool,
+    waited: Duration,
+) -> Step {
     if !screen_open {
         Step::Closed
     } else if stopping {
         Step::Stopping
-    } else if window {
+    } else if window() {
         Step::Ready
     } else if waited >= BOUND {
         Step::Expired
@@ -72,26 +76,25 @@ mod tests {
     #[test]
     fn a_closed_screen_or_a_stopping_browser_decides_first() {
         let late = BOUND + Duration::from_secs(1);
-        for (open, stopping, window, waited) in [
-            (false, false, false, Duration::ZERO),
-            (false, true, true, late),
-        ] {
-            assert_eq!(step(open, stopping, window, waited), Step::Closed);
+        let no_lookup =
+            || -> bool { panic!("A closed or stopping screen must not inspect its window") };
+        for (open, stopping, waited) in [(false, false, Duration::ZERO), (false, true, late)] {
+            assert_eq!(step(open, stopping, no_lookup, waited), Step::Closed);
         }
-        assert_eq!(step(true, true, true, Duration::ZERO), Step::Stopping);
-        assert_eq!(step(true, true, false, late), Step::Stopping);
+        assert_eq!(step(true, true, no_lookup, Duration::ZERO), Step::Stopping);
+        assert_eq!(step(true, true, no_lookup, late), Step::Stopping);
     }
 
     #[test]
     fn the_window_wins_over_the_bound_and_the_bound_ends_the_wait() {
-        assert_eq!(step(true, false, true, Duration::ZERO), Step::Ready);
-        assert_eq!(step(true, false, true, BOUND * 2), Step::Ready);
+        assert_eq!(step(true, false, || true, Duration::ZERO), Step::Ready);
+        assert_eq!(step(true, false, || true, BOUND * 2), Step::Ready);
         assert_eq!(
-            step(true, false, false, Duration::from_millis(244)),
+            step(true, false, || false, Duration::from_millis(244)),
             Step::Again
         );
-        assert_eq!(step(true, false, false, BOUND - POLL), Step::Again);
-        assert_eq!(step(true, false, false, BOUND), Step::Expired);
+        assert_eq!(step(true, false, || false, BOUND - POLL), Step::Again);
+        assert_eq!(step(true, false, || false, BOUND), Step::Expired);
     }
 
     #[test]
