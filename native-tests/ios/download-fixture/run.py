@@ -81,7 +81,7 @@ def save(path, value):
 def preserve_stage_checkpoint(out, result, stage, udid, name, created_device):
     temporary = None
     try:
-        if stage not in ("boot-retry-returned", "trust-returned", "before-test-returned"):
+        if stage not in ("boot-retry-returned", "trust-returned", "before-test"):
             return
         value = dict(result)
         value["diagnosticCheckpoint"] = {
@@ -797,14 +797,9 @@ def main():
                      "--project-root", str(scratch), "--project", str(scratch)],
                     out / "project.log", env=env)
             shutil.copyfile(scratch / "DownloadFixture.xcodeproj/project.pbxproj", out / "project.pbxproj")
-            # Destination evidence BEFORE xcodebuild: run 43100058856's
-            # "Unable to find a device matching id=<just-booted udid>" could
-            # not discriminate a vanished device from an xcodebuild-side
-            # matching failure on the degraded host. The pre-test inventory
-            # names which of the two it was.
-            command(["xcrun", "simctl", "list", "devices", "--json"],
-                    out / "before-test.log")
-            preserve_stage_checkpoint(out, result, "before-test-returned", udid, name, created_device)  # stage-checkpoint:before-test
+            # Record the exact destination from the owned creation readback.
+            # xcodebuild resolves it and cleanup checks the current inventory.
+            preserve_stage_checkpoint(out, result, "before-test", udid, name, created_device)  # stage-checkpoint:before-test
             log = command(["xcodebuild", "test", "-project", str(scratch / "DownloadFixture.xcodeproj"),
                            "-scheme", "DownloadFixture", "-destination", f"id={udid}",
                            "-derivedDataPath", str(scratch / "derived"), "-resultBundlePath", str(out / "Tests.xcresult"),

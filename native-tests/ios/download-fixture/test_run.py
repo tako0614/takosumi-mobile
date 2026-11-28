@@ -92,7 +92,7 @@ class HarnessTests(unittest.TestCase):
                     patch.object(fixture_runner.time, "time", side_effect=AssertionError("No new clock")), \
                     patch.object(fixture_runner.time, "monotonic", side_effect=AssertionError("No new clock")), \
                     patch.object(fixture_runner.time, "sleep", side_effect=AssertionError("No new wait")):
-                for stage in ("boot-retry-returned", "trust-returned", "before-test-returned"):
+                for stage in ("boot-retry-returned", "trust-returned", "before-test"):
                     fixture_runner.preserve_stage_checkpoint(out, result, stage, "replacement-id", "replacement-name", device)
                     value = json.loads(receipt.read_text())
                     self.assertEqual({key: item for key, item in value.items() if key != "diagnosticCheckpoint"}, result)
